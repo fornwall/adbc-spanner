@@ -27,14 +27,73 @@ pub(crate) fn is_ddl(sql: &str) -> bool {
 
 /// Split a (possibly multi-statement) SQL string into individual, trimmed, non-empty statements.
 ///
-/// The split is on `;` and is intentionally simple — Spanner DDL statements do not normally contain
-/// semicolons inside string literals, and `UpdateDatabaseDdl` wants the trailing `;` stripped.
+/// Splits on top-level `;`, ignoring semicolons inside string/identifier literals (`'…'`, `"…"`,
+/// `` `…` `` with backslash escapes) and comments (`-- …`, `# …`, `/* … */`). This is shared by DDL
+/// batching (`UpdateDatabaseDdl`) and multi-statement DML batching (`ExecuteBatchDml`).
 pub(crate) fn split_statements(sql: &str) -> Vec<String> {
-    sql.split(';')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' | '`' => {
+                // A quoted literal/identifier: copy through the matching close quote.
+                current.push(c);
+                while let Some(ch) = chars.next() {
+                    current.push(ch);
+                    match ch {
+                        '\\' => {
+                            if let Some(escaped) = chars.next() {
+                                current.push(escaped);
+                            }
+                        }
+                        _ if ch == c => break,
+                        _ => {}
+                    }
+                }
+            }
+            '-' if chars.peek() == Some(&'-') => copy_line_comment(&mut current, c, &mut chars),
+            '#' => copy_line_comment(&mut current, c, &mut chars),
+            '/' if chars.peek() == Some(&'*') => {
+                current.push(c);
+                current.push(chars.next().unwrap()); // '*'
+                let mut prev = '\0';
+                for ch in chars.by_ref() {
+                    current.push(ch);
+                    if prev == '*' && ch == '/' {
+                        break;
+                    }
+                    prev = ch;
+                }
+            }
+            ';' => push_statement(&mut statements, &mut current),
+            _ => current.push(c),
+        }
+    }
+    push_statement(&mut statements, &mut current);
+    statements
+}
+
+fn copy_line_comment(
+    out: &mut String,
+    first: char,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) {
+    out.push(first);
+    for ch in chars.by_ref() {
+        out.push(ch);
+        if ch == '\n' {
+            break;
+        }
+    }
+}
+
+fn push_statement(statements: &mut Vec<String>, current: &mut String) {
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        statements.push(trimmed.to_string());
+    }
+    current.clear();
 }
 
 /// The first SQL keyword, uppercased, skipping leading whitespace and `--`/`#`/`/* */` comments.
@@ -105,5 +164,27 @@ mod tests {
             ]
         );
         assert_eq!(split_statements("   ;  ; "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn split_respects_literals_and_comments() {
+        // A semicolon inside a string literal is not a separator.
+        assert_eq!(
+            split_statements("INSERT INTO t (s) VALUES ('a;b'); DELETE FROM t WHERE true"),
+            vec![
+                "INSERT INTO t (s) VALUES ('a;b')",
+                "DELETE FROM t WHERE true",
+            ]
+        );
+        // Backslash-escaped quote inside a string.
+        assert_eq!(
+            split_statements(r"UPDATE t SET s = 'x\';y' WHERE id = 1"),
+            vec![r"UPDATE t SET s = 'x\';y' WHERE id = 1"]
+        );
+        // Semicolon inside a line comment.
+        assert_eq!(
+            split_statements("SELECT 1 -- a; b\n; SELECT 2"),
+            vec!["SELECT 1 -- a; b", "SELECT 2"]
+        );
     }
 }

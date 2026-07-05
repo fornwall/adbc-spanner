@@ -24,8 +24,8 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
 
 - Connecting to production Spanner or a Spanner emulator.
 - SQL queries (`execute`), returned as typed Arrow `RecordBatch`es.
-- DML (`execute_update`), returning the affected-row count, run inside an automatically-retried
-  read/write transaction.
+- DML (`execute_update`), returning the affected-row count. A `;`-separated batch (e.g. dbt's
+  `DELETE; INSERT`) runs atomically in one read/write transaction via `ExecuteBatchDml`.
 - DDL (`CREATE`/`ALTER`/`DROP`/`RENAME`/…), routed to the Database Admin `UpdateDatabaseDdl` API. A
   `;`-separated batch is submitted as a single schema change, so multi-step changes (e.g. dbt's
   intermediate-table build then rename swap) are near-atomic.

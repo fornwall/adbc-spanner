@@ -13,6 +13,7 @@ use adbc_core::{Optionable, PartitionedResult, Statement};
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 use google_cloud_lro::Poller as _;
+use google_cloud_spanner::builder::BatchDmlBuilder;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::ReadWriteTransaction;
@@ -89,8 +90,9 @@ impl SpannerStatement {
         Ok(statements)
     }
 
-    /// Execute a set of (already parameter-bound) DML statements in one read/write transaction,
-    /// returning the total affected-row count. Retry-safe: the statement list is cloned per attempt.
+    /// Execute a set of DML statements atomically in one read/write transaction via Spanner's
+    /// `ExecuteBatchDml`, returning the total affected-row count. Retry-safe: the statement list is
+    /// cloned per attempt.
     fn run_statements(&self, statements: Vec<SpannerSql>) -> Result<i64> {
         if statements.is_empty() {
             return Ok(0);
@@ -106,11 +108,12 @@ impl SpannerStatement {
                 .run(move |transaction: ReadWriteTransaction| {
                     let statements = statements.clone();
                     async move {
-                        let mut total = 0;
+                        let mut batch = BatchDmlBuilder::new();
                         for statement in statements {
-                            total += transaction.execute_update(statement).await?;
+                            batch = batch.add_statement(statement);
                         }
-                        Ok(total)
+                        let counts = transaction.execute_batch_update(batch.build()).await?;
+                        Ok(counts.into_iter().sum::<i64>())
                     }
                 })
                 .await
@@ -307,34 +310,26 @@ impl Statement for SpannerStatement {
             let statements = self.build_bound_statements(&sql)?;
             return Ok(Some(self.run_statements(statements)?));
         }
-        // In manual transaction mode, buffer the DML to be applied atomically on commit; the
-        // affected-row count is not known until then.
-        if !self.txn.lock().unwrap().autocommit() {
-            self.txn.lock().unwrap().buffer(sql);
-            return Ok(None);
+        // Split a `;`-separated batch (e.g. dbt's DELETE; INSERT) into individual statements so the
+        // whole batch runs atomically in one transaction.
+        let parts = crate::ddl::split_statements(&sql);
+        // In manual transaction mode, buffer for atomic apply on commit; the affected-row count is
+        // not known until then.
+        {
+            let mut txn = self.txn.lock().unwrap();
+            if !txn.autocommit() {
+                for part in parts {
+                    txn.buffer(part);
+                }
+                return Ok(None);
+            }
         }
-        let client = self.client.clone();
-        let affected = self.runtime.block_on(async move {
-            let runner = client
-                .read_write_transaction()
-                .build()
-                .await
-                .map_err(from_spanner)?;
-            // The runner may retry the closure if Spanner aborts the transaction, so rebuild the
-            // statement from the (cloned) SQL on each attempt.
-            let outcome = runner
-                .run(move |transaction: ReadWriteTransaction| {
-                    let sql = sql.clone();
-                    async move {
-                        let statement = SpannerSql::builder(sql).build();
-                        transaction.execute_update(statement).await
-                    }
-                })
-                .await
-                .map_err(from_spanner)?;
-            Ok::<i64, Error>(outcome.result)
-        })?;
-        Ok(Some(affected))
+        // Autocommit: run the whole batch atomically via ExecuteBatchDml.
+        let statements: Vec<SpannerSql> = parts
+            .into_iter()
+            .map(|s| SpannerSql::builder(s).build())
+            .collect();
+        Ok(Some(self.run_statements(statements)?))
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {

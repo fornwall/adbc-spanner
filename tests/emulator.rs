@@ -539,6 +539,36 @@ fn query_and_dml_round_trip() {
         .unwrap();
     assert_eq!((a.value(0), a.value(1)), (1, 2));
     assert_eq!((b.value(0), b.value(1)), ("x", "y"));
+
+    // --- Batched multi-statement DML in one execute_update (atomic DELETE; INSERT) ---
+
+    let mut batch_ddl = connection.new_statement().expect("new statement");
+    batch_ddl
+        .set_sql_query(
+            "DROP TABLE IF EXISTS AdbcBatch; CREATE TABLE AdbcBatch (Id INT64) PRIMARY KEY (Id)",
+        )
+        .unwrap();
+    batch_ddl.execute_update().expect("create batch table");
+
+    let mut seed = connection.new_statement().expect("new statement");
+    seed.set_sql_query("INSERT INTO AdbcBatch (Id) VALUES (1)")
+        .unwrap();
+    assert_eq!(seed.execute_update().expect("seed"), Some(1));
+
+    // A single execute_update running two statements: the delete and the insert commit together,
+    // and the affected count is their sum (1 deleted + 2 inserted).
+    let mut batch = connection.new_statement().expect("new statement");
+    batch
+        .set_sql_query(
+            "DELETE FROM AdbcBatch WHERE true; INSERT INTO AdbcBatch (Id) VALUES (2), (3)",
+        )
+        .unwrap();
+    assert_eq!(batch.execute_update().expect("batch dml"), Some(3));
+    assert_eq!(count_rows(&mut connection, "AdbcBatch"), 2);
+
+    let mut drop_batch = connection.new_statement().expect("new statement");
+    drop_batch.set_sql_query("DROP TABLE AdbcBatch").unwrap();
+    drop_batch.execute_update().expect("drop batch table");
 }
 
 /// Open a connection, retrying briefly: a freshly-created emulator database can be momentarily
