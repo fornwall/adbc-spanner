@@ -189,4 +189,36 @@ fn query_and_dml_round_trip() {
         ),
         (2, "Bob", false, 3.25)
     );
+
+    // --- DDL through the driver (routed to the admin UpdateDatabaseDdl API) ---
+
+    // A batch of two DDL statements submitted as one near-atomic schema change; idempotent so the
+    // test can be re-run against a persistent emulator.
+    let mut ddl = connection.new_statement().expect("new statement");
+    ddl.set_sql_query(
+        "DROP TABLE IF EXISTS AdbcDdl; \
+         CREATE TABLE AdbcDdl (Id INT64, Note STRING(MAX)) PRIMARY KEY (Id)",
+    )
+    .unwrap();
+    assert_eq!(ddl.execute_update().expect("ddl"), None); // DDL reports no affected-row count
+
+    // The freshly-created table is immediately usable via the data plane.
+    let mut ins = connection.new_statement().expect("new statement");
+    ins.set_sql_query("INSERT INTO AdbcDdl (Id, Note) VALUES (7, 'hello')")
+        .unwrap();
+    assert_eq!(
+        ins.execute_update().expect("insert into ddl table"),
+        Some(1)
+    );
+
+    let mut check = connection.new_statement().expect("new statement");
+    check
+        .set_sql_query("SELECT Note FROM AdbcDdl WHERE Id = 7")
+        .unwrap();
+    let ddl_rows: Vec<_> = check
+        .execute()
+        .expect("select from ddl table")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(ddl_rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 }

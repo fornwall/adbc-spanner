@@ -79,11 +79,11 @@ impl SpannerDatabase {
         }
     }
 
-    /// Resolve the effective configuration and build a connected [`DatabaseClient`].
+    /// Resolve the effective configuration and establish a connection.
     ///
     /// Emulator handling: if `SPANNER_EMULATOR_HOST` is set it supplies the endpoint (unless one was
     /// given explicitly) and forces anonymous credentials.
-    pub(crate) fn connect(&self) -> Result<DatabaseClient> {
+    pub(crate) fn connect(&self) -> Result<Connected> {
         let database = self.database.clone().ok_or_else(|| {
             invalid_state(
                 "Spanner database path is not set; provide the `uri` or \
@@ -111,13 +111,27 @@ impl SpannerDatabase {
                 builder = builder.with_credentials(AnonymousCredentials::new().build());
             }
             let spanner = builder.build().await.map_err(from_spanner)?;
-            spanner
-                .database_client(database)
+            let client = spanner
+                .database_client(database.clone())
                 .build()
                 .await
-                .map_err(from_spanner)
+                .map_err(from_spanner)?;
+            Ok(Connected {
+                client,
+                spanner,
+                database,
+            })
         })
     }
+}
+
+/// An established connection's handles: the data-plane [`DatabaseClient`], the [`Spanner`] client
+/// (used to reach the Database Admin API for DDL), and the resolved database path.
+#[derive(Debug)]
+pub(crate) struct Connected {
+    pub(crate) client: DatabaseClient,
+    pub(crate) spanner: Spanner,
+    pub(crate) database: String,
 }
 
 impl Optionable for SpannerDatabase {
@@ -186,8 +200,10 @@ impl Database for SpannerDatabase {
     type ConnectionType = SpannerConnection;
 
     fn new_connection(&self) -> Result<Self::ConnectionType> {
-        let client = self.connect()?;
-        Ok(SpannerConnection::new(self.runtime.clone(), client))
+        Ok(SpannerConnection::new(
+            self.runtime.clone(),
+            self.connect()?,
+        ))
     }
 
     fn new_connection_with_opts(

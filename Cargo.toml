@@ -58,6 +58,8 @@ arrow-schema = ">=53.1, <59"
 google-cloud-spanner = "0.34.2-preview"
 # Anonymous credentials, used when talking to the Spanner emulator.
 google-cloud-auth = "1.13"
+# The `Poller` trait, to await the admin `UpdateDatabaseDdl` long-running operation used for DDL.
+google-cloud-lro = "1.8"
 # The Spanner client is async; we bridge it to the synchronous ADBC traits with a
 # dedicated multi-thread runtime.
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
@@ -74,5 +76,3 @@ tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
 # Admin clients, used by the emulator integration test to create the test instance and database.
 google-cloud-spanner-admin-instance-v1 = "1.12"
 google-cloud-spanner-admin-database-v1 = "1.12"
-# The `Poller` trait, for awaiting the admin long-running operations.
-google-cloud-lro = "1.8"

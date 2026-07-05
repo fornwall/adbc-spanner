@@ -13,8 +13,9 @@ use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection, OptionValue};
 use adbc_core::{Connection, Optionable};
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use google_cloud_spanner::client::DatabaseClient;
+use google_cloud_spanner::client::{DatabaseClient, Spanner};
 
+use crate::driver::Connected;
 use crate::error::{err, invalid_argument, invalid_state, not_implemented};
 use crate::runtime::SharedRuntime;
 use crate::statement::SpannerStatement;
@@ -23,14 +24,18 @@ use crate::statement::SpannerStatement;
 pub struct SpannerConnection {
     runtime: SharedRuntime,
     client: DatabaseClient,
+    spanner: Spanner,
+    database: String,
     read_only: bool,
 }
 
 impl SpannerConnection {
-    pub(crate) fn new(runtime: SharedRuntime, client: DatabaseClient) -> Self {
+    pub(crate) fn new(runtime: SharedRuntime, connected: Connected) -> Self {
         Self {
             runtime,
-            client,
+            client: connected.client,
+            spanner: connected.spanner,
+            database: connected.database,
             read_only: false,
         }
     }
@@ -94,6 +99,8 @@ impl Connection for SpannerConnection {
         Ok(SpannerStatement::new(
             self.runtime.clone(),
             self.client.clone(),
+            self.spanner.clone(),
+            self.database.clone(),
             self.read_only,
         ))
     }

@@ -5,12 +5,15 @@
 //! result back as an Arrow [`RecordBatch`]. Calling [`Statement::execute_update`] runs it as DML
 //! inside a read/write transaction and returns the number of affected rows.
 
+use std::sync::Arc;
+
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{OptionStatement, OptionValue};
 use adbc_core::{Optionable, PartitionedResult, Statement};
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
-use arrow_schema::Schema;
-use google_cloud_spanner::client::DatabaseClient;
+use arrow_schema::{ArrowError, Schema};
+use google_cloud_lro::Poller as _;
+use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
@@ -22,18 +25,58 @@ use crate::runtime::SharedRuntime;
 pub struct SpannerStatement {
     runtime: SharedRuntime,
     client: DatabaseClient,
+    spanner: Spanner,
+    database: String,
     read_only: bool,
     sql: Option<String>,
 }
 
 impl SpannerStatement {
-    pub(crate) fn new(runtime: SharedRuntime, client: DatabaseClient, read_only: bool) -> Self {
+    pub(crate) fn new(
+        runtime: SharedRuntime,
+        client: DatabaseClient,
+        spanner: Spanner,
+        database: String,
+        read_only: bool,
+    ) -> Self {
         Self {
             runtime,
             client,
+            spanner,
+            database,
             read_only,
             sql: None,
         }
+    }
+
+    /// Apply one or more DDL statements as a single Spanner `UpdateDatabaseDdl` schema change.
+    ///
+    /// Batching all statements into one call makes a multi-step change (for example dbt's
+    /// intermediate-table build followed by a rename swap) near-atomic.
+    fn run_ddl(&self, statements: Vec<String>) -> Result<()> {
+        if self.read_only {
+            return Err(invalid_state(
+                "cannot execute DDL: the connection is read-only",
+            ));
+        }
+        let spanner = self.spanner.clone();
+        let database = self.database.clone();
+        self.runtime.block_on(async move {
+            let admin = spanner
+                .database_admin_builder()
+                .build()
+                .await
+                .map_err(from_spanner)?;
+            admin
+                .update_database_ddl()
+                .set_database(database)
+                .set_statements(statements)
+                .poller()
+                .until_done()
+                .await
+                .map_err(from_spanner)?;
+            Ok::<(), Error>(())
+        })
     }
 
     fn sql(&self) -> Result<String> {
@@ -93,6 +136,13 @@ impl Statement for SpannerStatement {
 
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let sql = self.sql()?;
+        if crate::ddl::is_ddl(&sql) {
+            self.run_ddl(crate::ddl::split_statements(&sql))?;
+            // DDL has no result set — return an empty reader with an empty schema.
+            let schema = Arc::new(Schema::empty());
+            let empty: Vec<std::result::Result<RecordBatch, ArrowError>> = Vec::new();
+            return Ok(Box::new(RecordBatchIterator::new(empty, schema)));
+        }
         let client = self.client.clone();
         let (schema, batch) = self.runtime.block_on(async move {
             let transaction = client.single_use().build();
@@ -107,12 +157,17 @@ impl Statement for SpannerStatement {
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
+        let sql = self.sql()?;
+        if crate::ddl::is_ddl(&sql) {
+            self.run_ddl(crate::ddl::split_statements(&sql))?;
+            // DDL does not report an affected-row count.
+            return Ok(None);
+        }
         if self.read_only {
             return Err(invalid_state(
                 "cannot execute DML: the connection is read-only",
             ));
         }
-        let sql = self.sql()?;
         let client = self.client.clone();
         let affected = self.runtime.block_on(async move {
             let runner = client

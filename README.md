@@ -26,6 +26,9 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
 - SQL queries (`execute`), returned as typed Arrow `RecordBatch`es.
 - DML (`execute_update`), returning the affected-row count, run inside an automatically-retried
   read/write transaction.
+- DDL (`CREATE`/`ALTER`/`DROP`/`RENAME`/…), routed to the Database Admin `UpdateDatabaseDdl` API. A
+  `;`-separated batch is submitted as a single schema change, so multi-step changes (e.g. dbt's
+  intermediate-table build then rename swap) are near-atomic.
 - `get_table_types()` connection metadata.
 
 Not yet supported (return `NotImplemented`): query parameter binding / bulk ingest, manual
