@@ -1,6 +1,6 @@
 [package]
 name = "adbc-spanner"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -29,8 +29,9 @@ allow-branch = ["main"]
 tag-name = "v{{version}}"
 tag-message = "Release {{version}}"
 pre-release-commit-message = "Release {{version}}"
-# Publish to crates.io and push the release commit + tag.
-publish = true
+# Publishing is disabled while the google-cloud-* crates are pinned to git (see the dependency
+# note below) — crates.io rejects git dependencies. Re-enable once those are versioned releases.
+publish = false
 push = true
 
 [lib]
