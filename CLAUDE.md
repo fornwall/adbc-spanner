@@ -112,7 +112,10 @@ building and attaching the binaries. They do not overlap.
 ## Conventions / gotchas
 
 - Match surrounding style; keep `fmt`/`clippy` clean (CI fails otherwise).
-- Metadata methods not yet supported (`get_info`, `get_objects`, `get_table_schema`, statistics,
-  parameter binding, Substrait, partitioned execution) intentionally return `NotImplemented` — keep
-  that pattern until implementing them for real.
+- Supported so far: queries, DML, DDL (via admin `UpdateDatabaseDdl`), manual transactions
+  (buffer-and-commit), native Arrow types for DATE/TIMESTAMP/NUMERIC, parameter binding + bulk
+  ingest, `get_table_types`/`get_table_schema`, and keyfile/keyfile_json auth.
+- Still returning `NotImplemented` (keep the pattern until implemented): `get_info`, `get_objects`,
+  `get_statistics`, Substrait, partitioned execution, and mapping ARRAY/STRUCT to Arrow
+  `List`/`Struct` (currently JSON `Utf8`).
 - Commits in this environment may need `-c commit.gpgsign=false` if no signing agent is present.
