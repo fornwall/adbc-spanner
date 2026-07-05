@@ -7,7 +7,7 @@
 # emulator down again.
 #
 # Usage:
-#   scripts/with-emulator.sh cargo test --test emulator -- --nocapture
+#   scripts/with-emulator.sh cargo test --test integration -- --nocapture
 #   scripts/with-emulator.sh cargo test        # run the whole suite against the emulator
 #
 set -euo pipefail
@@ -47,6 +47,25 @@ for _ in $(seq 1 30); do
   fi
   sleep 1
 done
+
+# The forwarded TCP port opens ~1s before the emulator's admin API is actually
+# serving RPCs. Proceeding at TCP-open makes the test's `create_instance` fire too
+# early, fail, and (being best-effort) get silently dropped — leaving no instance
+# and a confusing "Instance not found" later. Gate on a real admin response instead:
+# the emulator's REST API returns 200 for a config listing only once it is ready.
+if command -v curl >/dev/null 2>&1; then
+  echo ">> waiting for the emulator admin API (REST port ${REST_PORT})"
+  for _ in $(seq 1 120); do
+    if [ "$(curl -s -o /dev/null -w '%{http_code}' \
+        "http://127.0.0.1:${REST_PORT}/v1/projects/emulator/instanceConfigs" 2>/dev/null)" = "200" ]; then
+      break
+    fi
+    sleep 0.5
+  done
+else
+  echo ">> curl not found; sleeping briefly for the admin API to come up" >&2
+  sleep 3
+fi
 
 export SPANNER_EMULATOR_HOST="localhost:${GRPC_PORT}"
 echo ">> SPANNER_EMULATOR_HOST=${SPANNER_EMULATOR_HOST}"

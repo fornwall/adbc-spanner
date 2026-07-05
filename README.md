@@ -168,17 +168,25 @@ Unit tests run with no external dependencies:
 cargo test
 ```
 
-The end-to-end integration test in [`tests/emulator.rs`](tests/emulator.rs) runs the driver against
-the [Cloud Spanner emulator](https://cloud.google.com/spanner/docs/emulator). It is **skipped
-automatically** unless `SPANNER_EMULATOR_HOST` is set, so the command above stays green everywhere.
+The end-to-end integration test in [`tests/integration.rs`](tests/integration.rs) runs the driver
+against Cloud Spanner. It is **skipped automatically** unless a target is configured, so the command
+above stays green everywhere. Two targets are supported:
+
+- `SPANNER_EMULATOR_HOST` — a local [Cloud Spanner emulator](https://cloud.google.com/spanner/docs/emulator).
+- `SPANNER_GCP_DATABASE` — a real Cloud Spanner database, given as `project.instance.database`,
+  reached with [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)
+  (e.g. after `gcloud auth application-default login`).
 
 The helper script starts the emulator in Docker, points the tests at it, and tears it down again:
 
 ```sh
-scripts/with-emulator.sh cargo test --test emulator -- --nocapture
+scripts/with-emulator.sh cargo test --test integration -- --nocapture
+
+# Or against a real instance:
+SPANNER_GCP_DATABASE=my-project.my-instance.my-db cargo test --test integration -- --nocapture
 ```
 
-The emulator suite also includes an **FFI smoke test** that loads the built shared library through
+The integration suite also includes an **FFI smoke test** that loads the built shared library through
 the ADBC [driver manager](https://crates.io/crates/adbc_driver_manager) (via the `AdbcSpannerInit`
 C entrypoint) and runs a query — exercising the C ABI that the trait-level tests bypass.
 

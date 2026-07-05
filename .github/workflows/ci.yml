@@ -53,9 +53,14 @@ jobs:
 
       - name: Wait for the Spanner emulator
         run: |
-          for _ in $(seq 1 30); do
-            if bash -c 'echo > /dev/tcp/127.0.0.1/9010' >/dev/null 2>&1; then
-              echo "emulator is up"; exit 0
+          # Wait for the admin API to actually serve RPCs, not just for the gRPC
+          # TCP port to open — the forwarded port accepts connections ~1s before
+          # the emulator is ready, and starting the test that early makes its
+          # create_instance fail silently ("Instance not found").
+          for _ in $(seq 1 60); do
+            if [ "$(curl -s -o /dev/null -w '%{http_code}' \
+                http://127.0.0.1:9020/v1/projects/emulator/instanceConfigs)" = "200" ]; then
+              echo "emulator admin API is up"; exit 0
             fi
             sleep 1
           done
@@ -66,7 +71,7 @@ jobs:
         run: cargo test --lib
 
       - name: Integration tests (Spanner emulator)
-        run: cargo test --test emulator
+        run: cargo test --test integration
 
   # Supply-chain + hygiene checks (no build / emulator needed):
   # cargo-deny — security advisories (RUSTSEC), license compliance, banned/duplicate

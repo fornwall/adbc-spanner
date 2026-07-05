@@ -1,18 +1,32 @@
-//! End-to-end integration test that runs the ADBC driver against the Cloud Spanner emulator.
+//! End-to-end integration test that runs the ADBC driver against Cloud Spanner.
 //!
-//! The test is **skipped automatically** unless the `SPANNER_EMULATOR_HOST` environment variable is
-//! set, so a plain `cargo test` stays green without any external dependency. To run it against a
-//! local emulator use the helper script, which starts the emulator, exports the variable and runs
-//! the test:
+//! The test is **skipped automatically** unless one of two environment variables is set, so a plain
+//! `cargo test` stays green without any external dependency:
 //!
-//! ```sh
-//! scripts/with-emulator.sh cargo test --test emulator -- --nocapture
-//! ```
+//! - `SPANNER_EMULATOR_HOST` — run against a local Spanner **emulator**. The helper script starts
+//!   the emulator, exports the variable and runs the test:
 //!
-//! Setup (creating the instance, database and table) uses the Spanner admin clients directly; the
-//! actual query and DML round-trip goes through the `adbc-spanner` driver being tested.
+//!   ```sh
+//!   scripts/with-emulator.sh cargo test --test integration -- --nocapture
+//!   ```
+//!
+//! - `SPANNER_GCP_DATABASE` — run against a **real** Cloud Spanner database, reached with
+//!   Application Default Credentials (`gcloud auth application-default login`, a service-account
+//!   key via `GOOGLE_APPLICATION_CREDENTIALS`, or the ambient GCP identity). The value is the target
+//!   database in `project.instance.database` form, e.g.
+//!
+//!   ```sh
+//!   SPANNER_GCP_DATABASE=my-project.my-instance.my-db cargo test --test integration -- --nocapture
+//!   ```
+//!
+//!   The instance must already exist; the test best-effort creates the database and the `Singers`
+//!   table it needs (both idempotent), and cleans up its own scratch tables, so it is safe to re-run
+//!   against a persistent database. If both variables are set, the emulator wins.
+//!
+//! Setup (creating the database and table) uses the Spanner admin clients directly; the actual query
+//! and DML round-trip goes through the `adbc-spanner` driver being tested.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use adbc_core::options::{
     AdbcVersion, ObjectDepth, OptionConnection, OptionDatabase, OptionStatement, OptionValue,
@@ -29,52 +43,125 @@ use google_cloud_lro::Poller;
 use google_cloud_spanner::client::Spanner;
 use google_cloud_spanner_admin_instance_v1::model::Instance;
 
+// Identifiers used against the emulator, which starts empty and lets us create everything.
 const PROJECT: &str = "test-project";
 const INSTANCE: &str = "test-instance";
 const DATABASE: &str = "adbc-test";
 
-fn database_path() -> String {
-    format!("projects/{PROJECT}/instances/{INSTANCE}/databases/{DATABASE}")
+/// Where the integration tests should run, resolved from the environment.
+struct TestTarget {
+    project: String,
+    instance: String,
+    database: String,
+    /// `true` when pointed at the local emulator (via `SPANNER_EMULATOR_HOST`), `false` for a real
+    /// Cloud Spanner database reached with Application Default Credentials.
+    is_emulator: bool,
 }
 
-fn emulator_configured() -> bool {
-    std::env::var("SPANNER_EMULATOR_HOST")
+impl TestTarget {
+    fn database_path(&self) -> String {
+        format!(
+            "projects/{}/instances/{}/databases/{}",
+            self.project, self.instance, self.database
+        )
+    }
+
+    fn instance_path(&self) -> String {
+        format!("projects/{}/instances/{}", self.project, self.instance)
+    }
+}
+
+/// Resolve the test target from the environment, or `None` to skip.
+///
+/// `SPANNER_EMULATOR_HOST` selects the emulator with fixed identifiers. `SPANNER_GCP_DATABASE`, in
+/// `project.instance.database` form, points the tests at a real Cloud Spanner database reached with
+/// Application Default Credentials. The emulator takes precedence if both are set.
+fn test_target() -> Option<TestTarget> {
+    if std::env::var("SPANNER_EMULATOR_HOST")
         .ok()
         .filter(|s| !s.is_empty())
         .is_some()
+    {
+        return Some(TestTarget {
+            project: PROJECT.to_string(),
+            instance: INSTANCE.to_string(),
+            database: DATABASE.to_string(),
+            is_emulator: true,
+        });
+    }
+
+    let spec = std::env::var("SPANNER_GCP_DATABASE")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    // Spanner project / instance / database ids cannot themselves contain a dot, so a plain split
+    // unambiguously recovers the three components.
+    match spec.split('.').collect::<Vec<_>>().as_slice() {
+        [project, instance, database] => Some(TestTarget {
+            project: project.to_string(),
+            instance: instance.to_string(),
+            database: database.to_string(),
+            is_emulator: false,
+        }),
+        _ => {
+            panic!("SPANNER_GCP_DATABASE must be in 'project.instance.database' form, got {spec:?}")
+        }
+    }
 }
 
-/// Create the test instance, database and `Singers` table if they do not already exist.
+/// DDL for the `Singers` table the tests read from. `if_not_exists` guards it for a pre-existing
+/// real database, where `create_database`'s extra statements do not run.
+fn singers_ddl(if_not_exists: bool) -> String {
+    let guard = if if_not_exists { "IF NOT EXISTS " } else { "" };
+    format!(
+        "CREATE TABLE {guard}Singers (\
+             SingerId INT64 NOT NULL, \
+             Name STRING(MAX), \
+             Active BOOL, \
+             Score FLOAT64\
+         ) PRIMARY KEY (SingerId)"
+    )
+}
+
+/// Create the test database and `Singers` table if they do not already exist.
 ///
 /// `create_instance` / `create_database` are best-effort: on a re-run against an already-populated
-/// emulator they fail with `AlreadyExists`, which we intentionally ignore.
-async fn ensure_database() {
-    // The client auto-detects `SPANNER_EMULATOR_HOST` and uses anonymous credentials.
+/// target they fail with `AlreadyExists`, which we intentionally ignore.
+///
+/// The **emulator** starts empty, so we also create the instance. A **real** instance is assumed to
+/// exist already (creating one is slow and billable); there we additionally issue a
+/// `CREATE TABLE IF NOT EXISTS Singers`, because on a pre-existing database `create_database`'s
+/// extra statements never run.
+async fn ensure_database(target: &TestTarget) {
+    // The client auto-detects `SPANNER_EMULATOR_HOST` (anonymous credentials) and otherwise uses
+    // Application Default Credentials — the same resolution the driver under test performs.
     let spanner = Spanner::builder()
         .build()
         .await
         .expect("failed to build Spanner client for setup");
 
-    let instance_admin = spanner
-        .instance_admin_builder()
-        .build()
-        .await
-        .expect("failed to build instance admin client");
-    let _ = instance_admin
-        .create_instance()
-        .set_parent(format!("projects/{PROJECT}"))
-        .set_instance_id(INSTANCE)
-        .set_instance(
-            Instance::new()
-                .set_config(format!(
-                    "projects/{PROJECT}/instanceConfigs/emulator-config"
-                ))
-                .set_display_name("ADBC test instance")
-                .set_node_count(1),
-        )
-        .poller()
-        .until_done()
-        .await;
+    if target.is_emulator {
+        let instance_admin = spanner
+            .instance_admin_builder()
+            .build()
+            .await
+            .expect("failed to build instance admin client");
+        let _ = instance_admin
+            .create_instance()
+            .set_parent(format!("projects/{}", target.project))
+            .set_instance_id(&target.instance)
+            .set_instance(
+                Instance::new()
+                    .set_config(format!(
+                        "projects/{}/instanceConfigs/emulator-config",
+                        target.project
+                    ))
+                    .set_display_name("ADBC test instance")
+                    .set_node_count(1),
+            )
+            .poller()
+            .until_done()
+            .await;
+    }
 
     let database_admin = spanner
         .database_admin_builder()
@@ -83,35 +170,63 @@ async fn ensure_database() {
         .expect("failed to build database admin client");
     let _ = database_admin
         .create_database()
-        .set_parent(format!("projects/{PROJECT}/instances/{INSTANCE}"))
-        .set_create_statement(format!("CREATE DATABASE `{DATABASE}`"))
-        .set_extra_statements(vec!["CREATE TABLE Singers (\
-                 SingerId INT64 NOT NULL, \
-                 Name STRING(MAX), \
-                 Active BOOL, \
-                 Score FLOAT64\
-             ) PRIMARY KEY (SingerId)"
-            .to_string()])
+        .set_parent(target.instance_path())
+        .set_create_statement(format!("CREATE DATABASE `{}`", target.database))
+        .set_extra_statements(vec![singers_ddl(false)])
         .poller()
         .until_done()
         .await;
+
+    // On a pre-existing real database the create above is a no-op (`AlreadyExists`), so reconcile
+    // the `Singers` table separately. Skipped for the emulator, whose fresh database always gets it
+    // from the extra statements above.
+    if !target.is_emulator {
+        let _ = database_admin
+            .update_database_ddl()
+            .set_database(target.database_path())
+            .set_statements(vec![singers_ddl(true)])
+            .poller()
+            .until_done()
+            .await;
+    }
+}
+
+/// Run [`ensure_database`] exactly once for the whole test binary.
+///
+/// The two integration tests run in parallel and share one database, so letting both drive the
+/// admin setup concurrently races (the emulator can report `Instance not found` if two
+/// `create_instance` calls overlap). Guard it behind a mutex + "already done" flag so the first test
+/// to arrive performs the setup and the second reuses it.
+fn ensure_database_once(target: &TestTarget) {
+    static DONE: Mutex<bool> = Mutex::new(false);
+    let mut done = DONE.lock().expect("setup lock poisoned");
+    if !*done {
+        // A throwaway runtime just for the async admin setup.
+        tokio::runtime::Runtime::new()
+            .expect("failed to build setup runtime")
+            .block_on(ensure_database(target));
+        *done = true;
+    }
 }
 
 #[test]
 fn query_and_dml_round_trip() {
-    if !emulator_configured() {
-        eprintln!("SPANNER_EMULATOR_HOST not set — skipping Spanner emulator integration test");
+    let Some(target) = test_target() else {
+        eprintln!(
+            "neither SPANNER_EMULATOR_HOST nor SPANNER_GCP_DATABASE set — \
+             skipping Spanner integration test"
+        );
         return;
-    }
+    };
 
-    // A throwaway runtime just for the async admin setup.
-    tokio::runtime::Runtime::new()
-        .expect("failed to build setup runtime")
-        .block_on(ensure_database());
+    ensure_database_once(&target);
 
     let mut driver = SpannerDriver::try_new().expect("create driver");
     let database = driver
-        .new_database_with_opts([(OptionDatabase::Uri, OptionValue::String(database_path()))])
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
 
@@ -667,18 +782,18 @@ fn cdylib_path() -> Option<std::path::PathBuf> {
 /// the trait-level tests bypass.
 #[test]
 fn ffi_driver_manager_smoke() {
-    if !emulator_configured() {
-        eprintln!("SPANNER_EMULATOR_HOST not set — skipping FFI smoke test");
+    let Some(target) = test_target() else {
+        eprintln!(
+            "neither SPANNER_EMULATOR_HOST nor SPANNER_GCP_DATABASE set — skipping FFI smoke test"
+        );
         return;
-    }
+    };
     let Some(cdylib) = cdylib_path() else {
         eprintln!("cdylib not built — skipping FFI smoke test (run `cargo build` first)");
         return;
     };
 
-    tokio::runtime::Runtime::new()
-        .expect("setup runtime")
-        .block_on(ensure_database());
+    ensure_database_once(&target);
 
     let mut driver = ManagedDriver::load_dynamic_from_filename(
         &cdylib,
@@ -688,7 +803,10 @@ fn ffi_driver_manager_smoke() {
     .expect("load driver via the driver manager");
 
     let database = driver
-        .new_database_with_opts([(OptionDatabase::Uri, OptionValue::String(database_path()))])
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
         .expect("new_database via FFI");
 
     // The freshly-created emulator database can lag; retry the connection briefly.

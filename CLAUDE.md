@@ -84,17 +84,28 @@ The TLS stack is hardwired to `aws-lc` (via `tonic/tls-aws-lc`, `rustls/aws_lc_r
 id-token backend) — there is no `ring` option. This is why the release CI builds natively per arch
 and installs NASM on Windows.
 
-## Testing against the emulator
+## Testing against the emulator (or a real instance)
 
-- `tests/emulator.rs` skips itself unless `SPANNER_EMULATOR_HOST` is set, so plain `cargo test` is
-  green everywhere.
-- It creates the instance/database/table via the admin clients
-  (`spanner.instance_admin_builder()` / `database_admin_builder()` → `create_instance` /
-  `create_database().set_extra_statements(..).poller().until_done()`), then exercises the driver
-  (DML insert + typed SELECT).
+- `tests/integration.rs` skips itself unless a target is configured, so plain `cargo test` is green
+  everywhere. Two targets are supported (`test_target()` resolves them; emulator wins if both set):
+  - `SPANNER_EMULATOR_HOST` — a local **emulator** (fixed `test-project`/`test-instance`/`adbc-test`
+    ids, all created by the test).
+  - `SPANNER_GCP_DATABASE` — a **real** Cloud Spanner database, `project.instance.database` form,
+    reached with Application Default Credentials (`gcloud auth application-default login` / a
+    service-account key). The instance must already exist; the test best-effort creates the database
+    and `CREATE TABLE IF NOT EXISTS Singers`, and cleans up its own scratch tables, so it is safe to
+    re-run against a persistent database. No driver change was needed — `SpannerDatabase::connect`
+    already falls back to ADC when there is no emulator host and no keyfile.
+- Setup creates the database/table via the admin clients (`instance_admin_builder()` /
+  `database_admin_builder()` → `create_instance` [emulator only] / `create_database(..).poller()`),
+  then exercises the driver (DML insert + typed SELECT). It runs once per binary behind a mutex
+  (`ensure_database_once`) so the two parallel tests don't race on setup.
 - `scripts/with-emulator.sh <cmd>` runs the emulator in Docker, exports the env var, runs the
-  command, and tears it down. It also works around a broken gcr.io Docker credential helper by using
-  a clean empty `DOCKER_CONFIG` (the emulator image is public).
+  command, and tears it down. It waits for the **admin API** (a REST 200 on `instanceConfigs`), not
+  just the gRPC TCP port — the forwarded port opens ~1s before the emulator is actually serving, and
+  starting the test that early made `create_instance` fail silently → "Instance not found". It also
+  works around a broken gcr.io Docker credential helper with a clean empty `DOCKER_CONFIG` (the
+  emulator image is public).
 
 ## Shared library (loadable driver)
 
