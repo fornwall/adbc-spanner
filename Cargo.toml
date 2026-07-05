@@ -79,6 +79,13 @@ base64 = "0.22"
 # Parsing Spanner's string-encoded DATE / TIMESTAMP values into Arrow Date32 / Timestamp.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
+# Lints applied in local dev too (CI additionally runs `clippy -D warnings`).
+[lints.rust]
+unexpected_cfgs = "warn"
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "warn"
+
 [profile.release]
 # Smaller shipped shared libraries.
 strip = true

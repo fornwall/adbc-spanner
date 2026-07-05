@@ -40,6 +40,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Docs (deny warnings / broken links)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps
+
+      - name: Build without default features (ffi off)
+        run: cargo build --no-default-features
+
       - name: Wait for the Spanner emulator
         run: |
           for _ in $(seq 1 30); do
@@ -56,3 +64,24 @@ jobs:
 
       - name: Integration tests (Spanner emulator)
         run: cargo test --test emulator
+
+  # Supply-chain + hygiene checks (no build / emulator needed):
+  # cargo-deny — security advisories (RUSTSEC), license compliance, banned/duplicate
+  #   crates and allowed sources (see deny.toml).
+  # cargo-machete — unused dependencies.
+  supply-chain:
+    name: cargo-deny + machete
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+
+      - name: Unused dependencies
+        run: cargo machete
