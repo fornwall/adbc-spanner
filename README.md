@@ -32,11 +32,14 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
 - Transactions: autocommit by default, or manual multi-statement transactions (set
   `adbc.connection.autocommit` to `false`, then `commit`/`rollback`). In manual mode DML is buffered
   and applied atomically in one read/write transaction on commit.
+- Parameter binding: `bind`/`bind_stream` an Arrow batch whose columns become Spanner named
+  parameters (a column `id` binds `@id`); each bound row runs the statement once.
+- Bulk ingest: set `adbc.ingest.target_table`, bind an Arrow batch, and `execute_update` inserts the
+  rows into that table in one transaction.
 - `get_table_types()` connection metadata.
 
-Not yet supported (return `NotImplemented`): query parameter binding / bulk ingest, Substrait,
-partitioned execution, and the richer catalog-metadata calls (`get_objects`, `get_table_schema`,
-`get_statistics`, …).
+Not yet supported (return `NotImplemented`): Substrait, partitioned execution, and the richer
+catalog-metadata calls (`get_objects`, `get_table_schema`, `get_statistics`, …).
 
 ## Shared library (loadable driver)
 

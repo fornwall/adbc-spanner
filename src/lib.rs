@@ -53,6 +53,7 @@
 //! # }
 //! ```
 
+mod bind;
 mod connection;
 mod conversion;
 mod ddl;

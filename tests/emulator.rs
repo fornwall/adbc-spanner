@@ -12,14 +12,16 @@
 //! Setup (creating the instance, database and table) uses the Spanner admin clients directly; the
 //! actual query and DML round-trip goes through the `adbc-spanner` driver being tested.
 
-use adbc_core::options::{OptionConnection, OptionDatabase, OptionValue};
+use std::sync::Arc;
+
+use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, OptionValue};
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_spanner::{SpannerConnection, SpannerDriver};
 use arrow_array::{
-    BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, RecordBatchReader,
-    StringArray, TimestampMicrosecondArray,
+    BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, RecordBatch,
+    RecordBatchReader, StringArray, TimestampMicrosecondArray,
 };
-use arrow_schema::{DataType, TimeUnit};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use google_cloud_lro::Poller;
 use google_cloud_spanner::client::Spanner;
 use google_cloud_spanner_admin_instance_v1::model::Instance;
@@ -347,6 +349,88 @@ fn query_and_dml_round_trip() {
     let mut drop_types = connection.new_statement().expect("new statement");
     drop_types.set_sql_query("DROP TABLE AdbcTypes").unwrap();
     drop_types.execute_update().expect("drop types table");
+
+    // --- Parameter binding and bulk ingest ---
+
+    let mut bind_ddl = connection.new_statement().expect("new statement");
+    bind_ddl
+        .set_sql_query(
+            "DROP TABLE IF EXISTS AdbcBind; \
+             CREATE TABLE AdbcBind (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
+        )
+        .unwrap();
+    bind_ddl.execute_update().expect("create bind table");
+
+    // Bulk ingest: two rows of an Arrow batch inserted into the target table.
+    let rows = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("Id", DataType::Int64, false),
+            Field::new("Name", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec!["Alice", "Bob"])),
+        ],
+    )
+    .unwrap();
+    let mut ingest = connection.new_statement().expect("new statement");
+    ingest
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcBind".into()),
+        )
+        .unwrap();
+    ingest.bind(rows).expect("bind ingest rows");
+    assert_eq!(ingest.execute_update().expect("ingest"), Some(2));
+    assert_eq!(count_rows(&mut connection, "AdbcBind"), 2);
+
+    // Parameterized query: bind @Id and read the matching row back.
+    let param = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(vec![2]))],
+    )
+    .unwrap();
+    let mut pq = connection.new_statement().expect("new statement");
+    pq.set_sql_query("SELECT Name FROM AdbcBind WHERE Id = @Id")
+        .unwrap();
+    pq.bind(param).expect("bind query param");
+    let pq_batches = pq
+        .execute()
+        .expect("param query")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(pq_batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    assert_eq!(
+        pq_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "Bob"
+    );
+
+    // Parameterized DML: update by bound @Id / @Name.
+    let upd = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("Id", DataType::Int64, false),
+            Field::new("Name", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["Alicia"])),
+        ],
+    )
+    .unwrap();
+    let mut pu = connection.new_statement().expect("new statement");
+    pu.set_sql_query("UPDATE AdbcBind SET Name = @Name WHERE Id = @Id")
+        .unwrap();
+    pu.bind(upd).expect("bind update params");
+    assert_eq!(pu.execute_update().expect("param update"), Some(1));
+
+    let mut drop_bind = connection.new_statement().expect("new statement");
+    drop_bind.set_sql_query("DROP TABLE AdbcBind").unwrap();
+    drop_bind.execute_update().expect("drop bind table");
 }
 
 /// Count the rows in `table` through a driver query.
