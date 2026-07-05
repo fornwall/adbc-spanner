@@ -613,9 +613,21 @@ fn query_and_dml_round_trip() {
 
     // --- STRUCT → native Arrow Struct (Spanner only returns structs inside an ARRAY) ---
 
+    // Build the array-of-structs with `ARRAY(SELECT AS STRUCT ...)`. A top-level array *literal* of
+    // `STRUCT(...)` constructions (`SELECT [STRUCT(1 AS a, ...), ...]`) is accepted by the emulator
+    // but rejected by real Spanner with UNIMPLEMENTED ("Spanner does not yet support returning STRUCT
+    // except as arrays-of-structs ... use ARRAY(SELECT AS STRUCT expr ...)"). `ARRAY(subquery)` has
+    // no inherent row order, so an explicit ordering column keeps the two elements deterministic.
     let mut arr_struct_q = connection.new_statement().expect("new statement");
     arr_struct_q
-        .set_sql_query("SELECT [STRUCT(1 AS a, 'x' AS b), STRUCT(2 AS a, 'y' AS b)] AS arr")
+        .set_sql_query(
+            "SELECT ARRAY(\
+                 SELECT AS STRUCT a, b FROM (\
+                     SELECT 0 AS n, 1 AS a, 'x' AS b \
+                     UNION ALL SELECT 1 AS n, 2 AS a, 'y' AS b\
+                 ) ORDER BY n\
+             ) AS arr",
+        )
         .unwrap();
     let arr_struct_reader = arr_struct_q.execute().expect("array-of-struct query");
 
