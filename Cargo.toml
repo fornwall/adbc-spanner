@@ -56,12 +56,20 @@ arrow-array = ">=53.1, <59"
 arrow-schema = ">=53.1, <59"
 # Offset / null buffers for building Arrow List arrays (ARRAY columns).
 arrow-buffer = ">=53.1, <59"
-# The official Google Cloud preview Spanner client.
-google-cloud-spanner = "0.34.2-preview"
-# Anonymous credentials, used when talking to the Spanner emulator.
-google-cloud-auth = "1.13"
+# --- google-cloud-* pinned to a git revision (temporary) ---
+# We map Spanner STRUCT columns to native Arrow Struct types, which needs
+# `Type::struct_type()` to introspect struct field names/types. That accessor
+# exists on google-cloud-rust `main` but is NOT in a crates.io release yet (the
+# latest, 0.34.2-preview, lacks it). Until a release ships it, we pin the whole
+# google-cloud family (spanner + auth + lro + admin) to the SAME git revision so
+# their shared internal crates (gax, gaxi, ...) resolve to one compatible copy.
+# NOTE: git dependencies cannot be published to crates.io — switch these back to
+# versioned releases once `Type::struct_type()` is published.
+google-cloud-spanner = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
+# Anonymous / service-account credentials.
+google-cloud-auth = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
 # The `Poller` trait, to await the admin `UpdateDatabaseDdl` long-running operation used for DDL.
-google-cloud-lro = "1.8"
+google-cloud-lro = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
 # The Spanner client is async; we bridge it to the synchronous ADBC traits with a
 # dedicated multi-thread runtime.
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
@@ -78,5 +86,6 @@ lto = "thin"
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
 # Admin clients, used by the emulator integration test to create the test instance and database.
-google-cloud-spanner-admin-instance-v1 = "1.12"
-google-cloud-spanner-admin-database-v1 = "1.12"
+# Pinned to the same git revision as the google-cloud family above (see the note there).
+google-cloud-spanner-admin-instance-v1 = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
+google-cloud-spanner-admin-database-v1 = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }

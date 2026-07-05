@@ -16,10 +16,10 @@ use std::sync::Arc;
 
 use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, OptionValue};
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
-use adbc_spanner::{SpannerConnection, SpannerDriver};
+use adbc_spanner::{SpannerConnection, SpannerDatabase, SpannerDriver};
 use arrow_array::{
     Array, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, ListArray,
-    RecordBatch, RecordBatchReader, StringArray, TimestampMicrosecondArray,
+    RecordBatch, RecordBatchReader, StringArray, StructArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use google_cloud_lro::Poller;
@@ -110,7 +110,7 @@ fn query_and_dml_round_trip() {
     let database = driver
         .new_database_with_opts([(OptionDatabase::Uri, OptionValue::String(database_path()))])
         .expect("create database");
-    let mut connection = database.new_connection().expect("create connection");
+    let mut connection = connect_with_retry(&database);
 
     // The driver reports the table types Spanner supports without hitting the network.
     let table_types = connection.get_table_types().expect("get_table_types");
@@ -492,6 +492,69 @@ fn query_and_dml_round_trip() {
     let mut drop_arr = connection.new_statement().expect("new statement");
     drop_arr.set_sql_query("DROP TABLE AdbcArr").unwrap();
     drop_arr.execute_update().expect("drop array table");
+
+    // --- STRUCT → native Arrow Struct (Spanner only returns structs inside an ARRAY) ---
+
+    let mut arr_struct_q = connection.new_statement().expect("new statement");
+    arr_struct_q
+        .set_sql_query("SELECT [STRUCT(1 AS a, 'x' AS b), STRUCT(2 AS a, 'y' AS b)] AS arr")
+        .unwrap();
+    let arr_struct_reader = arr_struct_q.execute().expect("array-of-struct query");
+
+    // The element type is Struct<a: Int64, b: Utf8>, with field names from the metadata.
+    match arr_struct_reader.schema().field(0).data_type() {
+        DataType::List(field) => match field.data_type() {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].name(), "a");
+                assert_eq!(fields[0].data_type(), &DataType::Int64);
+                assert_eq!(fields[1].name(), "b");
+                assert_eq!(fields[1].data_type(), &DataType::Utf8);
+            }
+            other => panic!("expected List<Struct>, got List<{other:?}>"),
+        },
+        other => panic!("expected List, got {other:?}"),
+    }
+
+    let arr_struct_batches = arr_struct_reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect array-of-struct");
+    let list = arr_struct_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let inner = list.value(0);
+    let inner = inner.as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(inner.len(), 2);
+    let a = inner
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let b = inner
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!((a.value(0), a.value(1)), (1, 2));
+    assert_eq!((b.value(0), b.value(1)), ("x", "y"));
+}
+
+/// Open a connection, retrying briefly: a freshly-created emulator database can be momentarily
+/// invisible to the data plane right after the admin `create_database` returns.
+fn connect_with_retry(database: &SpannerDatabase) -> SpannerConnection {
+    let mut last_err = None;
+    for _ in 0..20 {
+        match database.new_connection() {
+            Ok(connection) => return connection,
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+    }
+    panic!("create connection failed after retries: {last_err:?}");
 }
 
 /// Count the rows in `table` through a driver query.

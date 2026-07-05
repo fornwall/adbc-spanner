@@ -142,12 +142,17 @@ Credentials are resolved in this order:
 | `NUMERIC`                                   | `Decimal128(38, 9)`               |
 | `BYTES`                                     | `Binary`                          |
 | `STRING` / `JSON` / `UUID` / `INTERVAL` / `ENUM` | `Utf8`                       |
-| `ARRAY<scalar>`                             | `List<scalar>` (recursive)        |
-| `STRUCT`, `ARRAY<STRUCT>`                   | `Utf8` (JSON-encoded)             |
+| `ARRAY<T>`                                  | `List<T>` (recursive)             |
+| `STRUCT<..>`                                | `Struct<..>` (recursive)          |
 
-`NULL`s are represented as null slots in the corresponding Arrow array. `STRUCT` (and
-`ARRAY<STRUCT>`) stay JSON text because the preview Spanner client does not expose struct field
-names/types in the result metadata, so a native Arrow `Struct` schema cannot be built.
+`NULL`s are represented as null slots in the corresponding Arrow array. `ARRAY` and `STRUCT` map to
+native Arrow `List`/`Struct` recursively, so nested shapes like `ARRAY<STRUCT<..>>` round-trip with
+full type fidelity.
+
+> **Note:** native `STRUCT` mapping needs `Type::struct_type()`, which is on `google-cloud-rust`
+> `main` but not yet in a crates.io release. Until it ships, `Cargo.toml` pins the `google-cloud-*`
+> crates to a git revision — so `adbc-spanner` cannot itself be published to crates.io in the
+> meantime (see the note in `Cargo.toml`).
 
 ## Testing
 

@@ -690,8 +690,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-auth"
 version = "1.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a300d4011cb53573eafe2419630d303ced54aab6c194a6d9e4156de375800372"
+source = "git+https://github.com/fornwall/google-cloud-rust?rev=3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1#3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -719,8 +718,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-gax"
 version = "1.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f60f45dd97ff91cedfcb6b2b9f860d3d84739386c3557027687c52cc0e698fd"
+source = "git+https://github.com/fornwall/google-cloud-rust?rev=3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1#3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1"
 dependencies = [
  "bytes",
  "futures",
@@ -737,9 +735,8 @@ dependencies = [
 
 [[package]]
 name = "google-cloud-gax-internal"
-version = "0.7.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78e0d5b25e5714321efc3ea48a1457bcd943ba85fe7a0e80e97d989f3c9aea17"
+version = "0.7.15"
+source = "git+https://github.com/fornwall/google-cloud-rust?rev=3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1#3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1"
 dependencies = [
  "bytes",
  "futures",
@@ -777,8 +774,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-iam-v1"
 version = "1.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70a245c548c002e22d1644e88d9b7d6c32183b335e63510a1bb8580045c3282d"
+source = "git+https://github.com/fornwall/google-cloud-rust?rev=3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1#3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -795,8 +791,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-longrunning"
 version = "1.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6de120149ea50fd0cccc2d3dfb863bc23e398ead386fa59c5d8f8f6004ced01c"
+source = "git+https://github.com/fornwall/google-cloud-rust?rev=3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1#3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -813,10 +808,10 @@ dependencies = [
 [[package]]
 name = "google-cloud-lro"
 version = "1.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f40d4311479512e408b67777cf497dac6e41fbe8c96730416ed9d47855584b29"
+source = "git+https://github.com/fornwall/google-cloud-rust?rev=3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1#3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1"
 dependencies = [
  "google-cloud-gax",
+ "google-cloud-gax-internal",
  "google-cloud-longrunning",
  "google-cloud-rpc",
  "google-cloud-wkt",
@@ -828,8 +823,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-rpc"
 version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10b177796075b7bfc02bf2e405db665ee850a924fa44cedfc5282b473c5ab203"
+source = "git+https://github.com/fornwall/google-cloud-rust?rev=3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1#3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1"
 dependencies = [
  "bytes",
  "google-cloud-wkt",
@@ -841,8 +835,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-spanner"
 version = "0.34.2-preview"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22a64f16ec389210a19ac1b50a5b5128c77c277f65df957ca919e443ab34a8a1"
+source = "git+https://github.com/fornwall/google-cloud-rust?rev=3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1#3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1"
 dependencies = [
  "async-trait",
  "base64",
@@ -872,8 +865,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-spanner-admin-database-v1"
 version = "1.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4be522a7fb5d67e23aa31261d44df5068196669ec42791e0a44086bd76b92a60"
+source = "git+https://github.com/fornwall/google-cloud-rust?rev=3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1#3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -893,8 +885,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-spanner-admin-instance-v1"
 version = "1.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a71b50997806c5d9a0c45b082596b8959a9c9d0b8c00aa3246a17227bff4943"
+source = "git+https://github.com/fornwall/google-cloud-rust?rev=3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1#3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -913,8 +904,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-type"
 version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3658f2192252ba301a9d0a26e298bd56b55f0edb32de499a2f41ff244c09cf8"
+source = "git+https://github.com/fornwall/google-cloud-rust?rev=3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1#3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1"
 dependencies = [
  "bytes",
  "google-cloud-wkt",
@@ -926,8 +916,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-wkt"
 version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88e0186e2221bf82c5296500251b4650b111172c324984159a0de9f6bcaa18a5"
+source = "git+https://github.com/fornwall/google-cloud-rust?rev=3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1#3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1"
 dependencies = [
  "base64",
  "bytes",

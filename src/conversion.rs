@@ -19,22 +19,22 @@
 //! | `NUMERIC`                                   | `Decimal128(38, 9)`               |
 //! | `BYTES`                                     | `Binary`                          |
 //! | `STRING`/`JSON`/`UUID`/`INTERVAL`/`ENUM`    | `Utf8`                            |
-//! | `ARRAY<scalar>`                             | `List<scalar>`                    |
-//! | `STRUCT`, `ARRAY<STRUCT>`                   | `Utf8` (JSON-encoded)             |
+//! | `ARRAY<T>`                                  | `List<T>`                         |
+//! | `STRUCT<..>`                                | `Struct<..>`                      |
 //!
-//! `ARRAY` of a scalar maps to an Arrow `List` of the mapped element type (recursively). `STRUCT`
-//! (and `ARRAY<STRUCT>`) stay JSON text because the preview Spanner client does not expose struct
-//! field names/types in the result metadata, so a native Arrow `Struct` schema cannot be built.
+//! `ARRAY` and `STRUCT` map to native Arrow `List`/`Struct` recursively, so nested shapes like
+//! `ARRAY<STRUCT<..>>` round-trip with full type fidelity. (Struct field metadata comes from
+//! [`Type::struct_type`](google_cloud_spanner::value::Type::struct_type).)
 
 use std::sync::Arc;
 
 use adbc_core::error::{Result, Status};
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int64Array, ListArray, RecordBatch, StringArray, TimestampMicrosecondArray,
+    Int64Array, ListArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
-use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema, SchemaRef, TimeUnit};
+use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 use base64::Engine;
 use google_cloud_spanner::result::{ResultSet, ResultSetMetadata, Row};
 use google_cloud_spanner::value::{Kind, Type, TypeCode, Value};
@@ -106,24 +106,43 @@ fn arrow_type(ty: &Type) -> DataType {
             DataType::Timestamp(TimeUnit::Microsecond, Some(TIMESTAMP_TZ.into()))
         }
         TypeCode::Numeric => DataType::Decimal128(NUMERIC_PRECISION, NUMERIC_SCALE),
+        TypeCode::Struct => struct_arrow_type(ty),
         TypeCode::Array => match ty.array_element_type() {
-            // ARRAY of a scalar → Arrow List of that scalar. ARRAY of STRUCT/ARRAY cannot be mapped
-            // natively (see the STRUCT note below), so the whole array falls back to JSON text.
-            Some(element)
-                if !matches!(
-                    element.code(),
-                    TypeCode::Struct | TypeCode::Array | TypeCode::Unspecified
-                ) =>
-            {
+            // ARRAY<T> → Arrow List<T> (recursively; T may itself be a STRUCT). Spanner does not
+            // allow arrays of arrays; fall back to JSON text for anything unexpected.
+            Some(element) if !matches!(element.code(), TypeCode::Array | TypeCode::Unspecified) => {
                 DataType::List(Arc::new(Field::new(LIST_ITEM, arrow_type(&element), true)))
             }
             _ => DataType::Utf8,
         },
-        // STRUCT is rendered as JSON text: the preview Spanner client does not expose struct field
-        // names/types in the result metadata, so a native Arrow Struct schema cannot be built.
         // STRING, JSON, UUID, INTERVAL, ENUM, PROTO and any future/unknown code are UTF-8 text.
         _ => DataType::Utf8,
     }
+}
+
+/// Map a Spanner `STRUCT` type to an Arrow `Struct`, using the field names and types from the
+/// result metadata. Falls back to `Utf8` if the struct type is somehow unavailable.
+fn struct_arrow_type(ty: &Type) -> DataType {
+    match ty.struct_type() {
+        Some(st) => DataType::Struct(struct_fields(st)),
+        None => DataType::Utf8,
+    }
+}
+
+/// Build the Arrow child fields for a Spanner struct type (names verbatim, including empties/dups).
+fn struct_fields(st: &google_cloud_spanner::model::StructType) -> Fields {
+    st.fields
+        .iter()
+        .map(|f| {
+            let field_type = f
+                .r#type
+                .as_deref()
+                .cloned()
+                .map(Type::from)
+                .unwrap_or_default();
+            Field::new(&f.name, arrow_type(&field_type), true)
+        })
+        .collect()
 }
 
 fn build_batch(schema: SchemaRef, rows: &[Row]) -> Result<RecordBatch> {
@@ -215,8 +234,9 @@ fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Result<ArrayR
                 .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
         }))),
         DataType::List(field) => build_list(field, values)?,
-        // Utf8 and every fallback (JSON, STRUCT, ARRAY-of-STRUCT, …): keep strings verbatim, render
-        // anything else (numbers, bools, nested arrays/structs) as JSON text.
+        DataType::Struct(fields) => build_struct(fields, values)?,
+        // Utf8 and every fallback (JSON, …): keep strings verbatim, render anything else (numbers,
+        // bools, nested values) as JSON text.
         _ => Arc::new(StringArray::from_iter(values.iter().map(|&v| {
             present(v).map(|x| {
                 x.try_as_string()
@@ -252,6 +272,44 @@ fn build_list(field: &FieldRef, values: &[Option<&Value>]) -> Result<ArrayRef> {
     )
     .map_err(arrow_err)?;
     Ok(Arc::new(list))
+}
+
+/// Build an Arrow `Struct` array. Spanner encodes struct values positionally (a `ListValue` whose
+/// elements match the struct's field order); a value delivered as a keyed struct is handled too.
+fn build_struct(fields: &Fields, values: &[Option<&Value>]) -> Result<ArrayRef> {
+    let mut children: Vec<Vec<Option<&Value>>> =
+        vec![Vec::with_capacity(values.len()); fields.len()];
+    let mut validity: Vec<bool> = Vec::with_capacity(values.len());
+    for value in values {
+        match value {
+            Some(v) if v.kind() == Kind::List => {
+                let list = v.as_list();
+                for (i, child) in children.iter_mut().enumerate() {
+                    child.push(list.get(i));
+                }
+                validity.push(true);
+            }
+            Some(v) if v.kind() == Kind::Struct => {
+                let s = v.as_struct();
+                for (field, child) in fields.iter().zip(children.iter_mut()) {
+                    child.push(s.get(field.name()));
+                }
+                validity.push(true);
+            }
+            _ => {
+                children.iter_mut().for_each(|child| child.push(None));
+                validity.push(false);
+            }
+        }
+    }
+    let arrays = fields
+        .iter()
+        .zip(&children)
+        .map(|(field, vals)| build_array(field.data_type(), vals))
+        .collect::<Result<Vec<_>>>()?;
+    let array = StructArray::try_new(fields.clone(), arrays, Some(NullBuffer::from(validity)))
+        .map_err(arrow_err)?;
+    Ok(Arc::new(array))
 }
 
 /// Parse a Spanner `INT64` value. Integers arrive as strings; we also accept a numeric encoding for
