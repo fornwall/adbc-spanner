@@ -44,7 +44,7 @@ Besides the Rust crate, this builds a C-ABI **shared library** that any ADBC dri
 (`libadbc_spanner.so` on Linux, `libadbc_spanner.dylib` on macOS, `adbc_spanner.dll` on Windows). It
 exports the standard `AdbcSpannerInit` entrypoint (plus an `AdbcDriverInit` fallback).
 
-Prebuilt libraries for Linux (x86-64, aarch64), macOS (Apple Silicon) and Windows (x86-64) are
+Prebuilt libraries for Linux, macOS and Windows are
 attached to every CI run and to each tagged [release](https://github.com/fornwall/adbc-spanner/releases).
 To build one yourself: `cargo build --release` → `target/release/libadbc_spanner.so`.
 
