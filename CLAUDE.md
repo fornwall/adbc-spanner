@@ -34,9 +34,10 @@ SpannerDriver ──▶ SpannerDatabase ──▶ SpannerConnection ──▶ Sp
 
 - `src/driver.rs` — `SpannerDriver` + `SpannerDatabase`; option/config plumbing (database path,
   endpoint, emulator, `SPANNER_EMULATOR_HOST`) and building the Spanner `DatabaseClient`.
-- `src/connection.rs` — `SpannerConnection` (autocommit-only; `get_table_types`).
-- `src/statement.rs` — `execute` (query → Arrow) and `execute_update` (DML → row count, run in an
-  auto-retried read/write transaction).
+- `src/connection.rs` — `SpannerConnection`: transaction mode (autocommit default or manual
+  buffer-and-commit), `get_table_types` / `get_table_schema`.
+- `src/statement.rs` — `execute` (query → Arrow), `execute_update` (DML/DDL, incl. `;`-batches and
+  bound params), `execute_schema` (PLAN-only schema), parameter binding / bulk ingest.
 - `src/conversion.rs` — Spanner result set → Arrow schema + typed arrays (the type mapping lives
   here).
 - `src/runtime.rs` — a shared Tokio runtime; the ADBC traits are sync while the Spanner client is
@@ -51,19 +52,33 @@ Key design points:
 
 - **Sync-over-async bridge.** ADBC traits are synchronous; each method does `runtime.block_on`. Do
   not add a second runtime — reuse the shared one.
-- **Autocommit only.** Queries use a single-use read-only transaction; DML uses a read/write
-  transaction runner. `commit`/`rollback` and disabling autocommit return errors by design.
+- **Transactions.** Autocommit by default: queries use a single-use read-only transaction; DML
+  (including a `;`-separated batch via `ExecuteBatchDml`) uses a read/write runner. Setting
+  `adbc.connection.autocommit=false` enters manual mode, which **buffers** DML and applies the whole
+  batch atomically in one read/write transaction on `commit` (`rollback` discards it). The client
+  exposes no manual begin/commit handle, so buffer-and-replay is what makes manual transactions both
+  possible and retry-safe. In manual mode `execute_update` returns `None` (count unknown until
+  commit); queries and DDL still run immediately.
 - **Arrow version.** `arrow-array`/`arrow-schema` are pinned to the range `adbc_core` allows
   (`>=53.1, <59`) so the `RecordBatch`/`Schema`/`RecordBatchReader` types unify across crates.
 
 ## The google-cloud-spanner preview crate
 
-This uses the **googleapis preview** client `google-cloud-spanner = "0.34.2-preview"` (crate
-description "Google Cloud Client Libraries for Rust - Spanner"). Beware: `docs.rs/.../latest` and web
-summaries often surface an **older, unrelated** yoshidan-style API (`Client::new`, `client.single()`,
-`add_param`) — do not trust those. For ground truth, read the extracted source under
-`~/.cargo/registry/src/index.crates.io-*/google-cloud-spanner-0.34.2-preview/` (and its
-`tests/execute_query.rs`); same for `adbc_core-0.23.0` and `adbc_ffi-0.23.0`.
+This uses the **googleapis preview** client `google-cloud-spanner` (crate description "Google Cloud
+Client Libraries for Rust - Spanner"). Beware: `docs.rs/.../latest` and web summaries often surface
+an **older, unrelated** yoshidan-style API (`Client::new`, `client.single()`, `add_param`) — do not
+trust those. For ground truth, read the extracted source under
+`~/.cargo/git/checkouts/google-cloud-rust-*/` (the git dependency's checkout), or the crates.io
+source for `adbc_core-0.23.0` and `adbc_ffi-0.23.0`.
+
+**Temporary git pin.** `Cargo.toml` pins the whole `google-cloud-*` family (spanner, auth, lro, both
+admin crates) to a `google-cloud-rust` git revision, because native `STRUCT` mapping needs
+`Type::struct_type()`, which is on `main` but not yet in a crates.io release. Consequences: the crate
+**cannot be published to crates.io** until that ships (revert to versioned deps then); and locally,
+this machine's global git config rewrites `https://github.com` to SSH, so cargo fetches fail unless
+you set `CARGO_NET_GIT_FETCH_WITH_CLI=true` plus a `GIT_CONFIG_*` identity `insteadOf` override for
+the fork URL (see the session notes / the `with-emulator.sh` invocations). CI is unaffected (clean
+git config, public repo over HTTPS).
 
 The TLS stack is hardwired to `aws-lc` (via `tonic/tls-aws-lc`, `rustls/aws_lc_rs`, and the auth
 id-token backend) — there is no `ring` option. This is why the release CI builds natively per arch
