@@ -143,6 +143,38 @@ CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `cargo fmt --ch
 the full test suite with the emulator as a service container, so the integration test runs on every
 push.
 
+## Releasing
+
+Releases are cut with [`cargo-release`](https://github.com/crate-ci/cargo-release), configured under
+`[package.metadata.release]` in `Cargo.toml`.
+
+Prerequisites: `cargo install cargo-release`, a crates.io token (`cargo login`), and push access to
+`main`.
+
+Preview a release (dry run — this is the default, nothing is changed):
+
+```sh
+cargo release patch      # or: minor / major
+```
+
+Perform it:
+
+```sh
+cargo release patch --execute
+```
+
+That single command:
+
+1. bumps the version in `Cargo.toml` and commits it (`Release X.Y.Z`),
+2. publishes the crate to [crates.io](https://crates.io/crates/adbc-spanner),
+3. creates the annotated tag `vX.Y.Z` and pushes the commit and tag to `origin`.
+
+Pushing the `vX.Y.Z` tag triggers the [`Shared libraries`](.github/workflows/libraries.yml) workflow,
+which builds the Linux (x86-64, aarch64), macOS (Apple Silicon) and Windows (x86-64) shared libraries
+and attaches them to the [GitHub Release](https://github.com/fornwall/adbc-spanner/releases) for that
+tag. So the flow is: `cargo release … --execute` → crates.io publish + tag → CI attaches the prebuilt
+libraries to the release.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).

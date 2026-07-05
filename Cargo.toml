@@ -6,9 +6,32 @@ rust-version = "1.88"
 license = "Apache-2.0"
 description = "ADBC (Arrow Database Connectivity) driver for Google Cloud Spanner"
 repository = "https://github.com/fornwall/adbc-spanner"
+homepage = "https://github.com/fornwall/adbc-spanner"
+documentation = "https://docs.rs/adbc-spanner"
 readme = "README.md"
-keywords = ["adbc", "arrow", "spanner", "database"]
-categories = ["database"]
+keywords = ["adbc", "arrow", "spanner", "database", "gcp"]
+# Both slugs are valid crates.io categories.
+categories = ["database", "api-bindings"]
+# Keep the published package to what a consumer needs; CI, scripts and the crate lock
+# are not useful to downstream builds.
+exclude = [".github/", "scripts/", "/Cargo.lock"]
+
+[package.metadata.docs.rs]
+# Document the FFI entrypoint too.
+all-features = true
+
+# Release automation via cargo-release (https://github.com/crate-ci/cargo-release).
+[package.metadata.release]
+# Only cut releases from main.
+allow-branch = ["main"]
+# Tag as vX.Y.Z — this matches the `tags: ["v*"]` trigger of the shared-library release
+# workflow, so pushing the tag builds and attaches the platform libraries to the GitHub Release.
+tag-name = "v{{version}}"
+tag-message = "Release {{version}}"
+pre-release-commit-message = "Release {{version}}"
+# Publish to crates.io and push the release commit + tag.
+publish = true
+push = true
 
 [lib]
 # cdylib: the loadable ADBC driver shared library
