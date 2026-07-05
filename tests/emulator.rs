@@ -12,9 +12,9 @@
 //! Setup (creating the instance, database and table) uses the Spanner admin clients directly; the
 //! actual query and DML round-trip goes through the `adbc-spanner` driver being tested.
 
-use adbc_core::options::{OptionDatabase, OptionValue};
-use adbc_core::{Connection, Database, Driver, Statement};
-use adbc_spanner::SpannerDriver;
+use adbc_core::options::{OptionConnection, OptionDatabase, OptionValue};
+use adbc_core::{Connection, Database, Driver, Optionable, Statement};
+use adbc_spanner::{SpannerConnection, SpannerDriver};
 use arrow_array::{BooleanArray, Float64Array, Int64Array, RecordBatchReader, StringArray};
 use arrow_schema::DataType;
 use google_cloud_lro::Poller;
@@ -221,4 +221,86 @@ fn query_and_dml_round_trip() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(ddl_rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+    // --- Manual multi-statement transactions ---
+
+    let mut txn_ddl = connection.new_statement().expect("new statement");
+    txn_ddl
+        .set_sql_query(
+            "DROP TABLE IF EXISTS AdbcTxn; CREATE TABLE AdbcTxn (Id INT64) PRIMARY KEY (Id)",
+        )
+        .unwrap();
+    txn_ddl.execute_update().expect("create txn table");
+
+    // Enter manual transaction mode.
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("disable autocommit");
+
+    // Buffered DML returns None (count unknown until commit) and is not yet visible.
+    for id in [1, 2] {
+        let mut s = connection.new_statement().expect("new statement");
+        s.set_sql_query(format!("INSERT INTO AdbcTxn (Id) VALUES ({id})"))
+            .unwrap();
+        assert_eq!(s.execute_update().expect("buffered insert"), None);
+    }
+    assert_eq!(
+        count_rows(&mut connection, "AdbcTxn"),
+        0,
+        "buffered rows must not be visible before commit"
+    );
+
+    // Commit applies the whole batch atomically.
+    connection.commit().expect("commit");
+    assert_eq!(
+        count_rows(&mut connection, "AdbcTxn"),
+        2,
+        "rows must be visible after commit"
+    );
+
+    // A buffered insert followed by rollback leaves no trace.
+    let mut rolled = connection.new_statement().expect("new statement");
+    rolled
+        .set_sql_query("INSERT INTO AdbcTxn (Id) VALUES (3)")
+        .unwrap();
+    assert_eq!(rolled.execute_update().expect("buffered insert"), None);
+    connection.rollback().expect("rollback");
+    assert_eq!(
+        count_rows(&mut connection, "AdbcTxn"),
+        2,
+        "rolled-back row must not appear"
+    );
+
+    // Re-enabling autocommit commits any pending work (none here) and restores per-statement commit.
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("true".into()),
+        )
+        .expect("enable autocommit");
+
+    let mut drop_txn = connection.new_statement().expect("new statement");
+    drop_txn.set_sql_query("DROP TABLE AdbcTxn").unwrap();
+    drop_txn.execute_update().expect("drop txn table");
+}
+
+/// Count the rows in `table` through a driver query.
+fn count_rows(connection: &mut SpannerConnection, table: &str) -> i64 {
+    let mut q = connection.new_statement().expect("new statement");
+    q.set_sql_query(format!("SELECT COUNT(*) AS n FROM {table}"))
+        .unwrap();
+    let batches: Vec<_> = q
+        .execute()
+        .expect("count query")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0)
 }

@@ -1,24 +1,70 @@
 //! The [`SpannerConnection`] — an ADBC connection backed by a Spanner [`DatabaseClient`].
 //!
-//! This driver operates in autocommit mode: every statement runs in its own Spanner transaction
-//! (a single-use read-only transaction for queries, a read/write transaction for DML). Manual
-//! multi-statement transactions are not supported yet, so [`Connection::commit`] and
-//! [`Connection::rollback`] return an error, and disabling autocommit is rejected.
+//! ## Transactions
+//!
+//! By default the connection is in **autocommit** mode: every statement runs in its own Spanner
+//! transaction (a single-use read-only transaction for queries, a read/write transaction for DML).
+//!
+//! Setting the `adbc.connection.autocommit` option to `false` begins **manual** transaction mode.
+//! Because Spanner's client only exposes read/write transactions through a closure-based runner
+//! (there is no public begin/commit handle), the driver implements manual transactions by
+//! *buffering* DML statements and applying the whole batch atomically in a single read/write
+//! transaction on [`Connection::commit`] — which also makes the retry-on-abort safe, since the
+//! buffer is simply replayed. [`Connection::rollback`] discards the buffer.
+//!
+//! Consequences of this model, which callers should be aware of:
+//! - In manual mode, `execute_update` on DML returns `None` (the affected-row count is not known
+//!   until commit).
+//! - Queries (`execute`) and DDL always run immediately (DDL is never transactional in Spanner), so
+//!   a query does not observe DML buffered earlier in the same manual transaction.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use adbc_core::error::{Result, Status};
+use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection, OptionValue};
 use adbc_core::{Connection, Optionable};
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
+use google_cloud_spanner::statement::Statement as SpannerSql;
+use google_cloud_spanner::transaction::ReadWriteTransaction;
 
 use crate::driver::Connected;
-use crate::error::{err, invalid_argument, invalid_state, not_implemented};
+use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
 use crate::runtime::SharedRuntime;
 use crate::statement::SpannerStatement;
+
+/// Transaction state shared between a connection and the statements it creates.
+#[derive(Debug)]
+pub(crate) struct TxnState {
+    /// When false, the connection is in manual transaction mode and DML is buffered.
+    autocommit: bool,
+    /// DML statements buffered while in manual mode, applied atomically on commit.
+    pending: Vec<String>,
+}
+
+impl TxnState {
+    fn new() -> Self {
+        Self {
+            autocommit: true,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Whether the connection is currently in autocommit mode.
+    pub(crate) fn autocommit(&self) -> bool {
+        self.autocommit
+    }
+
+    /// Buffer a DML statement to be applied on the next commit.
+    pub(crate) fn buffer(&mut self, sql: String) {
+        self.pending.push(sql);
+    }
+}
+
+/// A handle to a connection's transaction state, shared with its statements.
+pub(crate) type SharedTxn = Arc<Mutex<TxnState>>;
 
 /// An ADBC connection to a Spanner database.
 pub struct SpannerConnection {
@@ -27,6 +73,7 @@ pub struct SpannerConnection {
     spanner: Spanner,
     database: String,
     read_only: bool,
+    txn: SharedTxn,
 }
 
 impl SpannerConnection {
@@ -37,7 +84,41 @@ impl SpannerConnection {
             spanner: connected.spanner,
             database: connected.database,
             read_only: false,
+            txn: Arc::new(Mutex::new(TxnState::new())),
         }
+    }
+
+    /// Apply a batch of buffered DML statements atomically in one read/write transaction.
+    ///
+    /// The runner may retry the closure on abort, so the statements are rebuilt from the (cloned)
+    /// buffer on each attempt.
+    fn apply_transaction(&self, statements: Vec<String>) -> Result<()> {
+        if statements.is_empty() {
+            return Ok(());
+        }
+        let client = self.client.clone();
+        self.runtime.block_on(async move {
+            let runner = client
+                .read_write_transaction()
+                .build()
+                .await
+                .map_err(from_spanner)?;
+            runner
+                .run(move |transaction: ReadWriteTransaction| {
+                    let statements = statements.clone();
+                    async move {
+                        for sql in statements {
+                            transaction
+                                .execute_update(SpannerSql::builder(sql).build())
+                                .await?;
+                        }
+                        Ok(())
+                    }
+                })
+                .await
+                .map_err(from_spanner)?;
+            Ok::<(), Error>(())
+        })
     }
 }
 
@@ -47,9 +128,14 @@ impl Optionable for SpannerConnection {
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
         match &key {
             OptionConnection::AutoCommit => {
-                if !parse_bool(value)? {
-                    return Err(not_implemented("disabling autocommit"));
+                let enable = parse_bool(value)?;
+                let currently = self.txn.lock().unwrap().autocommit;
+                if enable && !currently {
+                    // Enabling autocommit commits any active manual transaction.
+                    let pending = std::mem::take(&mut self.txn.lock().unwrap().pending);
+                    self.apply_transaction(pending)?;
                 }
+                self.txn.lock().unwrap().autocommit = enable;
             }
             OptionConnection::ReadOnly => self.read_only = parse_bool(value)?,
             other => {
@@ -64,7 +150,7 @@ impl Optionable for SpannerConnection {
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
         match &key {
-            OptionConnection::AutoCommit => Ok(true.to_string()),
+            OptionConnection::AutoCommit => Ok(self.txn.lock().unwrap().autocommit.to_string()),
             OptionConnection::ReadOnly => Ok(self.read_only.to_string()),
             other => Err(err(
                 format!("option {} is not set", connection_option_name(other)),
@@ -102,6 +188,7 @@ impl Connection for SpannerConnection {
             self.spanner.clone(),
             self.database.clone(),
             self.read_only,
+            self.txn.clone(),
         ))
     }
 
@@ -170,15 +257,27 @@ impl Connection for SpannerConnection {
     }
 
     fn commit(&mut self) -> Result<()> {
-        Err(invalid_state(
-            "connection is in autocommit mode; explicit commit is not supported",
-        ))
+        let pending = {
+            let mut st = self.txn.lock().unwrap();
+            if st.autocommit {
+                return Err(invalid_state(
+                    "commit invoked with autocommit enabled; no active transaction",
+                ));
+            }
+            std::mem::take(&mut st.pending)
+        };
+        self.apply_transaction(pending)
     }
 
     fn rollback(&mut self) -> Result<()> {
-        Err(invalid_state(
-            "connection is in autocommit mode; explicit rollback is not supported",
-        ))
+        let mut st = self.txn.lock().unwrap();
+        if st.autocommit {
+            return Err(invalid_state(
+                "rollback invoked with autocommit enabled; no active transaction",
+            ));
+        }
+        st.pending.clear();
+        Ok(())
     }
 
     fn read_partition(

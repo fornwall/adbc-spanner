@@ -29,11 +29,14 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
 - DDL (`CREATE`/`ALTER`/`DROP`/`RENAME`/…), routed to the Database Admin `UpdateDatabaseDdl` API. A
   `;`-separated batch is submitted as a single schema change, so multi-step changes (e.g. dbt's
   intermediate-table build then rename swap) are near-atomic.
+- Transactions: autocommit by default, or manual multi-statement transactions (set
+  `adbc.connection.autocommit` to `false`, then `commit`/`rollback`). In manual mode DML is buffered
+  and applied atomically in one read/write transaction on commit.
 - `get_table_types()` connection metadata.
 
-Not yet supported (return `NotImplemented`): query parameter binding / bulk ingest, manual
-multi-statement transactions (the driver is autocommit-only), Substrait, partitioned execution, and
-the richer catalog-metadata calls (`get_objects`, `get_table_schema`, `get_statistics`, …).
+Not yet supported (return `NotImplemented`): query parameter binding / bulk ingest, Substrait,
+partitioned execution, and the richer catalog-metadata calls (`get_objects`, `get_table_schema`,
+`get_statistics`, …).
 
 ## Shared library (loadable driver)
 

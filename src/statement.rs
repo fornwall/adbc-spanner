@@ -17,6 +17,7 @@ use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
+use crate::connection::SharedTxn;
 use crate::conversion::result_set_to_batch;
 use crate::error::{err, from_spanner, invalid_state, not_implemented};
 use crate::runtime::SharedRuntime;
@@ -28,6 +29,7 @@ pub struct SpannerStatement {
     spanner: Spanner,
     database: String,
     read_only: bool,
+    txn: SharedTxn,
     sql: Option<String>,
 }
 
@@ -38,6 +40,7 @@ impl SpannerStatement {
         spanner: Spanner,
         database: String,
         read_only: bool,
+        txn: SharedTxn,
     ) -> Self {
         Self {
             runtime,
@@ -45,6 +48,7 @@ impl SpannerStatement {
             spanner,
             database,
             read_only,
+            txn,
             sql: None,
         }
     }
@@ -167,6 +171,12 @@ impl Statement for SpannerStatement {
             return Err(invalid_state(
                 "cannot execute DML: the connection is read-only",
             ));
+        }
+        // In manual transaction mode, buffer the DML to be applied atomically on commit; the
+        // affected-row count is not known until then.
+        if !self.txn.lock().unwrap().autocommit() {
+            self.txn.lock().unwrap().buffer(sql);
+            return Ok(None);
         }
         let client = self.client.clone();
         let affected = self.runtime.block_on(async move {
