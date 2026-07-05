@@ -1,0 +1,40 @@
+[package]
+name = "adbc-spanner-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.adbc-spanner]
+path = ".."
+default-features = false
+features = ["fuzzing"]
+
+# Keep fuzz targets slim and out of the parent package build.
+[[bin]]
+name = "sql"
+path = "fuzz_targets/sql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "values"
+path = "fuzz_targets/values.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "like"
+path = "fuzz_targets/like.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

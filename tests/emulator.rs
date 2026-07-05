@@ -15,9 +15,10 @@
 use std::sync::Arc;
 
 use adbc_core::options::{
-    ObjectDepth, OptionConnection, OptionDatabase, OptionStatement, OptionValue,
+    AdbcVersion, ObjectDepth, OptionConnection, OptionDatabase, OptionStatement, OptionValue,
 };
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
+use adbc_driver_manager::ManagedDriver;
 use adbc_spanner::{SpannerConnection, SpannerDatabase, SpannerDriver};
 use arrow_array::{
     Array, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, ListArray,
@@ -640,6 +641,89 @@ fn query_and_dml_round_trip() {
         .downcast_ref::<StringArray>()
         .unwrap();
     assert_eq!(column_name.value(0), "SingerId");
+}
+
+/// Locate the built `cdylib` (`libadbc_spanner.so` / `.dylib` / `.dll`) next to the test binary.
+fn cdylib_path() -> Option<std::path::PathBuf> {
+    // The test binary lives in `target/<profile>/deps/`; the cdylib is in `target/<profile>/`.
+    let dir = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .parent()?
+        .to_path_buf();
+    let name = if cfg!(target_os = "windows") {
+        "adbc_spanner.dll"
+    } else if cfg!(target_os = "macos") {
+        "libadbc_spanner.dylib"
+    } else {
+        "libadbc_spanner.so"
+    };
+    let path = dir.join(name);
+    path.exists().then_some(path)
+}
+
+/// Load the driver through the ADBC **driver manager** (i.e. via the C ABI / `AdbcSpannerInit`
+/// entrypoint of the built shared library) and run a query — a smoke test of the FFI export that
+/// the trait-level tests bypass.
+#[test]
+fn ffi_driver_manager_smoke() {
+    if !emulator_configured() {
+        eprintln!("SPANNER_EMULATOR_HOST not set — skipping FFI smoke test");
+        return;
+    }
+    let Some(cdylib) = cdylib_path() else {
+        eprintln!("cdylib not built — skipping FFI smoke test (run `cargo build` first)");
+        return;
+    };
+
+    tokio::runtime::Runtime::new()
+        .expect("setup runtime")
+        .block_on(ensure_database());
+
+    let mut driver = ManagedDriver::load_dynamic_from_filename(
+        &cdylib,
+        Some(b"AdbcSpannerInit"),
+        AdbcVersion::V110,
+    )
+    .expect("load driver via the driver manager");
+
+    let database = driver
+        .new_database_with_opts([(OptionDatabase::Uri, OptionValue::String(database_path()))])
+        .expect("new_database via FFI");
+
+    // The freshly-created emulator database can lag; retry the connection briefly.
+    let mut connection = {
+        let mut conn = None;
+        let mut last = None;
+        for _ in 0..20 {
+            match database.new_connection() {
+                Ok(c) => {
+                    conn = Some(c);
+                    break;
+                }
+                Err(e) => {
+                    last = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
+        }
+        conn.unwrap_or_else(|| panic!("FFI connect failed: {last:?}"))
+    };
+
+    let mut statement = connection.new_statement().expect("new_statement via FFI");
+    statement.set_sql_query("SELECT 1 AS one").unwrap();
+    let reader = statement.execute().expect("execute via FFI");
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect via FFI");
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    let value = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(value, 1);
 }
 
 /// Open a connection, retrying briefly: a freshly-created emulator database can be momentarily

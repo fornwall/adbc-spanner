@@ -14,7 +14,7 @@ keywords = ["adbc", "arrow", "spanner", "database", "gcp"]
 categories = ["database", "api-bindings"]
 # Keep the published package to what a consumer needs; CI, scripts and the crate lock
 # are not useful to downstream builds.
-exclude = [".github/", "scripts/", "/Cargo.lock"]
+exclude = [".github/", "scripts/", "/fuzz", "/Cargo.lock"]
 
 [package.metadata.docs.rs]
 # Document the FFI entrypoint too.
@@ -45,6 +45,9 @@ default = ["ffi"]
 # Export the C ABI `AdbcSpannerInit` entrypoint so the cdylib is a driver the ADBC
 # driver manager (any language) can load. Disable for a pure-Rust rlib dependency.
 ffi = ["dep:adbc_ffi"]
+# Exposes internal parsing helpers under `adbc_spanner::fuzzing` for the fuzz targets.
+# Not a stable API; used only by the `fuzz/` crate.
+fuzzing = []
 
 [dependencies]
 # The abstract ADBC driver traits (Driver / Database / Connection / Statement).
@@ -93,6 +96,8 @@ lto = "thin"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+# Driver manager: loads the built cdylib through the C ABI for the FFI smoke test.
+adbc_driver_manager = "0.23"
 # Admin clients, used by the emulator integration test to create the test instance and database.
 # Pinned to the same git revision as the google-cloud family above (see the note there).
 google-cloud-spanner-admin-instance-v1 = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }

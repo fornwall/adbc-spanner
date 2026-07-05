@@ -336,7 +336,7 @@ fn parse_f64(value: &Value) -> Option<f64> {
 }
 
 /// Parse a Spanner `DATE` (`YYYY-MM-DD`) into days since the Unix epoch (Arrow `Date32`).
-fn parse_date_days(s: &str) -> Option<i32> {
+pub(crate) fn parse_date_days(s: &str) -> Option<i32> {
     let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
     let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?;
     i32::try_from((date - epoch).num_days()).ok()
@@ -344,7 +344,7 @@ fn parse_date_days(s: &str) -> Option<i32> {
 
 /// Parse a Spanner `TIMESTAMP` (RFC 3339, e.g. `2024-01-15T12:34:56.789Z`) into microseconds since
 /// the Unix epoch (Arrow `Timestamp(Microsecond)`).
-fn parse_timestamp_micros(s: &str) -> Option<i64> {
+pub(crate) fn parse_timestamp_micros(s: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.timestamp_micros())
@@ -352,7 +352,7 @@ fn parse_timestamp_micros(s: &str) -> Option<i64> {
 
 /// Parse a Spanner `NUMERIC` (decimal string) into an unscaled `i128` at scale 9 (Arrow
 /// `Decimal128(38, 9)`). Returns `None` on malformed input or i128 overflow.
-fn parse_numeric_i128(s: &str) -> Option<i128> {
+pub(crate) fn parse_numeric_i128(s: &str) -> Option<i128> {
     let s = s.trim();
     let (negative, digits) = match s.strip_prefix('-') {
         Some(rest) => (true, rest),

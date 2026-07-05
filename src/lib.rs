@@ -69,6 +69,38 @@ pub use connection::SpannerConnection;
 pub use driver::{SpannerDatabase, SpannerDriver};
 pub use statement::SpannerStatement;
 
+/// Internal parsing helpers exposed for fuzz targets only (enable the `fuzzing` feature).
+///
+/// **Not** part of the public API — no stability guarantees.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    /// Split a `;`-separated SQL batch into individual statements (quote/comment aware).
+    pub fn split_statements(sql: &str) -> Vec<String> {
+        crate::ddl::split_statements(sql)
+    }
+    /// Whether the SQL begins with a DDL statement.
+    pub fn is_ddl(sql: &str) -> bool {
+        crate::ddl::is_ddl(sql)
+    }
+    /// Parse a Spanner `DATE` string into Arrow `Date32` days.
+    pub fn parse_date_days(s: &str) -> Option<i32> {
+        crate::conversion::parse_date_days(s)
+    }
+    /// Parse a Spanner `TIMESTAMP` string into epoch microseconds.
+    pub fn parse_timestamp_micros(s: &str) -> Option<i64> {
+        crate::conversion::parse_timestamp_micros(s)
+    }
+    /// Parse a Spanner `NUMERIC` string into an unscaled `i128` (scale 9).
+    pub fn parse_numeric_i128(s: &str) -> Option<i128> {
+        crate::conversion::parse_numeric_i128(s)
+    }
+    /// Match an ADBC `LIKE` pattern against a value.
+    pub fn like_match(pattern: &str, value: &str) -> bool {
+        crate::connection::like_match(pattern, value)
+    }
+}
+
 /// Driver-specific database option: the fully-qualified Spanner database path,
 /// `projects/<project>/instances/<instance>/databases/<database>`.
 ///

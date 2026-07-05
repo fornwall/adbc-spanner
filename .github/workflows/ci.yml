@@ -48,6 +48,9 @@ jobs:
       - name: Build without default features (ffi off)
         run: cargo build --no-default-features
 
+      - name: Build the shared library (for the FFI smoke test)
+        run: cargo build
+
       - name: Wait for the Spanner emulator
         run: |
           for _ in $(seq 1 30); do

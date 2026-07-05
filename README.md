@@ -178,9 +178,26 @@ The helper script starts the emulator in Docker, points the tests at it, and tea
 scripts/with-emulator.sh cargo test --test emulator -- --nocapture
 ```
 
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `cargo fmt --check`, `clippy`, and
-the full test suite with the emulator as a service container, so the integration test runs on every
-push.
+The emulator suite also includes an **FFI smoke test** that loads the built shared library through
+the ADBC [driver manager](https://crates.io/crates/adbc_driver_manager) (via the `AdbcSpannerInit`
+C entrypoint) and runs a query — exercising the C ABI that the trait-level tests bypass.
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `cargo fmt --check`, `clippy`,
+`rustdoc -D warnings`, a `--no-default-features` build, the full test suite against an emulator
+service container, and supply-chain checks (`cargo-deny` + `cargo-machete`).
+
+### Fuzzing
+
+The [`fuzz/`](fuzz/) crate has [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) targets over
+the parts that parse untrusted strings — SQL statement splitting / DDL detection (`sql`), value
+parsers for `DATE`/`TIMESTAMP`/`NUMERIC` (`values`), and the `LIKE` matcher (`like`) — asserting the
+absence of panics (and, for `like`, no exponential blowup). Run one locally on nightly:
+
+```sh
+cargo +nightly fuzz run sql
+```
+
+Fuzzing runs weekly (and on demand) in CI ([`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml)).
 
 ## Releasing
 

@@ -278,16 +278,55 @@ fn collect_columns(
 }
 
 /// Match an ADBC `LIKE` pattern (`%` = any run, `_` = one char) against a value, case-sensitively.
-fn like_match(pattern: &str, value: &str) -> bool {
-    fn go(p: &[u8], v: &[u8]) -> bool {
-        match p.first() {
-            None => v.is_empty(),
-            Some(b'%') => go(&p[1..], v) || (!v.is_empty() && go(p, &v[1..])),
-            Some(b'_') => !v.is_empty() && go(&p[1..], &v[1..]),
-            Some(&c) => !v.is_empty() && v[0] == c && go(&p[1..], &v[1..]),
+///
+/// Iterative with backtrack pointers (O(pattern × value), no recursion) so adversarial patterns
+/// like `%a%a%a…` cannot cause exponential blowup or stack overflow.
+pub(crate) fn like_match(pattern: &str, value: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let v: Vec<char> = value.chars().collect();
+    let (mut pi, mut vi) = (0usize, 0usize);
+    // Position in the pattern/value to backtrack to after the most recent `%`.
+    let mut star: Option<(usize, usize)> = None;
+    while vi < v.len() {
+        if pi < p.len() && (p[pi] == '_' || p[pi] == v[vi]) {
+            pi += 1;
+            vi += 1;
+        } else if pi < p.len() && p[pi] == '%' {
+            star = Some((pi, vi));
+            pi += 1;
+        } else if let Some((sp, sv)) = star {
+            // Let the last `%` consume one more character and retry.
+            pi = sp + 1;
+            vi = sv + 1;
+            star = Some((sp, sv + 1));
+        } else {
+            return false;
         }
     }
-    go(pattern.as_bytes(), value.as_bytes())
+    while pi < p.len() && p[pi] == '%' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+#[cfg(test)]
+mod like_tests {
+    use super::like_match;
+
+    #[test]
+    fn like_matching() {
+        assert!(like_match("", ""));
+        assert!(like_match("%", ""));
+        assert!(like_match("%", "anything"));
+        assert!(like_match("Singers", "Singers"));
+        assert!(!like_match("Singers", "singers")); // case-sensitive
+        assert!(like_match("Sing%", "Singers"));
+        assert!(like_match("%ers", "Singers"));
+        assert!(like_match("S_ngers", "Singers"));
+        assert!(like_match("%a%a%", "banana"));
+        assert!(!like_match("%x%", "banana"));
+        assert!(!like_match("", "x"));
+    }
 }
 
 impl Optionable for SpannerConnection {
