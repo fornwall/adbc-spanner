@@ -15,8 +15,11 @@
 use adbc_core::options::{OptionConnection, OptionDatabase, OptionValue};
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_spanner::{SpannerConnection, SpannerDriver};
-use arrow_array::{BooleanArray, Float64Array, Int64Array, RecordBatchReader, StringArray};
-use arrow_schema::DataType;
+use arrow_array::{
+    BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, RecordBatchReader,
+    StringArray, TimestampMicrosecondArray,
+};
+use arrow_schema::{DataType, TimeUnit};
 use google_cloud_lro::Poller;
 use google_cloud_spanner::client::Spanner;
 use google_cloud_spanner_admin_instance_v1::model::Instance;
@@ -285,6 +288,65 @@ fn query_and_dml_round_trip() {
     let mut drop_txn = connection.new_statement().expect("new statement");
     drop_txn.set_sql_query("DROP TABLE AdbcTxn").unwrap();
     drop_txn.execute_update().expect("drop txn table");
+
+    // --- Native Arrow types for DATE / TIMESTAMP / NUMERIC ---
+
+    let mut types_ddl = connection.new_statement().expect("new statement");
+    types_ddl
+        .set_sql_query(
+            "DROP TABLE IF EXISTS AdbcTypes; \
+             CREATE TABLE AdbcTypes (Id INT64, D DATE, T TIMESTAMP, N NUMERIC) PRIMARY KEY (Id)",
+        )
+        .unwrap();
+    types_ddl.execute_update().expect("create types table");
+
+    let mut types_ins = connection.new_statement().expect("new statement");
+    types_ins
+        .set_sql_query(
+            "INSERT INTO AdbcTypes (Id, D, T, N) VALUES \
+             (1, DATE '2024-01-15', TIMESTAMP '2024-01-15T12:34:56.789012Z', NUMERIC '1.5')",
+        )
+        .unwrap();
+    assert_eq!(types_ins.execute_update().expect("insert types"), Some(1));
+
+    let mut types_q = connection.new_statement().expect("new statement");
+    types_q
+        .set_sql_query("SELECT D, T, N FROM AdbcTypes WHERE Id = 1")
+        .unwrap();
+    let types_reader = types_q.execute().expect("types query");
+    let types_schema = types_reader.schema();
+    assert_eq!(types_schema.field(0).data_type(), &DataType::Date32);
+    assert_eq!(
+        types_schema.field(1).data_type(),
+        &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+    );
+    assert_eq!(
+        types_schema.field(2).data_type(),
+        &DataType::Decimal128(38, 9)
+    );
+
+    let types_batches = types_reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect types");
+    let tb = &types_batches[0];
+    let date = tb.column(0).as_any().downcast_ref::<Date32Array>().unwrap();
+    let ts = tb
+        .column(1)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .unwrap();
+    let num = tb
+        .column(2)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    assert_eq!(date.value(0), 19737); // days from 1970-01-01 to 2024-01-15
+    assert_eq!(ts.value(0), 1_705_322_096_789_012); // micros since epoch
+    assert_eq!(num.value(0), 1_500_000_000); // 1.5 unscaled at scale 9
+
+    let mut drop_types = connection.new_statement().expect("new statement");
+    drop_types.set_sql_query("DROP TABLE AdbcTypes").unwrap();
+    drop_types.execute_update().expect("drop types table");
 }
 
 /// Count the rows in `table` through a driver query.

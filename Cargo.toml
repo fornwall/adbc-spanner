@@ -65,6 +65,8 @@ google-cloud-lro = "1.8"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 serde_json = "1"
 base64 = "0.22"
+# Parsing Spanner's string-encoded DATE / TIMESTAMP values into Arrow Date32 / Timestamp.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [profile.release]
 # Smaller shipped shared libraries.

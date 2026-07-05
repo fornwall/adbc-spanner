@@ -8,32 +8,42 @@
 //!
 //! The type mapping is:
 //!
-//! | Spanner type              | Arrow type   |
-//! |---------------------------|--------------|
-//! | `BOOL`                    | `Boolean`    |
-//! | `INT64`                   | `Int64`      |
-//! | `FLOAT64`                 | `Float64`    |
-//! | `FLOAT32`                 | `Float32`    |
-//! | `BYTES`                   | `Binary`     |
-//! | `STRING`/`DATE`/`TIMESTAMP`/`NUMERIC`/`JSON`/`UUID`/`INTERVAL`/`ENUM` | `Utf8` |
-//! | `ARRAY`/`STRUCT`          | `Utf8` (JSON-encoded) |
+//! | Spanner type                                | Arrow type                        |
+//! |---------------------------------------------|-----------------------------------|
+//! | `BOOL`                                      | `Boolean`                         |
+//! | `INT64`                                     | `Int64`                           |
+//! | `FLOAT64`                                   | `Float64`                         |
+//! | `FLOAT32`                                   | `Float32`                         |
+//! | `DATE`                                      | `Date32`                          |
+//! | `TIMESTAMP`                                 | `Timestamp(Microsecond, "UTC")`   |
+//! | `NUMERIC`                                   | `Decimal128(38, 9)`               |
+//! | `BYTES`                                     | `Binary`                          |
+//! | `STRING`/`JSON`/`UUID`/`INTERVAL`/`ENUM`    | `Utf8`                            |
+//! | `ARRAY`/`STRUCT`                            | `Utf8` (JSON-encoded)             |
 //!
-//! Arrays and structs are rendered as their JSON text for now; richer nested Arrow types are a
+//! Arrays and structs are still rendered as JSON text; mapping them to Arrow `List`/`Struct` is a
 //! future improvement.
 
 use std::sync::Arc;
 
 use adbc_core::error::{Result, Status};
 use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, Float32Builder, Float64Builder, Int64Builder, StringBuilder,
+    BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
+    Float64Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
 };
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use base64::Engine;
 use google_cloud_spanner::result::{ResultSet, ResultSetMetadata, Row};
 use google_cloud_spanner::value::{Kind, Type, TypeCode, Value};
 
 use crate::error::{err, from_spanner};
+
+/// Precision and scale of Spanner's `NUMERIC` type (GoogleSQL `NUMERIC` is fixed at 38 / 9).
+const NUMERIC_PRECISION: u8 = 38;
+const NUMERIC_SCALE: i8 = 9;
+/// Spanner `TIMESTAMP` values are absolute instants in UTC.
+const TIMESTAMP_TZ: &str = "UTC";
 
 /// Drain a Spanner [`ResultSet`] and materialise it as a single Arrow [`RecordBatch`] together with
 /// its schema.
@@ -86,8 +96,13 @@ fn arrow_type(ty: &Type) -> DataType {
         TypeCode::Float64 => DataType::Float64,
         TypeCode::Float32 => DataType::Float32,
         TypeCode::Bytes => DataType::Binary,
-        // STRING, DATE, TIMESTAMP, NUMERIC, JSON, UUID, INTERVAL, ENUM, PROTO, ARRAY, STRUCT and any
-        // future/unknown code are represented as (possibly JSON-encoded) UTF-8 text.
+        TypeCode::Date => DataType::Date32,
+        TypeCode::Timestamp => {
+            DataType::Timestamp(TimeUnit::Microsecond, Some(TIMESTAMP_TZ.into()))
+        }
+        TypeCode::Numeric => DataType::Decimal128(NUMERIC_PRECISION, NUMERIC_SCALE),
+        // STRING, JSON, UUID, INTERVAL, ENUM, PROTO, ARRAY, STRUCT and any future/unknown code are
+        // represented as (possibly JSON-encoded) UTF-8 text.
         _ => DataType::Utf8,
     }
 }
@@ -121,6 +136,9 @@ enum ColumnBuilder {
     Int64(Int64Builder),
     Float64(Float64Builder),
     Float32(Float32Builder),
+    Date32(Date32Builder),
+    TimestampMicros(TimestampMicrosecondBuilder),
+    Decimal128(Decimal128Builder),
     Binary(BinaryBuilder),
     Utf8(StringBuilder),
 }
@@ -132,6 +150,15 @@ impl ColumnBuilder {
             DataType::Int64 => ColumnBuilder::Int64(Int64Builder::new()),
             DataType::Float64 => ColumnBuilder::Float64(Float64Builder::new()),
             DataType::Float32 => ColumnBuilder::Float32(Float32Builder::new()),
+            DataType::Date32 => ColumnBuilder::Date32(Date32Builder::new()),
+            // Carry the exact tz / precision-scale from the schema onto the builder so the finished
+            // array's data type matches the field.
+            DataType::Timestamp(TimeUnit::Microsecond, _) => ColumnBuilder::TimestampMicros(
+                TimestampMicrosecondBuilder::new().with_data_type(data_type.clone()),
+            ),
+            DataType::Decimal128(_, _) => ColumnBuilder::Decimal128(
+                Decimal128Builder::new().with_data_type(data_type.clone()),
+            ),
             DataType::Binary => ColumnBuilder::Binary(BinaryBuilder::new()),
             _ => ColumnBuilder::Utf8(StringBuilder::new()),
         }
@@ -164,6 +191,22 @@ impl ColumnBuilder {
                 Some(v) => b.append_value(v as f32),
                 None => b.append_null(),
             },
+            ColumnBuilder::Date32(b) => match value.try_as_string().and_then(parse_date_days) {
+                Some(v) => b.append_value(v),
+                None => b.append_null(),
+            },
+            ColumnBuilder::TimestampMicros(b) => {
+                match value.try_as_string().and_then(parse_timestamp_micros) {
+                    Some(v) => b.append_value(v),
+                    None => b.append_null(),
+                }
+            }
+            ColumnBuilder::Decimal128(b) => {
+                match value.try_as_string().and_then(parse_numeric_i128) {
+                    Some(v) => b.append_value(v),
+                    None => b.append_null(),
+                }
+            }
             ColumnBuilder::Binary(b) => match value.try_as_string() {
                 // Spanner encodes BYTES as base64.
                 Some(s) => match base64::engine::general_purpose::STANDARD.decode(s) {
@@ -193,6 +236,9 @@ impl ColumnBuilder {
             ColumnBuilder::Int64(b) => b.append_null(),
             ColumnBuilder::Float64(b) => b.append_null(),
             ColumnBuilder::Float32(b) => b.append_null(),
+            ColumnBuilder::Date32(b) => b.append_null(),
+            ColumnBuilder::TimestampMicros(b) => b.append_null(),
+            ColumnBuilder::Decimal128(b) => b.append_null(),
             ColumnBuilder::Binary(b) => b.append_null(),
             ColumnBuilder::Utf8(b) => b.append_null(),
         }
@@ -204,6 +250,9 @@ impl ColumnBuilder {
             ColumnBuilder::Int64(b) => Arc::new(b.finish()),
             ColumnBuilder::Float64(b) => Arc::new(b.finish()),
             ColumnBuilder::Float32(b) => Arc::new(b.finish()),
+            ColumnBuilder::Date32(b) => Arc::new(b.finish()),
+            ColumnBuilder::TimestampMicros(b) => Arc::new(b.finish()),
+            ColumnBuilder::Decimal128(b) => Arc::new(b.finish()),
             ColumnBuilder::Binary(b) => Arc::new(b.finish()),
             ColumnBuilder::Utf8(b) => Arc::new(b.finish()),
         }
@@ -233,6 +282,54 @@ fn parse_f64(value: &Value) -> Option<f64> {
     }
 }
 
+/// Parse a Spanner `DATE` (`YYYY-MM-DD`) into days since the Unix epoch (Arrow `Date32`).
+fn parse_date_days(s: &str) -> Option<i32> {
+    let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?;
+    i32::try_from((date - epoch).num_days()).ok()
+}
+
+/// Parse a Spanner `TIMESTAMP` (RFC 3339, e.g. `2024-01-15T12:34:56.789Z`) into microseconds since
+/// the Unix epoch (Arrow `Timestamp(Microsecond)`).
+fn parse_timestamp_micros(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp_micros())
+}
+
+/// Parse a Spanner `NUMERIC` (decimal string) into an unscaled `i128` at scale 9 (Arrow
+/// `Decimal128(38, 9)`). Returns `None` on malformed input or i128 overflow.
+fn parse_numeric_i128(s: &str) -> Option<i128> {
+    let s = s.trim();
+    let (negative, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (int_part, frac_part) = digits.split_once('.').unwrap_or((digits, ""));
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    // Pad/truncate the fractional part to the fixed scale of 9.
+    let mut frac = String::with_capacity(NUMERIC_SCALE as usize);
+    frac.push_str(&frac_part[..frac_part.len().min(NUMERIC_SCALE as usize)]);
+    while frac.len() < NUMERIC_SCALE as usize {
+        frac.push('0');
+    }
+    let int_val: i128 = if int_part.is_empty() {
+        0
+    } else {
+        int_part.parse().ok()?
+    };
+    let frac_val: i128 = frac.parse().ok()?;
+    let unscaled = int_val.checked_mul(1_000_000_000)?.checked_add(frac_val)?;
+    Some(if negative { -unscaled } else { unscaled })
+}
+
 /// Recursively convert a Spanner [`Value`] into a [`serde_json::Value`], used to render arrays and
 /// structs as text.
 fn value_to_json(value: &Value) -> serde_json::Value {
@@ -249,5 +346,52 @@ fn value_to_json(value: &Value) -> serde_json::Value {
                 .map(|(k, v)| (k.clone(), value_to_json(v)))
                 .collect(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dates_to_epoch_days() {
+        assert_eq!(parse_date_days("1970-01-01"), Some(0));
+        assert_eq!(parse_date_days("1970-01-02"), Some(1));
+        assert_eq!(parse_date_days("1969-12-31"), Some(-1));
+        assert_eq!(parse_date_days("2024-01-15"), Some(19737));
+        assert_eq!(parse_date_days("not-a-date"), None);
+    }
+
+    #[test]
+    fn timestamps_to_epoch_micros() {
+        assert_eq!(parse_timestamp_micros("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_timestamp_micros("1970-01-01T00:00:00.000001Z"),
+            Some(1)
+        );
+        assert_eq!(
+            parse_timestamp_micros("2024-01-15T12:34:56.789012Z"),
+            Some(1_705_322_096_789_012)
+        );
+        // Sub-microsecond precision is truncated.
+        assert_eq!(
+            parse_timestamp_micros("1970-01-01T00:00:00.000000999Z"),
+            Some(0)
+        );
+        assert_eq!(parse_timestamp_micros("nope"), None);
+    }
+
+    #[test]
+    fn numerics_to_unscaled_i128() {
+        assert_eq!(parse_numeric_i128("0"), Some(0));
+        assert_eq!(parse_numeric_i128("1"), Some(1_000_000_000));
+        assert_eq!(parse_numeric_i128("1.5"), Some(1_500_000_000));
+        assert_eq!(parse_numeric_i128("-2.25"), Some(-2_250_000_000));
+        assert_eq!(parse_numeric_i128("0.000000001"), Some(1));
+        assert_eq!(parse_numeric_i128("+3"), Some(3_000_000_000));
+        // More than 9 fractional digits: extra precision is truncated.
+        assert_eq!(parse_numeric_i128("0.0000000019"), Some(1));
+        assert_eq!(parse_numeric_i128("abc"), None);
+        assert_eq!(parse_numeric_i128(""), None);
     }
 }

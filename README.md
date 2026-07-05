@@ -120,17 +120,21 @@ are used.
 
 ## Type mapping
 
-| Spanner type                                                 | Arrow type              |
-| ------------------------------------------------------------ | ----------------------- |
-| `BOOL`                                                       | `Boolean`               |
-| `INT64`                                                      | `Int64`                 |
-| `FLOAT64`                                                    | `Float64`               |
-| `FLOAT32`                                                    | `Float32`               |
-| `BYTES`                                                      | `Binary`                |
-| `STRING` / `DATE` / `TIMESTAMP` / `NUMERIC` / `JSON` / `UUID` / `INTERVAL` / `ENUM` | `Utf8` |
-| `ARRAY` / `STRUCT`                                           | `Utf8` (JSON-encoded)   |
+| Spanner type                                | Arrow type                        |
+| ------------------------------------------- | --------------------------------- |
+| `BOOL`                                      | `Boolean`                         |
+| `INT64`                                     | `Int64`                           |
+| `FLOAT64`                                   | `Float64`                         |
+| `FLOAT32`                                   | `Float32`                         |
+| `DATE`                                      | `Date32`                          |
+| `TIMESTAMP`                                 | `Timestamp(Microsecond, "UTC")`   |
+| `NUMERIC`                                   | `Decimal128(38, 9)`               |
+| `BYTES`                                     | `Binary`                          |
+| `STRING` / `JSON` / `UUID` / `INTERVAL` / `ENUM` | `Utf8`                       |
+| `ARRAY` / `STRUCT`                          | `Utf8` (JSON-encoded)             |
 
-`NULL`s are represented as null slots in the corresponding Arrow array.
+`NULL`s are represented as null slots in the corresponding Arrow array. `ARRAY`/`STRUCT` are still
+rendered as JSON text; mapping them to Arrow `List`/`Struct` is a planned improvement.
 
 ## Testing
 
