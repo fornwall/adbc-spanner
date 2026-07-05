@@ -29,8 +29,14 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-14
             lib: libadbc_spanner.dylib
+          - target: x86_64-apple-darwin
+            runner: macos-13 # Intel runner — builds x86-64 macOS natively.
+            lib: libadbc_spanner.dylib
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
+            lib: adbc_spanner.dll
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm # native ARM64 Windows; aws-lc-rs cross-compiles poorly, native is clean.
             lib: adbc_spanner.dll
 
     steps:
@@ -41,9 +47,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # aws-lc-sys (pulled in by the TLS stack) needs NASM to assemble on Windows x86-64.
-      - name: Install NASM (Windows)
-        if: runner.os == 'Windows'
+      # aws-lc-sys needs NASM to assemble on Windows x86-64. ARM64 Windows uses no NASM.
+      - name: Install NASM (Windows x86-64)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         uses: ilammy/setup-nasm@v1
 
       - uses: Swatinem/rust-cache@v2
