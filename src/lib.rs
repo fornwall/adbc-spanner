@@ -84,6 +84,16 @@ pub const OPTION_ENDPOINT: &str = "adbc.spanner.endpoint";
 /// is present in the environment.
 pub const OPTION_EMULATOR: &str = "adbc.spanner.emulator";
 
+/// Driver-specific database option: path to a service-account JSON key file to authenticate with
+/// (dbt's `keyfile`). Overridden by [`OPTION_KEYFILE_JSON`] if both are set.
+pub const OPTION_KEYFILE: &str = "adbc.spanner.keyfile";
+
+/// Driver-specific database option: an inline service-account JSON key (dbt's `keyfile_json`).
+///
+/// When neither this nor [`OPTION_KEYFILE`] is set (and not connecting to an emulator), the driver
+/// falls back to Application Default Credentials.
+pub const OPTION_KEYFILE_JSON: &str = "adbc.spanner.keyfile_json";
+
 /// The vendor name reported by [`Connection::get_info`](adbc_core::Connection::get_info).
 pub const VENDOR_NAME: &str = "Google Cloud Spanner";
 

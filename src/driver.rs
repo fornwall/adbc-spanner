@@ -4,12 +4,15 @@ use adbc_core::error::{Result, Status};
 use adbc_core::options::{OptionDatabase, OptionValue};
 use adbc_core::{Database, Driver, Optionable};
 use google_cloud_auth::credentials::anonymous::Builder as AnonymousCredentials;
+use google_cloud_auth::credentials::service_account::Builder as ServiceAccountCredentials;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 
 use crate::connection::SpannerConnection;
 use crate::error::{err, from_spanner, invalid_argument, invalid_state};
 use crate::runtime::{new_runtime, SharedRuntime};
-use crate::{OPTION_DATABASE, OPTION_EMULATOR, OPTION_ENDPOINT};
+use crate::{
+    OPTION_DATABASE, OPTION_EMULATOR, OPTION_ENDPOINT, OPTION_KEYFILE, OPTION_KEYFILE_JSON,
+};
 
 /// The Spanner ADBC driver — the entry point for creating [`SpannerDatabase`] instances.
 ///
@@ -67,6 +70,8 @@ pub struct SpannerDatabase {
     database: Option<String>,
     endpoint: Option<String>,
     emulator: bool,
+    keyfile: Option<String>,
+    keyfile_json: Option<String>,
 }
 
 impl SpannerDatabase {
@@ -76,6 +81,26 @@ impl SpannerDatabase {
             database: None,
             endpoint: None,
             emulator: false,
+            keyfile: None,
+            keyfile_json: None,
+        }
+    }
+
+    /// Resolve the inline service-account JSON to use, reading the key file if a path was given.
+    /// Inline JSON ([`OPTION_KEYFILE_JSON`]) takes precedence over a file path ([`OPTION_KEYFILE`]).
+    fn credentials_json(&self) -> Result<Option<String>> {
+        if let Some(json) = &self.keyfile_json {
+            Ok(Some(json.clone()))
+        } else if let Some(path) = &self.keyfile {
+            let json = std::fs::read_to_string(path).map_err(|e| {
+                err(
+                    format!("failed to read keyfile {path:?}: {e}"),
+                    Status::InvalidArguments,
+                )
+            })?;
+            Ok(Some(json))
+        } else {
+            Ok(None)
         }
     }
 
@@ -102,6 +127,14 @@ impl SpannerDatabase {
             }
         }
 
+        // Resolve service-account credentials up front (reads the key file, if any). Ignored in
+        // emulator mode, which always uses anonymous credentials.
+        let credentials_json = if emulator {
+            None
+        } else {
+            self.credentials_json()?
+        };
+
         self.runtime.block_on(async move {
             let mut builder = Spanner::builder();
             if let Some(endpoint) = endpoint {
@@ -109,7 +142,17 @@ impl SpannerDatabase {
             }
             if emulator {
                 builder = builder.with_credentials(AnonymousCredentials::new().build());
+            } else if let Some(json) = credentials_json {
+                let key = parse_service_account_key(&json)?;
+                let credentials = ServiceAccountCredentials::new(key).build().map_err(|e| {
+                    err(
+                        format!("failed to build service-account credentials: {e}"),
+                        Status::InvalidArguments,
+                    )
+                })?;
+                builder = builder.with_credentials(credentials);
             }
+            // Otherwise: Application Default Credentials.
             let spanner = builder.build().await.map_err(from_spanner)?;
             let client = spanner
                 .database_client(database.clone())
@@ -149,6 +192,12 @@ impl Optionable for SpannerDatabase {
             OptionDatabase::Other(name) if name == OPTION_EMULATOR => {
                 self.emulator = bool_value(&key, value)?
             }
+            OptionDatabase::Other(name) if name == OPTION_KEYFILE => {
+                self.keyfile = Some(string_value(&key, value)?)
+            }
+            OptionDatabase::Other(name) if name == OPTION_KEYFILE_JSON => {
+                self.keyfile_json = Some(string_value(&key, value)?)
+            }
             other => {
                 return Err(invalid_argument(format!(
                     "unsupported Spanner database option: {}",
@@ -167,6 +216,8 @@ impl Optionable for SpannerDatabase {
             OptionDatabase::Other(name) if name == OPTION_EMULATOR => {
                 Some(self.emulator.to_string())
             }
+            OptionDatabase::Other(name) if name == OPTION_KEYFILE => self.keyfile.clone(),
+            OptionDatabase::Other(name) if name == OPTION_KEYFILE_JSON => self.keyfile_json.clone(),
             _ => None,
         };
         value.ok_or_else(|| {
@@ -240,6 +291,16 @@ fn string_value(key: &OptionDatabase, value: OptionValue) -> Result<String> {
             option_name(key)
         ))),
     }
+}
+
+/// Parse a service-account JSON key, mapping errors to `InvalidArguments`.
+fn parse_service_account_key(json: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(json).map_err(|e| {
+        err(
+            format!("invalid service-account JSON key: {e}"),
+            Status::InvalidArguments,
+        )
+    })
 }
 
 fn bool_value(key: &OptionDatabase, value: OptionValue) -> Result<bool> {
@@ -335,5 +396,60 @@ mod tests {
             .set_option(OptionDatabase::Uri, OptionValue::Int(42))
             .unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
+    }
+
+    #[test]
+    fn keyfile_options_round_trip() {
+        let mut db = new_database();
+        db.set_option(
+            OptionDatabase::Other(OPTION_KEYFILE.into()),
+            OptionValue::String("/path/to/key.json".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other(OPTION_KEYFILE_JSON.into()),
+            OptionValue::String("{\"type\":\"service_account\"}".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(OPTION_KEYFILE.into()))
+                .unwrap(),
+            "/path/to/key.json"
+        );
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(OPTION_KEYFILE_JSON.into()))
+                .unwrap(),
+            "{\"type\":\"service_account\"}"
+        );
+    }
+
+    #[test]
+    fn missing_keyfile_is_an_error() {
+        let mut db = new_database();
+        db.keyfile = Some("/no/such/keyfile-does-not-exist.json".into());
+        let error = db.credentials_json().unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+    }
+
+    #[test]
+    fn inline_keyfile_json_takes_precedence_over_path() {
+        let mut db = new_database();
+        db.keyfile = Some("/ignored/path.json".into());
+        db.keyfile_json = Some("{\"inline\":true}".into());
+        assert_eq!(
+            db.credentials_json().unwrap(),
+            Some("{\"inline\":true}".to_string())
+        );
+    }
+
+    #[test]
+    fn invalid_service_account_json_is_rejected() {
+        assert_eq!(
+            parse_service_account_key("{ not valid json")
+                .unwrap_err()
+                .status,
+            Status::InvalidArguments
+        );
+        assert!(parse_service_account_key("{\"type\":\"service_account\"}").is_ok());
     }
 }

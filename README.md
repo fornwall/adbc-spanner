@@ -115,11 +115,19 @@ Options are set on the database (via `new_database_with_opts` or `set_option`):
 | `OptionDatabase::Uri` / `adbc.spanner.database`          | The Spanner database path `projects/<p>/instances/<i>/databases/<d>`. Required. |
 | `adbc.spanner.endpoint`                                  | Explicit gRPC endpoint, e.g. `http://localhost:9010` for an emulator.   |
 | `adbc.spanner.emulator`                                  | `true` to connect with anonymous credentials (emulator mode).           |
+| `adbc.spanner.keyfile`                                   | Path to a service-account JSON key file (dbt's `keyfile`).              |
+| `adbc.spanner.keyfile_json`                             | Inline service-account JSON key (dbt's `keyfile_json`); wins over `keyfile`. |
 
-The driver also honours the `SPANNER_EMULATOR_HOST` environment variable: when set it is used as the
-endpoint and anonymous credentials are selected automatically. Against production Spanner,
-[Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)
-are used.
+### Authentication
+
+Credentials are resolved in this order:
+
+1. **Emulator** — if `SPANNER_EMULATOR_HOST` is set (or `adbc.spanner.emulator` is `true`), anonymous
+   credentials are used and the endpoint is taken from the environment.
+2. **Service account** — a key supplied inline via `adbc.spanner.keyfile_json` or read from the path
+   in `adbc.spanner.keyfile`.
+3. **[Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)**
+   otherwise (e.g. `GOOGLE_APPLICATION_CREDENTIALS`, gcloud login, or the metadata server).
 
 ## Type mapping
 
