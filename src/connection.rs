@@ -24,7 +24,9 @@ use std::sync::{Arc, Mutex};
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection, OptionValue};
 use adbc_core::{Connection, Optionable};
-use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray};
+use arrow_array::{
+    ArrayRef, Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
+};
 use arrow_schema::{DataType, Field, Schema};
 use google_cloud_spanner::builder::BatchDmlBuilder;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
@@ -123,6 +125,169 @@ impl SpannerConnection {
             Ok::<(), Error>(())
         })
     }
+
+    /// Query `INFORMATION_SCHEMA` and assemble the schema→table→column hierarchy for `get_objects`,
+    /// applying the ADBC `LIKE`/type filters and the requested depth.
+    fn collect_objects(
+        &self,
+        depth: ObjectDepth,
+        db_schema: Option<&str>,
+        table_name: Option<&str>,
+        table_type: &Option<Vec<&str>>,
+        column_name: Option<&str>,
+    ) -> Result<Vec<crate::objects::DbSchema>> {
+        let populate_tables = matches!(
+            depth,
+            ObjectDepth::All | ObjectDepth::Tables | ObjectDepth::Columns
+        );
+        let populate_columns = matches!(depth, ObjectDepth::All | ObjectDepth::Columns);
+        let client = self.client.clone();
+
+        let (schema_batch, table_batch, column_batch) = self.runtime.block_on(async move {
+            let schemas =
+                query_batch(&client, "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA").await?;
+            let tables = if populate_tables {
+                Some(
+                    query_batch(
+                        &client,
+                        "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES",
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            let columns = if populate_columns {
+                Some(
+                    query_batch(
+                        &client,
+                        "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, IS_NULLABLE \
+                         FROM INFORMATION_SCHEMA.COLUMNS \
+                         ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION",
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            Ok::<_, Error>((schemas, tables, columns))
+        })?;
+
+        let schema_names = str_col(&schema_batch, 0)?;
+        let mut result = Vec::new();
+        for i in 0..schema_batch.num_rows() {
+            let schema_name = schema_names.value(i);
+            if db_schema.is_some_and(|p| !like_match(p, schema_name)) {
+                continue;
+            }
+            let mut tables = Vec::new();
+            if let Some(batch) = &table_batch {
+                let (ts, tn, tt) = (str_col(batch, 0)?, str_col(batch, 1)?, str_col(batch, 2)?);
+                for r in 0..batch.num_rows() {
+                    if ts.value(r) != schema_name {
+                        continue;
+                    }
+                    let name = tn.value(r);
+                    if table_name.is_some_and(|p| !like_match(p, name)) {
+                        continue;
+                    }
+                    let ttype = tt.value(r).to_string();
+                    if table_type
+                        .as_ref()
+                        .is_some_and(|types| !types.iter().any(|t| *t == ttype))
+                    {
+                        continue;
+                    }
+                    let columns = match &column_batch {
+                        Some(cb) => collect_columns(cb, schema_name, name, column_name)?,
+                        None => Vec::new(),
+                    };
+                    tables.push(crate::objects::Table {
+                        name: name.to_string(),
+                        table_type: ttype,
+                        columns,
+                    });
+                }
+            }
+            result.push(crate::objects::DbSchema {
+                name: schema_name.to_string(),
+                tables,
+            });
+        }
+        Ok(result)
+    }
+}
+
+/// Run a query and return its single materialised record batch.
+async fn query_batch(client: &DatabaseClient, sql: &str) -> Result<RecordBatch> {
+    let transaction = client.single_use().build();
+    let result_set = transaction
+        .execute_query(SpannerSql::builder(sql).build())
+        .await
+        .map_err(from_spanner)?;
+    let (_schema, batch) = result_set_to_batch(result_set).await?;
+    Ok(batch)
+}
+
+fn str_col(batch: &RecordBatch, index: usize) -> Result<&StringArray> {
+    batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            err(
+                format!("INFORMATION_SCHEMA column {index} is not a string"),
+                Status::Internal,
+            )
+        })
+}
+
+fn collect_columns(
+    batch: &RecordBatch,
+    schema: &str,
+    table: &str,
+    filter: Option<&str>,
+) -> Result<Vec<crate::objects::Column>> {
+    let (ts, tn, cn, nul) = (
+        str_col(batch, 0)?,
+        str_col(batch, 1)?,
+        str_col(batch, 2)?,
+        str_col(batch, 4)?,
+    );
+    let ordinal = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| err("ORDINAL_POSITION is not an integer", Status::Internal))?;
+    let mut columns = Vec::new();
+    for r in 0..batch.num_rows() {
+        if ts.value(r) != schema || tn.value(r) != table {
+            continue;
+        }
+        let name = cn.value(r);
+        if filter.is_some_and(|p| !like_match(p, name)) {
+            continue;
+        }
+        columns.push(crate::objects::Column {
+            name: name.to_string(),
+            ordinal: ordinal.value(r) as i32,
+            nullable: nul.value(r).eq_ignore_ascii_case("YES"),
+        });
+    }
+    Ok(columns)
+}
+
+/// Match an ADBC `LIKE` pattern (`%` = any run, `_` = one char) against a value, case-sensitively.
+fn like_match(pattern: &str, value: &str) -> bool {
+    fn go(p: &[u8], v: &[u8]) -> bool {
+        match p.first() {
+            None => v.is_empty(),
+            Some(b'%') => go(&p[1..], v) || (!v.is_empty() && go(p, &v[1..])),
+            Some(b'_') => !v.is_empty() && go(&p[1..], &v[1..]),
+            Some(&c) => !v.is_empty() && v[0] == c && go(&p[1..], &v[1..]),
+        }
+    }
+    go(pattern.as_bytes(), value.as_bytes())
 }
 
 impl Optionable for SpannerConnection {
@@ -206,16 +371,31 @@ impl Connection for SpannerConnection {
         Err(not_implemented("Connection::get_info"))
     }
 
+    /// Catalog/schema/table/column introspection, sourced from Spanner `INFORMATION_SCHEMA`.
+    ///
+    /// A Spanner database is a single, unnamed catalog (`""`). Name arguments are ADBC `LIKE`
+    /// patterns (`%`/`_`); `depth` bounds how far the hierarchy is populated.
     fn get_objects(
         &self,
-        _depth: ObjectDepth,
-        _catalog: Option<&str>,
-        _db_schema: Option<&str>,
-        _table_name: Option<&str>,
-        _table_type: Option<Vec<&str>>,
-        _column_name: Option<&str>,
+        depth: ObjectDepth,
+        catalog: Option<&str>,
+        db_schema: Option<&str>,
+        table_name: Option<&str>,
+        table_type: Option<Vec<&str>>,
+        column_name: Option<&str>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        Err(not_implemented("Connection::get_objects"))
+        let out_schema = adbc_core::schemas::GET_OBJECTS_SCHEMA.clone();
+        // Spanner has a single catalog (""); a catalog filter that excludes it yields no rows.
+        if catalog.is_some_and(|c| !like_match(c, "")) {
+            return Ok(Box::new(RecordBatchIterator::new(Vec::new(), out_schema)));
+        }
+        let schemas =
+            self.collect_objects(depth, db_schema, table_name, &table_type, column_name)?;
+        let batch = crate::objects::build(depth, schemas)?;
+        Ok(Box::new(RecordBatchIterator::new(
+            vec![Ok(batch)],
+            out_schema,
+        )))
     }
 
     /// Return the Arrow schema of a table.
@@ -261,10 +441,17 @@ impl Connection for SpannerConnection {
         Ok(Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema)))
     }
 
+    /// Spanner exposes no portable per-table statistics, so this returns an empty (but correctly
+    /// typed) result set — i.e. "no statistic names".
     fn get_statistic_names(&self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        Err(not_implemented("Connection::get_statistic_names"))
+        Ok(Box::new(RecordBatchIterator::new(
+            Vec::new(),
+            adbc_core::schemas::GET_STATISTIC_NAMES_SCHEMA.clone(),
+        )))
     }
 
+    /// Spanner exposes no portable per-table statistics, so this returns an empty (but correctly
+    /// typed) result set.
     fn get_statistics(
         &self,
         _catalog: Option<&str>,
@@ -272,7 +459,10 @@ impl Connection for SpannerConnection {
         _table_name: Option<&str>,
         _approximate: bool,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        Err(not_implemented("Connection::get_statistics"))
+        Ok(Box::new(RecordBatchIterator::new(
+            Vec::new(),
+            adbc_core::schemas::GET_STATISTICS_SCHEMA.clone(),
+        )))
     }
 
     fn commit(&mut self) -> Result<()> {
@@ -303,7 +493,11 @@ impl Connection for SpannerConnection {
         &self,
         _partition: impl AsRef<[u8]>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        Err(not_implemented("Connection::read_partition"))
+        // Pairs with Statement::execute_partitions; see the note there.
+        Err(not_implemented(
+            "partitioned execution: Spanner's Partition APIs are session-bound and unsupported by \
+             the emulator, so it is not implemented",
+        ))
     }
 }
 

@@ -364,6 +364,10 @@ impl Statement for SpannerStatement {
     }
 
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
+        // Spanner does support partitioned queries via a batch read-only transaction, but the
+        // partitions are only valid within that live, session-bound transaction — which does not
+        // map onto ADBC's opaque-token / read_partition model — and the Spanner emulator does not
+        // implement the Partition RPCs, so this is intentionally left unimplemented.
         Err(not_implemented("Statement::execute_partitions"))
     }
 
@@ -382,7 +386,11 @@ impl Statement for SpannerStatement {
     }
 
     fn set_substrait_plan(&mut self, _plan: impl AsRef<[u8]>) -> Result<()> {
-        Err(not_implemented("Statement::set_substrait_plan"))
+        // Spanner has no Substrait support (it executes GoogleSQL / PostgreSQL text), so there is
+        // nothing to execute a Substrait plan against.
+        Err(not_implemented(
+            "Substrait: Spanner does not support Substrait plans",
+        ))
     }
 
     fn cancel(&mut self) -> Result<()> {

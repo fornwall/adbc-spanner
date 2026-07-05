@@ -14,7 +14,9 @@
 
 use std::sync::Arc;
 
-use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, OptionValue};
+use adbc_core::options::{
+    ObjectDepth, OptionConnection, OptionDatabase, OptionStatement, OptionValue,
+};
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_spanner::{SpannerConnection, SpannerDatabase, SpannerDriver};
 use arrow_array::{
@@ -582,6 +584,62 @@ fn query_and_dml_round_trip() {
     assert_eq!(planned.field(0).data_type(), &DataType::Int64);
     assert_eq!(planned.field(1).name(), "b");
     assert_eq!(planned.field(1).data_type(), &DataType::Utf8);
+
+    // --- get_objects: catalog → schema → table → columns from INFORMATION_SCHEMA ---
+
+    let objects = connection
+        .get_objects(
+            ObjectDepth::All,
+            None,
+            Some(""),
+            Some("Singers"),
+            None,
+            None,
+        )
+        .expect("get_objects");
+    let object_batches = objects
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect objects");
+    let ob = &object_batches[0];
+    assert_eq!(ob.num_rows(), 1, "single catalog");
+
+    // catalog_db_schemas: List<Struct{db_schema_name, db_schema_tables}> — only the "" schema.
+    let schemas = ob.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+    let schemas = schemas.value(0);
+    let schemas = schemas.as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(schemas.len(), 1);
+
+    // db_schema_tables (field 1): List<Struct{table_name, table_type, table_columns, ...}>.
+    let tables = schemas
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let tables = tables.value(0);
+    let tables = tables.as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(tables.len(), 1);
+    let table_name = tables
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(table_name.value(0), "Singers");
+
+    // table_columns (field 2): List<Struct{column_name, ...}> — the four Singers columns.
+    let columns = tables
+        .column(2)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let columns = columns.value(0);
+    let columns = columns.as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(columns.len(), 4);
+    let column_name = columns
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(column_name.value(0), "SingerId");
 }
 
 /// Open a connection, retrying briefly: a freshly-created emulator database can be momentarily

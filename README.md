@@ -36,12 +36,16 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   parameters (a column `id` binds `@id`); each bound row runs the statement once.
 - Bulk ingest: set `adbc.ingest.target_table`, bind an Arrow batch, and `execute_update` inserts the
   rows into that table in one transaction.
-- Metadata: `get_table_types()` and `get_table_schema()` (returns a table's Arrow schema).
+- Metadata: `get_table_types()`, `get_table_schema()`, and `get_objects()` (catalog/schema/table/
+  column introspection from `INFORMATION_SCHEMA`). `get_statistics`/`get_statistic_names` return
+  empty results — Spanner exposes no portable per-table statistics.
 - `execute_schema()`: a query's result schema without running it (via `QueryMode::Plan`), so tools
   can introspect output columns — including a top-level `WITH` — with no data scan.
 
-Not yet supported (return `NotImplemented`): Substrait, partitioned execution, and the remaining
-catalog-metadata calls (`get_objects`, `get_statistics`, …).
+Not supported (return `NotImplemented`, by nature of Spanner): **Substrait** — Spanner has no
+Substrait support; and **partitioned execution** (`execute_partitions`/`read_partition`) — Spanner's
+Partition APIs are session-bound (they don't map onto ADBC's opaque-token model) and the emulator
+doesn't implement them.
 
 ## Shared library (loadable driver)
 
