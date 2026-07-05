@@ -10,9 +10,23 @@ readme = "README.md"
 keywords = ["adbc", "arrow", "spanner", "database"]
 categories = ["database"]
 
+[lib]
+# cdylib: the loadable ADBC driver shared library
+#         (libadbc_spanner.so / libadbc_spanner.dylib / adbc_spanner.dll).
+# rlib:   lets Rust code depend on this crate directly.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["ffi"]
+# Export the C ABI `AdbcSpannerInit` entrypoint so the cdylib is a driver the ADBC
+# driver manager (any language) can load. Disable for a pure-Rust rlib dependency.
+ffi = ["dep:adbc_ffi"]
+
 [dependencies]
 # The abstract ADBC driver traits (Driver / Database / Connection / Statement).
 adbc_core = "0.23"
+# C FFI driver exporter: generates the `AdbcSpannerInit` entrypoint for the shared library.
+adbc_ffi = { version = "0.23", optional = true }
 # Arrow types the ADBC traits are expressed in. Kept in the range adbc_core allows
 # so the RecordBatch / Schema / RecordBatchReader types unify across the crates.
 arrow-array = ">=53.1, <59"
@@ -26,6 +40,11 @@ google-cloud-auth = "1.13"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 serde_json = "1"
 base64 = "0.22"
+
+[profile.release]
+# Smaller shipped shared libraries.
+strip = true
+lto = "thin"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }

@@ -27,6 +27,27 @@ Not yet supported (return `NotImplemented`): query parameter binding / bulk inge
 multi-statement transactions (the driver is autocommit-only), Substrait, partitioned execution, and
 the richer catalog-metadata calls (`get_objects`, `get_table_schema`, `get_statistics`, …).
 
+## Shared library (loadable driver)
+
+Besides the Rust crate, this builds a C-ABI **shared library** that any ADBC driver manager can load
+(`libadbc_spanner.so` on Linux, `libadbc_spanner.dylib` on macOS, `adbc_spanner.dll` on Windows). It
+exports the standard `AdbcSpannerInit` entrypoint (plus an `AdbcDriverInit` fallback).
+
+Prebuilt libraries for Linux (x86-64, aarch64), macOS (Apple Silicon) and Windows (x86-64) are
+attached to every CI run and to each tagged [release](https://github.com/fornwall/adbc-spanner/releases).
+To build one yourself: `cargo build --release` → `target/release/libadbc_spanner.so`.
+
+Example, loading it from the Python driver manager:
+
+```python
+import adbc_driver_manager
+db = adbc_driver_manager.AdbcDatabase(
+    driver="/path/to/libadbc_spanner.so",
+    entrypoint="AdbcSpannerInit",
+    uri="projects/my-project/instances/my-instance/databases/my-db",
+)
+```
+
 ## Usage
 
 Add the dependency (this crate plus the Arrow crates you consume results with):

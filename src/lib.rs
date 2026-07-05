@@ -57,6 +57,8 @@ mod connection;
 mod conversion;
 mod driver;
 mod error;
+#[cfg(feature = "ffi")]
+mod ffi;
 mod runtime;
 mod statement;
 

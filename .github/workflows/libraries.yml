@@ -1,0 +1,98 @@
+name: Shared libraries
+
+# Build the loadable ADBC driver shared library for every supported platform.
+# Artifacts are attached to each run (downloadable from the run's summary page),
+# and, for tag pushes, also uploaded as assets on the corresponding GitHub Release.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            lib: libadbc_spanner.so
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            lib: libadbc_spanner.so
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            lib: libadbc_spanner.dylib
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            lib: adbc_spanner.dll
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # aws-lc-sys (pulled in by the TLS stack) needs NASM to assemble on Windows x86-64.
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build shared library
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="adbc-spanner-${{ matrix.target }}"
+          mkdir -p "$staging" dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.lib }}" "$staging/"
+          cp README.md LICENSE "$staging/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            # Include the MSVC import library for consumers that link at build time.
+            cp "target/${{ matrix.target }}/release/adbc_spanner.dll.lib" "$staging/" 2>/dev/null || true
+            7z a "dist/${staging}.zip" "$staging"
+          else
+            tar -czf "dist/${staging}.tar.gz" "$staging"
+          fi
+          ls -l dist
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: adbc-spanner-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Attach to GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

@@ -28,6 +28,17 @@ impl SpannerDriver {
     }
 }
 
+impl Default for SpannerDriver {
+    /// Create a driver with a fresh runtime.
+    ///
+    /// Required by the C FFI driver exporter, which cannot surface a fallible constructor. Panics
+    /// only if the Tokio runtime cannot be created (catastrophic OS resource exhaustion); prefer
+    /// [`SpannerDriver::try_new`] in Rust code.
+    fn default() -> Self {
+        Self::try_new().expect("failed to initialize the Spanner ADBC driver Tokio runtime")
+    }
+}
+
 impl Driver for SpannerDriver {
     type DatabaseType = SpannerDatabase;
 
