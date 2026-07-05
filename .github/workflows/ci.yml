@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # Run the Spanner emulator as a service container so the integration test has
+    # a real Spanner to talk to.
+    services:
+      spanner:
+        image: gcr.io/cloud-spanner-emulator/emulator
+        ports:
+          - 9010:9010
+          - 9020:9020
+
+    env:
+      SPANNER_EMULATOR_HOST: localhost:9010
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Wait for the Spanner emulator
+        run: |
+          for _ in $(seq 1 30); do
+            if bash -c 'echo > /dev/tcp/127.0.0.1/9010' >/dev/null 2>&1; then
+              echo "emulator is up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "emulator did not become ready" >&2
+          exit 1
+
+      - name: Unit tests
+        run: cargo test --lib
+
+      - name: Integration tests (Spanner emulator)
+        run: cargo test --test emulator
