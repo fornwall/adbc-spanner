@@ -30,7 +30,7 @@ jobs:
             runner: macos-14
             lib: libadbc_spanner.dylib
           - target: x86_64-apple-darwin
-            runner: macos-13 # Intel runner — builds x86-64 macOS natively.
+            runner: macos-14 # cross-compiled from the arm64 runner (Apple toolchain is universal).
             lib: libadbc_spanner.dylib
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
