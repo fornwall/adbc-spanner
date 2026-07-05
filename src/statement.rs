@@ -15,6 +15,7 @@ use arrow_schema::{ArrowError, Schema, SchemaRef};
 use google_cloud_lro::Poller as _;
 use google_cloud_spanner::builder::BatchDmlBuilder;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
+use google_cloud_spanner::model::execute_sql_request::QueryMode;
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
@@ -333,7 +334,33 @@ impl Statement for SpannerStatement {
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {
-        Err(not_implemented("Statement::execute_schema"))
+        let sql = self.sql()?;
+        if crate::ddl::is_ddl(&sql) {
+            return Err(invalid_state("execute_schema is only valid for queries"));
+        }
+        let client = self.client.clone();
+        let bound = self.bound.clone();
+        let schema = self.runtime.block_on(async move {
+            let transaction = client.single_use().build();
+            // QueryMode::Plan analyses the query and returns its column metadata without scanning
+            // any data, so dbt can introspect a model's output columns without wrapping it in a
+            // `SELECT ... WHERE false` subquery.
+            let mut builder = SpannerSql::builder(sql).set_query_mode(QueryMode::Plan);
+            // Bind parameters if any were provided (values are irrelevant to the schema) so that
+            // `@param` references resolve.
+            if let Some(batch) = bound.first() {
+                if batch.num_rows() > 0 {
+                    builder = bind::bind_row(builder, batch, 0)?;
+                }
+            }
+            let result_set = transaction
+                .execute_query(builder.build())
+                .await
+                .map_err(from_spanner)?;
+            let (schema, _batch) = result_set_to_batch(result_set).await?;
+            Ok::<SchemaRef, Error>(schema)
+        })?;
+        Ok((*schema).clone())
     }
 
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {

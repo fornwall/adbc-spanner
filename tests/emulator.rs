@@ -569,6 +569,19 @@ fn query_and_dml_round_trip() {
     let mut drop_batch = connection.new_statement().expect("new statement");
     drop_batch.set_sql_query("DROP TABLE AdbcBatch").unwrap();
     drop_batch.execute_update().expect("drop batch table");
+
+    // --- execute_schema returns a query's schema without running it (incl. a top-level WITH) ---
+
+    let mut schema_stmt = connection.new_statement().expect("new statement");
+    schema_stmt
+        .set_sql_query("WITH cte AS (SELECT 1 AS a, 'x' AS b) SELECT a, b FROM cte")
+        .unwrap();
+    let planned = schema_stmt.execute_schema().expect("execute_schema");
+    assert_eq!(planned.fields().len(), 2);
+    assert_eq!(planned.field(0).name(), "a");
+    assert_eq!(planned.field(0).data_type(), &DataType::Int64);
+    assert_eq!(planned.field(1).name(), "b");
+    assert_eq!(planned.field(1).data_type(), &DataType::Utf8);
 }
 
 /// Open a connection, retrying briefly: a freshly-created emulator database can be momentarily
