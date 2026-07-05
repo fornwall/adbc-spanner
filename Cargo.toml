@@ -54,6 +54,8 @@ adbc_ffi = { version = "0.23", optional = true }
 # so the RecordBatch / Schema / RecordBatchReader types unify across the crates.
 arrow-array = ">=53.1, <59"
 arrow-schema = ">=53.1, <59"
+# Offset / null buffers for building Arrow List arrays (ARRAY columns).
+arrow-buffer = ">=53.1, <59"
 # The official Google Cloud preview Spanner client.
 google-cloud-spanner = "0.34.2-preview"
 # Anonymous credentials, used when talking to the Spanner emulator.

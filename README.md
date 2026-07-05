@@ -142,10 +142,12 @@ Credentials are resolved in this order:
 | `NUMERIC`                                   | `Decimal128(38, 9)`               |
 | `BYTES`                                     | `Binary`                          |
 | `STRING` / `JSON` / `UUID` / `INTERVAL` / `ENUM` | `Utf8`                       |
-| `ARRAY` / `STRUCT`                          | `Utf8` (JSON-encoded)             |
+| `ARRAY<scalar>`                             | `List<scalar>` (recursive)        |
+| `STRUCT`, `ARRAY<STRUCT>`                   | `Utf8` (JSON-encoded)             |
 
-`NULL`s are represented as null slots in the corresponding Arrow array. `ARRAY`/`STRUCT` are still
-rendered as JSON text; mapping them to Arrow `List`/`Struct` is a planned improvement.
+`NULL`s are represented as null slots in the corresponding Arrow array. `STRUCT` (and
+`ARRAY<STRUCT>`) stay JSON text because the preview Spanner client does not expose struct field
+names/types in the result metadata, so a native Arrow `Struct` schema cannot be built.
 
 ## Testing
 

@@ -18,8 +18,8 @@ use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, Opti
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_spanner::{SpannerConnection, SpannerDriver};
 use arrow_array::{
-    BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, RecordBatch,
-    RecordBatchReader, StringArray, TimestampMicrosecondArray,
+    Array, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, ListArray,
+    RecordBatch, RecordBatchReader, StringArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use google_cloud_lro::Poller;
@@ -443,6 +443,55 @@ fn query_and_dml_round_trip() {
     let mut drop_bind = connection.new_statement().expect("new statement");
     drop_bind.set_sql_query("DROP TABLE AdbcBind").unwrap();
     drop_bind.execute_update().expect("drop bind table");
+
+    // --- ARRAY<scalar> maps to a native Arrow List ---
+
+    let mut arr_ddl = connection.new_statement().expect("new statement");
+    arr_ddl
+        .set_sql_query(
+            "DROP TABLE IF EXISTS AdbcArr; \
+             CREATE TABLE AdbcArr (Id INT64, Nums ARRAY<INT64>, Tags ARRAY<STRING(MAX)>) \
+             PRIMARY KEY (Id)",
+        )
+        .unwrap();
+    arr_ddl.execute_update().expect("create array table");
+
+    let mut arr_ins = connection.new_statement().expect("new statement");
+    arr_ins
+        .set_sql_query("INSERT INTO AdbcArr (Id, Nums, Tags) VALUES (1, [10, 20, 30], ['a', 'b'])")
+        .unwrap();
+    assert_eq!(arr_ins.execute_update().expect("insert arrays"), Some(1));
+
+    let mut arr_q = connection.new_statement().expect("new statement");
+    arr_q
+        .set_sql_query("SELECT Nums, Tags FROM AdbcArr WHERE Id = 1")
+        .unwrap();
+    let arr_reader = arr_q.execute().expect("array query");
+    let arr_schema = arr_reader.schema();
+    assert_eq!(
+        arr_schema.field(0).data_type(),
+        &DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
+    );
+    assert_eq!(
+        arr_schema.field(1).data_type(),
+        &DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+    );
+    let arr_batches = arr_reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect arrays");
+    let ab = &arr_batches[0];
+    let nums = ab.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+    let nums0 = nums.value(0);
+    let nums0 = nums0.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(nums0.values(), &[10, 20, 30]);
+    let tags = ab.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+    let tags0 = tags.value(0);
+    let tags0 = tags0.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!((tags0.value(0), tags0.value(1)), ("a", "b"));
+
+    let mut drop_arr = connection.new_statement().expect("new statement");
+    drop_arr.set_sql_query("DROP TABLE AdbcArr").unwrap();
+    drop_arr.execute_update().expect("drop array table");
 }
 
 /// Count the rows in `table` through a driver query.

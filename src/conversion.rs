@@ -19,25 +19,30 @@
 //! | `NUMERIC`                                   | `Decimal128(38, 9)`               |
 //! | `BYTES`                                     | `Binary`                          |
 //! | `STRING`/`JSON`/`UUID`/`INTERVAL`/`ENUM`    | `Utf8`                            |
-//! | `ARRAY`/`STRUCT`                            | `Utf8` (JSON-encoded)             |
+//! | `ARRAY<scalar>`                             | `List<scalar>`                    |
+//! | `STRUCT`, `ARRAY<STRUCT>`                   | `Utf8` (JSON-encoded)             |
 //!
-//! Arrays and structs are still rendered as JSON text; mapping them to Arrow `List`/`Struct` is a
-//! future improvement.
+//! `ARRAY` of a scalar maps to an Arrow `List` of the mapped element type (recursively). `STRUCT`
+//! (and `ARRAY<STRUCT>`) stay JSON text because the preview Spanner client does not expose struct
+//! field names/types in the result metadata, so a native Arrow `Struct` schema cannot be built.
 
 use std::sync::Arc;
 
 use adbc_core::error::{Result, Status};
-use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
-    Float64Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
+use arrow_array::{
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int64Array, ListArray, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
-use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema, SchemaRef, TimeUnit};
 use base64::Engine;
 use google_cloud_spanner::result::{ResultSet, ResultSetMetadata, Row};
 use google_cloud_spanner::value::{Kind, Type, TypeCode, Value};
 
 use crate::error::{err, from_spanner};
+
+/// Field name used for the element of an Arrow `List` (the Arrow convention).
+const LIST_ITEM: &str = "item";
 
 /// Precision and scale of Spanner's `NUMERIC` type (GoogleSQL `NUMERIC` is fixed at 38 / 9).
 const NUMERIC_PRECISION: u8 = 38;
@@ -101,27 +106,44 @@ fn arrow_type(ty: &Type) -> DataType {
             DataType::Timestamp(TimeUnit::Microsecond, Some(TIMESTAMP_TZ.into()))
         }
         TypeCode::Numeric => DataType::Decimal128(NUMERIC_PRECISION, NUMERIC_SCALE),
-        // STRING, JSON, UUID, INTERVAL, ENUM, PROTO, ARRAY, STRUCT and any future/unknown code are
-        // represented as (possibly JSON-encoded) UTF-8 text.
+        TypeCode::Array => match ty.array_element_type() {
+            // ARRAY of a scalar → Arrow List of that scalar. ARRAY of STRUCT/ARRAY cannot be mapped
+            // natively (see the STRUCT note below), so the whole array falls back to JSON text.
+            Some(element)
+                if !matches!(
+                    element.code(),
+                    TypeCode::Struct | TypeCode::Array | TypeCode::Unspecified
+                ) =>
+            {
+                DataType::List(Arc::new(Field::new(LIST_ITEM, arrow_type(&element), true)))
+            }
+            _ => DataType::Utf8,
+        },
+        // STRUCT is rendered as JSON text: the preview Spanner client does not expose struct field
+        // names/types in the result metadata, so a native Arrow Struct schema cannot be built.
+        // STRING, JSON, UUID, INTERVAL, ENUM, PROTO and any future/unknown code are UTF-8 text.
         _ => DataType::Utf8,
     }
 }
 
 fn build_batch(schema: SchemaRef, rows: &[Row]) -> Result<RecordBatch> {
-    let mut builders: Vec<ColumnBuilder> = schema
-        .fields()
-        .iter()
-        .map(|f| ColumnBuilder::new(f.data_type()))
-        .collect();
-
+    // Collect values column-major, then build each column (recursively, for nested lists).
+    let mut columns: Vec<Vec<Option<&Value>>> =
+        vec![Vec::with_capacity(rows.len()); schema.fields().len()];
     for row in rows {
         let values = row.raw_values();
-        for (i, builder) in builders.iter_mut().enumerate() {
-            builder.append(values.get(i))?;
+        for (i, column) in columns.iter_mut().enumerate() {
+            column.push(values.get(i));
         }
     }
 
-    let arrays: Vec<ArrayRef> = builders.into_iter().map(ColumnBuilder::finish).collect();
+    let arrays: Vec<ArrayRef> = schema
+        .fields()
+        .iter()
+        .zip(&columns)
+        .map(|(field, values)| build_array(field.data_type(), values))
+        .collect::<Result<_>>()?;
+
     RecordBatch::try_new(schema, arrays).map_err(|e| {
         err(
             format!("failed to build record batch: {e}"),
@@ -130,133 +152,106 @@ fn build_batch(schema: SchemaRef, rows: &[Row]) -> Result<RecordBatch> {
     })
 }
 
-/// A typed Arrow array builder, one per result column.
-enum ColumnBuilder {
-    Bool(BooleanBuilder),
-    Int64(Int64Builder),
-    Float64(Float64Builder),
-    Float32(Float32Builder),
-    Date32(Date32Builder),
-    TimestampMicros(TimestampMicrosecondBuilder),
-    Decimal128(Decimal128Builder),
-    Binary(BinaryBuilder),
-    Utf8(StringBuilder),
+/// Return the value unless it is a SQL `NULL` (or absent).
+fn present(value: Option<&Value>) -> Option<&Value> {
+    value.filter(|v| v.kind() != Kind::Null)
 }
 
-impl ColumnBuilder {
-    fn new(data_type: &DataType) -> Self {
-        match data_type {
-            DataType::Boolean => ColumnBuilder::Bool(BooleanBuilder::new()),
-            DataType::Int64 => ColumnBuilder::Int64(Int64Builder::new()),
-            DataType::Float64 => ColumnBuilder::Float64(Float64Builder::new()),
-            DataType::Float32 => ColumnBuilder::Float32(Float32Builder::new()),
-            DataType::Date32 => ColumnBuilder::Date32(Date32Builder::new()),
-            // Carry the exact tz / precision-scale from the schema onto the builder so the finished
-            // array's data type matches the field.
-            DataType::Timestamp(TimeUnit::Microsecond, _) => ColumnBuilder::TimestampMicros(
-                TimestampMicrosecondBuilder::new().with_data_type(data_type.clone()),
-            ),
-            DataType::Decimal128(_, _) => ColumnBuilder::Decimal128(
-                Decimal128Builder::new().with_data_type(data_type.clone()),
-            ),
-            DataType::Binary => ColumnBuilder::Binary(BinaryBuilder::new()),
-            _ => ColumnBuilder::Utf8(StringBuilder::new()),
-        }
-    }
+fn arrow_err(e: ArrowError) -> adbc_core::error::Error {
+    err(
+        format!("failed to build Arrow array: {e}"),
+        Status::Internal,
+    )
+}
 
-    fn append(&mut self, value: Option<&Value>) -> Result<()> {
-        let value = match value {
-            Some(v) if v.kind() != Kind::Null => v,
-            // Missing column or explicit NULL.
-            _ => {
-                self.append_null();
-                return Ok(());
+/// Build an Arrow array of the given `data_type` from one Spanner value per row.
+fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Result<ArrayRef> {
+    Ok(match data_type {
+        DataType::Boolean => Arc::new(BooleanArray::from_iter(
+            values
+                .iter()
+                .map(|&v| present(v).and_then(Value::try_as_bool)),
+        )),
+        DataType::Int64 => Arc::new(Int64Array::from_iter(
+            values.iter().map(|&v| present(v).and_then(parse_int64)),
+        )),
+        DataType::Float64 => Arc::new(Float64Array::from_iter(
+            values.iter().map(|&v| present(v).and_then(parse_f64)),
+        )),
+        DataType::Float32 => Arc::new(Float32Array::from_iter(
+            values
+                .iter()
+                .map(|&v| present(v).and_then(parse_f64).map(|f| f as f32)),
+        )),
+        DataType::Date32 => Arc::new(Date32Array::from_iter(values.iter().map(|&v| {
+            present(v)
+                .and_then(Value::try_as_string)
+                .and_then(parse_date_days)
+        }))),
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            let array = TimestampMicrosecondArray::from_iter(values.iter().map(|&v| {
+                present(v)
+                    .and_then(Value::try_as_string)
+                    .and_then(parse_timestamp_micros)
+            }));
+            Arc::new(array.with_timezone_opt(tz.clone()))
+        }
+        DataType::Decimal128(precision, scale) => {
+            let array = Decimal128Array::from_iter(values.iter().map(|&v| {
+                present(v)
+                    .and_then(Value::try_as_string)
+                    .and_then(parse_numeric_i128)
+            }));
+            Arc::new(
+                array
+                    .with_precision_and_scale(*precision, *scale)
+                    .map_err(arrow_err)?,
+            )
+        }
+        // Spanner encodes BYTES as base64.
+        DataType::Binary => Arc::new(BinaryArray::from_iter(values.iter().map(|&v| {
+            present(v)
+                .and_then(Value::try_as_string)
+                .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+        }))),
+        DataType::List(field) => build_list(field, values)?,
+        // Utf8 and every fallback (JSON, STRUCT, ARRAY-of-STRUCT, …): keep strings verbatim, render
+        // anything else (numbers, bools, nested arrays/structs) as JSON text.
+        _ => Arc::new(StringArray::from_iter(values.iter().map(|&v| {
+            present(v).map(|x| {
+                x.try_as_string()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value_to_json(x).to_string())
+            })
+        }))),
+    })
+}
+
+/// Build an Arrow `List` array: each Spanner value is a list (or null) of the element type.
+fn build_list(field: &FieldRef, values: &[Option<&Value>]) -> Result<ArrayRef> {
+    let mut children: Vec<Option<&Value>> = Vec::new();
+    let mut offsets: Vec<i32> = Vec::with_capacity(values.len() + 1);
+    offsets.push(0);
+    let mut validity: Vec<bool> = Vec::with_capacity(values.len());
+    for value in values {
+        match value {
+            Some(v) if v.kind() == Kind::List => {
+                children.extend(v.as_list().iter().map(Some));
+                validity.push(true);
             }
-        };
-
-        match self {
-            ColumnBuilder::Bool(b) => match value.try_as_bool() {
-                Some(v) => b.append_value(v),
-                None => b.append_null(),
-            },
-            ColumnBuilder::Int64(b) => match parse_int64(value) {
-                Some(v) => b.append_value(v),
-                None => b.append_null(),
-            },
-            ColumnBuilder::Float64(b) => match parse_f64(value) {
-                Some(v) => b.append_value(v),
-                None => b.append_null(),
-            },
-            ColumnBuilder::Float32(b) => match parse_f64(value) {
-                Some(v) => b.append_value(v as f32),
-                None => b.append_null(),
-            },
-            ColumnBuilder::Date32(b) => match value.try_as_string().and_then(parse_date_days) {
-                Some(v) => b.append_value(v),
-                None => b.append_null(),
-            },
-            ColumnBuilder::TimestampMicros(b) => {
-                match value.try_as_string().and_then(parse_timestamp_micros) {
-                    Some(v) => b.append_value(v),
-                    None => b.append_null(),
-                }
-            }
-            ColumnBuilder::Decimal128(b) => {
-                match value.try_as_string().and_then(parse_numeric_i128) {
-                    Some(v) => b.append_value(v),
-                    None => b.append_null(),
-                }
-            }
-            ColumnBuilder::Binary(b) => match value.try_as_string() {
-                // Spanner encodes BYTES as base64.
-                Some(s) => match base64::engine::general_purpose::STANDARD.decode(s) {
-                    Ok(bytes) => b.append_value(bytes),
-                    Err(e) => {
-                        return Err(err(
-                            format!("failed to base64-decode BYTES value: {e}"),
-                            Status::InvalidData,
-                        ))
-                    }
-                },
-                None => b.append_null(),
-            },
-            ColumnBuilder::Utf8(b) => match value.try_as_string() {
-                Some(s) => b.append_value(s),
-                // Non-string values in a text column (numbers, bools, arrays, structs) are rendered
-                // as JSON.
-                None => b.append_value(value_to_json(value).to_string()),
-            },
+            _ => validity.push(false),
         }
-        Ok(())
+        offsets.push(children.len() as i32);
     }
-
-    fn append_null(&mut self) {
-        match self {
-            ColumnBuilder::Bool(b) => b.append_null(),
-            ColumnBuilder::Int64(b) => b.append_null(),
-            ColumnBuilder::Float64(b) => b.append_null(),
-            ColumnBuilder::Float32(b) => b.append_null(),
-            ColumnBuilder::Date32(b) => b.append_null(),
-            ColumnBuilder::TimestampMicros(b) => b.append_null(),
-            ColumnBuilder::Decimal128(b) => b.append_null(),
-            ColumnBuilder::Binary(b) => b.append_null(),
-            ColumnBuilder::Utf8(b) => b.append_null(),
-        }
-    }
-
-    fn finish(mut self) -> ArrayRef {
-        match &mut self {
-            ColumnBuilder::Bool(b) => Arc::new(b.finish()),
-            ColumnBuilder::Int64(b) => Arc::new(b.finish()),
-            ColumnBuilder::Float64(b) => Arc::new(b.finish()),
-            ColumnBuilder::Float32(b) => Arc::new(b.finish()),
-            ColumnBuilder::Date32(b) => Arc::new(b.finish()),
-            ColumnBuilder::TimestampMicros(b) => Arc::new(b.finish()),
-            ColumnBuilder::Decimal128(b) => Arc::new(b.finish()),
-            ColumnBuilder::Binary(b) => Arc::new(b.finish()),
-            ColumnBuilder::Utf8(b) => Arc::new(b.finish()),
-        }
-    }
+    let child = build_array(field.data_type(), &children)?;
+    let list = ListArray::try_new(
+        field.clone(),
+        OffsetBuffer::new(ScalarBuffer::from(offsets)),
+        child,
+        Some(NullBuffer::from(validity)),
+    )
+    .map_err(arrow_err)?;
+    Ok(Arc::new(list))
 }
 
 /// Parse a Spanner `INT64` value. Integers arrive as strings; we also accept a numeric encoding for
