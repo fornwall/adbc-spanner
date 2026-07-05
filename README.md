@@ -1,5 +1,10 @@
 # adbc-spanner
 
+[![Crates.io](https://img.shields.io/crates/v/adbc-spanner.svg)](https://crates.io/crates/adbc-spanner)
+[![Docs.rs](https://img.shields.io/docsrs/adbc-spanner)](https://docs.rs/adbc-spanner)
+[![CI](https://github.com/fornwall/adbc-spanner/actions/workflows/ci.yml/badge.svg)](https://github.com/fornwall/adbc-spanner/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 An [ADBC](https://arrow.apache.org/adbc/) (Arrow Database Connectivity) driver for
 [Google Cloud Spanner](https://cloud.google.com/spanner), written in Rust.
 
