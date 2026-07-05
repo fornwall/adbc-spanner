@@ -1,0 +1,36 @@
+[package]
+name = "adbc-spanner"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "ADBC (Arrow Database Connectivity) driver for Google Cloud Spanner"
+repository = "https://github.com/fornwall/adbc-spanner"
+readme = "README.md"
+keywords = ["adbc", "arrow", "spanner", "database"]
+categories = ["database"]
+
+[dependencies]
+# The abstract ADBC driver traits (Driver / Database / Connection / Statement).
+adbc_core = "0.23"
+# Arrow types the ADBC traits are expressed in. Kept in the range adbc_core allows
+# so the RecordBatch / Schema / RecordBatchReader types unify across the crates.
+arrow-array = ">=53.1, <59"
+arrow-schema = ">=53.1, <59"
+# The official Google Cloud preview Spanner client.
+google-cloud-spanner = "0.34.2-preview"
+# Anonymous credentials, used when talking to the Spanner emulator.
+google-cloud-auth = "1.13"
+# The Spanner client is async; we bridge it to the synchronous ADBC traits with a
+# dedicated multi-thread runtime.
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+serde_json = "1"
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+# Admin clients, used by the emulator integration test to create the test instance and database.
+google-cloud-spanner-admin-instance-v1 = "1.12"
+google-cloud-spanner-admin-database-v1 = "1.12"
+# The `Poller` trait, for awaiting the admin long-running operations.
+google-cloud-lro = "1.8"

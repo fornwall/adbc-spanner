@@ -1,0 +1,192 @@
+//! End-to-end integration test that runs the ADBC driver against the Cloud Spanner emulator.
+//!
+//! The test is **skipped automatically** unless the `SPANNER_EMULATOR_HOST` environment variable is
+//! set, so a plain `cargo test` stays green without any external dependency. To run it against a
+//! local emulator use the helper script, which starts the emulator, exports the variable and runs
+//! the test:
+//!
+//! ```sh
+//! scripts/with-emulator.sh cargo test --test emulator -- --nocapture
+//! ```
+//!
+//! Setup (creating the instance, database and table) uses the Spanner admin clients directly; the
+//! actual query and DML round-trip goes through the `adbc-spanner` driver being tested.
+
+use adbc_core::options::{OptionDatabase, OptionValue};
+use adbc_core::{Connection, Database, Driver, Statement};
+use adbc_spanner::SpannerDriver;
+use arrow_array::{BooleanArray, Float64Array, Int64Array, RecordBatchReader, StringArray};
+use arrow_schema::DataType;
+use google_cloud_lro::Poller;
+use google_cloud_spanner::client::Spanner;
+use google_cloud_spanner_admin_instance_v1::model::Instance;
+
+const PROJECT: &str = "test-project";
+const INSTANCE: &str = "test-instance";
+const DATABASE: &str = "adbc-test";
+
+fn database_path() -> String {
+    format!("projects/{PROJECT}/instances/{INSTANCE}/databases/{DATABASE}")
+}
+
+fn emulator_configured() -> bool {
+    std::env::var("SPANNER_EMULATOR_HOST")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_some()
+}
+
+/// Create the test instance, database and `Singers` table if they do not already exist.
+///
+/// `create_instance` / `create_database` are best-effort: on a re-run against an already-populated
+/// emulator they fail with `AlreadyExists`, which we intentionally ignore.
+async fn ensure_database() {
+    // The client auto-detects `SPANNER_EMULATOR_HOST` and uses anonymous credentials.
+    let spanner = Spanner::builder()
+        .build()
+        .await
+        .expect("failed to build Spanner client for setup");
+
+    let instance_admin = spanner
+        .instance_admin_builder()
+        .build()
+        .await
+        .expect("failed to build instance admin client");
+    let _ = instance_admin
+        .create_instance()
+        .set_parent(format!("projects/{PROJECT}"))
+        .set_instance_id(INSTANCE)
+        .set_instance(
+            Instance::new()
+                .set_config(format!(
+                    "projects/{PROJECT}/instanceConfigs/emulator-config"
+                ))
+                .set_display_name("ADBC test instance")
+                .set_node_count(1),
+        )
+        .poller()
+        .until_done()
+        .await;
+
+    let database_admin = spanner
+        .database_admin_builder()
+        .build()
+        .await
+        .expect("failed to build database admin client");
+    let _ = database_admin
+        .create_database()
+        .set_parent(format!("projects/{PROJECT}/instances/{INSTANCE}"))
+        .set_create_statement(format!("CREATE DATABASE `{DATABASE}`"))
+        .set_extra_statements(vec!["CREATE TABLE Singers (\
+                 SingerId INT64 NOT NULL, \
+                 Name STRING(MAX), \
+                 Active BOOL, \
+                 Score FLOAT64\
+             ) PRIMARY KEY (SingerId)"
+            .to_string()])
+        .poller()
+        .until_done()
+        .await;
+}
+
+#[test]
+fn query_and_dml_round_trip() {
+    if !emulator_configured() {
+        eprintln!("SPANNER_EMULATOR_HOST not set — skipping Spanner emulator integration test");
+        return;
+    }
+
+    // A throwaway runtime just for the async admin setup.
+    tokio::runtime::Runtime::new()
+        .expect("failed to build setup runtime")
+        .block_on(ensure_database());
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(OptionDatabase::Uri, OptionValue::String(database_path()))])
+        .expect("create database");
+    let mut connection = database.new_connection().expect("create connection");
+
+    // The driver reports the table types Spanner supports without hitting the network.
+    let table_types = connection.get_table_types().expect("get_table_types");
+    assert_eq!(table_types.schema().field(0).name(), "table_type");
+
+    // Idempotency: clear any rows left over from a previous run.
+    let mut delete = connection.new_statement().expect("new statement");
+    delete
+        .set_sql_query("DELETE FROM Singers WHERE true")
+        .unwrap();
+    delete.execute_update().expect("delete");
+
+    // Insert two rows via DML and assert the affected-row count.
+    let mut insert = connection.new_statement().expect("new statement");
+    insert
+        .set_sql_query(
+            "INSERT INTO Singers (SingerId, Name, Active, Score) \
+             VALUES (1, 'Alice', true, 4.5), (2, 'Bob', false, 3.25)",
+        )
+        .unwrap();
+    assert_eq!(insert.execute_update().expect("insert"), Some(2));
+
+    // Read the rows back through the driver as Arrow.
+    let mut query = connection.new_statement().expect("new statement");
+    query
+        .set_sql_query("SELECT SingerId, Name, Active, Score FROM Singers ORDER BY SingerId")
+        .unwrap();
+    let reader = query.execute().expect("query");
+
+    // The Arrow schema should reflect the Spanner column types.
+    let schema = reader.schema();
+    assert_eq!(schema.field(0).name(), "SingerId");
+    assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+    assert_eq!(schema.field(2).data_type(), &DataType::Boolean);
+    assert_eq!(schema.field(3).data_type(), &DataType::Float64);
+
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect batches");
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2, "expected two rows back");
+
+    let batch = &batches[0];
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let names = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let active = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
+    let score = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+
+    assert_eq!(
+        (
+            ids.value(0),
+            names.value(0),
+            active.value(0),
+            score.value(0)
+        ),
+        (1, "Alice", true, 4.5)
+    );
+    assert_eq!(
+        (
+            ids.value(1),
+            names.value(1),
+            active.value(1),
+            score.value(1)
+        ),
+        (2, "Bob", false, 3.25)
+    );
+}
