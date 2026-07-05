@@ -26,6 +26,7 @@ use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection, OptionValue};
 use adbc_core::{Connection, Optionable};
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use google_cloud_spanner::builder::BatchDmlBuilder;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::ReadWriteTransaction;
@@ -89,7 +90,8 @@ impl SpannerConnection {
         }
     }
 
-    /// Apply a batch of buffered DML statements atomically in one read/write transaction.
+    /// Apply the buffered DML statements atomically in one read/write transaction via
+    /// `ExecuteBatchDml` (a single RPC).
     ///
     /// The runner may retry the closure on abort, so the statements are rebuilt from the (cloned)
     /// buffer on each attempt.
@@ -108,11 +110,11 @@ impl SpannerConnection {
                 .run(move |transaction: ReadWriteTransaction| {
                     let statements = statements.clone();
                     async move {
+                        let mut batch = BatchDmlBuilder::new();
                         for sql in statements {
-                            transaction
-                                .execute_update(SpannerSql::builder(sql).build())
-                                .await?;
+                            batch = batch.add_statement(SpannerSql::builder(sql).build());
                         }
+                        transaction.execute_batch_update(batch.build()).await?;
                         Ok(())
                     }
                 })
