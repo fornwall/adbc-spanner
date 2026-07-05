@@ -30,6 +30,7 @@ use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
+use crate::conversion::result_set_to_batch;
 use crate::driver::Connected;
 use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
 use crate::runtime::SharedRuntime;
@@ -215,13 +216,29 @@ impl Connection for SpannerConnection {
         Err(not_implemented("Connection::get_objects"))
     }
 
+    /// Return the Arrow schema of a table.
+    ///
+    /// Implemented by running a zero-row `SELECT * FROM <table> LIMIT 0` and mapping the result-set
+    /// column metadata to Arrow (the same mapping used for query results). Spanner has no catalog
+    /// concept, so `catalog` is ignored.
     fn get_table_schema(
         &self,
         _catalog: Option<&str>,
-        _db_schema: Option<&str>,
-        _table_name: &str,
+        db_schema: Option<&str>,
+        table_name: &str,
     ) -> Result<Schema> {
-        Err(not_implemented("Connection::get_table_schema"))
+        let table = qualified_table(db_schema, table_name);
+        let sql = format!("SELECT * FROM {table} LIMIT 0");
+        let client = self.client.clone();
+        let (schema, _batch) = self.runtime.block_on(async move {
+            let transaction = client.single_use().build();
+            let result_set = transaction
+                .execute_query(SpannerSql::builder(sql).build())
+                .await
+                .map_err(from_spanner)?;
+            result_set_to_batch(result_set).await
+        })?;
+        Ok((*schema).clone())
     }
 
     /// Return the table types supported by Spanner as a single-column (`table_type: utf8`) batch,
@@ -304,4 +321,24 @@ fn parse_bool(value: OptionValue) -> Result<bool> {
 
 fn connection_option_name(key: &OptionConnection) -> String {
     key.as_ref().to_string()
+}
+
+/// Backtick-quote a table name, optionally qualified by a (named) schema.
+fn qualified_table(db_schema: Option<&str>, table_name: &str) -> String {
+    match db_schema.filter(|s| !s.is_empty()) {
+        Some(schema) => format!("`{schema}`.`{table_name}`"),
+        None => format!("`{table_name}`"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qualifies_table_names() {
+        assert_eq!(qualified_table(None, "Users"), "`Users`");
+        assert_eq!(qualified_table(Some(""), "Users"), "`Users`");
+        assert_eq!(qualified_table(Some("app"), "Users"), "`app`.`Users`");
+    }
 }

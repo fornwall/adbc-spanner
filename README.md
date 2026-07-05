@@ -36,10 +36,10 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   parameters (a column `id` binds `@id`); each bound row runs the statement once.
 - Bulk ingest: set `adbc.ingest.target_table`, bind an Arrow batch, and `execute_update` inserts the
   rows into that table in one transaction.
-- `get_table_types()` connection metadata.
+- Metadata: `get_table_types()` and `get_table_schema()` (returns a table's Arrow schema).
 
-Not yet supported (return `NotImplemented`): Substrait, partitioned execution, and the richer
-catalog-metadata calls (`get_objects`, `get_table_schema`, `get_statistics`, …).
+Not yet supported (return `NotImplemented`): Substrait, partitioned execution, and the remaining
+catalog-metadata calls (`get_objects`, `get_statistics`, …).
 
 ## Shared library (loadable driver)
 

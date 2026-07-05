@@ -195,6 +195,18 @@ fn query_and_dml_round_trip() {
         (2, "Bob", false, 3.25)
     );
 
+    // --- get_table_schema reflects the table's column types ---
+
+    let singers_schema = connection
+        .get_table_schema(None, None, "Singers")
+        .expect("get_table_schema");
+    assert_eq!(singers_schema.fields().len(), 4);
+    assert_eq!(singers_schema.field(0).name(), "SingerId");
+    assert_eq!(singers_schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(singers_schema.field(1).data_type(), &DataType::Utf8);
+    assert_eq!(singers_schema.field(2).data_type(), &DataType::Boolean);
+    assert_eq!(singers_schema.field(3).data_type(), &DataType::Float64);
+
     // --- DDL through the driver (routed to the admin UpdateDatabaseDdl API) ---
 
     // A batch of two DDL statements submitted as one near-atomic schema change; idempotent so the
