@@ -38,31 +38,33 @@ Spanner's model self-skip rather than fail.
 
 ## What CI gates on
 
-CI runs the **`SpannerDatabaseTest` and `SpannerConnectionTest`** suites
-(lifecycle + metadata: `get_info`, `get_objects`, `get_table_types`,
-`get_table_schema`, autocommit/transaction options), minus the small set of
-known gaps below. Of that set 16 tests pass and 6 self-skip (features Spanner
-does not expose). The exclusion list lives in `scripts/run-adbc-validation.sh`.
+CI runs the **`SpannerDatabaseTest` and `SpannerConnectionTest`** suites in full
+— lifecycle + metadata: `get_info`, `get_objects` (including table columns and
+primary-key/constraint metadata), `get_table_types`, `get_table_schema`
+(returning `NOT_FOUND` for a missing table), autocommit/transaction options. **19
+tests pass and 6 self-skip** (features Spanner does not expose, e.g. temp tables,
+views, statistics, current-catalog metadata).
 
-### Known gaps (excluded from the gate)
+## Follow-up work: gating `StatementTest`
 
-These are real driver conformance gaps the suite surfaced — the backlog it exists
-to drive, not suite bugs:
+`StatementTest` is compiled and runnable via `--full` but **not gated yet**.
+Bringing it into the gate is natural follow-up work the suite now makes easy to
+tackle incrementally — one quirk or driver fix at a time. Much of it needs
+per-test adaptation to Spanner's model:
 
-| Test | Gap |
-|------|-----|
-| `ConnectionTest.MetadataGetTableSchemaNotFound` | `get_table_schema` on a missing table returns `INTERNAL`; the spec wants `NOT_FOUND`. The driver flattens every backend error to `INTERNAL` (Spanner reports a missing table as `INVALID_ARGUMENT`). |
-| `ConnectionTest.MetadataGetObjectsColumns` | `get_objects` leaves `table_constraints` null; the suite expects it populated. |
-| `ConnectionTest.MetadataGetObjectsPrimaryKey` | `get_objects` does not emit primary-key constraints. |
+- **Mandatory primary keys** — Spanner tables must declare a primary key, so the
+  suite's key-less sample tables need quirks-provided DDL.
+- **Append-only ingest** — the driver ingests into an existing table only; the
+  suite's default create-mode ingest tests self-skip (`supports_bulk_ingest`
+  returns true only for `append`).
+- **Named parameters** — Spanner uses `@name`, not positional `?`, so parameter
+  binding tests bind by column name.
+- **`rows_affected` under buffer-and-commit** — manual-mode DML is buffered and
+  the affected-row count is unknown until commit, unlike the suite's assumption.
 
-### `StatementTest`
-
-`StatementTest` is compiled and runnable (`--full`) but **not gated**. Much of it
-does not fit Spanner's model — create-mode ingest (the driver is append-only),
-mandatory primary keys, named parameters, `rows_affected` in the buffer-and-commit
-manual-transaction model — so it is a mix of legitimate skips, model mismatches
-and a few genuine gaps. Bringing it into the gate is future work, one quirk /
-driver fix at a time.
+Each is a self-contained increment: tune `SpannerQuirks`, fix a driver gap if one
+is real, then move the newly-green tests into the gated filter in
+`scripts/run-adbc-validation.sh`.
 
 ## A note on failures aborting the process
 

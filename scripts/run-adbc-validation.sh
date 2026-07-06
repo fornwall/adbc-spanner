@@ -27,13 +27,10 @@ EMULATOR_DATABASE="projects/test-project/instances/test-instance/databases/adbc-
 FULL=0
 [ "${1:-}" = "--full" ] && FULL=1
 
-# The gated subset: lifecycle + metadata, excluding known gaps (documented in the
-# README). These exclusions are the conformance backlog the suite surfaced, not
-# suite bugs. Keep in sync with adbc-validation/README.md.
+# The gated subset: the full lifecycle + metadata suites (DatabaseTest +
+# ConnectionTest), which pass in full — 19 pass, 6 self-skip (features Spanner
+# does not expose). StatementTest is intentionally not gated yet; see the README.
 GATED_FILTER='SpannerDatabaseTest.*:SpannerConnectionTest.*'
-GATED_FILTER+='-SpannerConnectionTest.MetadataGetTableSchemaNotFound'
-GATED_FILTER+=':SpannerConnectionTest.MetadataGetObjectsColumns'
-GATED_FILTER+=':SpannerConnectionTest.MetadataGetObjectsPrimaryKey'
 
 # No target configured: run under a throwaway emulator, then re-enter this script.
 if [ -z "${SPANNER_EMULATOR_HOST:-}" ] && [ -z "${SPANNER_GCP_DATABASE:-}" ]; then

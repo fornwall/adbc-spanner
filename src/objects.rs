@@ -25,11 +25,21 @@ pub(crate) struct Column {
     pub nullable: bool,
 }
 
-/// A table with its columns.
+/// A constraint on a table (primary key, foreign key, unique, check).
+pub(crate) struct Constraint {
+    pub name: Option<String>,
+    /// ADBC constraint type string, e.g. `"PRIMARY KEY"`, `"FOREIGN KEY"`.
+    pub constraint_type: String,
+    /// The constraint's key columns, in key order (empty for e.g. check constraints).
+    pub columns: Vec<String>,
+}
+
+/// A table with its columns and constraints.
 pub(crate) struct Table {
     pub name: String,
     pub table_type: String,
     pub columns: Vec<Column>,
+    pub constraints: Vec<Constraint>,
 }
 
 /// A database schema with its tables.
@@ -154,11 +164,26 @@ pub(crate) fn build(depth: ObjectDepth, schemas: Vec<DbSchema>) -> Result<Record
                 let lengths: Vec<usize> = tables.iter().map(|t| t.columns.len()).collect();
                 list_of(col_item, &lengths, column_struct)?
             };
-            // table_constraints: not populated → null list per table.
-            let table_constraints = new_null_array(
-                field(&table_fields, "table_constraints").data_type(),
-                tables.len(),
-            );
+            // table_constraints: a non-null (possibly empty) list per table at column depth,
+            // otherwise a null list per table (like table_columns).
+            let table_constraints: ArrayRef = if !populate_columns {
+                new_null_array(
+                    field(&table_fields, "table_constraints").data_type(),
+                    tables.len(),
+                )
+            } else {
+                let cons_field = field(&table_fields, "table_constraints");
+                let cons_item = match cons_field.data_type() {
+                    DataType::List(item) => item.clone(),
+                    _ => unreachable!(),
+                };
+                let constraint_fields = list_struct_fields(&table_fields, "table_constraints");
+                let constraints: Vec<&Constraint> =
+                    tables.iter().flat_map(|t| t.constraints.iter()).collect();
+                let constraint_struct = build_constraint_struct(&constraint_fields, &constraints)?;
+                let lengths: Vec<usize> = tables.iter().map(|t| t.constraints.len()).collect();
+                list_of(cons_item, &lengths, constraint_struct)?
+            };
 
             let table_struct: ArrayRef = Arc::new(
                 StructArray::try_new(
@@ -211,6 +236,48 @@ fn build_column_struct(column_fields: &Fields, columns: &[&Column]) -> ArrayRef 
     Arc::new(StructArray::new(column_fields.clone(), arrays, None))
 }
 
+/// Build the constraint struct array: `constraint_name` / `constraint_type` / the key-column list
+/// (`constraint_column_names`), leaving `constraint_column_usage` (foreign-key referencing info)
+/// null.
+fn build_constraint_struct(
+    constraint_fields: &Fields,
+    constraints: &[&Constraint],
+) -> Result<ArrayRef> {
+    let n = constraints.len();
+
+    // constraint_column_names: one non-null list<utf8> per constraint, its key columns in order.
+    let names_field = field(constraint_fields, "constraint_column_names");
+    let name_item = match names_field.data_type() {
+        DataType::List(item) => item.clone(),
+        _ => unreachable!("constraint_column_names is a list"),
+    };
+    let flat_columns: Vec<&str> = constraints
+        .iter()
+        .flat_map(|c| c.columns.iter().map(String::as_str))
+        .collect();
+    let column_child: ArrayRef =
+        Arc::new(StringArray::from_iter(flat_columns.into_iter().map(Some)));
+    let column_lengths: Vec<usize> = constraints.iter().map(|c| c.columns.len()).collect();
+    let constraint_column_names = list_of(name_item, &column_lengths, column_child)?;
+
+    let arrays: Vec<ArrayRef> = constraint_fields
+        .iter()
+        .map(|f| match f.name().as_str() {
+            "constraint_name" => Arc::new(StringArray::from_iter(
+                constraints.iter().map(|c| c.name.clone()),
+            )) as ArrayRef,
+            "constraint_type" => Arc::new(StringArray::from_iter(
+                constraints.iter().map(|c| Some(c.constraint_type.clone())),
+            )) as ArrayRef,
+            "constraint_column_names" => constraint_column_names.clone(),
+            _ => new_null_array(f.data_type(), n),
+        })
+        .collect();
+    Ok(Arc::new(
+        StructArray::try_new(constraint_fields.clone(), arrays, None).map_err(arrow_err)?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,6 +301,11 @@ mod tests {
                         nullable: true,
                     },
                 ],
+                constraints: vec![Constraint {
+                    name: Some("PK_Users".into()),
+                    constraint_type: "PRIMARY KEY".into(),
+                    columns: vec!["Id".into()],
+                }],
             }],
         }]
     }
