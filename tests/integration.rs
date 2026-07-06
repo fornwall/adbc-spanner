@@ -135,7 +135,8 @@ fn prop_tables_ddl(if_not_exists: bool) -> Vec<String> {
         format!(
             "CREATE TABLE {g}AdbcPropBind \
                  (Id INT64, IntCol INT64, FloatCol FLOAT64, BoolCol BOOL, \
-                  StrCol STRING(MAX), BytesCol BYTES(MAX)) \
+                  StrCol STRING(MAX), BytesCol BYTES(MAX), \
+                  DateCol DATE, TsCol TIMESTAMP, NumCol NUMERIC) \
              PRIMARY KEY (Id)"
         ),
         format!(
@@ -863,9 +864,10 @@ fn run(connection: &mut SpannerConnection, sql: &str) {
         .unwrap_or_else(|e| panic!("failed to run {sql:?}: {e:?}"));
 }
 
-/// Property: arbitrary scalar values bound as parameters (the `bind.rs` write path) survive a round
-/// trip through Spanner and come back byte-for-byte via the Arrow read path (`conversion.rs`),
-/// nulls included. Covers the Arrow types the bind path supports: Int64, Float64, Bool, Utf8, Binary.
+/// Property: arbitrary values bound as parameters (the `bind.rs` write path) survive a round trip
+/// through Spanner and come back byte-for-byte via the Arrow read path (`conversion.rs`), nulls
+/// included. Covers every Arrow type the bind path supports: Int64, Float64, Bool, Utf8, Binary,
+/// Date32, Timestamp(Microsecond), and Decimal128 across NUMERIC's full range.
 #[test]
 fn prop_bind_round_trip() {
     let Some(target) = test_target() else {
@@ -883,11 +885,25 @@ fn prop_bind_round_trip() {
         )])
         .expect("create database");
     let connection = RefCell::new(connect_with_retry(&database));
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
     // Finite floats only: NaN/Inf don't compare with `==` and take a separate string wire path.
     let float = any::<f64>().prop_filter("finite", |f| f.is_finite());
     // Any non-control Unicode, up to 24 chars.
     let text = proptest::string::string_regex("\\PC{0,24}").unwrap();
     let bytes = proptest::collection::vec(any::<u8>(), 0..24);
+    // Date / timestamp components in Spanner's supported range; NUMERIC across its full range
+    // (integer part < 10^28, well beyond what a 96-bit decimal could hold).
+    let date = (1i32..=9999, 1u32..=12, 1u32..=28);
+    let ts = (
+        1i32..=9999,
+        1u32..=12,
+        1u32..=28,
+        0u32..24,
+        0u32..60,
+        0u32..60,
+        0u32..1_000_000,
+    );
+    let numeric = (any::<bool>(), 0u128..10u128.pow(28), 0u32..1_000_000_000);
 
     proptest!(prop_config(), |(
         oi in proptest::option::of(any::<i64>()),
@@ -895,9 +911,32 @@ fn prop_bind_round_trip() {
         ob in proptest::option::of(any::<bool>()),
         os in proptest::option::of(text),
         oby in proptest::option::of(bytes),
+        od in proptest::option::of(date),
+        ot in proptest::option::of(ts),
+        on in proptest::option::of(numeric),
     )| {
         let mut conn = connection.borrow_mut();
 
+        // Derive the exact Arrow encodings the read path should return for each temporal value.
+        let exp_days = od.map(|(y, m, d)| {
+            (NaiveDate::from_ymd_opt(y, m, d).unwrap() - epoch).num_days() as i32
+        });
+        let exp_micros = ot.map(|(y, mo, d, h, mi, s, us)| {
+            NaiveDate::from_ymd_opt(y, mo, d)
+                .unwrap()
+                .and_hms_micro_opt(h, mi, s, us)
+                .unwrap()
+                .and_utc()
+                .timestamp_micros()
+        });
+        let exp_unscaled = on.map(|(neg, int_mag, frac)| {
+            let mag = int_mag as i128 * 1_000_000_000 + frac as i128;
+            if neg { -mag } else { mag }
+        });
+
+        let num_col = Decimal128Array::from(vec![exp_unscaled])
+            .with_precision_and_scale(38, 9)
+            .unwrap();
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("Id", DataType::Int64, false),
@@ -906,6 +945,13 @@ fn prop_bind_round_trip() {
                 Field::new("BoolCol", DataType::Boolean, true),
                 Field::new("StrCol", DataType::Utf8, true),
                 Field::new("BytesCol", DataType::Binary, true),
+                Field::new("DateCol", DataType::Date32, true),
+                Field::new(
+                    "TsCol",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    true,
+                ),
+                Field::new("NumCol", DataType::Decimal128(38, 9), true),
             ])),
             vec![
                 Arc::new(Int64Array::from(vec![1i64])),
@@ -914,6 +960,9 @@ fn prop_bind_round_trip() {
                 Arc::new(BooleanArray::from(vec![ob])),
                 Arc::new(StringArray::from(vec![os.as_deref()])),
                 Arc::new(BinaryArray::from_opt_vec(vec![oby.as_deref()])),
+                Arc::new(Date32Array::from(vec![exp_days])),
+                Arc::new(TimestampMicrosecondArray::from(vec![exp_micros])),
+                Arc::new(num_col),
             ],
         )
         .unwrap();
@@ -921,16 +970,20 @@ fn prop_bind_round_trip() {
         run(&mut conn, "DELETE FROM AdbcPropBind WHERE true");
         let mut ins = conn.new_statement().expect("new statement");
         ins.set_sql_query(
-            "INSERT INTO AdbcPropBind (Id, IntCol, FloatCol, BoolCol, StrCol, BytesCol) \
-             VALUES (@Id, @IntCol, @FloatCol, @BoolCol, @StrCol, @BytesCol)",
+            "INSERT INTO AdbcPropBind \
+                 (Id, IntCol, FloatCol, BoolCol, StrCol, BytesCol, DateCol, TsCol, NumCol) \
+             VALUES (@Id, @IntCol, @FloatCol, @BoolCol, @StrCol, @BytesCol, @DateCol, @TsCol, @NumCol)",
         )
         .unwrap();
         ins.bind(batch).expect("bind row");
         prop_assert_eq!(ins.execute_update().expect("insert"), Some(1));
 
         let mut q = conn.new_statement().expect("new statement");
-        q.set_sql_query("SELECT IntCol, FloatCol, BoolCol, StrCol, BytesCol FROM AdbcPropBind WHERE Id = 1")
-            .unwrap();
+        q.set_sql_query(
+            "SELECT IntCol, FloatCol, BoolCol, StrCol, BytesCol, DateCol, TsCol, NumCol \
+             FROM AdbcPropBind WHERE Id = 1",
+        )
+        .unwrap();
         let batches = q
             .execute()
             .expect("select")
@@ -944,6 +997,17 @@ fn prop_bind_round_trip() {
         let bo = b.column(2).as_any().downcast_ref::<BooleanArray>().unwrap();
         let s = b.column(3).as_any().downcast_ref::<StringArray>().unwrap();
         let by = b.column(4).as_any().downcast_ref::<BinaryArray>().unwrap();
+        let d = b.column(5).as_any().downcast_ref::<Date32Array>().unwrap();
+        let t = b
+            .column(6)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let n = b
+            .column(7)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
 
         match oi {
             Some(v) => prop_assert_eq!(i.value(0), v),
@@ -964,6 +1028,18 @@ fn prop_bind_round_trip() {
         match &oby {
             Some(v) => prop_assert_eq!(by.value(0), v.as_slice()),
             None => prop_assert!(by.is_null(0)),
+        }
+        match exp_days {
+            Some(v) => prop_assert_eq!(d.value(0), v),
+            None => prop_assert!(d.is_null(0)),
+        }
+        match exp_micros {
+            Some(v) => prop_assert_eq!(t.value(0), v),
+            None => prop_assert!(t.is_null(0)),
+        }
+        match exp_unscaled {
+            Some(v) => prop_assert_eq!(n.value(0), v),
+            None => prop_assert!(n.is_null(0)),
         }
     });
 }
