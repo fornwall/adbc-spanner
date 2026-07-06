@@ -1,9 +1,12 @@
 //! The [`SpannerStatement`] — an ADBC statement that runs SQL against Spanner and returns Arrow.
 //!
 //! A statement holds a SQL string set via [`Statement::set_sql_query`]. Calling
-//! [`Statement::execute`] runs it as a query in a single-use read-only transaction and streams the
-//! result back as an Arrow [`RecordBatch`]. Calling [`Statement::execute_update`] runs it as DML
-//! inside a read/write transaction and returns the number of affected rows.
+//! [`Statement::execute`] runs it as a query in a single-use read-only transaction and returns a
+//! streaming Arrow [`RecordBatchReader`]: rows are pulled from Spanner and converted to Arrow in
+//! bounded chunks (see [`OPTION_ROWS_PER_BATCH`](crate::OPTION_ROWS_PER_BATCH)) as the consumer
+//! iterates, so a large result set is not fully materialised in memory. Calling
+//! [`Statement::execute_update`] runs it as DML inside a read/write transaction and returns the
+//! number of affected rows.
 
 use std::sync::Arc;
 
@@ -19,9 +22,13 @@ use google_cloud_spanner::statement::Statement as SpannerSql;
 
 use crate::bind;
 use crate::connection::SharedTxn;
-use crate::conversion::result_set_to_batch;
+use crate::conversion::{result_set_to_batch, stream_query};
 use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
 use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
+
+/// Default number of rows converted into each streamed Arrow batch (see
+/// [`OPTION_ROWS_PER_BATCH`](crate::OPTION_ROWS_PER_BATCH)).
+const DEFAULT_ROWS_PER_BATCH: usize = 8192;
 
 /// An ADBC statement bound to a Spanner [`DatabaseClient`].
 pub struct SpannerStatement {
@@ -39,6 +46,8 @@ pub struct SpannerStatement {
     /// Ingest mode (`adbc.ingest.mode`), stored in canonical form once set so it round-trips
     /// through `get_option`. Only `append` is accepted.
     ingest_mode: Option<String>,
+    /// Rows converted into each streamed Arrow batch by `execute` (`adbc.spanner.rows_per_batch`).
+    rows_per_batch: usize,
     /// Cancellation signal for this statement's in-flight execution (see [`Statement::cancel`]).
     cancel: CancelSignal,
 }
@@ -63,6 +72,7 @@ impl SpannerStatement {
             bound: Vec::new(),
             target_table: None,
             ingest_mode: None,
+            rows_per_batch: DEFAULT_ROWS_PER_BATCH,
             cancel: CancelSignal::new(),
         }
     }
@@ -201,6 +211,9 @@ impl Optionable for SpannerStatement {
                 }
                 other => return Err(not_implemented(&format!("ingest mode {other:?}"))),
             },
+            OptionStatement::Other(k) if k == crate::OPTION_ROWS_PER_BATCH => {
+                self.rows_per_batch = rows_per_batch_option(value)?;
+            }
             other => {
                 return Err(not_implemented(&format!(
                     "statement option {}",
@@ -215,6 +228,9 @@ impl Optionable for SpannerStatement {
         let value = match &key {
             OptionStatement::TargetTable => self.target_table.clone(),
             OptionStatement::IngestMode => self.ingest_mode.clone(),
+            OptionStatement::Other(k) if k == crate::OPTION_ROWS_PER_BATCH => {
+                Some(self.rows_per_batch.to_string())
+            }
             _ => None,
         };
         value.ok_or_else(|| {
@@ -230,6 +246,11 @@ impl Optionable for SpannerStatement {
     }
 
     fn get_option_int(&self, key: Self::Option) -> Result<i64> {
+        if let OptionStatement::Other(k) = &key {
+            if k == crate::OPTION_ROWS_PER_BATCH {
+                return Ok(self.rows_per_batch as i64);
+            }
+        }
         Err(err(
             format!("option {} is not set", key.as_ref()),
             Status::NotFound,
@@ -278,16 +299,21 @@ impl Statement for SpannerStatement {
             return self.execute_bound_query(&sql);
         }
         let client = self.client.clone();
-        let (schema, batch) = block_on_cancellable(&self.runtime, &self.cancel, async move {
+        let runtime = self.runtime.clone();
+        let cancel = self.cancel.clone();
+        let batch_size = self.rows_per_batch;
+        // Stream the result: `stream_query` fetches the first chunk (settling the schema) and the
+        // returned reader converts the rest to Arrow one bounded chunk at a time as it is iterated.
+        let reader = block_on_cancellable(&self.runtime, &self.cancel, async move {
             let transaction = client.single_use().build();
             let statement = SpannerSql::builder(sql).build();
             let result_set = transaction
                 .execute_query(statement)
                 .await
                 .map_err(from_spanner)?;
-            result_set_to_batch(result_set).await
+            stream_query(runtime, cancel, result_set, batch_size).await
         })?;
-        Ok(Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema)))
+        Ok(Box::new(reader))
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
@@ -421,4 +447,23 @@ fn string_option(value: OptionValue) -> Result<String> {
         OptionValue::String(s) => Ok(s),
         _ => Err(invalid_argument("statement option requires a string value")),
     }
+}
+
+/// Parse a positive batch-size option, accepted as either an integer or a numeric string.
+fn rows_per_batch_option(value: OptionValue) -> Result<usize> {
+    let n = match value {
+        OptionValue::Int(i) => i,
+        OptionValue::String(s) => s
+            .parse::<i64>()
+            .map_err(|_| invalid_argument("rows_per_batch must be a positive integer"))?,
+        _ => {
+            return Err(invalid_argument(
+                "rows_per_batch must be a positive integer",
+            ))
+        }
+    };
+    usize::try_from(n)
+        .ok()
+        .filter(|&n| n > 0)
+        .ok_or_else(|| invalid_argument("rows_per_batch must be a positive integer"))
 }

@@ -182,6 +182,13 @@ pub const OPTION_KEYFILE: &str = "adbc.spanner.keyfile";
 /// falls back to Application Default Credentials.
 pub const OPTION_KEYFILE_JSON: &str = "adbc.spanner.keyfile_json";
 
+/// Driver-specific statement option: the number of rows converted into each Arrow
+/// [`RecordBatch`](arrow_array::RecordBatch) streamed by
+/// [`Statement::execute`](adbc_core::Statement::execute). Larger batches trade memory for fewer
+/// per-batch conversions; smaller batches lower first-batch latency and peak memory. Accepts a
+/// positive integer (via `set_option`/`set_option_int`); defaults to 8192.
+pub const OPTION_ROWS_PER_BATCH: &str = "adbc.spanner.rows_per_batch";
+
 /// The vendor name reported by [`Connection::get_info`](adbc_core::Connection::get_info).
 pub const VENDOR_NAME: &str = "Google Cloud Spanner";
 

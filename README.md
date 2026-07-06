@@ -23,7 +23,10 @@ SpannerDriver ──▶ SpannerDatabase ──▶ SpannerConnection ──▶ Sp
 Early but working and tested end-to-end against the Spanner emulator. Supported today:
 
 - Connecting to production Spanner or a Spanner emulator.
-- SQL queries (`execute`), returned as typed Arrow `RecordBatch`es.
+- SQL queries (`execute`), streamed back as typed Arrow `RecordBatch`es: rows are pulled from Spanner
+  and converted to Arrow in bounded chunks as the reader is iterated, so a large result set is never
+  fully materialised in memory. The chunk size is tunable via the `adbc.spanner.rows_per_batch`
+  statement option (default 8192).
 - DML (`execute_update`), returning the affected-row count. A `;`-separated batch (e.g. dbt's
   `DELETE; INSERT`) runs atomically in one read/write transaction via `ExecuteBatchDml`.
 - DDL (`CREATE`/`ALTER`/`DROP`/`RENAME`/…), routed to the Database Admin `UpdateDatabaseDdl` API. A

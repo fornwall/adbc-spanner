@@ -25,8 +25,9 @@ pub(crate) type SharedRuntime = Arc<Runtime>;
 /// (an [`Arc<Notify>`]). [`CancelSignal::signal`] — invoked from another thread by a `cancel()`
 /// call — wakes an operation currently waiting inside [`block_on_cancellable`], which then returns
 /// [`Status::Cancelled`]. Signalling with no in-flight operation is a harmless no-op, and the
-/// signal is reusable for the next operation. Because the driver materialises results eagerly, this
-/// interrupts a still-running query/DML, not iteration over an already-fetched result.
+/// signal is reusable for the next operation. A query's result is streamed lazily, so the same
+/// signal also interrupts an in-flight chunk fetch while a caller iterates the result reader, not
+/// only the initial still-running query/DML.
 #[derive(Clone)]
 pub(crate) struct CancelSignal(Arc<Notify>);
 

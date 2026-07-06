@@ -1720,3 +1720,85 @@ fn get_statistics_reports_real_counts() {
     drop.set_sql_query("DROP TABLE AdbcStats").unwrap();
     drop.execute_update().expect("drop stats table");
 }
+
+#[test]
+fn execute_streams_in_batches() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping execute_streams_in_batches");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    run(
+        &mut connection,
+        "DROP TABLE IF EXISTS AdbcStream; \
+         CREATE TABLE AdbcStream (Id INT64) PRIMARY KEY (Id)",
+    );
+    // 2500 rows in one DML via GENERATE_ARRAY.
+    run(
+        &mut connection,
+        "INSERT INTO AdbcStream (Id) \
+         SELECT n FROM UNNEST(GENERATE_ARRAY(1, 2500)) AS n",
+    );
+
+    let mut query = connection.new_statement().expect("new statement");
+    // A small batch size so the 2500 rows span several batches.
+    query
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionValue::Int(1000),
+        )
+        .expect("set rows_per_batch");
+    assert_eq!(
+        query
+            .get_option_int(OptionStatement::Other(
+                adbc_spanner::OPTION_ROWS_PER_BATCH.into()
+            ))
+            .expect("get rows_per_batch"),
+        1000
+    );
+    query
+        .set_sql_query("SELECT Id FROM AdbcStream ORDER BY Id")
+        .unwrap();
+    let reader = query.execute().expect("streaming query");
+    let schema = reader.schema();
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect streamed batches");
+
+    // 2500 rows at 1000 per batch → three batches (1000, 1000, 500).
+    assert_eq!(batches.len(), 3, "expected three streamed batches");
+    assert!(batches.iter().all(|b| b.schema() == schema));
+    let sizes: Vec<usize> = batches.iter().map(RecordBatch::num_rows).collect();
+    assert_eq!(sizes, vec![1000, 1000, 500]);
+
+    // The concatenation is exactly 1..=2500 in order.
+    let total: usize = sizes.iter().sum();
+    assert_eq!(total, 2500);
+    let mut expected = 1i64;
+    for batch in &batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..ids.len() {
+            assert_eq!(ids.value(i), expected);
+            expected += 1;
+        }
+    }
+
+    let mut drop = connection.new_statement().expect("new statement");
+    drop.set_sql_query("DROP TABLE AdbcStream").unwrap();
+    drop.execute_update().expect("drop stream table");
+}
