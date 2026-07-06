@@ -36,7 +36,7 @@ use google_cloud_spanner::transaction::ReadWriteTransaction;
 use crate::conversion::result_set_to_batch;
 use crate::driver::Connected;
 use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
-use crate::runtime::SharedRuntime;
+use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
 use crate::statement::SpannerStatement;
 
 /// Transaction state shared between a connection and the statements it creates.
@@ -80,6 +80,9 @@ pub struct SpannerConnection {
     database: String,
     read_only: bool,
     txn: SharedTxn,
+    /// Cancellation signal for this connection's in-flight metadata/commit operations
+    /// (see [`Connection::cancel`]).
+    cancel: CancelSignal,
 }
 
 impl SpannerConnection {
@@ -91,13 +94,14 @@ impl SpannerConnection {
             database: connected.database,
             read_only: false,
             txn: Arc::new(Mutex::new(TxnState::new())),
+            cancel: CancelSignal::new(),
         }
     }
 
     /// Apply the buffered DML statements atomically in one read/write transaction, discarding the
     /// affected-row count (a commit reports no count).
     fn apply_transaction(&self, statements: Vec<SpannerSql>) -> Result<()> {
-        run_batch_dml(&self.runtime, &self.client, statements)?;
+        run_batch_dml(&self.runtime, &self.client, &self.cancel, statements)?;
         Ok(())
     }
 
@@ -125,9 +129,12 @@ impl SpannerConnection {
             constraint_batch,
             key_column_batch,
             referential_batch,
-        ) = self.runtime.block_on(async move {
-            let schemas =
-                query_batch(&client, "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA").await?;
+        ) = block_on_cancellable(&self.runtime, &self.cancel, async move {
+            let schemas = query_batch(
+                &client,
+                "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA",
+            )
+            .await?;
             let tables = if populate_tables {
                 Some(
                     query_batch(
@@ -192,7 +199,14 @@ impl SpannerConnection {
             } else {
                 (None, None, None)
             };
-            Ok::<_, Error>((schemas, tables, columns, constraints, key_columns, referential))
+            Ok::<_, Error>((
+                schemas,
+                tables,
+                columns,
+                constraints,
+                key_columns,
+                referential,
+            ))
         })?;
 
         let schema_names = str_col(&schema_batch, 0)?;
@@ -252,7 +266,7 @@ impl SpannerConnection {
     fn table_exists(&self, db_schema: &str, table_name: &str) -> Result<bool> {
         let client = self.client.clone();
         let (schema, table) = (db_schema.to_string(), table_name.to_string());
-        self.runtime.block_on(async move {
+        block_on_cancellable(&self.runtime, &self.cancel, async move {
             let statement = SpannerSql::builder(
                 "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
                  WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table",
@@ -279,13 +293,14 @@ impl SpannerConnection {
 pub(crate) fn run_batch_dml(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
+    cancel: &CancelSignal,
     statements: Vec<SpannerSql>,
 ) -> Result<i64> {
     if statements.is_empty() {
         return Ok(0);
     }
     let client = client.clone();
-    runtime.block_on(async move {
+    block_on_cancellable(runtime, cancel, async move {
         let runner = client
             .read_write_transaction()
             .build()
@@ -626,7 +641,11 @@ impl Connection for SpannerConnection {
     }
 
     fn cancel(&mut self) -> Result<()> {
-        Err(not_implemented("Connection::cancel"))
+        // Best-effort: wake an in-flight metadata/commit operation so it returns Cancelled. A
+        // cancel with nothing running is a no-op. Statements have their own signal, so this does
+        // not affect a query running on a statement from this connection.
+        self.cancel.signal();
+        Ok(())
     }
 
     /// Driver / vendor metadata, sourced entirely from static driver constants (no Spanner RPC).
@@ -683,7 +702,7 @@ impl Connection for SpannerConnection {
         let table = qualified_table(db_schema, table_name);
         let sql = format!("SELECT * FROM {table} LIMIT 0");
         let client = self.client.clone();
-        let result = self.runtime.block_on(async move {
+        let result = block_on_cancellable(&self.runtime, &self.cancel, async move {
             let transaction = client.single_use().build();
             let result_set = transaction
                 .execute_query(SpannerSql::builder(sql).build())

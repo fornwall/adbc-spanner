@@ -141,9 +141,10 @@ building and attaching the binaries. They do not overlap.
 - Supported so far: queries, DML, DDL (via admin `UpdateDatabaseDdl`), manual transactions
   (buffer-and-commit), native Arrow types for DATE/TIMESTAMP/NUMERIC and native `List`/`Struct` for
   ARRAY/STRUCT, parameter binding + bulk ingest, `get_info` (static driver/vendor metadata),
-  `get_objects`, `get_table_types`/`get_table_schema`, and keyfile/keyfile_json auth.
+  `get_objects` (incl. foreign-key `constraint_column_usage`), `get_table_types`/`get_table_schema`,
+  `get_parameter_schema`, best-effort `Connection`/`Statement::cancel` (a shared `CancelSignal`
+  interrupts an in-flight `block_on` op), and keyfile/keyfile_json auth.
   (`get_statistics`/`get_statistic_names` return empty, correctly-typed result sets.)
-- Still returning `NotImplemented` (keep the pattern until implemented): Substrait, partitioned
-  execution (`execute_partitions`/`read_partition`), cancellation (`Connection`/`Statement::cancel`),
-  and `get_parameter_schema`.
+- Still returning `NotImplemented` (keep the pattern until implemented): Substrait and partitioned
+  execution (`execute_partitions`/`read_partition`).
 - Commits in this environment may need `-c commit.gpgsign=false` if no signing agent is present.
