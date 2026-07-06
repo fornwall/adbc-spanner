@@ -36,8 +36,12 @@ jobs:
           workspaces: "fuzz -> target"
 
       - name: Fuzz ${{ matrix.target }}
+        # cargo-fuzz defaults the fuzz target to its own build triple. The prebuilt
+        # binary from install-action is musl-static, and sanitizers are incompatible
+        # with a statically linked libc, so pin the target to the host gnu triple.
         run: |
-          cargo +nightly fuzz run ${{ matrix.target }} -- \
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            --target x86_64-unknown-linux-gnu -- \
             -max_total_time=${{ github.event.inputs.max_total_time || '120' }} \
             -rss_limit_mb=4096
 
