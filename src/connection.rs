@@ -44,8 +44,10 @@ use crate::statement::SpannerStatement;
 pub(crate) struct TxnState {
     /// When false, the connection is in manual transaction mode and DML is buffered.
     autocommit: bool,
-    /// DML statements buffered while in manual mode, applied atomically on commit.
-    pending: Vec<String>,
+    /// DML statements buffered while in manual mode, applied atomically on commit. Built
+    /// statements (not raw SQL) so that parameterized DML — which carries bound values — buffers
+    /// just like a plain `;`-batch does.
+    pending: Vec<SpannerSql>,
 }
 
 impl TxnState {
@@ -62,8 +64,8 @@ impl TxnState {
     }
 
     /// Buffer a DML statement to be applied on the next commit.
-    pub(crate) fn buffer(&mut self, sql: String) {
-        self.pending.push(sql);
+    pub(crate) fn buffer(&mut self, statement: SpannerSql) {
+        self.pending.push(statement);
     }
 }
 
@@ -92,38 +94,11 @@ impl SpannerConnection {
         }
     }
 
-    /// Apply the buffered DML statements atomically in one read/write transaction via
-    /// `ExecuteBatchDml` (a single RPC).
-    ///
-    /// The runner may retry the closure on abort, so the statements are rebuilt from the (cloned)
-    /// buffer on each attempt.
-    fn apply_transaction(&self, statements: Vec<String>) -> Result<()> {
-        if statements.is_empty() {
-            return Ok(());
-        }
-        let client = self.client.clone();
-        self.runtime.block_on(async move {
-            let runner = client
-                .read_write_transaction()
-                .build()
-                .await
-                .map_err(from_spanner)?;
-            runner
-                .run(move |transaction: ReadWriteTransaction| {
-                    let statements = statements.clone();
-                    async move {
-                        let mut batch = BatchDmlBuilder::new();
-                        for sql in statements {
-                            batch = batch.add_statement(SpannerSql::builder(sql).build());
-                        }
-                        transaction.execute_batch_update(batch.build()).await?;
-                        Ok(())
-                    }
-                })
-                .await
-                .map_err(from_spanner)?;
-            Ok::<(), Error>(())
-        })
+    /// Apply the buffered DML statements atomically in one read/write transaction, discarding the
+    /// affected-row count (a commit reports no count).
+    fn apply_transaction(&self, statements: Vec<SpannerSql>) -> Result<()> {
+        run_batch_dml(&self.runtime, &self.client, statements)?;
+        Ok(())
     }
 
     /// Query `INFORMATION_SCHEMA` and assemble the schema→table→column hierarchy for `get_objects`,
@@ -216,6 +191,44 @@ impl SpannerConnection {
         }
         Ok(result)
     }
+}
+
+/// Apply DML `statements` atomically in one read/write transaction via Spanner's `ExecuteBatchDml`
+/// (a single RPC), returning the total affected-row count.
+///
+/// The runner may retry the closure on abort, so the (cloned) statement list is replayed on each
+/// attempt. Shared by autocommit `execute_update` and the manual-mode commit path.
+pub(crate) fn run_batch_dml(
+    runtime: &SharedRuntime,
+    client: &DatabaseClient,
+    statements: Vec<SpannerSql>,
+) -> Result<i64> {
+    if statements.is_empty() {
+        return Ok(0);
+    }
+    let client = client.clone();
+    runtime.block_on(async move {
+        let runner = client
+            .read_write_transaction()
+            .build()
+            .await
+            .map_err(from_spanner)?;
+        let outcome = runner
+            .run(move |transaction: ReadWriteTransaction| {
+                let statements = statements.clone();
+                async move {
+                    let mut batch = BatchDmlBuilder::new();
+                    for statement in statements {
+                        batch = batch.add_statement(statement);
+                    }
+                    let counts = transaction.execute_batch_update(batch.build()).await?;
+                    Ok(counts.into_iter().sum::<i64>())
+                }
+            })
+            .await
+            .map_err(from_spanner)?;
+        Ok::<i64, Error>(outcome.result)
+    })
 }
 
 /// Run a query and return its single materialised record batch.

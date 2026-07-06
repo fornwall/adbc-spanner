@@ -437,6 +437,49 @@ fn query_and_dml_round_trip() {
         "rolled-back row must not appear"
     );
 
+    // Parameterized DML must honour manual-transaction buffering too. Regression test: a bound
+    // INSERT used to bypass the buffer and commit immediately in its own transaction, so it was
+    // visible before commit and survived a rollback.
+    let buffer_param_insert = |connection: &mut SpannerConnection, id: i64| {
+        let row = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![id]))],
+        )
+        .unwrap();
+        let mut s = connection.new_statement().expect("new statement");
+        s.set_sql_query("INSERT INTO AdbcTxn (Id) VALUES (@Id)")
+            .unwrap();
+        s.bind(row).expect("bind param");
+        assert_eq!(
+            s.execute_update().expect("buffered param insert"),
+            None,
+            "parameterized DML in manual mode must buffer (return None), not commit immediately"
+        );
+    };
+
+    // Buffered, then committed: the bound row appears only after commit.
+    buffer_param_insert(&mut connection, 3);
+    assert_eq!(
+        count_rows(&mut connection, "AdbcTxn"),
+        2,
+        "buffered parameterized row must not be visible before commit"
+    );
+    connection.commit().expect("commit param");
+    assert_eq!(
+        count_rows(&mut connection, "AdbcTxn"),
+        3,
+        "parameterized row must be visible after commit"
+    );
+
+    // Buffered, then rolled back: the bound row leaves no trace.
+    buffer_param_insert(&mut connection, 4);
+    connection.rollback().expect("rollback param");
+    assert_eq!(
+        count_rows(&mut connection, "AdbcTxn"),
+        3,
+        "rolled-back parameterized row must not appear"
+    );
+
     // Re-enabling autocommit commits any pending work (none here) and restores per-statement commit.
     connection
         .set_option(
