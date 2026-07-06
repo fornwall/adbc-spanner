@@ -27,10 +27,25 @@ EMULATOR_DATABASE="projects/test-project/instances/test-instance/databases/adbc-
 FULL=0
 [ "${1:-}" = "--full" ] && FULL=1
 
-# The gated subset: the full lifecycle + metadata suites (DatabaseTest +
-# ConnectionTest), which pass in full — 19 pass, 6 self-skip (features Spanner
-# does not expose). StatementTest is intentionally not gated yet; see the README.
+# The gated subset. DatabaseTest + ConnectionTest pass in full (lifecycle +
+# metadata). From StatementTest we gate the cases that pass cleanly today, as an
+# explicit allowlist rather than an exclude list: the remaining cases fail in
+# ways that abort the process (the upstream adbc_ffi error release is not
+# idempotent, so an error-path assertion double-frees), so a negative filter
+# could not stay green. The excluded cases are documented in the README.
 GATED_FILTER='SpannerDatabaseTest.*:SpannerConnectionTest.*'
+GATED_FILTER+=':SpannerStatementTest.NewInit'
+GATED_FILTER+=':SpannerStatementTest.Release'
+GATED_FILTER+=':SpannerStatementTest.SqlPrepareGetParameterSchema'
+GATED_FILTER+=':SpannerStatementTest.SqlPrepareUpdateNoParams'
+GATED_FILTER+=':SpannerStatementTest.SqlPrepareErrorParamCountMismatch'
+GATED_FILTER+=':SpannerStatementTest.SqlQueryErrors'
+GATED_FILTER+=':SpannerStatementTest.SqlSchemaInts'
+GATED_FILTER+=':SpannerStatementTest.SqlSchemaStrings'
+GATED_FILTER+=':SpannerStatementTest.SqlSchemaErrors'
+GATED_FILTER+=':SpannerStatementTest.ConcurrentStatements'
+GATED_FILTER+=':SpannerStatementTest.ResultIndependence'
+GATED_FILTER+=':SpannerStatementTest.ResultInvalidation'
 
 # No target configured: run under a throwaway emulator, then re-enter this script.
 if [ -z "${SPANNER_EMULATOR_HOST:-}" ] && [ -z "${SPANNER_GCP_DATABASE:-}" ]; then

@@ -236,15 +236,32 @@ fn skip_line_comment(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     }
 }
 
-/// Build an `INSERT INTO <table> (<cols>) VALUES (@<cols>)` statement for bulk ingest.
+/// Backtick-quote a Spanner identifier, escaping embedded backticks. Keeps reserved words
+/// (`create`, `index`, …) and otherwise-unsafe names valid, and closes the identifier-injection
+/// vector when a caller's table/column names reach the generated SQL.
+fn quote_ident(ident: &str) -> String {
+    format!("`{}`", ident.replace('`', "``"))
+}
+
+/// Build an `` INSERT INTO `table` (`cols`) VALUES (@cols) `` statement for bulk ingest.
+///
+/// Identifiers are quoted; the `@name` parameter references reuse the (unquoted) column names,
+/// which [`bind_row`] binds by field name.
 pub(crate) fn insert_sql(table: &str, columns: &[String]) -> String {
-    let names = columns.join(", ");
+    let names = columns
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
     let params = columns
         .iter()
         .map(|c| format!("@{c}"))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("INSERT INTO {table} ({names}) VALUES ({params})")
+    format!(
+        "INSERT INTO {} ({names}) VALUES ({params})",
+        quote_ident(table)
+    )
 }
 
 #[cfg(test)]
@@ -261,11 +278,21 @@ mod tests {
     fn builds_insert_sql() {
         assert_eq!(
             insert_sql("Users", &["Id".to_string(), "Name".to_string()]),
-            "INSERT INTO Users (Id, Name) VALUES (@Id, @Name)"
+            "INSERT INTO `Users` (`Id`, `Name`) VALUES (@Id, @Name)"
         );
         assert_eq!(
             insert_sql("T", &["a".to_string()]),
-            "INSERT INTO T (a) VALUES (@a)"
+            "INSERT INTO `T` (`a`) VALUES (@a)"
+        );
+        // Reserved words and embedded backticks are quoted/escaped so the DDL-shaped names the
+        // ADBC ingest-escaping tests use (table `create`, column `index`) are valid identifiers.
+        assert_eq!(
+            insert_sql("create", &["index".to_string()]),
+            "INSERT INTO `create` (`index`) VALUES (@index)"
+        );
+        assert_eq!(
+            insert_sql("a`b", &["c`d".to_string()]),
+            "INSERT INTO `a``b` (`c``d`) VALUES (@c`d)"
         );
     }
 

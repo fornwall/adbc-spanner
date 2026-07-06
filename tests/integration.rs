@@ -668,6 +668,53 @@ fn query_and_dml_round_trip() {
     drop_bind.set_sql_query("DROP TABLE AdbcBind").unwrap();
     drop_bind.execute_update().expect("drop bind table");
 
+    // Preparing a statement before its query is set is an InvalidState error (ADBC precondition).
+    let mut unprepared = connection.new_statement().expect("new statement");
+    assert_eq!(
+        unprepared.prepare().unwrap_err().status,
+        adbc_core::error::Status::InvalidState,
+    );
+
+    // Bulk ingest must quote identifiers, so reserved words survive as table/column names. This is
+    // the value of the ADBC suite's ingest-escaping tests, which we can only run in append mode
+    // (Spanner requires a primary key, so it has no create-mode ingest). Table `create` and column
+    // `index` are both reserved words.
+    let mut esc_ddl = connection.new_statement().expect("new statement");
+    esc_ddl
+        .set_sql_query(
+            "DROP TABLE IF EXISTS `create`; \
+             CREATE TABLE `create` (`index` INT64) PRIMARY KEY (`index`)",
+        )
+        .unwrap();
+    esc_ddl
+        .execute_update()
+        .expect("create reserved-word table");
+    let esc_rows = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "index",
+            DataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(Int64Array::from(vec![42, -42]))],
+    )
+    .unwrap();
+    let mut esc_ingest = connection.new_statement().expect("new statement");
+    esc_ingest
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("create".into()),
+        )
+        .unwrap();
+    esc_ingest.bind(esc_rows).expect("bind reserved-word rows");
+    assert_eq!(
+        esc_ingest.execute_update().expect("ingest reserved"),
+        Some(2)
+    );
+    assert_eq!(count_rows(&mut connection, "`create`"), 2);
+    let mut drop_esc = connection.new_statement().expect("new statement");
+    drop_esc.set_sql_query("DROP TABLE `create`").unwrap();
+    drop_esc.execute_update().expect("drop reserved-word table");
+
     // --- ARRAY<scalar> maps to a native Arrow List ---
 
     let mut arr_ddl = connection.new_statement().expect("new statement");

@@ -38,33 +38,48 @@ Spanner's model self-skip rather than fail.
 
 ## What CI gates on
 
-CI runs the **`SpannerDatabaseTest` and `SpannerConnectionTest`** suites in full
-— lifecycle + metadata: `get_info`, `get_objects` (including table columns and
-primary-key/constraint metadata), `get_table_types`, `get_table_schema`
-(returning `NOT_FOUND` for a missing table), autocommit/transaction options. **19
-tests pass and 6 self-skip** (features Spanner does not expose, e.g. temp tables,
-views, statistics, current-catalog metadata).
+- **`SpannerDatabaseTest` + `SpannerConnectionTest`** in full — lifecycle +
+  metadata: `get_info`, `get_objects` (including table columns and
+  primary-key/constraint metadata), `get_table_types`, `get_table_schema`
+  (`NOT_FOUND` for a missing table), autocommit/transaction options.
+- **The `SpannerStatementTest` cases that pass cleanly** — `execute_schema` for
+  int/string columns and its error path, `prepare` / `get_parameter_schema` /
+  parameter-count validation, query error handling, concurrent statements, and
+  result independence/invalidation.
 
-## Follow-up work: gating `StatementTest`
+**31 tests pass, 6 self-skip** (features Spanner does not expose — temp tables,
+views, statistics, current-catalog metadata). The `StatementTest` cases are an
+explicit allowlist in `scripts/run-adbc-validation.sh` (see the next section for
+why it is an allowlist, not an exclude list).
 
-`StatementTest` is compiled and runnable via `--full` but **not gated yet**.
-Bringing it into the gate is natural follow-up work the suite now makes easy to
-tackle incrementally — one quirk or driver fix at a time. Much of it needs
-per-test adaptation to Spanner's model:
+## Follow-up work: the remaining `StatementTest` cases
 
-- **Mandatory primary keys** — Spanner tables must declare a primary key, so the
-  suite's key-less sample tables need quirks-provided DDL.
-- **Append-only ingest** — the driver ingests into an existing table only; the
-  suite's default create-mode ingest tests self-skip (`supports_bulk_ingest`
-  returns true only for `append`).
-- **Named parameters** — Spanner uses `@name`, not positional `?`, so parameter
-  binding tests bind by column name.
-- **`rows_affected` under buffer-and-commit** — manual-mode DML is buffered and
-  the affected-row count is unknown until commit, unlike the suite's assumption.
+The rest of `StatementTest` (runnable via `--full`) is gated incrementally as
+each case is understood. The remaining ones fall into four buckets:
 
-Each is a self-contained increment: tune `SpannerQuirks`, fix a driver gap if one
-is real, then move the newly-green tests into the gated filter in
-`scripts/run-adbc-validation.sh`.
+- **Blocked upstream by `adbc_ffi`** — the error-release function is not
+  idempotent (see the note below), so any test that surfaces and releases an
+  error aborts the process instead of failing cleanly. Also, `ExecuteQuery` on
+  the query path never writes `rows_affected`, so tests asserting it is `1`/`-1`
+  get the caller's initial `0`. Not fixable from this crate.
+- **Suite-internal non-Spanner DDL** — several cases issue hardcoded
+  `CREATE TABLE x (foo INT)` / `TEXT` / `FLOAT` with no primary key and
+  double-quoted identifiers. There is no quirks hook for these, and they are not
+  valid Spanner DDL (which needs `INT64`, a `PRIMARY KEY`, backtick quoting).
+- **Create-mode ingest** — Spanner requires a primary key, so the driver has no
+  create-mode ingest; the suite's ingest tests create the target table. Where the
+  value is separable from create-mode — e.g. the ingest **identifier-escaping**
+  tests (reserved-word table/column names) — it is captured natively instead: the
+  driver quotes ingest identifiers (`bind::insert_sql`) and
+  `tests/integration.rs` exercises an append-mode ingest into a table `create`
+  with a column `index`.
+- **Genuine driver gaps** — closed as found. `prepare()` now returns
+  `INVALID_STATE` when no query is set (the suite's `SqlPrepareErrorNoQuery`;
+  covered by a Rust test since the C++ one trips the upstream release bug).
+
+Each remaining case is a self-contained increment: tune `SpannerQuirks`, fix a
+driver gap if one is real (and cover it with a native test when the C++ case is
+blocked upstream), then add the newly-green test to the allowlist.
 
 ## A note on failures aborting the process
 

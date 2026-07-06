@@ -376,7 +376,9 @@ impl Statement for SpannerStatement {
     }
 
     fn prepare(&mut self) -> Result<()> {
-        // Spanner prepares/plans statements server-side on execution, so this is a no-op.
+        // Spanner prepares/plans statements server-side on execution, so there is nothing to do
+        // beyond the ADBC precondition that a query must have been set first.
+        self.sql()?;
         Ok(())
     }
 
