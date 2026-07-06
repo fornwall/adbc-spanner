@@ -164,6 +164,78 @@ fn numeric_string(unscaled: i128, scale: u32) -> String {
     )
 }
 
+/// Extract the distinct named parameters (`@name`) referenced by `sql`, in order of first
+/// appearance.
+///
+/// Skips `@name` occurrences inside string / identifier literals (`'…'`, `"…"`, `` `…` `` with
+/// backslash escapes) and comments (`-- …`, `# …`, `/* … */`), and does not treat statement hints
+/// (`@{…}`) or system variables (`@@var`) as parameters — the same lexical rules as
+/// [`crate::ddl::split_statements`]. Used by `get_parameter_schema` when no parameter data has been
+/// bound yet.
+pub(crate) fn named_parameters(sql: &str) -> Vec<String> {
+    let mut params: Vec<String> = Vec::new();
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' | '`' => {
+                // Skip a quoted literal/identifier, honouring backslash escapes.
+                while let Some(ch) = chars.next() {
+                    match ch {
+                        '\\' => {
+                            chars.next();
+                        }
+                        _ if ch == c => break,
+                        _ => {}
+                    }
+                }
+            }
+            '-' if chars.peek() == Some(&'-') => skip_line_comment(&mut chars),
+            '#' => skip_line_comment(&mut chars),
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next(); // '*'
+                let mut prev = '\0';
+                for ch in chars.by_ref() {
+                    if prev == '*' && ch == '/' {
+                        break;
+                    }
+                    prev = ch;
+                }
+            }
+            '@' => match chars.peek() {
+                // `@@var` (system variable) or `@{…}` (statement hint): not a bind parameter.
+                Some('@') | Some('{') => {
+                    chars.next();
+                }
+                Some(&ch) if ch == '_' || ch.is_ascii_alphabetic() => {
+                    let mut name = String::new();
+                    while let Some(&ch) = chars.peek() {
+                        if ch == '_' || ch.is_ascii_alphanumeric() {
+                            name.push(ch);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if !params.iter().any(|p| p == &name) {
+                        params.push(name);
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    params
+}
+
+fn skip_line_comment(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    for ch in chars.by_ref() {
+        if ch == '\n' {
+            break;
+        }
+    }
+}
+
 /// Build an `INSERT INTO <table> (<cols>) VALUES (@<cols>)` statement for bulk ingest.
 pub(crate) fn insert_sql(table: &str, columns: &[String]) -> String {
     let names = columns.join(", ");
@@ -270,6 +342,29 @@ mod tests {
             )],
         );
         assert!(bind_row(Statement::builder("SELECT @n"), &b, 0).is_ok());
+    }
+
+    #[test]
+    fn extracts_named_parameters() {
+        // Basic references, in order, with a later reuse deduped.
+        assert_eq!(
+            named_parameters("SELECT @a, @b FROM t WHERE @a > 0"),
+            vec!["a", "b"]
+        );
+        // No parameters.
+        assert_eq!(named_parameters("SELECT 1"), Vec::<String>::new());
+        // `@` inside string literals and comments is not a parameter.
+        assert_eq!(named_parameters("SELECT '@x', @y -- @z\n"), vec!["y"]);
+        assert_eq!(named_parameters("SELECT @y /* @z */, @w"), vec!["y", "w"]);
+        assert_eq!(named_parameters("SELECT `@col`, @p"), vec!["p"]);
+        // Statement hints (`@{…}`) and system variables (`@@var`) are not parameters.
+        assert_eq!(
+            named_parameters("SELECT @{JOIN_METHOD=HASH_JOIN} * FROM t WHERE id = @id"),
+            vec!["id"]
+        );
+        assert_eq!(named_parameters("SELECT @@rows"), Vec::<String>::new());
+        // First-seen order is preserved across repeats.
+        assert_eq!(named_parameters("@b @a @a @b @c"), vec!["b", "a", "c"]);
     }
 
     #[test]

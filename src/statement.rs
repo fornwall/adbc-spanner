@@ -11,7 +11,7 @@ use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{OptionStatement, OptionValue};
 use adbc_core::{Optionable, PartitionedResult, Statement};
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
-use arrow_schema::{ArrowError, Schema, SchemaRef};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use google_cloud_lro::Poller as _;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::model::execute_sql_request::QueryMode;
@@ -36,6 +36,9 @@ pub struct SpannerStatement {
     bound: Vec<RecordBatch>,
     /// Target table for bulk ingest (`adbc.ingest.target_table`), if set.
     target_table: Option<String>,
+    /// Ingest mode (`adbc.ingest.mode`), stored in canonical form once set so it round-trips
+    /// through `get_option`. Only `append` is accepted.
+    ingest_mode: Option<String>,
 }
 
 impl SpannerStatement {
@@ -57,6 +60,7 @@ impl SpannerStatement {
             sql: None,
             bound: Vec::new(),
             target_table: None,
+            ingest_mode: None,
         }
     }
 
@@ -184,7 +188,9 @@ impl Optionable for SpannerStatement {
             OptionStatement::TargetTable => self.target_table = Some(string_option(value)?),
             OptionStatement::IngestMode => match string_option(value)?.as_str() {
                 // Only appending into an existing table is supported.
-                "adbc.ingest.mode.append" | "append" => {}
+                "adbc.ingest.mode.append" | "append" => {
+                    self.ingest_mode = Some("adbc.ingest.mode.append".to_string());
+                }
                 other => return Err(not_implemented(&format!("ingest mode {other:?}"))),
             },
             other => {
@@ -198,17 +204,21 @@ impl Optionable for SpannerStatement {
     }
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
-        Err(err(
-            format!("option {} is not set", key.as_ref()),
-            Status::NotFound,
-        ))
+        let value = match &key {
+            OptionStatement::TargetTable => self.target_table.clone(),
+            OptionStatement::IngestMode => self.ingest_mode.clone(),
+            _ => None,
+        };
+        value.ok_or_else(|| {
+            err(
+                format!("option {} is not set", key.as_ref()),
+                Status::NotFound,
+            )
+        })
     }
 
     fn get_option_bytes(&self, key: Self::Option) -> Result<Vec<u8>> {
-        Err(err(
-            format!("option {} is not set", key.as_ref()),
-            Status::NotFound,
-        ))
+        Ok(self.get_option_string(key)?.into_bytes())
     }
 
     fn get_option_int(&self, key: Self::Option) -> Result<i64> {
@@ -348,7 +358,21 @@ impl Statement for SpannerStatement {
     }
 
     fn get_parameter_schema(&self) -> Result<Schema> {
-        Err(not_implemented("Statement::get_parameter_schema"))
+        // If parameter (or bulk-ingest) data has already been bound, each column *is* a parameter,
+        // so its schema is the parameter schema — carrying real, known types.
+        if let Some(batch) = self.bound.first() {
+            return Ok((*batch.schema()).clone());
+        }
+        // Otherwise derive the parameters from the statement's `@name` references. Spanner infers
+        // parameter types from the surrounding SQL at execution time and exposes no way to
+        // introspect them beforehand, so each parameter is typed as `Null` — Arrow's convention for
+        // an unknown/any type — with the parameter name preserved.
+        let sql = self.sql()?;
+        let fields: Vec<Field> = bind::named_parameters(&sql)
+            .into_iter()
+            .map(|name| Field::new(name, DataType::Null, true))
+            .collect();
+        Ok(Schema::new(fields))
     }
 
     fn prepare(&mut self) -> Result<()> {
