@@ -80,7 +80,8 @@ google-cloud-lro = { git = "https://github.com/fornwall/google-cloud-rust", rev 
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 serde_json = "1"
 base64 = "0.22"
-# Parsing Spanner's string-encoded DATE / TIMESTAMP values into Arrow Date32 / Timestamp.
+# Parsing Spanner's string-encoded DATE / TIMESTAMP values into Arrow Date32 / Timestamp, and
+# formatting them (plus NUMERIC) back to those wire strings when binding parameters.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Only pulled in by the `fuzzing` feature: derives `Arbitrary` for the option-fuzz input type.
 arbitrary = { version = "1", features = ["derive"], optional = true }
