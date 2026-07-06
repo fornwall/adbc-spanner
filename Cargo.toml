@@ -51,16 +51,27 @@ ffi = ["dep:adbc_ffi"]
 fuzzing = ["dep:arbitrary"]
 
 [dependencies]
-# The abstract ADBC driver traits (Driver / Database / Connection / Statement).
-adbc_core = "0.23"
-# C FFI driver exporter: generates the `AdbcSpannerInit` entrypoint for the shared library.
-adbc_ffi = { version = "0.23", optional = true }
-# Arrow types the ADBC traits are expressed in. Kept in the range adbc_core allows
-# so the RecordBatch / Schema / RecordBatchReader types unify across the crates.
-arrow-array = ">=53.1, <59"
-arrow-schema = ">=53.1, <59"
+# --- adbc_core / adbc_ffi pinned to a git revision (temporary) ---
+# The abstract ADBC driver traits, and the C FFI driver exporter that generates the
+# `AdbcSpannerInit` entrypoint for the shared library. Pinned to a fork of
+# apache/arrow-adbc carrying two fixes that are not in the latest crates.io release (0.23):
+#   1. `release_ffi_error` is idempotent — it nulls the error's message / private_data /
+#      release pointers after freeing, so a second release (which consumers do via the
+#      standard `if (error.release) error.release(&error)` idiom) is a safe no-op rather
+#      than a double-free. Already on arrow-adbc `main`; only missing from the 0.23 release.
+#   2. `AdbcStatementExecuteQuery` writes `rows_affected = -1` on the query path (a result
+#      stream was requested) instead of leaving the caller's out-parameter untouched.
+#      Submitted upstream as https://github.com/apache/arrow-adbc/pull/4469.
+# Both let the C++ `adbc_validation` suite behave correctly against this driver (see
+# adbc-validation/). Revert to a versioned crates.io release once these ship.
+adbc_core = { git = "https://github.com/fornwall/arrow-adbc", rev = "786e7f3488eb71b200ece775b027a647cf42db9e" }
+adbc_ffi = { git = "https://github.com/fornwall/arrow-adbc", rev = "786e7f3488eb71b200ece775b027a647cf42db9e", optional = true }
+# Arrow types the ADBC traits are expressed in. Kept in the range the (git) adbc crates
+# allow (>=58, <60) so the RecordBatch / Schema / RecordBatchReader types unify across them.
+arrow-array = ">=58, <60"
+arrow-schema = ">=58, <60"
 # Offset / null buffers for building Arrow List arrays (ARRAY columns).
-arrow-buffer = ">=53.1, <59"
+arrow-buffer = ">=58, <60"
 # --- google-cloud-* pinned to a git revision (temporary) ---
 # We map Spanner STRUCT columns to native Arrow Struct types, which needs
 # `Type::struct_type()` to introspect struct field names/types. That accessor
@@ -103,7 +114,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
 # Property-based round-trip testing of the driver against the emulator (integration test only).
 proptest = "1"
 # Driver manager: loads the built cdylib through the C ABI for the FFI smoke test.
-adbc_driver_manager = "0.23"
+# Same git pin as adbc_core / adbc_ffi above (the three must share one revision).
+adbc_driver_manager = { git = "https://github.com/fornwall/arrow-adbc", rev = "786e7f3488eb71b200ece775b027a647cf42db9e" }
 # Admin clients, used by the emulator integration test to create the test instance and database.
 # Pinned to the same git revision as the google-cloud family above (see the note there).
 google-cloud-spanner-admin-instance-v1 = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }

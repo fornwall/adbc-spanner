@@ -28,8 +28,15 @@ instance/database when needed, and runs the suite. Requirements beyond the Rust
 toolchain: a C++17 compiler, CMake (≥ 3.20) and git. Everything else — the
 arrow-adbc validation library, the ADBC driver manager, fmt, nanoarrow and
 GoogleTest — is fetched and built from source at a pinned arrow-adbc release
-(`ARROW_ADBC_TAG` in `CMakeLists.txt`, kept in step with the `adbc_core` /
-`adbc_ffi` crate versions). No system packages are required.
+(`ARROW_ADBC_TAG` in `CMakeLists.txt`). No system packages are required.
+
+The **driver** (cdylib) links the `adbc_core` / `adbc_ffi` crates from a git pin
+(see `Cargo.toml`) that carries two fixes not yet in a crates.io release: an
+idempotent `AdbcError` release (no double-free on a second release) and
+`AdbcStatementExecuteQuery` writing `rows_affected = -1` on the query path
+(upstream [apache/arrow-adbc#4469](https://github.com/apache/arrow-adbc/pull/4469)).
+The **C++** validation library and driver manager come from `ARROW_ADBC_TAG`;
+they interoperate with the driver over the C ABI.
 
 `SpannerQuirks` (in `spanner_validation.cc`) describes Spanner's capabilities to
 the suite — named `@p` parameters, DDL via the admin API, append-only ingest,
@@ -42,51 +49,49 @@ Spanner's model self-skip rather than fail.
   metadata: `get_info`, `get_objects` (including table columns and
   primary-key/constraint metadata), `get_table_types`, `get_table_schema`
   (`NOT_FOUND` for a missing table), autocommit/transaction options.
-- **The `SpannerStatementTest` cases that pass cleanly** — `execute_schema` for
-  int/string columns and its error path, `prepare` / `get_parameter_schema` /
-  parameter-count validation, query error handling, concurrent statements, and
-  result independence/invalidation.
+- **The `SpannerStatementTest` cases that pass cleanly** — `execute` and
+  `execute_schema` for int/string columns and their error paths, `prepare` /
+  `get_parameter_schema` / parameter-count / no-query validation, query error
+  handling, concurrent statements, and result independence/invalidation.
 
-**31 tests pass, 6 self-skip** (features Spanner does not expose — temp tables,
+**35 tests pass, 6 self-skip** (features Spanner does not expose — temp tables,
 views, statistics, current-catalog metadata). The `StatementTest` cases are an
-explicit allowlist in `scripts/run-adbc-validation.sh` (see the next section for
-why it is an allowlist, not an exclude list).
+explicit allowlist in `scripts/run-adbc-validation.sh`.
 
 ## Follow-up work: the remaining `StatementTest` cases
 
 The rest of `StatementTest` (runnable via `--full`) is gated incrementally as
-each case is understood. The remaining ones fall into four buckets:
+each case is understood. Every remaining case now fails **cleanly** (no aborts —
+see the note below); they fall into three buckets, none of them incremental
+driver work:
 
-- **Blocked upstream by `adbc_ffi`** — the error-release function is not
-  idempotent (see the note below), so any test that surfaces and releases an
-  error aborts the process instead of failing cleanly. Also, `ExecuteQuery` on
-  the query path never writes `rows_affected`, so tests asserting it is `1`/`-1`
-  get the caller's initial `0`. Not fixable from this crate.
 - **Suite-internal non-Spanner DDL** — several cases issue hardcoded
   `CREATE TABLE x (foo INT)` / `TEXT` / `FLOAT` with no primary key and
   double-quoted identifiers. There is no quirks hook for these, and they are not
-  valid Spanner DDL (which needs `INT64`, a `PRIMARY KEY`, backtick quoting).
+  valid Spanner DDL (which needs `INT64`/`FLOAT64`, a `PRIMARY KEY`, backtick
+  quoting). Covers e.g. `SqlBind`, `SqlQueryEmpty`, `SqlQueryFloats`,
+  `SqlSchemaFloats`, `SqlQueryRowsAffectedDelete`, `Transactions`.
 - **Create-mode ingest** — Spanner requires a primary key, so the driver has no
-  create-mode ingest; the suite's ingest tests create the target table. Where the
-  value is separable from create-mode — e.g. the ingest **identifier-escaping**
-  tests (reserved-word table/column names) — it is captured natively instead: the
-  driver quotes ingest identifiers (`bind::insert_sql`) and
-  `tests/integration.rs` exercises an append-mode ingest into a table `create`
-  with a column `index`.
-- **Genuine driver gaps** — closed as found. `prepare()` now returns
-  `INVALID_STATE` when no query is set (the suite's `SqlPrepareErrorNoQuery`;
-  covered by a Rust test since the C++ one trips the upstream release bug).
+  create-mode ingest; the suite's ingest tests create the target table
+  (`SqlIngest*`). Where the value is separable from create-mode — the ingest
+  **identifier-escaping** tests (reserved-word table/column names) — it is
+  captured natively instead: the driver quotes ingest identifiers
+  (`bind::insert_sql`) and `tests/integration.rs` exercises an append-mode ingest
+  into a table `create` with a column `index`.
+- **One upstream `adbc_ffi` gap** — `ErrorCompatibility` checks that the driver
+  preserves the caller's `AdbcError.private_data` / `private_driver`; the FFI
+  exporter does not. Not fixable from this crate.
 
-Each remaining case is a self-contained increment: tune `SpannerQuirks`, fix a
-driver gap if one is real (and cover it with a native test when the C++ case is
-blocked upstream), then add the newly-green test to the allowlist.
+The two `adbc_ffi` issues that previously blocked a whole swath of these — a
+non-idempotent error release (which aborted the process) and a missing
+`rows_affected` on the query path — are **fixed** in the git-pinned `adbc_ffi`
+(see the top of this file), which is what unblocked `SqlQueryInts` /
+`SqlQueryStrings` / `SqlPrepareSelectNoParams` / `SqlPrepareErrorNoQuery`.
 
-## A note on failures aborting the process
+## A note on `--full` process isolation
 
-The upstream `adbc_ffi` error-release function is not idempotent, and the
-validation matchers release an error once on a *failed* assertion without
-clearing it — so a failing assertion double-frees and aborts the process rather
-than reporting a clean failure. Passing assertions are unaffected. Because of
-this, `--full` runs each test in its own process via `ctest`, so one aborting
-test does not hide the rest. The gated subset contains only passing tests, so it
-never trips this.
+`--full` runs each test in its own process via `ctest`. This is no longer
+required for safety — the git-pinned `adbc_ffi` makes the driver's `AdbcError`
+release idempotent, so a *failed* assertion now reports cleanly instead of
+double-freeing and aborting the process. Per-test isolation is kept because it
+still gives the cleanest independent pass/fail report.

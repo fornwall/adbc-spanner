@@ -674,6 +674,15 @@ fn query_and_dml_round_trip() {
         unprepared.prepare().unwrap_err().status,
         adbc_core::error::Status::InvalidState,
     );
+    // A bulk-ingest statement needs no SQL query, so preparing one (target set, no query) is OK.
+    let mut ingest_prepare = connection.new_statement().expect("new statement");
+    ingest_prepare
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcBind".into()),
+        )
+        .unwrap();
+    ingest_prepare.prepare().expect("prepare ingest statement");
 
     // Bulk ingest must quote identifiers, so reserved words survive as table/column names. This is
     // the value of the ADBC suite's ingest-escaping tests, which we can only run in append mode

@@ -27,9 +27,8 @@ dependencies = [
 
 [[package]]
 name = "adbc_core"
-version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46b169525a7c41670fe95874103c7c6ce713ac699123f81a200bc31f9ad3b02e"
+version = "0.24.0"
+source = "git+https://github.com/fornwall/arrow-adbc?rev=786e7f3488eb71b200ece775b027a647cf42db9e#786e7f3488eb71b200ece775b027a647cf42db9e"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -37,9 +36,8 @@ dependencies = [
 
 [[package]]
 name = "adbc_driver_manager"
-version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12aa1ae565ec6d45cfe71c20b5c2b3cbd6ba5d7176ecd0c0a448e970a93c35e4"
+version = "0.24.0"
+source = "git+https://github.com/fornwall/arrow-adbc?rev=786e7f3488eb71b200ece775b027a647cf42db9e#786e7f3488eb71b200ece775b027a647cf42db9e"
 dependencies = [
  "adbc_core",
  "adbc_ffi",
@@ -50,14 +48,13 @@ dependencies = [
  "regex",
  "toml",
  "windows-registry",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
 name = "adbc_ffi"
-version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6851c2ab953511cf7a244aadcbc0586442fd3c67dfe371457369048880dd513"
+version = "0.24.0"
+source = "git+https://github.com/fornwall/arrow-adbc?rev=786e7f3488eb71b200ece775b027a647cf42db9e#786e7f3488eb71b200ece775b027a647cf42db9e"
 dependencies = [
  "adbc_core",
  "arrow-array",
@@ -130,9 +127,9 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "arrow-array"
-version = "58.3.0"
+version = "59.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfd33d3e92f207444098c75b42de99d329562be0cf686b307b097cc52b4e999e"
+checksum = "0c60c79628e9a97cb90d7a0dc3e944f216a902f837d4ecabc14d524bddbbc137"
 dependencies = [
  "ahash 0.8.12",
  "arrow-buffer",
@@ -148,9 +145,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-buffer"
-version = "58.3.0"
+version = "59.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c6cd424c2693bcdbc150d843dc9d4d137dd2de4782ce6df491ad11a3a0416c0"
+checksum = "6026f638c400e9878c1b1cc05c3cfd46fbf381285916ab408678701c1df46c1a"
 dependencies = [
  "bytes",
  "half",
@@ -160,9 +157,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-data"
-version = "58.3.0"
+version = "59.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c88210023a2bfee1896af366309a3028fc3bcbd6515fa29a7990ee1baa08ee0"
+checksum = "7bd568aa70c4ec5947027b0d5caee94877433b661a0bb9e8ddceeeb5f0c9b1ab"
 dependencies = [
  "arrow-buffer",
  "arrow-schema",
@@ -173,9 +170,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-schema"
-version = "58.3.0"
+version = "59.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f633dbfdf39c039ada1bf9e34c694816eb71fbb7dc78f613993b7245e078a1ed"
+checksum = "80b3e786a0dd9103acd583a6fb486dbf2f3268466cc0bd571dcf34cef231c1f1"
 dependencies = [
  "bitflags",
 ]
