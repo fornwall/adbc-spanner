@@ -144,7 +144,9 @@ building and attaching the binaries. They do not overlap.
   `get_objects` (incl. foreign-key `constraint_column_usage`), `get_table_types`/`get_table_schema`,
   `get_parameter_schema`, best-effort `Connection`/`Statement::cancel` (a shared `CancelSignal`
   interrupts an in-flight `block_on` op), and keyfile/keyfile_json auth.
-  (`get_statistics`/`get_statistic_names` return empty, correctly-typed result sets.)
+  (`get_statistics` computes exact `ROW_COUNT`/`NULL_COUNT`/`DISTINCT_COUNT` via one aggregate scan
+  per table — see `src/statistics.rs`; `approximate=true` returns nothing since Spanner has no cheap
+  stats. `get_statistic_names` returns an empty, correctly-typed result set.)
 - Still returning `NotImplemented` (keep the pattern until implemented): Substrait and partitioned
   execution (`execute_partitions`/`read_partition`).
 - Commits in this environment may need `-c commit.gpgsign=false` if no signing agent is present.

@@ -38,8 +38,9 @@ use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_driver_manager::ManagedDriver;
 use adbc_spanner::{SpannerConnection, SpannerDatabase, SpannerDriver};
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
-    ListArray, RecordBatch, RecordBatchReader, StringArray, StructArray, TimestampMicrosecondArray,
+    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int16Array,
+    Int64Array, ListArray, RecordBatch, RecordBatchReader, StringArray, StructArray,
+    TimestampMicrosecondArray, UnionArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::{NaiveDate, SecondsFormat};
@@ -1583,4 +1584,139 @@ fn count_rows(connection: &mut SpannerConnection, table: &str) -> i64 {
         .downcast_ref::<Int64Array>()
         .unwrap()
         .value(0)
+}
+
+/// Extract (table, column, key, value) tuples from a get_statistics result batch.
+fn extract_statistics(batch: &RecordBatch) -> Vec<(String, Option<String>, i16, i64)> {
+    let mut out = Vec::new();
+    let db_schemas_list = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let db_schemas = db_schemas_list.value(0);
+    let db_schemas = db_schemas.as_any().downcast_ref::<StructArray>().unwrap();
+    let stats_list = db_schemas
+        .column_by_name("db_schema_statistics")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    for i in 0..db_schemas.len() {
+        let stats = stats_list.value(i);
+        let stats = stats.as_any().downcast_ref::<StructArray>().unwrap();
+        let table = stats
+            .column_by_name("table_name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let column = stats
+            .column_by_name("column_name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let key = stats
+            .column_by_name("statistic_key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap();
+        let value = stats
+            .column_by_name("statistic_value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UnionArray>()
+            .unwrap();
+        for r in 0..stats.len() {
+            let col = if column.is_null(r) {
+                None
+            } else {
+                Some(column.value(r).to_string())
+            };
+            let v = value.value(r);
+            let v = v.as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+            out.push((table.value(r).to_string(), col, key.value(r), v));
+        }
+    }
+    out
+}
+
+#[test]
+fn get_statistics_reports_real_counts() {
+    use adbc_core::constants::{
+        ADBC_STATISTIC_DISTINCT_COUNT_KEY, ADBC_STATISTIC_NULL_COUNT_KEY,
+        ADBC_STATISTIC_ROW_COUNT_KEY,
+    };
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping get_statistics_reports_real_counts");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    run(
+        &mut connection,
+        "DROP TABLE IF EXISTS AdbcStats; \
+         CREATE TABLE AdbcStats (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
+    );
+    run(
+        &mut connection,
+        "INSERT INTO AdbcStats (Id, Name) VALUES (1, 'a'), (2, 'a'), (3, NULL)",
+    );
+
+    // Exact statistics.
+    let batches = connection
+        .get_statistics(None, None, Some("AdbcStats"), false)
+        .expect("get_statistics")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect statistics");
+    let stats = extract_statistics(&batches[0]);
+    let has = |col: Option<&str>, key: i16, val: i64| {
+        stats
+            .iter()
+            .any(|(t, c, k, v)| t == "AdbcStats" && c.as_deref() == col && *k == key && *v == val)
+    };
+    assert!(
+        has(None, ADBC_STATISTIC_ROW_COUNT_KEY, 3),
+        "row count 3: {stats:?}"
+    );
+    assert!(
+        has(Some("Name"), ADBC_STATISTIC_NULL_COUNT_KEY, 1),
+        "Name null 1: {stats:?}"
+    );
+    assert!(
+        has(Some("Name"), ADBC_STATISTIC_DISTINCT_COUNT_KEY, 1),
+        "Name distinct 1: {stats:?}"
+    );
+    assert!(
+        has(Some("Id"), ADBC_STATISTIC_NULL_COUNT_KEY, 0),
+        "Id null 0: {stats:?}"
+    );
+    assert!(
+        has(Some("Id"), ADBC_STATISTIC_DISTINCT_COUNT_KEY, 3),
+        "Id distinct 3: {stats:?}"
+    );
+
+    // approximate=true yields nothing (Spanner has no cheap statistics).
+    let approx = connection
+        .get_statistics(None, None, Some("AdbcStats"), true)
+        .expect("get_statistics approx")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect approx");
+    assert!(extract_statistics(&approx[0]).is_empty());
+
+    let mut drop = connection.new_statement().expect("new statement");
+    drop.set_sql_query("DROP TABLE AdbcStats").unwrap();
+    drop.execute_update().expect("drop stats table");
 }

@@ -56,14 +56,20 @@ Spanner's model self-skip rather than fail.
   handling, query cancellation, concurrent statements, and result
   independence/invalidation.
 
-**39 tests pass, 3 self-skip.** The `StatementTest` cases are an explicit
-allowlist in `scripts/run-adbc-validation.sh`. The 3 remaining `ConnectionTest`
-skips are features Spanner does not expose:
+**40 tests pass, 2 self-skip.** The `StatementTest` cases are an explicit
+allowlist in `scripts/run-adbc-validation.sh`. The 2 remaining `ConnectionTest`
+skips both hinge on **create-mode ingest**, which Spanner cannot support: every
+table needs a `PRIMARY KEY`, so there is no way to create a table from an
+arbitrary Arrow schema.
 
-| Skipped test | Why | Enable-able? |
-|---|---|---|
-| `MetadataGetTableSchema`, `…Escaping` | gate on create-mode ingest | No — Spanner's mandatory primary key rules out create-mode ingest |
-| `MetadataGetStatisticNames` | `supports_statistics()` | No — Spanner exposes no portable per-table statistics |
+| Skipped test | Why |
+|---|---|
+| `MetadataGetTableSchema` | gated on `supports_bulk_ingest(CREATE)` (uses create-mode ingest to build its fixture) |
+| `MetadataGetTableSchemaEscaping` | same — create-mode ingest of a reserved-word table |
+
+(`MetadataGetStatisticNames` is now gated: `get_statistic_names` returns a valid
+empty catalog — Spanner has no per-column statistics to name, which the suite
+accepts.)
 
 ## Follow-up work: the remaining `StatementTest` cases
 
