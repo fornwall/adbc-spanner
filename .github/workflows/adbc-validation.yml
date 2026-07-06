@@ -1,0 +1,53 @@
+name: ADBC validation
+
+# Runs the canonical Apache Arrow ADBC C++ validation suite against the driver's
+# C ABI (see adbc-validation/). Kept separate from the main CI job because it
+# builds arrow-adbc + GoogleTest from source, which is slower than the Rust tests.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validation:
+    runs-on: ubuntu-latest
+
+    # A Spanner emulator to validate against, same as the main CI job.
+    services:
+      spanner:
+        image: gcr.io/cloud-spanner-emulator/emulator
+        ports:
+          - 9010:9010
+          - 9020:9020
+
+    env:
+      SPANNER_EMULATOR_HOST: localhost:9010
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Wait for the Spanner emulator
+        run: |
+          # Gate on a real admin-API response, not just the gRPC TCP port (which
+          # opens ~1s early); the run script creates the instance/database over
+          # this REST API.
+          for _ in $(seq 1 60); do
+            if [ "$(curl -s -o /dev/null -w '%{http_code}' \
+                http://localhost:9020/v1/projects/emulator/instanceConfigs)" = "200" ]; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Spanner emulator admin API did not become ready" >&2
+          exit 1
+
+      - name: Run the ADBC C++ validation suite (gated subset)
+        run: scripts/run-adbc-validation.sh

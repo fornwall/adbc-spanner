@@ -14,7 +14,7 @@ keywords = ["adbc", "arrow", "spanner", "database", "gcp"]
 categories = ["database", "api-bindings"]
 # Keep the published package to what a consumer needs; CI, scripts and the crate lock
 # are not useful to downstream builds.
-exclude = [".github/", "scripts/", "/fuzz", "/Cargo.lock"]
+exclude = [".github/", "scripts/", "/fuzz", "/adbc-validation", "/Cargo.lock"]
 
 [package.metadata.docs.rs]
 # Document the FFI entrypoint too.
