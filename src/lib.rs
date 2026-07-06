@@ -65,6 +65,7 @@ mod info;
 mod objects;
 mod runtime;
 mod statement;
+mod statistics;
 
 pub use connection::SpannerConnection;
 pub use driver::{SpannerDatabase, SpannerDriver};

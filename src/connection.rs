@@ -283,6 +283,148 @@ impl SpannerConnection {
             Ok::<bool, Error>(batch.num_rows() > 0)
         })
     }
+
+    /// Compute exact statistics for the base tables matching the `LIKE` filters: `ROW_COUNT` per
+    /// table, and `NULL_COUNT` (+ `DISTINCT_COUNT` for groupable types) per column.
+    fn collect_statistics(
+        &self,
+        db_schema: Option<&str>,
+        table_name: Option<&str>,
+    ) -> Result<Vec<crate::statistics::SchemaStatistics>> {
+        let client = self.client.clone();
+        let (table_batch, column_batch) =
+            block_on_cancellable(&self.runtime, &self.cancel, async move {
+                let tables = query_batch(
+                    &client,
+                    "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
+                     WHERE TABLE_TYPE = 'BASE TABLE'",
+                )
+                .await?;
+                let columns = query_batch(
+                    &client,
+                    "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, SPANNER_TYPE \
+                     FROM INFORMATION_SCHEMA.COLUMNS \
+                     ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION",
+                )
+                .await?;
+                Ok::<_, Error>((tables, columns))
+            })?;
+
+        let (ts, tn) = (str_col(&table_batch, 0)?, str_col(&table_batch, 1)?);
+        let (cts, ctn, ccn, ctype) = (
+            str_col(&column_batch, 0)?,
+            str_col(&column_batch, 1)?,
+            str_col(&column_batch, 2)?,
+            str_col(&column_batch, 3)?,
+        );
+
+        let mut schemas: Vec<crate::statistics::SchemaStatistics> = Vec::new();
+        for r in 0..table_batch.num_rows() {
+            let schema = ts.value(r);
+            let table = tn.value(r);
+            if db_schema.is_some_and(|p| !like_match(p, schema)) {
+                continue;
+            }
+            if table_name.is_some_and(|p| !like_match(p, table)) {
+                continue;
+            }
+            // (column name, whether its type is groupable → distinct-countable), in ordinal order.
+            let columns: Vec<(String, bool)> = (0..column_batch.num_rows())
+                .filter(|&c| cts.value(c) == schema && ctn.value(c) == table)
+                .map(|c| (ccn.value(c).to_string(), is_groupable(ctype.value(c))))
+                .collect();
+            let stats = self.table_statistics(schema, table, &columns)?;
+            match schemas.iter_mut().find(|s| s.db_schema == schema) {
+                Some(s) => s.statistics.extend(stats),
+                None => schemas.push(crate::statistics::SchemaStatistics {
+                    db_schema: schema.to_string(),
+                    statistics: stats,
+                }),
+            }
+        }
+        Ok(schemas)
+    }
+
+    /// Run one aggregate scan over `table`, returning its `ROW_COUNT` and per-column `NULL_COUNT`
+    /// (and `DISTINCT_COUNT` for groupable columns).
+    fn table_statistics(
+        &self,
+        schema: &str,
+        table: &str,
+        columns: &[(String, bool)],
+    ) -> Result<Vec<crate::statistics::Statistic>> {
+        use adbc_core::constants::{
+            ADBC_STATISTIC_DISTINCT_COUNT_KEY, ADBC_STATISTIC_NULL_COUNT_KEY,
+            ADBC_STATISTIC_ROW_COUNT_KEY,
+        };
+
+        // Build one SELECT computing every count in a single scan; `plan` maps each result column
+        // after the row count to its (column, statistic key).
+        let mut exprs = vec!["COUNT(*)".to_string()];
+        let mut plan: Vec<(String, i16)> = Vec::new();
+        for (name, groupable) in columns {
+            let quoted = format!("`{}`", name.replace('`', "``"));
+            exprs.push(format!("COUNTIF({quoted} IS NULL)"));
+            plan.push((name.clone(), ADBC_STATISTIC_NULL_COUNT_KEY));
+            if *groupable {
+                exprs.push(format!("COUNT(DISTINCT {quoted})"));
+                plan.push((name.clone(), ADBC_STATISTIC_DISTINCT_COUNT_KEY));
+            }
+        }
+        let sql = format!(
+            "SELECT {} FROM {}",
+            exprs.join(", "),
+            qualified_table(Some(schema), table)
+        );
+        let client = self.client.clone();
+        let batch = block_on_cancellable(&self.runtime, &self.cancel, async move {
+            let transaction = client.single_use().build();
+            let result_set = transaction
+                .execute_query(SpannerSql::builder(sql).build())
+                .await
+                .map_err(from_spanner)?;
+            let (_schema, batch) = result_set_to_batch(result_set).await?;
+            Ok::<_, Error>(batch)
+        })?;
+
+        // The aggregate query always yields exactly one row of `Int64` counts.
+        let value = |index: usize| -> Result<i64> {
+            batch
+                .column(index)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .filter(|a| a.len() == 1)
+                .map(|a| a.value(0))
+                .ok_or_else(|| {
+                    err(
+                        "statistic aggregate is not a single integer",
+                        Status::Internal,
+                    )
+                })
+        };
+        let mut out = vec![crate::statistics::Statistic {
+            table: table.to_string(),
+            column: None,
+            key: ADBC_STATISTIC_ROW_COUNT_KEY,
+            value: value(0)?,
+        }];
+        for (index, (column, key)) in plan.into_iter().enumerate() {
+            out.push(crate::statistics::Statistic {
+                table: table.to_string(),
+                column: Some(column),
+                key,
+                value: value(index + 1)?,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Whether a Spanner column type supports `COUNT(DISTINCT)`. `ARRAY`, `STRUCT` and `JSON` are not
+/// groupable, so distinct counts are skipped for them.
+fn is_groupable(spanner_type: &str) -> bool {
+    let t = spanner_type.trim_start();
+    !(t.starts_with("ARRAY") || t.starts_with("STRUCT") || t == "JSON")
 }
 
 /// Apply DML `statements` atomically in one read/write transaction via Spanner's `ExecuteBatchDml`
@@ -755,18 +897,32 @@ impl Connection for SpannerConnection {
         )))
     }
 
-    /// Spanner exposes no portable per-table statistics, so this returns an empty (but correctly
-    /// typed) result set.
+    /// Table/column statistics, computed exactly from aggregate scans (`ROW_COUNT`, and per column
+    /// `NULL_COUNT` and `DISTINCT_COUNT`). Name arguments are ADBC `LIKE` patterns.
+    ///
+    /// Spanner keeps no cheap/pre-computed statistics, so an `approximate` request returns nothing
+    /// rather than triggering the expensive exact scans; pass `approximate = false` to compute them.
     fn get_statistics(
         &self,
-        _catalog: Option<&str>,
-        _db_schema: Option<&str>,
-        _table_name: Option<&str>,
-        _approximate: bool,
+        catalog: Option<&str>,
+        db_schema: Option<&str>,
+        table_name: Option<&str>,
+        approximate: bool,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+        let out_schema = adbc_core::schemas::GET_STATISTICS_SCHEMA.clone();
+        // Spanner is a single unnamed catalog (""); a catalog filter that excludes it yields nothing.
+        if catalog.is_some_and(|c| !like_match(c, "")) {
+            return Ok(Box::new(RecordBatchIterator::new(Vec::new(), out_schema)));
+        }
+        let schemas = if approximate {
+            Vec::new()
+        } else {
+            self.collect_statistics(db_schema, table_name)?
+        };
+        let batch = crate::statistics::build(schemas, out_schema.clone())?;
         Ok(Box::new(RecordBatchIterator::new(
-            Vec::new(),
-            adbc_core::schemas::GET_STATISTICS_SCHEMA.clone(),
+            vec![Ok(batch)],
+            out_schema,
         )))
     }
 

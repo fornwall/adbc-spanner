@@ -37,8 +37,11 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
 - Bulk ingest: set `adbc.ingest.target_table`, bind an Arrow batch, and `execute_update` inserts the
   rows into that table in one transaction.
 - Metadata: `get_table_types()`, `get_table_schema()`, and `get_objects()` (catalog/schema/table/
-  column introspection from `INFORMATION_SCHEMA`). `get_statistics`/`get_statistic_names` return
-  empty results — Spanner exposes no portable per-table statistics.
+  column introspection from `INFORMATION_SCHEMA`).
+- Statistics: `get_statistics()` computes exact table/column counts with one aggregate scan per table
+  — `ROW_COUNT`, and per column `NULL_COUNT` (plus `DISTINCT_COUNT` for groupable types). Spanner has
+  no cheap pre-computed statistics, so an `approximate` request returns nothing rather than scanning;
+  `get_statistic_names` is empty (Spanner has no custom named statistics).
 - `execute_schema()`: a query's result schema without running it (via `QueryMode::Plan`), so tools
   can introspect output columns — including a top-level `WITH` — with no data scan.
 
