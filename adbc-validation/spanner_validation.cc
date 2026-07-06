@@ -47,7 +47,22 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   // an ordinary ExecuteQuery of a DROP/CREATE works here.
   AdbcStatusCode DropTable(struct AdbcConnection* connection, const std::string& name,
                            struct AdbcError* error) const override {
-    return RunIgnoringResult(connection, "DROP TABLE IF EXISTS `" + name + "`", error);
+    return RunIgnoringResult(connection, "DROP TABLE IF EXISTS " + Qualified(name, ""),
+                             error);
+  }
+
+  AdbcStatusCode DropTable(struct AdbcConnection* connection, const std::string& name,
+                           const std::string& db_schema,
+                           struct AdbcError* error) const override {
+    return RunIgnoringResult(
+        connection, "DROP TABLE IF EXISTS " + Qualified(name, db_schema), error);
+  }
+
+  // Spanner has named schemas (CREATE SCHEMA), so db-schema-scoped metadata can be tested.
+  AdbcStatusCode EnsureDbSchema(struct AdbcConnection* connection, const std::string& name,
+                                struct AdbcError* error) const override {
+    return RunIgnoringResult(connection, "CREATE SCHEMA IF NOT EXISTS `" + name + "`",
+                             error);
   }
 
   // The suite's fixed two-column sample table (int64s INT64, strings STRING).
@@ -56,23 +71,21 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   AdbcStatusCode CreateSampleTable(struct AdbcConnection* connection,
                                    const std::string& name,
                                    struct AdbcError* error) const override {
-    RAISE_ADBC(RunIgnoringResult(
-        connection,
-        "CREATE TABLE `" + name +
-            "` (int64s INT64, strings STRING(MAX)) PRIMARY KEY (int64s)",
-        error));
-    return RunIgnoringResult(connection,
-                             "INSERT INTO `" + name +
-                                 "` (int64s, strings) VALUES "
-                                 "(42, 'foo'), (-42, NULL), (NULL, '')",
-                             error);
+    return CreateSampleTable(connection, name, "", error);
   }
 
   AdbcStatusCode CreateSampleTable(struct AdbcConnection* connection,
                                    const std::string& name, const std::string& schema,
                                    struct AdbcError* error) const override {
-    if (!schema.empty()) return ADBC_STATUS_NOT_IMPLEMENTED;
-    return CreateSampleTable(connection, name, error);
+    const std::string table = Qualified(name, schema);
+    RAISE_ADBC(RunIgnoringResult(
+        connection,
+        "CREATE TABLE " + table + " (int64s INT64, strings STRING(MAX)) PRIMARY KEY (int64s)",
+        error));
+    return RunIgnoringResult(connection,
+                             "INSERT INTO " + table +
+                                 " (int64s, strings) VALUES (42, 'foo'), (-42, NULL), (NULL, '')",
+                             error);
   }
 
   std::optional<std::string> PrimaryKeyTableDdl(std::string_view name) const override {
@@ -122,6 +135,12 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   std::string db_schema() const override { return ""; }
 
  private:
+  // Backtick-quote a table name, optionally qualified by a named schema.
+  static std::string Qualified(const std::string& name, const std::string& schema) {
+    if (schema.empty()) return "`" + name + "`";
+    return "`" + schema + "`.`" + name + "`";
+  }
+
   // Execute a statement purely for its side effect (DDL/DML), discarding any result.
   static AdbcStatusCode RunIgnoringResult(struct AdbcConnection* connection,
                                           const std::string& sql,
