@@ -31,7 +31,8 @@ use std::sync::Arc;
 use adbc_core::error::{Result, Status};
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int64Array, ListArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
+    Int64Array, ListArray, RecordBatch, RecordBatchReader, StringArray, StructArray,
+    TimestampMicrosecondArray,
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
@@ -40,6 +41,7 @@ use google_cloud_spanner::result::{ResultSet, ResultSetMetadata, Row};
 use google_cloud_spanner::value::{Kind, Type, TypeCode, Value};
 
 use crate::error::{err, from_spanner};
+use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
 
 /// Field name used for the element of an Arrow `List` (the Arrow convention).
 const LIST_ITEM: &str = "item";
@@ -62,6 +64,97 @@ pub(crate) async fn result_set_to_batch(mut rs: ResultSet) -> Result<(SchemaRef,
     let schema = build_schema(rs.metadata(), rows.first());
     let batch = build_batch(schema.clone(), &rows)?;
     Ok((schema, batch))
+}
+
+/// Pull up to `max` rows from a Spanner result set, stopping early when the stream ends.
+async fn pull_chunk(rs: &mut ResultSet, max: usize) -> Result<Vec<Row>> {
+    let mut rows = Vec::with_capacity(max);
+    while rows.len() < max {
+        match rs.next().await {
+            Some(row) => rows.push(row.map_err(from_spanner)?),
+            None => break,
+        }
+    }
+    Ok(rows)
+}
+
+/// Wrap a Spanner [`ResultSet`] as a streaming Arrow [`RecordBatchReader`].
+///
+/// The first chunk of rows is pulled here (Spanner delivers the column metadata with the first
+/// partial result set, so this also settles the schema), and the reader yields the rest lazily,
+/// converting one bounded chunk to Arrow per [`Iterator::next`] rather than materialising the whole
+/// result up front. Each chunk fetch is cancellable via the shared [`CancelSignal`].
+pub(crate) async fn stream_query(
+    runtime: SharedRuntime,
+    cancel: CancelSignal,
+    mut rs: ResultSet,
+    batch_size: usize,
+) -> Result<SpannerBatchReader> {
+    let first = pull_chunk(&mut rs, batch_size).await?;
+    let schema = build_schema(rs.metadata(), first.first());
+    Ok(SpannerBatchReader {
+        runtime,
+        cancel,
+        schema,
+        result_set: Some(rs),
+        first: Some(first),
+        batch_size,
+    })
+}
+
+/// A streaming [`RecordBatchReader`] over a Spanner [`ResultSet`].
+///
+/// Rows are fetched from the server and converted to Arrow in bounded chunks of `batch_size`, so a
+/// large result set is never fully held in memory — at most one chunk of [`Row`]s plus the Arrow
+/// batch built from it. The ADBC traits are synchronous, so each `next` bridges to the async client
+/// with a cancellable `block_on`.
+pub(crate) struct SpannerBatchReader {
+    runtime: SharedRuntime,
+    cancel: CancelSignal,
+    schema: SchemaRef,
+    /// The live result set; `None` once the stream is exhausted or a chunk fetch errored.
+    result_set: Option<ResultSet>,
+    /// The first chunk of rows, fetched up front to settle the schema; emitted on the first `next`.
+    first: Option<Vec<Row>>,
+    batch_size: usize,
+}
+
+/// Surface a driver error to a `RecordBatchReader` consumer, whose only error channel is
+/// [`ArrowError`] (this preserves the message and, via the source chain, the ADBC status).
+fn to_arrow_error(e: adbc_core::error::Error) -> ArrowError {
+    ArrowError::ExternalError(Box::new(e))
+}
+
+impl Iterator for SpannerBatchReader {
+    type Item = std::result::Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Emit the prefetched first chunk (which settled the schema) before pulling any more. This
+        // also yields the single (possibly empty) batch of a small or empty result, matching the
+        // one-batch shape callers previously saw.
+        if let Some(rows) = self.first.take() {
+            return Some(build_batch(self.schema.clone(), &rows).map_err(to_arrow_error));
+        }
+        let rs = self.result_set.as_mut()?;
+        match block_on_cancellable(&self.runtime, &self.cancel, pull_chunk(rs, self.batch_size)) {
+            // An empty chunk means the stream is drained; drop the result set and stop.
+            Ok(rows) if rows.is_empty() => {
+                self.result_set = None;
+                None
+            }
+            Ok(rows) => Some(build_batch(self.schema.clone(), &rows).map_err(to_arrow_error)),
+            Err(e) => {
+                self.result_set = None;
+                Some(Err(to_arrow_error(e)))
+            }
+        }
+    }
+}
+
+impl RecordBatchReader for SpannerBatchReader {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
 }
 
 /// Build the Arrow schema for a result set from Spanner's column metadata, falling back to

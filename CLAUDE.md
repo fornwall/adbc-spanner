@@ -36,10 +36,12 @@ SpannerDriver ──▶ SpannerDatabase ──▶ SpannerConnection ──▶ Sp
   endpoint, emulator, `SPANNER_EMULATOR_HOST`) and building the Spanner `DatabaseClient`.
 - `src/connection.rs` — `SpannerConnection`: transaction mode (autocommit default or manual
   buffer-and-commit), `get_table_types` / `get_table_schema`.
-- `src/statement.rs` — `execute` (query → Arrow), `execute_update` (DML/DDL, incl. `;`-batches and
-  bound params), `execute_schema` (PLAN-only schema), parameter binding / bulk ingest.
+- `src/statement.rs` — `execute` (query → streaming Arrow reader), `execute_update` (DML/DDL, incl.
+  `;`-batches and bound params), `execute_schema` (PLAN-only schema), parameter binding / bulk
+  ingest.
 - `src/conversion.rs` — Spanner result set → Arrow schema + typed arrays (the type mapping lives
-  here).
+  here), plus `SpannerBatchReader`, the streaming `RecordBatchReader` that `execute` returns (pulls
+  rows in bounded chunks of `adbc.spanner.rows_per_batch`, default 8192).
 - `src/runtime.rs` — a shared Tokio runtime; the ADBC traits are sync while the Spanner client is
   async, so every call bridges via `runtime.block_on(...)`. The runtime is created once by the
   driver and shared via `Arc` into every database/connection/statement.
@@ -138,7 +140,9 @@ building and attaching the binaries. They do not overlap.
 ## Conventions / gotchas
 
 - Match surrounding style; keep `fmt`/`clippy` clean (CI fails otherwise).
-- Supported so far: queries, DML, DDL (via admin `UpdateDatabaseDdl`), manual transactions
+- Supported so far: streaming queries (`execute` returns a lazy `SpannerBatchReader` that converts
+  bounded row chunks to Arrow on demand; chunk size via `adbc.spanner.rows_per_batch`), DML, DDL (via
+  admin `UpdateDatabaseDdl`), manual transactions
   (buffer-and-commit), native Arrow types for DATE/TIMESTAMP/NUMERIC and native `List`/`Struct` for
   ARRAY/STRUCT, parameter binding + bulk ingest, `get_info` (static driver/vendor metadata),
   `get_objects` (incl. foreign-key `constraint_column_usage`), `get_table_types`/`get_table_schema`,
