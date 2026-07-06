@@ -28,17 +28,20 @@ FULL=0
 [ "${1:-}" = "--full" ] && FULL=1
 
 # The gated subset. DatabaseTest + ConnectionTest pass in full (lifecycle +
-# metadata). From StatementTest we gate the cases that pass cleanly today, as an
-# explicit allowlist rather than an exclude list: the remaining cases fail in
-# ways that abort the process (the upstream adbc_ffi error release is not
-# idempotent, so an error-path assertion double-frees), so a negative filter
-# could not stay green. The excluded cases are documented in the README.
+# metadata). From StatementTest we gate the cases that pass cleanly, as an
+# explicit allowlist rather than an exclude list: the remaining cases are genuine
+# Spanner-model / suite-portability gaps (documented in the README), and an
+# allowlist keeps the gate meaningful without tracking every non-applicable case.
 GATED_FILTER='SpannerDatabaseTest.*:SpannerConnectionTest.*'
 GATED_FILTER+=':SpannerStatementTest.NewInit'
 GATED_FILTER+=':SpannerStatementTest.Release'
 GATED_FILTER+=':SpannerStatementTest.SqlPrepareGetParameterSchema'
+GATED_FILTER+=':SpannerStatementTest.SqlPrepareSelectNoParams'
 GATED_FILTER+=':SpannerStatementTest.SqlPrepareUpdateNoParams'
+GATED_FILTER+=':SpannerStatementTest.SqlPrepareErrorNoQuery'
 GATED_FILTER+=':SpannerStatementTest.SqlPrepareErrorParamCountMismatch'
+GATED_FILTER+=':SpannerStatementTest.SqlQueryInts'
+GATED_FILTER+=':SpannerStatementTest.SqlQueryStrings'
 GATED_FILTER+=':SpannerStatementTest.SqlQueryErrors'
 GATED_FILTER+=':SpannerStatementTest.SqlSchemaInts'
 GATED_FILTER+=':SpannerStatementTest.SqlSchemaStrings'

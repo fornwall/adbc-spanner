@@ -376,9 +376,14 @@ impl Statement for SpannerStatement {
     }
 
     fn prepare(&mut self) -> Result<()> {
-        // Spanner prepares/plans statements server-side on execution, so there is nothing to do
-        // beyond the ADBC precondition that a query must have been set first.
-        self.sql()?;
+        // ADBC requires InvalidState when there is nothing to prepare. Otherwise this is a no-op:
+        // Spanner prepares/plans statements server-side on execution, so preparing a set query — or
+        // a bulk-ingest target (which needs no SQL) — has nothing to do here.
+        if self.sql.is_none() && self.target_table.is_none() {
+            return Err(invalid_state(
+                "cannot prepare: no SQL query set on statement; call set_sql_query first",
+            ));
+        }
         Ok(())
     }
 
