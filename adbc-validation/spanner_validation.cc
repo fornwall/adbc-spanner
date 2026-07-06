@@ -8,8 +8,10 @@
 //   SPANNER_EMULATOR_HOST  (read by the driver itself) selects the emulator
 //
 // `SpannerQuirks` describes Spanner's capabilities to the suite so tests that do
-// not apply to Spanner's model (temp tables, views, statistics, create-mode
-// ingest, ...) self-skip rather than fail.
+// not apply to Spanner's model (temp tables, statistics, current-catalog
+// metadata, Arrow view types on ingest, create-mode ingest, ...) self-skip
+// rather than fail. (Spanner *does* support SQL views; the driver reports them
+// in get_table_types.)
 
 #include <cstdlib>
 #include <cstring>
@@ -144,6 +146,8 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   bool supports_transactions() const override { return true; }
   bool supports_metadata_current_catalog() const override { return false; }
   bool supports_metadata_current_db_schema() const override { return false; }
+  // Arrow view *types* (Utf8View/BinaryView memory layouts) on ingest — unrelated
+  // to SQL views, which Spanner does support.
   bool supports_ingest_view_types() const override { return false; }
   bool supports_ingest_float16() const override { return false; }
 
