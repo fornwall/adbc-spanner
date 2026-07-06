@@ -97,8 +97,21 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # One checksums file over every platform archive, so downstream
+          # consumers can pin the driver by hash instead of trusting a mutable
+          # release tag (verify with `sha256sum -c SHA256SUMS`). The glob matches
+          # only the archives, never the SHA256SUMS file itself.
+          sha256sum adbc-spanner-* > SHA256SUMS
+          echo "Published checksums:"
+          cat SHA256SUMS
+
       - name: Publish release assets
         uses: softprops/action-gh-release@v3
         with:
+          # dist/* now also includes the generated SHA256SUMS file.
           files: dist/*
           generate_release_notes: true
