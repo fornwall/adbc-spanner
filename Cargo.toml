@@ -46,8 +46,9 @@ default = ["ffi"]
 # driver manager (any language) can load. Disable for a pure-Rust rlib dependency.
 ffi = ["dep:adbc_ffi"]
 # Exposes internal parsing helpers under `adbc_spanner::fuzzing` for the fuzz targets.
-# Not a stable API; used only by the `fuzz/` crate.
-fuzzing = []
+# Not a stable API; used only by the `fuzz/` crate. Pulls in `arbitrary` so the
+# option-fuzzing entry point can take a derived-`Arbitrary` input type.
+fuzzing = ["dep:arbitrary"]
 
 [dependencies]
 # The abstract ADBC driver traits (Driver / Database / Connection / Statement).
@@ -81,6 +82,8 @@ serde_json = "1"
 base64 = "0.22"
 # Parsing Spanner's string-encoded DATE / TIMESTAMP values into Arrow Date32 / Timestamp.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# Only pulled in by the `fuzzing` feature: derives `Arbitrary` for the option-fuzz input type.
+arbitrary = { version = "1", features = ["derive"], optional = true }
 
 # Lints applied in local dev too (CI additionally runs `clippy -D warnings`).
 [lints.rust]

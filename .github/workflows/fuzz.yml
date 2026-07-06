@@ -1,15 +1,16 @@
 name: Fuzz
 
 # Fuzzing is expensive, so it runs on a schedule (and on demand) rather than on every push.
-# Each target gets a short smoke run; the corpus is not persisted here.
+# Each target seeds from the committed fuzz/seeds/<target> corpus; the generated corpus is not
+# persisted between runs.
 on:
   schedule:
-    - cron: "0 3 * * 1" # Mondays 03:00 UTC
+    - cron: "0 3 * * *" # daily at 03:00 UTC
   workflow_dispatch:
     inputs:
       max_total_time:
         description: "Seconds to fuzz each target"
-        default: "120"
+        default: "1200"
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [sql, values, like]
+        target: [sql, values, like, options]
     steps:
       - uses: actions/checkout@v7
 
@@ -39,10 +40,18 @@ jobs:
         # cargo-fuzz defaults the fuzz target to its own build triple. The prebuilt
         # binary from install-action is musl-static, and sanitizers are incompatible
         # with a statically linked libc, so pin the target to the host gnu triple.
+        #
+        # New units are written to the (ephemeral, gitignored) corpus dir listed first;
+        # the committed seed corpus is passed read-alongside so short runs start with
+        # meaningful coverage. Not every target has seeds (e.g. `options`).
         run: |
+          mkdir -p "fuzz/corpus/${{ matrix.target }}"
+          seeds="fuzz/seeds/${{ matrix.target }}"
+          [ -d "$seeds" ] || seeds=""
           cargo +nightly fuzz run ${{ matrix.target }} \
-            --target x86_64-unknown-linux-gnu -- \
-            -max_total_time=${{ github.event.inputs.max_total_time || '120' }} \
+            --target x86_64-unknown-linux-gnu \
+            "fuzz/corpus/${{ matrix.target }}" $seeds -- \
+            -max_total_time=${{ github.event.inputs.max_total_time || '1200' }} \
             -rss_limit_mb=4096
 
       - name: Upload any crash artifacts
