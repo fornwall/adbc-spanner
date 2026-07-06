@@ -13,11 +13,9 @@ use adbc_core::{Optionable, PartitionedResult, Statement};
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 use google_cloud_lro::Poller as _;
-use google_cloud_spanner::builder::BatchDmlBuilder;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::model::execute_sql_request::QueryMode;
 use google_cloud_spanner::statement::Statement as SpannerSql;
-use google_cloud_spanner::transaction::ReadWriteTransaction;
 
 use crate::bind;
 use crate::connection::SharedTxn;
@@ -91,36 +89,25 @@ impl SpannerStatement {
         Ok(statements)
     }
 
-    /// Execute a set of DML statements atomically in one read/write transaction via Spanner's
-    /// `ExecuteBatchDml`, returning the total affected-row count. Retry-safe: the statement list is
-    /// cloned per attempt.
-    fn run_statements(&self, statements: Vec<SpannerSql>) -> Result<i64> {
-        if statements.is_empty() {
-            return Ok(0);
+    /// Apply DML `statements` honouring the connection's transaction mode.
+    ///
+    /// In autocommit mode they run immediately in one atomic read/write transaction and the
+    /// affected-row count is returned. In manual mode they are buffered for the next `commit` and
+    /// `None` is returned (the count is unknown until commit). Routing every DML form — plain
+    /// `;`-batches, parameterized DML and bulk ingest — through here keeps them all consistent with
+    /// the buffer-and-commit model.
+    fn run_or_buffer(&self, statements: Vec<SpannerSql>) -> Result<Option<i64>> {
+        {
+            let mut txn = self.txn.lock().unwrap();
+            if !txn.autocommit() {
+                for statement in statements {
+                    txn.buffer(statement);
+                }
+                return Ok(None);
+            }
         }
-        let client = self.client.clone();
-        self.runtime.block_on(async move {
-            let runner = client
-                .read_write_transaction()
-                .build()
-                .await
-                .map_err(from_spanner)?;
-            let outcome = runner
-                .run(move |transaction: ReadWriteTransaction| {
-                    let statements = statements.clone();
-                    async move {
-                        let mut batch = BatchDmlBuilder::new();
-                        for statement in statements {
-                            batch = batch.add_statement(statement);
-                        }
-                        let counts = transaction.execute_batch_update(batch.build()).await?;
-                        Ok(counts.into_iter().sum::<i64>())
-                    }
-                })
-                .await
-                .map_err(from_spanner)?;
-            Ok::<i64, Error>(outcome.result)
-        })
+        let count = crate::connection::run_batch_dml(&self.runtime, &self.client, statements)?;
+        Ok(Some(count))
     }
 
     /// Run a parameterized query once per bound row, concatenating the result batches.
@@ -292,13 +279,14 @@ impl Statement for SpannerStatement {
                 return Err(invalid_state("cannot ingest: the connection is read-only"));
             }
             let statements = self.build_ingest_statements(&table)?;
-            return Ok(Some(self.run_statements(statements)?));
+            return self.run_or_buffer(statements);
         }
 
         let sql = self.sql()?;
         if crate::ddl::is_ddl(&sql) {
             self.run_ddl(crate::ddl::split_statements(&sql))?;
-            // DDL does not report an affected-row count.
+            // DDL does not report an affected-row count (and is never transactional in Spanner, so
+            // it always runs immediately rather than buffering).
             return Ok(None);
         }
         if self.read_only {
@@ -306,31 +294,19 @@ impl Statement for SpannerStatement {
                 "cannot execute DML: the connection is read-only",
             ));
         }
-        // Parameterized DML: apply every bound row atomically in one transaction.
-        if !self.bound.is_empty() {
-            let statements = self.build_bound_statements(&sql)?;
-            return Ok(Some(self.run_statements(statements)?));
-        }
-        // Split a `;`-separated batch (e.g. dbt's DELETE; INSERT) into individual statements so the
-        // whole batch runs atomically in one transaction.
-        let parts = crate::ddl::split_statements(&sql);
-        // In manual transaction mode, buffer for atomic apply on commit; the affected-row count is
-        // not known until then.
-        {
-            let mut txn = self.txn.lock().unwrap();
-            if !txn.autocommit() {
-                for part in parts {
-                    txn.buffer(part);
-                }
-                return Ok(None);
-            }
-        }
-        // Autocommit: run the whole batch atomically via ExecuteBatchDml.
-        let statements: Vec<SpannerSql> = parts
-            .into_iter()
-            .map(|s| SpannerSql::builder(s).build())
-            .collect();
-        Ok(Some(self.run_statements(statements)?))
+        // Build the statements to apply: one per bound row for parameterized DML, otherwise a
+        // `;`-separated batch (e.g. dbt's DELETE; INSERT) split into individual statements so the
+        // whole batch is applied atomically. `run_or_buffer` then either runs them (autocommit) or
+        // buffers them for commit (manual mode).
+        let statements = if !self.bound.is_empty() {
+            self.build_bound_statements(&sql)?
+        } else {
+            crate::ddl::split_statements(&sql)
+                .into_iter()
+                .map(|s| SpannerSql::builder(s).build())
+                .collect()
+        };
+        self.run_or_buffer(statements)
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {
