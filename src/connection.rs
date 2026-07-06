@@ -18,14 +18,14 @@
 //! - Queries (`execute`) and DDL always run immediately (DDL is never transactional in Spanner), so
 //!   a query does not observe DML buffered earlier in the same manual transaction.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection, OptionValue};
 use adbc_core::{Connection, Optionable};
 use arrow_array::{
-    ArrayRef, Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
+    Array, ArrayRef, Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema};
 use google_cloud_spanner::builder::BatchDmlBuilder;
@@ -118,8 +118,14 @@ impl SpannerConnection {
         let populate_columns = matches!(depth, ObjectDepth::All | ObjectDepth::Columns);
         let client = self.client.clone();
 
-        let (schema_batch, table_batch, column_batch, constraint_batch, key_column_batch) =
-            self.runtime.block_on(async move {
+        let (
+            schema_batch,
+            table_batch,
+            column_batch,
+            constraint_batch,
+            key_column_batch,
+            referential_batch,
+        ) = self.runtime.block_on(async move {
             let schemas =
                 query_batch(&client, "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA").await?;
             let tables = if populate_tables {
@@ -148,8 +154,11 @@ impl SpannerConnection {
             };
             // Constraints (primary/foreign/unique/check) and their key columns, populated at the
             // same depth as columns. KEY_COLUMN_USAGE covers the key-based constraints; its rows are
-            // ordered so each constraint's columns come out in key order.
-            let (constraints, key_columns) = if populate_columns {
+            // ordered so each constraint's columns come out in key order. For foreign keys,
+            // REFERENTIAL_CONSTRAINTS maps the FK to the referenced unique/primary-key constraint,
+            // whose own KEY_COLUMN_USAGE rows give the referenced (parent) columns in order — the
+            // ordering CONSTRAINT_COLUMN_USAGE does not preserve.
+            let (constraints, key_columns, referential) = if populate_columns {
                 (
                     Some(
                         query_batch(
@@ -162,17 +171,28 @@ impl SpannerConnection {
                     Some(
                         query_batch(
                             &client,
-                            "SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, COLUMN_NAME \
+                            "SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, TABLE_SCHEMA, TABLE_NAME, \
+                             COLUMN_NAME, CAST(ORDINAL_POSITION AS STRING), \
+                             CAST(POSITION_IN_UNIQUE_CONSTRAINT AS STRING) \
                              FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE \
                              ORDER BY CONSTRAINT_SCHEMA, CONSTRAINT_NAME, ORDINAL_POSITION",
                         )
                         .await?,
                     ),
+                    Some(
+                        query_batch(
+                            &client,
+                            "SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, UNIQUE_CONSTRAINT_SCHEMA, \
+                             UNIQUE_CONSTRAINT_NAME \
+                             FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS",
+                        )
+                        .await?,
+                    ),
                 )
             } else {
-                (None, None)
+                (None, None, None)
             };
-            Ok::<_, Error>((schemas, tables, columns, constraints, key_columns))
+            Ok::<_, Error>((schemas, tables, columns, constraints, key_columns, referential))
         })?;
 
         let schema_names = str_col(&schema_batch, 0)?;
@@ -204,10 +224,13 @@ impl SpannerConnection {
                         Some(cb) => collect_columns(cb, schema_name, name, column_name)?,
                         None => Vec::new(),
                     };
-                    let constraints = match (&constraint_batch, &key_column_batch) {
-                        (Some(cb), Some(kb)) => collect_constraints(cb, kb, schema_name, name)?,
-                        _ => Vec::new(),
-                    };
+                    let constraints =
+                        match (&constraint_batch, &key_column_batch, &referential_batch) {
+                            (Some(cb), Some(kb), Some(rb)) => {
+                                collect_constraints(cb, kb, rb, schema_name, name)?
+                            }
+                            _ => Vec::new(),
+                        };
                     tables.push(crate::objects::Table {
                         name: name.to_string(),
                         table_type: ttype,
@@ -346,10 +369,12 @@ fn collect_columns(
 }
 
 /// Assemble the constraints for one table from `INFORMATION_SCHEMA.TABLE_CONSTRAINTS` (one row per
-/// constraint) and `KEY_COLUMN_USAGE` (one row per key column, already ordered by key position).
+/// constraint), `KEY_COLUMN_USAGE` (one row per key column, ordered by key position) and, for
+/// foreign keys, `REFERENTIAL_CONSTRAINTS` (mapping each FK to the referenced unique constraint).
 fn collect_constraints(
     constraints: &RecordBatch,
     key_columns: &RecordBatch,
+    referential: &RecordBatch,
     schema: &str,
     table: &str,
 ) -> Result<Vec<crate::objects::Constraint>> {
@@ -359,11 +384,11 @@ fn collect_constraints(
         str_col(constraints, 2)?,
         str_col(constraints, 3)?,
     );
-    // KEY_COLUMN_USAGE: CONSTRAINT_SCHEMA, CONSTRAINT_NAME, COLUMN_NAME.
+    // KEY_COLUMN_USAGE columns 0..7: CONSTRAINT_SCHEMA, CONSTRAINT_NAME, .., COLUMN_NAME (index 4).
     let (kcs, kcn, kcol) = (
         str_col(key_columns, 0)?,
         str_col(key_columns, 1)?,
-        str_col(key_columns, 2)?,
+        str_col(key_columns, 4)?,
     );
     let mut out = Vec::new();
     for r in 0..constraints.num_rows() {
@@ -377,13 +402,95 @@ fn collect_constraints(
             .filter(|&k| kcs.value(k) == schema && kcn.value(k) == name)
             .map(|k| kcol.value(k).to_string())
             .collect();
+        let constraint_type = ct.value(r).to_string();
+        let usages = if constraint_type == "FOREIGN KEY" {
+            foreign_key_usages(key_columns, referential, schema, name)?
+        } else {
+            Vec::new()
+        };
         out.push(crate::objects::Constraint {
             name: Some(name.to_string()),
-            constraint_type: ct.value(r).to_string(),
+            constraint_type,
             columns,
+            usages,
         });
     }
     Ok(out)
+}
+
+/// The referenced (parent) columns of one foreign key, in the same order as its own key columns.
+///
+/// `CONSTRAINT_COLUMN_USAGE` lists the referenced columns but does not preserve order, so instead:
+/// find the referenced unique constraint via `REFERENTIAL_CONSTRAINTS`, index its key columns by
+/// ordinal, then walk the FK's own columns (ordered) mapping each through
+/// `POSITION_IN_UNIQUE_CONSTRAINT` to the referenced column at that ordinal.
+fn foreign_key_usages(
+    key_columns: &RecordBatch,
+    referential: &RecordBatch,
+    schema: &str,
+    fk_name: &str,
+) -> Result<Vec<crate::objects::Usage>> {
+    // KEY_COLUMN_USAGE: 0 CONSTRAINT_SCHEMA, 1 CONSTRAINT_NAME, 2 TABLE_SCHEMA, 3 TABLE_NAME,
+    // 4 COLUMN_NAME, 5 ORDINAL_POSITION, 6 POSITION_IN_UNIQUE_CONSTRAINT.
+    let (kcs, kcn, kts, ktn, kcol, kord, kpos) = (
+        str_col(key_columns, 0)?,
+        str_col(key_columns, 1)?,
+        str_col(key_columns, 2)?,
+        str_col(key_columns, 3)?,
+        str_col(key_columns, 4)?,
+        str_col(key_columns, 5)?,
+        str_col(key_columns, 6)?,
+    );
+    // REFERENTIAL_CONSTRAINTS: 0 CONSTRAINT_SCHEMA, 1 CONSTRAINT_NAME, 2 UNIQUE_CONSTRAINT_SCHEMA,
+    // 3 UNIQUE_CONSTRAINT_NAME.
+    let (rcs, rcn, rus, run) = (
+        str_col(referential, 0)?,
+        str_col(referential, 1)?,
+        str_col(referential, 2)?,
+        str_col(referential, 3)?,
+    );
+
+    // The referenced unique/primary-key constraint.
+    let Some((unique_schema, unique_name)) = (0..referential.num_rows())
+        .find(|&r| rcs.value(r) == schema && rcn.value(r) == fk_name)
+        .map(|r| (rus.value(r).to_string(), run.value(r).to_string()))
+    else {
+        return Ok(Vec::new());
+    };
+
+    // Index the referenced constraint's key columns by ordinal position.
+    let referenced: HashMap<i64, crate::objects::Usage> = (0..key_columns.num_rows())
+        .filter(|&k| kcs.value(k) == unique_schema && kcn.value(k) == unique_name)
+        .filter_map(|k| {
+            let ord = kord.value(k).parse::<i64>().ok()?;
+            Some((
+                ord,
+                crate::objects::Usage {
+                    db_schema: kts.value(k).to_string(),
+                    table: ktn.value(k).to_string(),
+                    column: kcol.value(k).to_string(),
+                },
+            ))
+        })
+        .collect();
+
+    // Walk the FK's own columns in key order, mapping each to its referenced column.
+    let mut fk_columns: Vec<(i64, i64)> = (0..key_columns.num_rows())
+        .filter(|&k| kcs.value(k) == schema && kcn.value(k) == fk_name && !kpos.is_null(k))
+        .filter_map(|k| Some((kord.value(k).parse().ok()?, kpos.value(k).parse().ok()?)))
+        .collect();
+    fk_columns.sort_by_key(|&(ordinal, _)| ordinal);
+
+    Ok(fk_columns
+        .into_iter()
+        .filter_map(|(_, position)| {
+            referenced.get(&position).map(|u| crate::objects::Usage {
+                db_schema: u.db_schema.clone(),
+                table: u.table.clone(),
+                column: u.column.clone(),
+            })
+        })
+        .collect())
 }
 
 /// Match an ADBC `LIKE` pattern (`%` = any run, `_` = one char) against a value, case-sensitively.

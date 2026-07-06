@@ -105,6 +105,22 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
            "PRIMARY KEY (id_primary_col1, id_primary_col2)";
   }
 
+  // A child table with a single-column FK (id_child_col3 -> parent_1.id) and a composite FK
+  // ((id_child_col1, id_child_col2) -> parent_2.(id_primary_col1, id_primary_col2)); Spanner
+  // supports table-level FOREIGN KEY constraints.
+  std::optional<std::string> ForeignKeyChildTableDdl(
+      std::string_view child_name, std::string_view parent_name_1,
+      std::string_view parent_name_2) const override {
+    return "CREATE TABLE `" + std::string(child_name) +
+           "` (id_child_col1 INT64, id_child_col2 INT64, id_child_col3 INT64, "
+           "CONSTRAINT fk_single FOREIGN KEY (id_child_col3) REFERENCES `" +
+           std::string(parent_name_1) +
+           "` (id), "
+           "CONSTRAINT fk_composite FOREIGN KEY (id_child_col1, id_child_col2) REFERENCES `" +
+           std::string(parent_name_2) +
+           "` (id_primary_col1, id_primary_col2)) PRIMARY KEY (id_child_col1)";
+  }
+
   // Spanner uses named query parameters (@name); the driver binds a column named
   // `pN` to @pN.
   std::string BindParameter(int index) const override {
