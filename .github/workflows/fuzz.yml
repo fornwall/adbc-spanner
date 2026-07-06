@@ -22,7 +22,7 @@ jobs:
       matrix:
         target: [sql, values, like]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install nightly (cargo-fuzz needs it)
         uses: dtolnay/rust-toolchain@nightly
@@ -43,7 +43,7 @@ jobs:
 
       - name: Upload any crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-${{ matrix.target }}-artifacts
           path: fuzz/artifacts/
