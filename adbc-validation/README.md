@@ -53,17 +53,16 @@ Spanner's model self-skip rather than fail.
 - **The `SpannerStatementTest` cases that pass cleanly** — `execute` and
   `execute_schema` for int/string columns and their error paths, `prepare` /
   `get_parameter_schema` / parameter-count / no-query validation, query error
-  handling, concurrent statements, and result independence/invalidation.
+  handling, query cancellation, concurrent statements, and result
+  independence/invalidation.
 
-**37 tests pass, 4 self-skip.** The `StatementTest` cases are an explicit
-allowlist in `scripts/run-adbc-validation.sh`. The 4 remaining `ConnectionTest`
-skips are features Spanner does not expose or that the driver does not yet
-implement:
+**39 tests pass, 3 self-skip.** The `StatementTest` cases are an explicit
+allowlist in `scripts/run-adbc-validation.sh`. The 3 remaining `ConnectionTest`
+skips are features Spanner does not expose:
 
 | Skipped test | Why | Enable-able? |
 |---|---|---|
 | `MetadataGetTableSchema`, `…Escaping` | gate on create-mode ingest | No — Spanner's mandatory primary key rules out create-mode ingest |
-| `MetadataGetObjectsCancel` | `supports_cancel()` | No — statement/connection cancellation is not implemented |
 | `MetadataGetStatisticNames` | `supports_statistics()` | No — Spanner exposes no portable per-table statistics |
 
 ## Follow-up work: the remaining `StatementTest` cases

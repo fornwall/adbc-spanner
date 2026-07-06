@@ -88,7 +88,7 @@ google-cloud-auth = { git = "https://github.com/fornwall/google-cloud-rust", rev
 google-cloud-lro = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
 # The Spanner client is async; we bridge it to the synchronous ADBC traits with a
 # dedicated multi-thread runtime.
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
 serde_json = "1"
 base64 = "0.22"
 # Parsing Spanner's string-encoded DATE / TIMESTAMP values into Arrow Date32 / Timestamp, and
@@ -110,7 +110,7 @@ strip = true
 lto = "thin"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync"] }
 # Property-based round-trip testing of the driver against the emulator (integration test only).
 proptest = "1"
 # Driver manager: loads the built cdylib through the C ABI for the FFI smoke test.

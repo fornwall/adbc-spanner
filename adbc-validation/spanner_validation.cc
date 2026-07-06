@@ -137,7 +137,7 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   bool supports_get_objects() const override { return true; }
   bool supports_partitioned_data() const override { return false; }
   bool supports_statistics() const override { return false; }
-  bool supports_cancel() const override { return false; }
+  bool supports_cancel() const override { return true; }
   bool supports_dynamic_parameter_binding() const override { return true; }
   bool supports_error_on_incompatible_schema() const override { return false; }
   bool supports_concurrent_statements() const override { return true; }

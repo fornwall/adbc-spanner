@@ -21,7 +21,7 @@ use crate::bind;
 use crate::connection::SharedTxn;
 use crate::conversion::result_set_to_batch;
 use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
-use crate::runtime::SharedRuntime;
+use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
 
 /// An ADBC statement bound to a Spanner [`DatabaseClient`].
 pub struct SpannerStatement {
@@ -39,6 +39,8 @@ pub struct SpannerStatement {
     /// Ingest mode (`adbc.ingest.mode`), stored in canonical form once set so it round-trips
     /// through `get_option`. Only `append` is accepted.
     ingest_mode: Option<String>,
+    /// Cancellation signal for this statement's in-flight execution (see [`Statement::cancel`]).
+    cancel: CancelSignal,
 }
 
 impl SpannerStatement {
@@ -61,6 +63,7 @@ impl SpannerStatement {
             bound: Vec::new(),
             target_table: None,
             ingest_mode: None,
+            cancel: CancelSignal::new(),
         }
     }
 
@@ -110,7 +113,12 @@ impl SpannerStatement {
                 return Ok(None);
             }
         }
-        let count = crate::connection::run_batch_dml(&self.runtime, &self.client, statements)?;
+        let count = crate::connection::run_batch_dml(
+            &self.runtime,
+            &self.client,
+            &self.cancel,
+            statements,
+        )?;
         Ok(Some(count))
     }
 
@@ -122,7 +130,7 @@ impl SpannerStatement {
         let statements = self.build_bound_statements(sql)?;
         let client = self.client.clone();
         let (schema, batches): (Option<SchemaRef>, Vec<RecordBatch>) =
-            self.runtime.block_on(async move {
+            block_on_cancellable(&self.runtime, &self.cancel, async move {
                 let mut schema = None;
                 let mut batches = Vec::new();
                 for statement in statements {
@@ -155,7 +163,7 @@ impl SpannerStatement {
         }
         let spanner = self.spanner.clone();
         let database = self.database.clone();
-        self.runtime.block_on(async move {
+        block_on_cancellable(&self.runtime, &self.cancel, async move {
             let admin = spanner
                 .database_admin_builder()
                 .build()
@@ -270,7 +278,7 @@ impl Statement for SpannerStatement {
             return self.execute_bound_query(&sql);
         }
         let client = self.client.clone();
-        let (schema, batch) = self.runtime.block_on(async move {
+        let (schema, batch) = block_on_cancellable(&self.runtime, &self.cancel, async move {
             let transaction = client.single_use().build();
             let statement = SpannerSql::builder(sql).build();
             let result_set = transaction
@@ -326,7 +334,7 @@ impl Statement for SpannerStatement {
         }
         let client = self.client.clone();
         let bound = self.bound.clone();
-        let schema = self.runtime.block_on(async move {
+        let schema = block_on_cancellable(&self.runtime, &self.cancel, async move {
             let transaction = client.single_use().build();
             // QueryMode::Plan analyses the query and returns its column metadata without scanning
             // any data, so dbt can introspect a model's output columns without wrapping it in a
@@ -401,7 +409,10 @@ impl Statement for SpannerStatement {
     }
 
     fn cancel(&mut self) -> Result<()> {
-        Err(not_implemented("Statement::cancel"))
+        // Best-effort: wake an in-flight execution so it returns Cancelled. A cancel with nothing
+        // running (e.g. after the eagerly-materialised result has been returned) is a no-op.
+        self.cancel.signal();
+        Ok(())
     }
 }
 
