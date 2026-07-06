@@ -426,11 +426,17 @@ impl Connection for SpannerConnection {
         Err(not_implemented("Connection::cancel"))
     }
 
+    /// Driver / vendor metadata, sourced entirely from static driver constants (no Spanner RPC).
+    ///
+    /// `codes = None` returns the set of codes the driver has a meaningful value for; an explicit
+    /// set returns one row per requested code (a null value for codes it cannot answer).
     fn get_info(
         &self,
-        _codes: Option<HashSet<InfoCode>>,
+        codes: Option<HashSet<InfoCode>>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        Err(not_implemented("Connection::get_info"))
+        let batch = crate::info::build(codes)?;
+        let schema = batch.schema();
+        Ok(Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema)))
     }
 
     /// Catalog/schema/table/column introspection, sourced from Spanner `INFORMATION_SCHEMA`.

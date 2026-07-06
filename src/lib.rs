@@ -61,6 +61,7 @@ mod driver;
 mod error;
 #[cfg(feature = "ffi")]
 mod ffi;
+mod info;
 mod objects;
 mod runtime;
 mod statement;

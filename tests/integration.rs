@@ -31,7 +31,8 @@ use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 use adbc_core::options::{
-    AdbcVersion, ObjectDepth, OptionConnection, OptionDatabase, OptionStatement, OptionValue,
+    AdbcVersion, InfoCode, ObjectDepth, OptionConnection, OptionDatabase, OptionStatement,
+    OptionValue,
 };
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_driver_manager::ManagedDriver;
@@ -1237,6 +1238,215 @@ fn ffi_driver_manager_smoke() {
         .unwrap()
         .value(0);
     assert_eq!(value, 1);
+}
+
+/// Drive the driver through the ADBC **driver manager** (the real C-ABI path a language binding
+/// uses) across the metadata / query / DML / transaction / ingest surface, asserting the canonical
+/// ADBC result schemas — a conformance smoke test in the spirit of the `adbc_driver_manager`
+/// project's own reusable driver checks. Complements `query_and_dml_round_trip`, which exercises the
+/// same surface at the Rust-trait level.
+#[test]
+fn conformance_via_driver_manager() {
+    use adbc_core::schemas::{GET_INFO_SCHEMA, GET_OBJECTS_SCHEMA, GET_TABLE_TYPES_SCHEMA};
+
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping conformance_via_driver_manager");
+        return;
+    };
+    let Some(cdylib) = cdylib_path() else {
+        eprintln!("cdylib not built — skipping conformance test (run `cargo build` first)");
+        return;
+    };
+    ensure_database_once(&target);
+    // Holds for the whole body: this test issues DDL/DML, which Spanner will not run concurrently
+    // with a schema change from the other DDL/DML-heavy tests.
+    let _guard = serial_guard();
+
+    let mut driver = ManagedDriver::load_dynamic_from_filename(
+        &cdylib,
+        Some(b"AdbcSpannerInit"),
+        AdbcVersion::V110,
+    )
+    .expect("load driver via the driver manager");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("new_database via FFI");
+    // The freshly-created emulator database can lag; retry the connection briefly.
+    let mut connection = {
+        let mut conn = None;
+        for _ in 0..20 {
+            match database.new_connection() {
+                Ok(c) => {
+                    conn = Some(c);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(250)),
+            }
+        }
+        conn.expect("connect via FFI")
+    };
+
+    // --- get_info: canonical schema, all reported codes, and a filtered subset. ---
+    let reader = connection.get_info(None).expect("get_info(None)");
+    assert_eq!(reader.schema(), GET_INFO_SCHEMA.clone());
+    let all_info = reader.collect::<Result<Vec<_>, _>>().expect("collect info");
+    assert!(
+        all_info.iter().map(|b| b.num_rows()).sum::<usize>() >= 4,
+        "get_info should report at least the core codes"
+    );
+    let subset = connection
+        .get_info(Some([InfoCode::VendorName, InfoCode::DriverName].into()))
+        .expect("get_info(subset)");
+    assert_eq!(subset.schema(), GET_INFO_SCHEMA.clone());
+    let subset_rows: usize = subset
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect subset")
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(subset_rows, 2, "one row per explicitly requested code");
+
+    // --- get_table_types: canonical schema, TABLE and VIEW present. ---
+    let reader = connection.get_table_types().expect("get_table_types");
+    assert_eq!(reader.schema(), GET_TABLE_TYPES_SCHEMA.clone());
+    let types: Vec<String> = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect table types")
+        .iter()
+        .flat_map(|b| {
+            let col = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            (0..col.len())
+                .map(|i| col.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(types.contains(&"TABLE".to_string()) && types.contains(&"VIEW".to_string()));
+
+    // --- Scratch table for the metadata / DML / ingest checks. ---
+    run_ffi(
+        &mut connection,
+        "DROP TABLE IF EXISTS AdbcConf; \
+         CREATE TABLE AdbcConf (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
+    );
+
+    // get_objects: canonical schema and one catalog row (Spanner's single unnamed catalog).
+    let reader = connection
+        .get_objects(ObjectDepth::All, None, None, None, None, None)
+        .expect("get_objects");
+    assert_eq!(reader.schema(), GET_OBJECTS_SCHEMA.clone());
+    let objects = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect objects");
+    assert_eq!(objects.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+    // get_table_schema: the scratch table's columns come back with the right names/types.
+    let schema = connection
+        .get_table_schema(None, None, "AdbcConf")
+        .expect("get_table_schema");
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(names, vec!["Id", "Name"]);
+    assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+
+    // --- execute (query) and execute_update (DML) through the FFI path. ---
+    let mut s = connection.new_statement().expect("new statement");
+    s.set_sql_query("INSERT INTO AdbcConf (Id, Name) VALUES (1, 'a')")
+        .unwrap();
+    assert_eq!(s.execute_update().expect("insert"), Some(1));
+    assert_eq!(ffi_count(&mut connection, "AdbcConf"), 1);
+
+    // --- Manual transaction: buffered DML is invisible until commit, discarded on rollback. ---
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("disable autocommit");
+    let mut s = connection.new_statement().expect("new statement");
+    s.set_sql_query("INSERT INTO AdbcConf (Id, Name) VALUES (2, 'b')")
+        .unwrap();
+    assert_eq!(s.execute_update().expect("buffered insert"), None);
+    assert_eq!(
+        ffi_count(&mut connection, "AdbcConf"),
+        1,
+        "not visible pre-commit"
+    );
+    connection.commit().expect("commit");
+    assert_eq!(
+        ffi_count(&mut connection, "AdbcConf"),
+        2,
+        "visible after commit"
+    );
+    let mut s = connection.new_statement().expect("new statement");
+    s.set_sql_query("INSERT INTO AdbcConf (Id, Name) VALUES (3, 'c')")
+        .unwrap();
+    assert_eq!(s.execute_update().expect("buffered insert"), None);
+    connection.rollback().expect("rollback");
+    assert_eq!(
+        ffi_count(&mut connection, "AdbcConf"),
+        2,
+        "rollback discards"
+    );
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("true".into()),
+        )
+        .expect("enable autocommit");
+
+    // --- Bulk ingest through the FFI path. ---
+    let rows = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("Id", DataType::Int64, false),
+            Field::new("Name", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![10, 11])),
+            Arc::new(StringArray::from(vec!["x", "y"])),
+        ],
+    )
+    .unwrap();
+    let mut ingest = connection.new_statement().expect("new statement");
+    ingest
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcConf".into()),
+        )
+        .unwrap();
+    ingest.bind(rows).expect("bind ingest rows");
+    assert_eq!(ingest.execute_update().expect("ingest"), Some(2));
+    assert_eq!(ffi_count(&mut connection, "AdbcConf"), 4);
+
+    run_ffi(&mut connection, "DROP TABLE AdbcConf");
+}
+
+/// Run a statement for its side effect through a driver-manager connection.
+fn run_ffi(connection: &mut adbc_driver_manager::ManagedConnection, sql: &str) {
+    let mut s = connection.new_statement().expect("new statement");
+    s.set_sql_query(sql).unwrap();
+    s.execute_update()
+        .unwrap_or_else(|e| panic!("run {sql:?}: {e:?}"));
+}
+
+/// Count rows in `table` through a driver-manager connection.
+fn ffi_count(connection: &mut adbc_driver_manager::ManagedConnection, table: &str) -> i64 {
+    let mut q = connection.new_statement().expect("new statement");
+    q.set_sql_query(format!("SELECT COUNT(*) AS n FROM {table}"))
+        .unwrap();
+    let batches: Vec<_> = q
+        .execute()
+        .expect("count query")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0)
 }
 
 /// Serialize the schema-mutating / DML-heavy tests against each other. Spanner rejects a schema

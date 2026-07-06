@@ -139,9 +139,11 @@ building and attaching the binaries. They do not overlap.
 
 - Match surrounding style; keep `fmt`/`clippy` clean (CI fails otherwise).
 - Supported so far: queries, DML, DDL (via admin `UpdateDatabaseDdl`), manual transactions
-  (buffer-and-commit), native Arrow types for DATE/TIMESTAMP/NUMERIC, parameter binding + bulk
-  ingest, `get_table_types`/`get_table_schema`, and keyfile/keyfile_json auth.
-- Still returning `NotImplemented` (keep the pattern until implemented): `get_info`, `get_objects`,
-  `get_statistics`, Substrait, partitioned execution, and mapping ARRAY/STRUCT to Arrow
-  `List`/`Struct` (currently JSON `Utf8`).
+  (buffer-and-commit), native Arrow types for DATE/TIMESTAMP/NUMERIC and native `List`/`Struct` for
+  ARRAY/STRUCT, parameter binding + bulk ingest, `get_info` (static driver/vendor metadata),
+  `get_objects`, `get_table_types`/`get_table_schema`, and keyfile/keyfile_json auth.
+  (`get_statistics`/`get_statistic_names` return empty, correctly-typed result sets.)
+- Still returning `NotImplemented` (keep the pattern until implemented): Substrait, partitioned
+  execution (`execute_partitions`/`read_partition`), cancellation (`Connection`/`Statement::cancel`),
+  and `get_parameter_schema`.
 - Commits in this environment may need `-c commit.gpgsign=false` if no signing agent is present.
