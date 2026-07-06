@@ -47,10 +47,36 @@ views, statistics, current-catalog metadata).
 
 ## Follow-up work: gating `StatementTest`
 
-`StatementTest` is compiled and runnable via `--full` but **not gated yet**.
-Bringing it into the gate is natural follow-up work the suite now makes easy to
-tackle incrementally — one quirk or driver fix at a time. Much of it needs
-per-test adaptation to Spanner's model:
+`StatementTest` is compiled and runnable via `--full` but **not gated yet**. A
+`--full` run currently shows **12 pass, the majority self-skip, and 18 fail** (of
+the ~79 `StatementTest` cases). The 18 failures fall into three buckets, and only
+the first is driver-side:
+
+**1. Driver gaps (fixable here).** For example, `prepare()` used to return `OK`
+with no query set instead of `INVALID_STATE` — now fixed, so
+`SqlPrepareErrorNoQuery`'s assertion passes (the test still aborts afterwards on
+the upstream error-release bug below, but the driver behaviour is now correct).
+
+**2. Upstream `adbc_ffi` (0.23) limitations — not reachable from the driver.**
+- `AdbcStatementExecuteQuery` never writes `rows_affected` when a result stream is
+  requested (only the no-stream branch does), so every test asserting
+  `rows_affected ∈ {1, -1}` sees `0`. The Rust `Statement::execute` trait returns
+  only a reader, with no channel to report the count on this path.
+- The non-idempotent `AdbcError` release (see the note below) turns any error-path
+  test into a `Subprocess aborted` — so even a *correct* driver error aborts
+  rather than reporting a clean pass.
+
+**3. Suite portability — hard-coded non-Spanner DDL.** Several tests issue fixed
+DDL that Spanner rejects: no `PRIMARY KEY` (`CREATE TABLE queryempty (foo INT)`),
+non-Spanner type names (`INTEGER` / `TEXT` / `INT`), and double-quoted
+identifiers. This DDL does not route through `SpannerQuirks`, so those tests
+cannot pass on Spanner without upstream suite changes.
+
+Net: gating the whole suite is blocked more by upstream (`adbc_ffi`) and suite
+portability than by incremental driver work. The realistic path is to gate the
+specific green subset that avoids both — tune `SpannerQuirks`, fix real driver
+gaps where they exist, then move the newly-green tests into the gated filter in
+`scripts/run-adbc-validation.sh`. Spanner model quirks that stay relevant:
 
 - **Mandatory primary keys** — Spanner tables must declare a primary key, so the
   suite's key-less sample tables need quirks-provided DDL.
@@ -61,10 +87,6 @@ per-test adaptation to Spanner's model:
   binding tests bind by column name.
 - **`rows_affected` under buffer-and-commit** — manual-mode DML is buffered and
   the affected-row count is unknown until commit, unlike the suite's assumption.
-
-Each is a self-contained increment: tune `SpannerQuirks`, fix a driver gap if one
-is real, then move the newly-green tests into the gated filter in
-`scripts/run-adbc-validation.sh`.
 
 ## A note on failures aborting the process
 

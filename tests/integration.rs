@@ -264,6 +264,14 @@ fn query_and_dml_round_trip() {
     let table_types = connection.get_table_types().expect("get_table_types");
     assert_eq!(table_types.schema().field(0).name(), "table_type");
 
+    // prepare() with no query set is INVALID_STATE (ADBC conformance; the C++ validation suite's
+    // SqlPrepareErrorNoQuery asserts this).
+    let mut no_query = connection.new_statement().expect("new statement");
+    let prepare_err = no_query
+        .prepare()
+        .expect_err("prepare with no query set should be an error");
+    assert_eq!(prepare_err.status, adbc_core::error::Status::InvalidState);
+
     // Idempotency: clear any rows left over from a previous run.
     let mut delete = connection.new_statement().expect("new statement");
     delete
