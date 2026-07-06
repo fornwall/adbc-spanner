@@ -19,13 +19,15 @@
 //!   SPANNER_GCP_DATABASE=my-project.my-instance.my-db cargo test --test integration -- --nocapture
 //!   ```
 //!
-//!   The instance must already exist; the test best-effort creates the database and the `Singers`
-//!   table it needs (both idempotent), and cleans up its own scratch tables, so it is safe to re-run
-//!   against a persistent database. If both variables are set, the emulator wins.
+//!   The instance must already exist; the test best-effort creates the database and the tables it
+//!   needs (the `Singers` table and the property-test tables, all idempotent), and clears or drops
+//!   its scratch data, so it is safe to re-run against a persistent database. If both variables are
+//!   set, the emulator wins.
 //!
 //! Setup (creating the database and table) uses the Spanner admin clients directly; the actual query
 //! and DML round-trip goes through the `adbc-spanner` driver being tested.
 
+use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 use adbc_core::options::{
@@ -35,13 +37,15 @@ use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_driver_manager::ManagedDriver;
 use adbc_spanner::{SpannerConnection, SpannerDatabase, SpannerDriver};
 use arrow_array::{
-    Array, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, ListArray,
-    RecordBatch, RecordBatchReader, StringArray, StructArray, TimestampMicrosecondArray,
+    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
+    ListArray, RecordBatch, RecordBatchReader, StringArray, StructArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use chrono::{NaiveDate, SecondsFormat};
 use google_cloud_lro::Poller;
 use google_cloud_spanner::client::Spanner;
 use google_cloud_spanner_admin_instance_v1::model::Instance;
+use proptest::prelude::*;
 
 // Identifiers used against the emulator, which starts empty and lets us create everything.
 const PROJECT: &str = "test-project";
@@ -122,6 +126,25 @@ fn singers_ddl(if_not_exists: bool) -> String {
     )
 }
 
+/// DDL for the tables the property-based round-trip tests write to. Created during one-time setup
+/// (not in the test bodies) so the parallel tests never issue concurrent schema changes, which the
+/// emulator rejects database-wide. Column names avoid Spanner reserved words (e.g. `BY`).
+fn prop_tables_ddl(if_not_exists: bool) -> Vec<String> {
+    let g = if if_not_exists { "IF NOT EXISTS " } else { "" };
+    vec![
+        format!(
+            "CREATE TABLE {g}AdbcPropBind \
+                 (Id INT64, IntCol INT64, FloatCol FLOAT64, BoolCol BOOL, \
+                  StrCol STRING(MAX), BytesCol BYTES(MAX)) \
+             PRIMARY KEY (Id)"
+        ),
+        format!(
+            "CREATE TABLE {g}AdbcPropTypes \
+                 (Id INT64, D DATE, T TIMESTAMP, N NUMERIC) PRIMARY KEY (Id)"
+        ),
+    ]
+}
+
 /// Create the test database and `Singers` table if they do not already exist.
 ///
 /// `create_instance` / `create_database` are best-effort: on a re-run against an already-populated
@@ -168,11 +191,13 @@ async fn ensure_database(target: &TestTarget) {
         .build()
         .await
         .expect("failed to build database admin client");
+    let mut create_statements = vec![singers_ddl(false)];
+    create_statements.extend(prop_tables_ddl(false));
     let _ = database_admin
         .create_database()
         .set_parent(target.instance_path())
         .set_create_statement(format!("CREATE DATABASE `{}`", target.database))
-        .set_extra_statements(vec![singers_ddl(false)])
+        .set_extra_statements(create_statements)
         .poller()
         .until_done()
         .await;
@@ -181,10 +206,12 @@ async fn ensure_database(target: &TestTarget) {
     // the `Singers` table separately. Skipped for the emulator, whose fresh database always gets it
     // from the extra statements above.
     if !target.is_emulator {
+        let mut reconcile = vec![singers_ddl(true)];
+        reconcile.extend(prop_tables_ddl(true));
         let _ = database_admin
             .update_database_ddl()
             .set_database(target.database_path())
-            .set_statements(vec![singers_ddl(true)])
+            .set_statements(reconcile)
             .poller()
             .until_done()
             .await;
@@ -220,6 +247,7 @@ fn query_and_dml_round_trip() {
     };
 
     ensure_database_once(&target);
+    let _serial = serial_guard();
 
     let mut driver = SpannerDriver::try_new().expect("create driver");
     let database = driver
@@ -770,6 +798,242 @@ fn query_and_dml_round_trip() {
     assert_eq!(column_name.value(0), "SingerId");
 }
 
+/// Number of generated cases per property. Each case is a full DELETE + INSERT + SELECT round trip
+/// over the network, so this is kept modest to bound the emulator wall-clock.
+const PROP_CASES: u32 = 64;
+
+/// A `ProptestConfig` for the emulator round-trips: a bounded case count and no on-disk regression
+/// file (a persisted seed is useless anyway — reproducing it needs a live emulator).
+fn prop_config() -> ProptestConfig {
+    ProptestConfig {
+        cases: PROP_CASES,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    }
+}
+
+/// Run a statement that returns no rows (DDL / DML), panicking on error.
+fn run(connection: &mut SpannerConnection, sql: &str) {
+    let mut s = connection.new_statement().expect("new statement");
+    s.set_sql_query(sql).unwrap();
+    s.execute_update()
+        .unwrap_or_else(|e| panic!("failed to run {sql:?}: {e:?}"));
+}
+
+/// Property: arbitrary scalar values bound as parameters (the `bind.rs` write path) survive a round
+/// trip through Spanner and come back byte-for-byte via the Arrow read path (`conversion.rs`),
+/// nulls included. Covers the Arrow types the bind path supports: Int64, Float64, Bool, Utf8, Binary.
+#[test]
+fn prop_bind_round_trip() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping prop_bind_round_trip");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let connection = RefCell::new(connect_with_retry(&database));
+    // Finite floats only: NaN/Inf don't compare with `==` and take a separate string wire path.
+    let float = any::<f64>().prop_filter("finite", |f| f.is_finite());
+    // Any non-control Unicode, up to 24 chars.
+    let text = proptest::string::string_regex("\\PC{0,24}").unwrap();
+    let bytes = proptest::collection::vec(any::<u8>(), 0..24);
+
+    proptest!(prop_config(), |(
+        oi in proptest::option::of(any::<i64>()),
+        of in proptest::option::of(float),
+        ob in proptest::option::of(any::<bool>()),
+        os in proptest::option::of(text),
+        oby in proptest::option::of(bytes),
+    )| {
+        let mut conn = connection.borrow_mut();
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("Id", DataType::Int64, false),
+                Field::new("IntCol", DataType::Int64, true),
+                Field::new("FloatCol", DataType::Float64, true),
+                Field::new("BoolCol", DataType::Boolean, true),
+                Field::new("StrCol", DataType::Utf8, true),
+                Field::new("BytesCol", DataType::Binary, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])),
+                Arc::new(Int64Array::from(vec![oi])),
+                Arc::new(Float64Array::from(vec![of])),
+                Arc::new(BooleanArray::from(vec![ob])),
+                Arc::new(StringArray::from(vec![os.as_deref()])),
+                Arc::new(BinaryArray::from_opt_vec(vec![oby.as_deref()])),
+            ],
+        )
+        .unwrap();
+
+        run(&mut conn, "DELETE FROM AdbcPropBind WHERE true");
+        let mut ins = conn.new_statement().expect("new statement");
+        ins.set_sql_query(
+            "INSERT INTO AdbcPropBind (Id, IntCol, FloatCol, BoolCol, StrCol, BytesCol) \
+             VALUES (@Id, @IntCol, @FloatCol, @BoolCol, @StrCol, @BytesCol)",
+        )
+        .unwrap();
+        ins.bind(batch).expect("bind row");
+        prop_assert_eq!(ins.execute_update().expect("insert"), Some(1));
+
+        let mut q = conn.new_statement().expect("new statement");
+        q.set_sql_query("SELECT IntCol, FloatCol, BoolCol, StrCol, BytesCol FROM AdbcPropBind WHERE Id = 1")
+            .unwrap();
+        let batches = q
+            .execute()
+            .expect("select")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        prop_assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        let b = &batches[0];
+
+        let i = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let f = b.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let bo = b.column(2).as_any().downcast_ref::<BooleanArray>().unwrap();
+        let s = b.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+        let by = b.column(4).as_any().downcast_ref::<BinaryArray>().unwrap();
+
+        match oi {
+            Some(v) => prop_assert_eq!(i.value(0), v),
+            None => prop_assert!(i.is_null(0)),
+        }
+        match of {
+            Some(v) => prop_assert_eq!(f.value(0), v),
+            None => prop_assert!(f.is_null(0)),
+        }
+        match ob {
+            Some(v) => prop_assert_eq!(bo.value(0), v),
+            None => prop_assert!(bo.is_null(0)),
+        }
+        match &os {
+            Some(v) => prop_assert_eq!(s.value(0), v.as_str()),
+            None => prop_assert!(s.is_null(0)),
+        }
+        match &oby {
+            Some(v) => prop_assert_eq!(by.value(0), v.as_slice()),
+            None => prop_assert!(by.is_null(0)),
+        }
+    });
+}
+
+/// Property: arbitrary DATE / TIMESTAMP / NUMERIC values, inserted as SQL literals (the bind path
+/// doesn't accept these Arrow types), come back through the read path as the exact Arrow encoding —
+/// epoch days, epoch micros, and unscaled scale-9 `i128` respectively. Values are confined to
+/// Spanner's supported ranges (years 1..=9999, NUMERIC magnitude < 10^28). Nulls included.
+#[test]
+fn prop_temporal_round_trip() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping prop_temporal_round_trip");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let connection = RefCell::new(connect_with_retry(&database));
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+
+    proptest!(prop_config(), |(
+        od in proptest::option::of((1i32..=9999, 1u32..=12, 1u32..=28)),
+        ot in proptest::option::of((1i32..=9999, 1u32..=12, 1u32..=28, 0u32..24, 0u32..60, 0u32..60, 0u32..1_000_000)),
+        on in proptest::option::of((any::<bool>(), 0u128..10u128.pow(28), 0u32..1_000_000_000)),
+    )| {
+        let mut conn = connection.borrow_mut();
+
+        // Build each column's literal and the expected Arrow value.
+        let (d_lit, exp_days) = match od {
+            Some((y, m, d)) => {
+                let date = NaiveDate::from_ymd_opt(y, m, d).unwrap();
+                let days = (date - epoch).num_days() as i32;
+                (format!("DATE '{}'", date.format("%Y-%m-%d")), Some(days))
+            }
+            None => ("NULL".to_string(), None),
+        };
+        let (t_lit, exp_micros) = match ot {
+            Some((y, mo, d, h, mi, s, us)) => {
+                let dt = NaiveDate::from_ymd_opt(y, mo, d)
+                    .unwrap()
+                    .and_hms_micro_opt(h, mi, s, us)
+                    .unwrap()
+                    .and_utc();
+                (
+                    format!("TIMESTAMP '{}'", dt.to_rfc3339_opts(SecondsFormat::Micros, true)),
+                    Some(dt.timestamp_micros()),
+                )
+            }
+            None => ("NULL".to_string(), None),
+        };
+        let (n_lit, exp_unscaled) = match on {
+            Some((neg, int_mag, frac)) => {
+                let mag = int_mag as i128 * 1_000_000_000 + frac as i128;
+                let unscaled = if neg { -mag } else { mag };
+                let sign = if neg { "-" } else { "" };
+                (format!("NUMERIC '{sign}{int_mag}.{frac:09}'"), Some(unscaled))
+            }
+            None => ("NULL".to_string(), None),
+        };
+
+        run(&mut conn, "DELETE FROM AdbcPropTypes WHERE true");
+        run(
+            &mut conn,
+            &format!(
+                "INSERT INTO AdbcPropTypes (Id, D, T, N) VALUES (1, {d_lit}, {t_lit}, {n_lit})"
+            ),
+        );
+
+        let mut q = conn.new_statement().expect("new statement");
+        q.set_sql_query("SELECT D, T, N FROM AdbcPropTypes WHERE Id = 1")
+            .unwrap();
+        let batches = q
+            .execute()
+            .expect("select")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        prop_assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        let b = &batches[0];
+
+        let d = b.column(0).as_any().downcast_ref::<Date32Array>().unwrap();
+        let t = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let n = b
+            .column(2)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+
+        match exp_days {
+            Some(v) => prop_assert_eq!(d.value(0), v),
+            None => prop_assert!(d.is_null(0)),
+        }
+        match exp_micros {
+            Some(v) => prop_assert_eq!(t.value(0), v),
+            None => prop_assert!(t.is_null(0)),
+        }
+        match exp_unscaled {
+            Some(v) => prop_assert_eq!(n.value(0), v),
+            None => prop_assert!(n.is_null(0)),
+        }
+    });
+}
+
 /// Locate the built `cdylib` (`libadbc_spanner.so` / `.dylib` / `.dll`) next to the test binary.
 fn cdylib_path() -> Option<std::path::PathBuf> {
     // The test binary lives in `target/<profile>/deps/`; the cdylib is in `target/<profile>/`.
@@ -854,6 +1118,19 @@ fn ffi_driver_manager_smoke() {
         .unwrap()
         .value(0);
     assert_eq!(value, 1);
+}
+
+/// Serialize the schema-mutating / DML-heavy tests against each other. Spanner rejects a schema
+/// change while a read-write transaction is in progress on the database, so the DDL-heavy
+/// `query_and_dml_round_trip` cannot run concurrently with the DML-heavy property tests. Each holds
+/// this guard for its whole body. Lock poisoning is ignored so one test's failure surfaces on its
+/// own rather than cascading into the others. (`ffi_driver_manager_smoke` only reads, so it is
+/// exempt — read-only transactions do not block schema changes.)
+fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Open a connection, retrying briefly: a freshly-created emulator database can be momentarily
