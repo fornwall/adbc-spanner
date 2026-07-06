@@ -118,7 +118,8 @@ impl SpannerConnection {
         let populate_columns = matches!(depth, ObjectDepth::All | ObjectDepth::Columns);
         let client = self.client.clone();
 
-        let (schema_batch, table_batch, column_batch) = self.runtime.block_on(async move {
+        let (schema_batch, table_batch, column_batch, constraint_batch, key_column_batch) =
+            self.runtime.block_on(async move {
             let schemas =
                 query_batch(&client, "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA").await?;
             let tables = if populate_tables {
@@ -145,7 +146,33 @@ impl SpannerConnection {
             } else {
                 None
             };
-            Ok::<_, Error>((schemas, tables, columns))
+            // Constraints (primary/foreign/unique/check) and their key columns, populated at the
+            // same depth as columns. KEY_COLUMN_USAGE covers the key-based constraints; its rows are
+            // ordered so each constraint's columns come out in key order.
+            let (constraints, key_columns) = if populate_columns {
+                (
+                    Some(
+                        query_batch(
+                            &client,
+                            "SELECT TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE \
+                             FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS",
+                        )
+                        .await?,
+                    ),
+                    Some(
+                        query_batch(
+                            &client,
+                            "SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, COLUMN_NAME \
+                             FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE \
+                             ORDER BY CONSTRAINT_SCHEMA, CONSTRAINT_NAME, ORDINAL_POSITION",
+                        )
+                        .await?,
+                    ),
+                )
+            } else {
+                (None, None)
+            };
+            Ok::<_, Error>((schemas, tables, columns, constraints, key_columns))
         })?;
 
         let schema_names = str_col(&schema_batch, 0)?;
@@ -177,10 +204,15 @@ impl SpannerConnection {
                         Some(cb) => collect_columns(cb, schema_name, name, column_name)?,
                         None => Vec::new(),
                     };
+                    let constraints = match (&constraint_batch, &key_column_batch) {
+                        (Some(cb), Some(kb)) => collect_constraints(cb, kb, schema_name, name)?,
+                        _ => Vec::new(),
+                    };
                     tables.push(crate::objects::Table {
                         name: name.to_string(),
                         table_type: ttype,
                         columns,
+                        constraints,
                     });
                 }
             }
@@ -190,6 +222,29 @@ impl SpannerConnection {
             });
         }
         Ok(result)
+    }
+
+    /// Whether a table exists, via a parameterized `INFORMATION_SCHEMA.TABLES` lookup. The default
+    /// (unnamed) schema is the empty string in Spanner.
+    fn table_exists(&self, db_schema: &str, table_name: &str) -> Result<bool> {
+        let client = self.client.clone();
+        let (schema, table) = (db_schema.to_string(), table_name.to_string());
+        self.runtime.block_on(async move {
+            let statement = SpannerSql::builder(
+                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
+                 WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table",
+            )
+            .add_param("schema", &schema)
+            .add_param("table", &table)
+            .build();
+            let transaction = client.single_use().build();
+            let result_set = transaction
+                .execute_query(statement)
+                .await
+                .map_err(from_spanner)?;
+            let (_schema, batch) = result_set_to_batch(result_set).await?;
+            Ok::<bool, Error>(batch.num_rows() > 0)
+        })
     }
 }
 
@@ -288,6 +343,47 @@ fn collect_columns(
         });
     }
     Ok(columns)
+}
+
+/// Assemble the constraints for one table from `INFORMATION_SCHEMA.TABLE_CONSTRAINTS` (one row per
+/// constraint) and `KEY_COLUMN_USAGE` (one row per key column, already ordered by key position).
+fn collect_constraints(
+    constraints: &RecordBatch,
+    key_columns: &RecordBatch,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<crate::objects::Constraint>> {
+    let (ts, tn, cn, ct) = (
+        str_col(constraints, 0)?,
+        str_col(constraints, 1)?,
+        str_col(constraints, 2)?,
+        str_col(constraints, 3)?,
+    );
+    // KEY_COLUMN_USAGE: CONSTRAINT_SCHEMA, CONSTRAINT_NAME, COLUMN_NAME.
+    let (kcs, kcn, kcol) = (
+        str_col(key_columns, 0)?,
+        str_col(key_columns, 1)?,
+        str_col(key_columns, 2)?,
+    );
+    let mut out = Vec::new();
+    for r in 0..constraints.num_rows() {
+        if ts.value(r) != schema || tn.value(r) != table {
+            continue;
+        }
+        let name = cn.value(r);
+        // Columns for this constraint, in key order (the query is ordered by ORDINAL_POSITION);
+        // check/... constraints have no key columns and get an empty list.
+        let columns = (0..key_columns.num_rows())
+            .filter(|&k| kcs.value(k) == schema && kcn.value(k) == name)
+            .map(|k| kcol.value(k).to_string())
+            .collect();
+        out.push(crate::objects::Constraint {
+            name: Some(name.to_string()),
+            constraint_type: ct.value(r).to_string(),
+            columns,
+        });
+    }
+    Ok(out)
 }
 
 /// Match an ADBC `LIKE` pattern (`%` = any run, `_` = one char) against a value, case-sensitively.
@@ -480,15 +576,30 @@ impl Connection for SpannerConnection {
         let table = qualified_table(db_schema, table_name);
         let sql = format!("SELECT * FROM {table} LIMIT 0");
         let client = self.client.clone();
-        let (schema, _batch) = self.runtime.block_on(async move {
+        let result = self.runtime.block_on(async move {
             let transaction = client.single_use().build();
             let result_set = transaction
                 .execute_query(SpannerSql::builder(sql).build())
                 .await
                 .map_err(from_spanner)?;
             result_set_to_batch(result_set).await
-        })?;
-        Ok((*schema).clone())
+        });
+        match result {
+            Ok((schema, _batch)) => Ok((*schema).clone()),
+            // A missing table surfaces from the query analyzer as `INVALID_ARGUMENT` ("Table not
+            // found"), but ADBC wants `NotFound`. Only touch `INFORMATION_SCHEMA` on the error path
+            // so the common (table exists) case stays a single query.
+            Err(error) => {
+                if self.table_exists(db_schema.unwrap_or(""), table_name)? {
+                    Err(error)
+                } else {
+                    Err(err(
+                        format!("table {table_name:?} not found"),
+                        Status::NotFound,
+                    ))
+                }
+            }
+        }
     }
 
     /// Return the table types supported by Spanner as a single-column (`table_type: utf8`) batch,
