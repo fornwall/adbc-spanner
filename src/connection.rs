@@ -288,12 +288,15 @@ pub(crate) fn like_match(pattern: &str, value: &str) -> bool {
     // Position in the pattern/value to backtrack to after the most recent `%`.
     let mut star: Option<(usize, usize)> = None;
     while vi < v.len() {
-        if pi < p.len() && (p[pi] == '_' || p[pi] == v[vi]) {
-            pi += 1;
-            vi += 1;
-        } else if pi < p.len() && p[pi] == '%' {
+        // `%` must be tested before the literal/`_` branch: otherwise a `%` in the pattern that
+        // happens to equal the current value char (e.g. both are `%`) would be consumed as a
+        // literal instead of acting as a wildcard.
+        if pi < p.len() && p[pi] == '%' {
             star = Some((pi, vi));
             pi += 1;
+        } else if pi < p.len() && (p[pi] == '_' || p[pi] == v[vi]) {
+            pi += 1;
+            vi += 1;
         } else if let Some((sp, sv)) = star {
             // Let the last `%` consume one more character and retry.
             pi = sp + 1;
@@ -326,6 +329,13 @@ mod like_tests {
         assert!(like_match("%a%a%", "banana"));
         assert!(!like_match("%x%", "banana"));
         assert!(!like_match("", "x"));
+        // A pattern `%` must stay a wildcard even when the value has a literal `%` where the
+        // wildcard begins matching — the value starts with `%`, or a `%` follows matched literals.
+        // The literal branch used to mis-consume it there, so these all failed. Found by the `like`
+        // fuzz target's differential regex oracle.
+        assert!(like_match("%", "%foo"));
+        assert!(like_match("%", "%^%?"));
+        assert!(like_match("a%", "a%b"));
     }
 }
 

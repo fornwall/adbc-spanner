@@ -271,7 +271,7 @@ impl Database for SpannerDatabase {
 
 /// Prefix a bare `host:port` emulator address with an `http://` scheme, as expected by the gRPC
 /// transport.
-fn ensure_scheme(host: &str) -> String {
+pub(crate) fn ensure_scheme(host: &str) -> String {
     if host.starts_with("http://") || host.starts_with("https://") {
         host.to_string()
     } else {

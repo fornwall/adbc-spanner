@@ -9,6 +9,10 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+# Differential/round-trip oracles for the fuzz targets: `regex` gives an independent
+# LIKE-semantics reference, `chrono` an independent DATE/TIMESTAMP reference.
+regex = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [dependencies.adbc-spanner]
 path = ".."
@@ -33,6 +37,13 @@ bench = false
 [[bin]]
 name = "like"
 path = "fuzz_targets/like.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "options"
+path = "fuzz_targets/options.rs"
 test = false
 doc = false
 bench = false

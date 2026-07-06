@@ -99,6 +99,59 @@ pub mod fuzzing {
     pub fn like_match(pattern: &str, value: &str) -> bool {
         crate::connection::like_match(pattern, value)
     }
+    /// Normalize an emulator endpoint by adding an `http://` scheme when absent.
+    pub fn ensure_scheme(host: &str) -> String {
+        crate::driver::ensure_scheme(host)
+    }
+
+    /// An arbitrary ADBC option value, mirroring the variants of
+    /// [`OptionValue`](adbc_core::options::OptionValue) the driver accepts.
+    #[derive(arbitrary::Arbitrary, Debug)]
+    pub enum OptValue {
+        Str(String),
+        Int(i64),
+        Double(f64),
+        Bytes(Vec<u8>),
+    }
+
+    /// Drive the database option-handling code (`set_option` / `get_option_string`) with arbitrary
+    /// key/value pairs, exactly as the C ABI would after a driver manager forwards untrusted option
+    /// strings. Exercises the string/bool/int coercions and the unknown-key error path; must never
+    /// panic. No network I/O — this stops well before `connect()`.
+    ///
+    /// The `SpannerDriver` (and its shared Tokio runtime) is built once and reused across calls so
+    /// fuzzing throughput is not dominated by runtime construction.
+    pub fn exercise_database_options(ops: Vec<(String, OptValue)>) {
+        use adbc_core::options::{OptionDatabase, OptionValue};
+        use adbc_core::{Driver, Optionable};
+        use std::sync::{Mutex, OnceLock};
+
+        static DRIVER: OnceLock<Mutex<crate::SpannerDriver>> = OnceLock::new();
+        let driver = DRIVER.get_or_init(|| {
+            Mutex::new(crate::SpannerDriver::try_new().expect("driver construction is infallible"))
+        });
+
+        let mut database = {
+            let mut guard = driver.lock().unwrap();
+            match guard.new_database() {
+                Ok(db) => db,
+                Err(_) => return,
+            }
+        };
+
+        for (key, value) in ops {
+            let value = match value {
+                OptValue::Str(s) => OptionValue::String(s),
+                OptValue::Int(i) => OptionValue::Int(i),
+                OptValue::Double(d) => OptionValue::Double(d),
+                OptValue::Bytes(b) => OptionValue::Bytes(b),
+            };
+            // Both known driver options and arbitrary unknown keys go through `Other`; errors
+            // (unsupported key, wrong value type, non-boolean text) are expected, not panics.
+            let _ = database.set_option(OptionDatabase::Other(key.clone()), value);
+            let _ = database.get_option_string(OptionDatabase::Other(key));
+        }
+    }
 }
 
 /// Driver-specific database option: the fully-qualified Spanner database path,

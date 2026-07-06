@@ -1,0 +1,1 @@
+INSERT INTO t (s) VALUES ('a;b'); DELETE FROM t WHERE true
