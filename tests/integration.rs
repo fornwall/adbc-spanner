@@ -583,6 +583,25 @@ fn query_and_dml_round_trip() {
             OptionValue::String("AdbcBind".into()),
         )
         .unwrap();
+    ingest
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .unwrap();
+    // Statement options round-trip through get_option (ingest mode reported in canonical form).
+    assert_eq!(
+        ingest
+            .get_option_string(OptionStatement::TargetTable)
+            .unwrap(),
+        "AdbcBind"
+    );
+    assert_eq!(
+        ingest
+            .get_option_string(OptionStatement::IngestMode)
+            .unwrap(),
+        "adbc.ingest.mode.append"
+    );
     ingest.bind(rows).expect("bind ingest rows");
     assert_eq!(ingest.execute_update().expect("ingest"), Some(2));
     assert_eq!(count_rows(&mut connection, "AdbcBind"), 2);
@@ -596,7 +615,21 @@ fn query_and_dml_round_trip() {
     let mut pq = connection.new_statement().expect("new statement");
     pq.set_sql_query("SELECT Name FROM AdbcBind WHERE Id = @Id")
         .unwrap();
+    // Before binding, get_parameter_schema derives the parameter names from the SQL; Spanner does
+    // not expose parameter types ahead of execution, so the type is Null (Arrow's "unknown").
+    let ps = pq
+        .get_parameter_schema()
+        .expect("parameter schema from SQL");
+    assert_eq!(ps.fields().len(), 1);
+    assert_eq!(ps.field(0).name(), "Id");
+    assert_eq!(ps.field(0).data_type(), &DataType::Null);
     pq.bind(param).expect("bind query param");
+    // Once data is bound, the parameter schema reflects the bound column's real type.
+    let ps = pq
+        .get_parameter_schema()
+        .expect("parameter schema from bound data");
+    assert_eq!(ps.field(0).name(), "Id");
+    assert_eq!(ps.field(0).data_type(), &DataType::Int64);
     let pq_batches = pq
         .execute()
         .expect("param query")
