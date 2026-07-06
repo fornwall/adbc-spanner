@@ -250,8 +250,8 @@ mod tests {
         assert_eq!(numeric_string(-1, 9), "-0.000000001");
         assert_eq!(numeric_string(150, 2), "1.50");
         assert_eq!(numeric_string(-7, 0), "-7");
-        // 10^30 exceeds rust_decimal's 96-bit mantissa but is a valid Spanner NUMERIC; it must
-        // format exactly, which is the whole point of not routing through a narrower type.
+        // 10^30 overflows a 96-bit decimal mantissa but is a valid Spanner NUMERIC; it must format
+        // exactly, which is the whole point of formatting the i128 rather than a narrower type.
         assert_eq!(
             numeric_string(10i128.pow(30), 9),
             "1000000000000000000000.000000000"
@@ -259,8 +259,8 @@ mod tests {
     }
 
     #[test]
-    fn binds_numeric_beyond_the_old_rust_decimal_limit() {
-        // 10^30 (unscaled) used to be rejected; it now binds, since we format the i128 directly.
+    fn binds_numeric_beyond_a_96_bit_decimal() {
+        // 10^30 (unscaled) overflows a 96-bit decimal but binds fine: we format the i128 directly.
         let b = batch(
             vec![Field::new("n", DataType::Decimal128(38, 9), false)],
             vec![Arc::new(
