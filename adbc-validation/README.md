@@ -46,24 +46,23 @@ Spanner's model self-skip rather than fail.
 ## What CI gates on
 
 - **`SpannerDatabaseTest` + `SpannerConnectionTest`** in full — lifecycle +
-  metadata: `get_info`, `get_objects` (including table columns and
-  primary-key/constraint metadata), `get_table_types`, `get_table_schema`
-  (`NOT_FOUND` for a missing table, and a named-schema-qualified table — Spanner
-  has `CREATE SCHEMA`), autocommit/transaction options.
+  metadata: `get_info`, `get_objects` (table columns, primary-key/constraint
+  metadata, and foreign-key `constraint_column_usage`), `get_table_types`,
+  `get_table_schema` (`NOT_FOUND` for a missing table, and a named-schema-qualified
+  table — Spanner has `CREATE SCHEMA`), autocommit/transaction options.
 - **The `SpannerStatementTest` cases that pass cleanly** — `execute` and
   `execute_schema` for int/string columns and their error paths, `prepare` /
   `get_parameter_schema` / parameter-count / no-query validation, query error
   handling, concurrent statements, and result independence/invalidation.
 
-**36 tests pass, 5 self-skip.** The `StatementTest` cases are an explicit
-allowlist in `scripts/run-adbc-validation.sh`. The 5 remaining `ConnectionTest`
+**37 tests pass, 4 self-skip.** The `StatementTest` cases are an explicit
+allowlist in `scripts/run-adbc-validation.sh`. The 4 remaining `ConnectionTest`
 skips are features Spanner does not expose or that the driver does not yet
 implement:
 
 | Skipped test | Why | Enable-able? |
 |---|---|---|
 | `MetadataGetTableSchema`, `…Escaping` | gate on create-mode ingest | No — Spanner's mandatory primary key rules out create-mode ingest |
-| `MetadataGetObjectsForeignKey` | needs FK constraint metadata | Follow-up — Spanner has foreign keys; requires `get_objects` to emit `constraint_column_usage` (referenced table/columns, from `INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE`) |
 | `MetadataGetObjectsCancel` | `supports_cancel()` | No — statement/connection cancellation is not implemented |
 | `MetadataGetStatisticNames` | `supports_statistics()` | No — Spanner exposes no portable per-table statistics |
 

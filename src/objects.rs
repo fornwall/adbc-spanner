@@ -25,6 +25,13 @@ pub(crate) struct Column {
     pub nullable: bool,
 }
 
+/// A column referenced by a foreign-key constraint (the parent side).
+pub(crate) struct Usage {
+    pub db_schema: String,
+    pub table: String,
+    pub column: String,
+}
+
 /// A constraint on a table (primary key, foreign key, unique, check).
 pub(crate) struct Constraint {
     pub name: Option<String>,
@@ -32,6 +39,9 @@ pub(crate) struct Constraint {
     pub constraint_type: String,
     /// The constraint's key columns, in key order (empty for e.g. check constraints).
     pub columns: Vec<String>,
+    /// For a foreign key, the referenced (parent) columns, in the same order as `columns`.
+    /// Empty for non-foreign-key constraints.
+    pub usages: Vec<Usage>,
 }
 
 /// A table with its columns and constraints.
@@ -237,8 +247,8 @@ fn build_column_struct(column_fields: &Fields, columns: &[&Column]) -> ArrayRef 
 }
 
 /// Build the constraint struct array: `constraint_name` / `constraint_type` / the key-column list
-/// (`constraint_column_names`), leaving `constraint_column_usage` (foreign-key referencing info)
-/// null.
+/// (`constraint_column_names`) / and, for foreign keys, the referenced columns
+/// (`constraint_column_usage`).
 fn build_constraint_struct(
     constraint_fields: &Fields,
     constraints: &[&Constraint],
@@ -260,6 +270,22 @@ fn build_constraint_struct(
     let column_lengths: Vec<usize> = constraints.iter().map(|c| c.columns.len()).collect();
     let constraint_column_names = list_of(name_item, &column_lengths, column_child)?;
 
+    // constraint_column_usage: one non-null list<struct> per constraint — the referenced (parent)
+    // columns for a foreign key, empty for everything else.
+    let usage_field = field(constraint_fields, "constraint_column_usage");
+    let usage_item = match usage_field.data_type() {
+        DataType::List(item) => item.clone(),
+        _ => unreachable!("constraint_column_usage is a list"),
+    };
+    let usage_fields = match usage_item.data_type() {
+        DataType::Struct(fs) => fs.clone(),
+        _ => unreachable!("constraint_column_usage item is a struct"),
+    };
+    let flat_usages: Vec<&Usage> = constraints.iter().flat_map(|c| c.usages.iter()).collect();
+    let usage_struct = build_usage_struct(&usage_fields, &flat_usages);
+    let usage_lengths: Vec<usize> = constraints.iter().map(|c| c.usages.len()).collect();
+    let constraint_column_usage = list_of(usage_item, &usage_lengths, usage_struct)?;
+
     let arrays: Vec<ArrayRef> = constraint_fields
         .iter()
         .map(|f| match f.name().as_str() {
@@ -270,12 +296,39 @@ fn build_constraint_struct(
                 constraints.iter().map(|c| Some(c.constraint_type.clone())),
             )) as ArrayRef,
             "constraint_column_names" => constraint_column_names.clone(),
+            "constraint_column_usage" => constraint_column_usage.clone(),
             _ => new_null_array(f.data_type(), n),
         })
         .collect();
     Ok(Arc::new(
         StructArray::try_new(constraint_fields.clone(), arrays, None).map_err(arrow_err)?,
     ))
+}
+
+/// Build the foreign-key `constraint_column_usage` struct array (one entry per referenced column):
+/// `fk_table` / `fk_column_name` from the parent side, `fk_db_schema` the parent schema, and an
+/// empty `fk_catalog` (Spanner has a single unnamed catalog).
+fn build_usage_struct(usage_fields: &Fields, usages: &[&Usage]) -> ArrayRef {
+    let n = usages.len();
+    let arrays: Vec<ArrayRef> = usage_fields
+        .iter()
+        .map(|f| match f.name().as_str() {
+            "fk_catalog" => {
+                Arc::new(StringArray::from_iter(usages.iter().map(|_| Some("")))) as ArrayRef
+            }
+            "fk_db_schema" => Arc::new(StringArray::from_iter(
+                usages.iter().map(|u| Some(u.db_schema.clone())),
+            )) as ArrayRef,
+            "fk_table" => Arc::new(StringArray::from_iter(
+                usages.iter().map(|u| Some(u.table.clone())),
+            )) as ArrayRef,
+            "fk_column_name" => Arc::new(StringArray::from_iter(
+                usages.iter().map(|u| Some(u.column.clone())),
+            )) as ArrayRef,
+            _ => new_null_array(f.data_type(), n),
+        })
+        .collect();
+    Arc::new(StructArray::new(usage_fields.clone(), arrays, None))
 }
 
 #[cfg(test)]
@@ -301,11 +354,24 @@ mod tests {
                         nullable: true,
                     },
                 ],
-                constraints: vec![Constraint {
-                    name: Some("PK_Users".into()),
-                    constraint_type: "PRIMARY KEY".into(),
-                    columns: vec!["Id".into()],
-                }],
+                constraints: vec![
+                    Constraint {
+                        name: Some("PK_Users".into()),
+                        constraint_type: "PRIMARY KEY".into(),
+                        columns: vec!["Id".into()],
+                        usages: Vec::new(),
+                    },
+                    Constraint {
+                        name: Some("FK_Users_Org".into()),
+                        constraint_type: "FOREIGN KEY".into(),
+                        columns: vec!["OrgId".into()],
+                        usages: vec![Usage {
+                            db_schema: String::new(),
+                            table: "Orgs".into(),
+                            column: "Id".into(),
+                        }],
+                    },
+                ],
             }],
         }]
     }
