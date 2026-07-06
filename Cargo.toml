@@ -99,6 +99,8 @@ lto = "thin"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+# Property-based round-trip testing of the driver against the emulator (integration test only).
+proptest = "1"
 # Driver manager: loads the built cdylib through the C ABI for the FFI smoke test.
 adbc_driver_manager = "0.23"
 # Admin clients, used by the emulator integration test to create the test instance and database.
