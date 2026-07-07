@@ -546,6 +546,75 @@ fn query_and_dml_round_trip() {
         "commit without an active manual transaction must fail"
     );
 
+    // A FAILED commit must keep the buffered DML: the transaction stays open so the caller can
+    // retry (a genuine replay) or roll back. Regression test: the buffer used to be taken
+    // *before* the apply, so the DML was lost on error and a retried commit saw an empty batch
+    // and reported success with nothing written. Force the failure with DML that buffers fine
+    // (buffering never talks to Spanner) but cannot execute — an unknown table.
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("disable autocommit");
+    let buffer_sql = |connection: &mut SpannerConnection, sql: &str| {
+        let mut s = connection.new_statement().expect("new statement");
+        s.set_sql_query(sql).unwrap();
+        assert_eq!(s.execute_update().expect("buffer DML"), None);
+    };
+    buffer_sql(&mut connection, "INSERT INTO AdbcTxn (Id) VALUES (7)");
+    buffer_sql(
+        &mut connection,
+        "INSERT INTO AdbcTxnNoSuchTable (Id) VALUES (7)",
+    );
+    assert!(
+        connection.commit().is_err(),
+        "committing a batch with an unknown table must fail"
+    );
+    assert_eq!(
+        count_rows(&mut connection, "AdbcTxn"),
+        5,
+        "a failed commit must apply nothing (the batch is atomic)"
+    );
+    assert!(
+        connection.commit().is_err(),
+        "a retried failed commit must replay the buffer and fail again — not report success \
+         on an emptied buffer"
+    );
+    // The failing statement is still buffered, so enabling autocommit (an implicit commit) must
+    // fail too and leave the connection in manual mode with the buffer intact.
+    assert!(
+        connection
+            .set_option(
+                OptionConnection::AutoCommit,
+                OptionValue::String("true".into()),
+            )
+            .is_err(),
+        "enabling autocommit must fail while the buffered batch cannot commit"
+    );
+    assert_eq!(
+        connection
+            .get_option_string(OptionConnection::AutoCommit)
+            .expect("get autocommit"),
+        "false",
+        "a failed implicit commit must not flip the connection into autocommit mode"
+    );
+    // Rollback discards the failed batch; after that the retry path is clean again.
+    connection.rollback().expect("rollback failed batch");
+    buffer_sql(&mut connection, "INSERT INTO AdbcTxn (Id) VALUES (7)");
+    connection.commit().expect("commit after rollback");
+    assert_eq!(
+        count_rows(&mut connection, "AdbcTxn"),
+        6,
+        "the replacement batch must commit normally after the failed one was rolled back"
+    );
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("true".into()),
+        )
+        .expect("re-enable autocommit");
+
     let mut drop_txn = connection.new_statement().expect("new statement");
     drop_txn.set_sql_query("DROP TABLE AdbcTxn").unwrap();
     drop_txn.execute_update().expect("drop txn table");

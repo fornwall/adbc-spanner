@@ -20,6 +20,13 @@
 //!   support `THEN RETURN`) — and the rows would be unobtainable at commit time anyway.
 //! - Queries (`execute`) and DDL always run immediately (DDL is never transactional in Spanner), so
 //!   a query does not observe DML buffered earlier in the same manual transaction.
+//! - A **failed** commit keeps the buffer and the transaction open: the caller can retry
+//!   [`Connection::commit`] (replaying the batch) or [`Connection::rollback`] to discard it. The
+//!   same holds when re-enabling autocommit fails to commit the buffer: the connection stays in
+//!   manual mode. On `ABORTED` (the retriable code preserved in `vendor_code`) the failed attempt
+//!   is guaranteed not to have committed, so the replay is exact; after an *ambiguous* transport
+//!   failure the usual Spanner caveat applies — the commit may have landed, so a replay can apply
+//!   the batch twice unless the DML is idempotent.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -733,13 +740,25 @@ impl Optionable for SpannerConnection {
         match &key {
             OptionConnection::AutoCommit => {
                 let enable = parse_bool(value)?;
-                let currently = self.txn.lock().unwrap().autocommit;
-                if enable && !currently {
-                    // Enabling autocommit commits any active manual transaction.
-                    let pending = std::mem::take(&mut self.txn.lock().unwrap().pending);
-                    self.apply_transaction(pending)?;
-                }
-                self.txn.lock().unwrap().autocommit = enable;
+                // Enabling autocommit commits any active manual transaction. Like `commit`, apply
+                // from a clone and drain only on success: a failed apply must leave the buffer
+                // (and manual mode — note the early return keeps `autocommit` false) intact so
+                // the caller can retry or roll back, not silently lose the writes and flip mode.
+                let pending = {
+                    let st = self.txn.lock().unwrap();
+                    (enable && !st.autocommit).then(|| st.pending.clone())
+                };
+                let applied = match pending {
+                    Some(pending) => {
+                        let applied = pending.len();
+                        self.apply_transaction(pending)?;
+                        applied
+                    }
+                    None => 0,
+                };
+                let mut st = self.txn.lock().unwrap();
+                st.pending.drain(..applied);
+                st.autocommit = enable;
             }
             OptionConnection::ReadOnly => self.read_only = parse_bool(value)?,
             other => {
@@ -953,16 +972,28 @@ impl Connection for SpannerConnection {
     }
 
     fn commit(&mut self) -> Result<()> {
+        // Apply from a *clone* of the buffer and drain it only after success. Taking the buffer
+        // up front would lose the DML on a failed apply (e.g. ABORTED once the runner's retries
+        // are exhausted — the very code `error.rs` preserves in `vendor_code` so callers can
+        // retry) and, worse, a retried `commit()` would then see an empty list and report
+        // success with nothing written. Keeping the buffer makes retry a genuine replay and
+        // leaves `rollback()` available to discard instead (see the module doc for the replay
+        // caveats).
         let pending = {
-            let mut st = self.txn.lock().unwrap();
+            let st = self.txn.lock().unwrap();
             if st.autocommit {
                 return Err(invalid_state(
                     "commit invoked with autocommit enabled; no active transaction",
                 ));
             }
-            std::mem::take(&mut st.pending)
+            st.pending.clone()
         };
-        self.apply_transaction(pending)
+        let applied = pending.len();
+        self.apply_transaction(pending)?;
+        // Drain exactly the statements that were applied; anything buffered concurrently while
+        // the commit RPC ran stays pending for the next commit.
+        self.txn.lock().unwrap().pending.drain(..applied);
+        Ok(())
     }
 
     fn rollback(&mut self) -> Result<()> {

@@ -26,15 +26,22 @@
 //! - **`reset_peer_surfaces_error_then_recovers`** — a `reset_peer` toxic makes RPCs fail; the driver
 //!   surfaces a clean ADBC error (no panic/hang, bounded by a watchdog), and once the toxic is
 //!   removed a subsequent query **recovers** (the gRPC channel re-establishes through the proxy).
+//! - **`commit_under_transport_fault_never_loses_the_write`** — a manual-transaction `commit()`
+//!   started under a `reset_peer` toxic must not lose the buffered DML: the write has to land
+//!   once the fault clears. (Verified along the way: the pinned client marks all data-plane RPCs
+//!   idempotent and retries transport faults without an attempt cap, so such a commit *blocks and
+//!   heals* rather than erroring — a driver-level commit failure cannot be transport-injected;
+//!   the failed-commit/retry contract is covered at the SQL level in `tests/integration.rs`.)
 
 use std::process::Command;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use adbc_core::options::{OptionDatabase, OptionStatement, OptionValue};
+use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, OptionValue};
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_spanner::{SpannerConnection, SpannerDatabase, SpannerDriver};
+use arrow_array::Int64Array;
 use google_cloud_lro::Poller;
 use google_cloud_spanner::client::Spanner;
 use google_cloud_spanner_admin_instance_v1::model::Instance;
@@ -44,6 +51,11 @@ const PROJECT: &str = "test-project";
 const INSTANCE: &str = "test-instance";
 const DATABASE: &str = "adbc-test";
 const STREAM_TABLE: &str = "ResilStream";
+// A tiny table for the manual-transaction commit-fault test. The buffered DML is an idempotent
+// UPDATE so the test's assertions hold regardless of whether the faulted commit RPC reached the
+// emulator before the reset (a failed commit's outcome is inherently ambiguous at the transport
+// layer).
+const TXN_TABLE: &str = "ResilTxn";
 // The streaming table carries a wide payload so the result set is far larger than the gRPC/HTTP-2
 // receive buffer (empirically ~12 MB against the emulator). `execute()` fills that buffer and
 // returns; the remaining rows must then be pulled message-by-message over the network as the reader
@@ -206,9 +218,13 @@ fn ensure_setup() {
                 .create_database()
                 .set_parent(format!("projects/{PROJECT}/instances/{INSTANCE}"))
                 .set_create_statement(format!("CREATE DATABASE `{DATABASE}`"))
-                .set_extra_statements(vec![format!(
-                    "CREATE TABLE {STREAM_TABLE} (Id INT64, Payload STRING(MAX)) PRIMARY KEY (Id)"
-                )])
+                .set_extra_statements(vec![
+                    format!(
+                        "CREATE TABLE {STREAM_TABLE} (Id INT64, Payload STRING(MAX)) \
+                         PRIMARY KEY (Id)"
+                    ),
+                    format!("CREATE TABLE {TXN_TABLE} (Id INT64, Val INT64) PRIMARY KEY (Id)"),
+                ])
                 .poller()
                 .until_done()
                 .await;
@@ -423,6 +439,162 @@ fn reset_peer_surfaces_error_then_recovers() {
         "driver did not recover after the reset_peer toxic was removed"
     );
     eprintln!("reset_peer surfaced a clean error and the driver recovered afterwards");
+}
+
+/// A manual-transaction `commit()` under a transient transport fault must never lose the buffered
+/// write: once the fault clears, the update has to land — through whichever path the client
+/// surfaces the fault.
+///
+/// Empirically (verified against the pinned client) a *persistent* transport fault cannot make
+/// `commit()` return an error at all: `apply_request_defaults` marks every Spanner data-plane RPC
+/// idempotent (safe for DML because `seqno` gives replay protection) and `SpannerRetryPolicy` has
+/// no attempt cap, so the client retries the faulted RPC internally until the network heals and
+/// the same `commit()` call then succeeds. That is the branch this test pins down today. If a
+/// future client version starts surfacing transport errors instead, the `Err` branch takes over
+/// and exercises the driver's failed-commit contract directly: the buffer must survive the error
+/// (the take-before-apply regression consumed it, so a retried commit "succeeded" on an empty
+/// batch — a silent lost write) and a retried `commit()` must replay it. The SQL-level version of
+/// that regression is covered deterministically in `tests/integration.rs`.
+///
+/// The buffered DML is an idempotent UPDATE (`SET Val = 1`), so the final assertion is immune to
+/// the inherent ambiguity of a faulted commit (the RPC may or may not have reached the emulator
+/// before the reset): however many times the update is applied, `Val` must end up 1. Under the
+/// regression a retried commit succeeds instantly on an empty buffer and `Val` stays 0.
+#[test]
+fn commit_under_transport_fault_never_loses_the_write() {
+    let Some(toxi) = toxi() else {
+        eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
+        return;
+    };
+    ensure_setup();
+
+    let connection = Arc::new(Mutex::new(connect()));
+
+    // Seed one row (Id=1, Val=0) in autocommit mode, idempotently across re-runs.
+    {
+        let mut conn = connection.lock().expect("connection lock");
+        run(&mut conn, &format!("DELETE FROM {TXN_TABLE} WHERE true"));
+        run(
+            &mut conn,
+            &format!("INSERT INTO {TXN_TABLE} (Id, Val) VALUES (1, 0)"),
+        );
+    }
+
+    // Enter manual mode and buffer the update — buffering is local, no RPC happens yet.
+    connection
+        .lock()
+        .expect("connection lock")
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("disable autocommit");
+    {
+        let mut conn = connection.lock().expect("connection lock");
+        let mut s = conn.new_statement().expect("new statement");
+        s.set_sql_query(format!("UPDATE {TXN_TABLE} SET Val = 1 WHERE Id = 1"))
+            .unwrap();
+        assert_eq!(
+            s.execute_update().expect("buffer update"),
+            None,
+            "manual mode must buffer the DML (count unknown until commit)"
+        );
+    }
+
+    // Break the transport before the commit starts, run the commit on a worker thread, and give
+    // it a few seconds under the fault. Expected today: the commit neither succeeds nor fails —
+    // the client is retrying inside the call (see the doc comment). Clear the toxic afterwards
+    // regardless, so a test failure doesn't leave the proxy poisoned for the other tests.
+    toxi.add_reset_peer("resil_commit_reset", 0);
+    let (tx, rx) = mpsc::channel();
+    let commit_conn = connection.clone();
+    let worker = std::thread::spawn(move || {
+        let result = commit_conn.lock().expect("connection lock").commit();
+        let _ = tx.send(result);
+    });
+    let during_fault = rx.recv_timeout(Duration::from_secs(5));
+    toxi.remove_toxic("resil_commit_reset");
+
+    match during_fault {
+        // Today's client: the commit is blocked in the client's internal retry loop. With the
+        // fault gone it must complete successfully on its own (allow generously for the retry
+        // backoff plus channel re-establishment).
+        Err(_) => {
+            eprintln!("commit is blocked retrying under the fault (expected); removing the fault");
+            let healed = rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("commit did not complete within 60s of the fault being removed");
+            worker.join().expect("commit worker panicked");
+            healed.expect("commit should succeed once the transport fault is gone");
+        }
+        // A client that surfaces the transport error instead: the driver must have kept the
+        // buffer, so a retried commit() replays it once the channel re-establishes.
+        Ok(Err(error)) => {
+            eprintln!("commit surfaced the fault as an error ({error}); retrying the commit");
+            worker.join().expect("commit worker panicked");
+            let mut last = None;
+            let retried =
+                (0..20).any(
+                    |_| match connection.lock().expect("connection lock").commit() {
+                        Ok(()) => true,
+                        Err(e) => {
+                            last = Some(e);
+                            std::thread::sleep(Duration::from_millis(500));
+                            false
+                        }
+                    },
+                );
+            assert!(
+                retried,
+                "retried commit did not succeed after the fault was removed: {last:?}"
+            );
+        }
+        Ok(Ok(())) => panic!(
+            "commit reported success while the transport to the emulator was reset — \
+             the fault did not take effect (toxiproxy problem?)"
+        ),
+    }
+
+    // THE assertion: the buffered update landed, whichever path delivered it. Under the
+    // take-before-apply regression a failed attempt emptied the buffer, so the follow-up commit
+    // reported success with nothing written and Val stayed 0.
+    assert_eq!(
+        query_int(
+            &connection,
+            &format!("SELECT Val FROM {TXN_TABLE} WHERE Id = 1"),
+        ),
+        1,
+        "the buffered update must not be lost by a commit under a transport fault"
+    );
+
+    // Leave the connection in autocommit mode (the buffer is empty now, so this commits nothing).
+    connection
+        .lock()
+        .expect("connection lock")
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("true".into()),
+        )
+        .expect("re-enable autocommit");
+    eprintln!("the write survived a transport fault during commit");
+}
+
+/// Run a query expected to return a single INT64 cell and return its value.
+fn query_int(connection: &Arc<Mutex<SpannerConnection>>, sql: &str) -> i64 {
+    let mut conn = connection.lock().expect("connection lock");
+    let mut s = conn.new_statement().expect("new statement");
+    s.set_sql_query(sql).unwrap();
+    let batches: Vec<_> = s
+        .execute()
+        .expect("int query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("int query stream");
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("INT64 column")
+        .value(0)
 }
 
 /// Run `SELECT 1` on the shared connection, returning the ADBC result.
