@@ -677,6 +677,62 @@ fn query_and_dml_round_trip() {
     drop_reuse.set_sql_query("DROP TABLE AdbcReuse").unwrap();
     drop_reuse.execute_update().expect("drop reuse table");
 
+    // Create-mode bulk ingest: the driver builds the table from the bound Arrow schema (with a
+    // synthetic UUID primary key), so no CREATE TABLE is needed first. Exercises create/append/replace.
+    let mut drop_create = connection.new_statement().expect("new statement");
+    drop_create
+        .set_sql_query("DROP TABLE IF EXISTS AdbcCreate")
+        .unwrap();
+    drop_create.execute_update().expect("pre-drop create table");
+    let create_rows = || {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("Id", DataType::Int64, false),
+                Field::new("Label", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![10, 20])),
+                Arc::new(StringArray::from(vec!["x", "y"])),
+            ],
+        )
+        .unwrap()
+    };
+    let ingest_create = |connection: &mut SpannerConnection, mode: &str| {
+        let mut s = connection.new_statement().expect("new statement");
+        s.set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcCreate".into()),
+        )
+        .unwrap();
+        s.set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String(mode.into()),
+        )
+        .unwrap();
+        s.bind(create_rows()).expect("bind ingest rows");
+        s.execute_update().expect("ingest")
+    };
+    assert_eq!(ingest_create(&mut connection, "create"), Some(2)); // creates table + 2 rows
+    assert_eq!(count_rows(&mut connection, "AdbcCreate"), 2);
+    assert_eq!(ingest_create(&mut connection, "append"), Some(2)); // appends
+    assert_eq!(count_rows(&mut connection, "AdbcCreate"), 4);
+    assert_eq!(ingest_create(&mut connection, "replace"), Some(2)); // drops + recreates
+    assert_eq!(count_rows(&mut connection, "AdbcCreate"), 2);
+    // The data columns read back even though the table also has the synthetic key column.
+    let mut read_create = connection.new_statement().expect("new statement");
+    read_create
+        .set_sql_query("SELECT Id, Label FROM AdbcCreate ORDER BY Id")
+        .unwrap();
+    let created = read_create
+        .execute()
+        .expect("read created")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(created.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    let mut drop_created = connection.new_statement().expect("new statement");
+    drop_created.set_sql_query("DROP TABLE AdbcCreate").unwrap();
+    drop_created.execute_update().expect("drop create table");
+
     // Parameterized query: bind @Id and read the matching row back.
     let param = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, false)])),

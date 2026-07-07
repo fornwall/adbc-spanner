@@ -1,0 +1,3 @@
+// part: metadata
+
+skip = "Spanner returns TIMESTAMP as Arrow Timestamp(Nanosecond); does not match the case's unit"
