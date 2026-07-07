@@ -94,6 +94,20 @@ incremental driver work:
 - **One upstream `adbc_ffi` gap** — `ErrorCompatibility` checks that the driver
   preserves the caller's `AdbcError.private_data` / `private_driver`; the FFI
   exporter does not. Not fixable from this crate.
+- **`ECANCELED` through the C stream** — `SqlQueryCancel` requires the result
+  stream's `get_next` to return exactly `ECANCELED` (125) after a cancel, but
+  arrow-rs's `FFI_ArrowArrayStream` exporter (which `adbc_ffi` uses to export
+  the driver's `RecordBatchReader`) maps every error to
+  `ENOSYS`/`ENOMEM`/`EIO`/`EINVAL` — there is no `ArrowError` variant that
+  reaches 125, so no Rust driver behind `adbc_ffi` can satisfy the case today.
+  The driver's cancellation itself works and is sticky (a cancel landing
+  between two chunk fetches cancels the next one); it surfaces through the C
+  stream as `EINVAL` with the message `Cancelled: operation cancelled`. The
+  case previously "passed" only because a between-chunk cancel was silently
+  lost and the stream ran to completion. Covered natively by
+  `cancel_between_stream_chunks_cancels_the_next_fetch` in
+  `tests/integration.rs`; fixing the errno needs a status-aware stream export
+  in `adbc_ffi` (the git-pinned fork), at which point the case can be re-gated.
 - **Rigid single-partition assumption** — `SqlPartitionedInts` is now *runnable*
   (the driver implements `execute_partitions`/`read_partition`, and the
   `supports_partitioned_data` quirk is `true`), but the upstream case hardcodes
