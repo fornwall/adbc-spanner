@@ -24,7 +24,9 @@ use google_cloud_spanner::statement::Statement as SpannerSql;
 use crate::bind;
 use crate::connection::SharedTxn;
 use crate::conversion::{result_set_to_batch, stream_query};
-use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
+use crate::error::{
+    err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
+};
 use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
 
 /// Default number of rows converted into each streamed Arrow batch (see
@@ -209,7 +211,7 @@ impl SpannerStatement {
                 .database_admin_builder()
                 .build()
                 .await
-                .map_err(from_spanner)?;
+                .map_err(from_builder)?;
             admin
                 .update_database_ddl()
                 .set_database(database)

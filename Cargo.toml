@@ -120,3 +120,7 @@ adbc_driver_manager = { git = "https://github.com/fornwall/arrow-adbc", rev = "7
 # Pinned to the same git revision as the google-cloud family above (see the note there).
 google-cloud-spanner-admin-instance-v1 = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
 google-cloud-spanner-admin-database-v1 = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
+# Names the gax error/status types so the error-mapping unit test can build a real gax error.
+# google-cloud-spanner re-exports this crate's `Error` at runtime, so this is a test-only dependency.
+# Same git pin as the google-cloud family above (see the note there).
+google-cloud-gax = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
