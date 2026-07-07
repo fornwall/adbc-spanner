@@ -42,7 +42,8 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        # --all-features so the `fuzzing` helper module is linted too.
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Docs (deny warnings / broken links)
         env:

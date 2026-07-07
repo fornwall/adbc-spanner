@@ -11,12 +11,6 @@ they are to bite a real user. (All P1 and P2 findings from the original review h
 
 - **macOS deployment target**: the `macosx_10_12` tag is asserted, not enforced — export
   `MACOSX_DEPLOYMENT_TARGET` in the build (aws-lc's cmake defaults from the host).
-- **Test/fuzz upkeep**: `AdbcDdl` scratch table is never dropped (leaks into a real
-  `SPANNER_GCP_DATABASE`); no integration round-trip for JSON/`arrow.json` or FLOAT32 columns;
-  `ensure_database_once` poisons its mutex on setup panic (the file already solves this pattern
-  for `serial_guard`); fuzz corpus is discarded every run — cache it so coverage accumulates;
-  `ci.yml` clippy omits `--all-features` so the `fuzzing` module is never linted; the `like` fuzz
-  oracle's `Regex::new().unwrap()` can panic on `CompiledTooBig` if `-max_len` is ever raised.
 
 ## Verified non-issues
 

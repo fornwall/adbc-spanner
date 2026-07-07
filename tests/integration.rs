@@ -38,8 +38,8 @@ use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_driver_manager::ManagedDriver;
 use adbc_spanner::{SpannerConnection, SpannerDatabase, SpannerDriver};
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int16Array,
-    Int64Array, ListArray, RecordBatch, RecordBatchReader, StringArray, StructArray,
+    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int16Array, Int64Array, ListArray, RecordBatch, RecordBatchReader, StringArray, StructArray,
     TimestampMicrosecondArray, TimestampNanosecondArray, UnionArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -229,7 +229,10 @@ async fn ensure_database(target: &TestTarget) {
 /// to arrive performs the setup and the second reuses it.
 fn ensure_database_once(target: &TestTarget) {
     static DONE: Mutex<bool> = Mutex::new(false);
-    let mut done = DONE.lock().expect("setup lock poisoned");
+    // Like `serial_guard`, ignore poisoning: if the first arrival's setup panicked, that failure
+    // should surface on its own rather than cascade into every later test as a "poisoned lock"
+    // panic. `done` is still false then, so the next test simply retries the idempotent setup.
+    let mut done = DONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if !*done {
         // A throwaway runtime just for the async admin setup.
         tokio::runtime::Runtime::new()
@@ -394,6 +397,12 @@ fn query_and_dml_round_trip() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(ddl_rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+    // Drop the scratch table like every other section, so re-runs against a persistent
+    // `SPANNER_GCP_DATABASE` don't accumulate leftovers.
+    let mut drop_ddl = connection.new_statement().expect("new statement");
+    drop_ddl.set_sql_query("DROP TABLE AdbcDdl").unwrap();
+    drop_ddl.execute_update().expect("drop ddl table");
 
     // --- Manual multi-statement transactions ---
 
@@ -1931,6 +1940,89 @@ fn get_statistics_reports_real_counts() {
     let mut drop = connection.new_statement().expect("new statement");
     drop.set_sql_query("DROP TABLE AdbcStats").unwrap();
     drop.execute_update().expect("drop stats table");
+}
+
+/// JSON and FLOAT32 columns round-trip through the driver: JSON keeps `Utf8` storage but is tagged
+/// with the canonical `arrow.json` extension in the field metadata, FLOAT32 maps to Arrow
+/// `Float32`, and NULLs in both survive.
+#[test]
+fn json_and_float32_round_trip() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping json_and_float32_round_trip");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    run(
+        &mut connection,
+        "DROP TABLE IF EXISTS AdbcJson; \
+         CREATE TABLE AdbcJson (Id INT64, Doc JSON, Ratio FLOAT32) PRIMARY KEY (Id)",
+    );
+    run(
+        &mut connection,
+        r#"INSERT INTO AdbcJson (Id, Doc, Ratio) VALUES
+           (1, JSON '{"a":1,"b":"x"}', 1.5), (2, NULL, NULL)"#,
+    );
+
+    let mut query = connection.new_statement().expect("new statement");
+    query
+        .set_sql_query("SELECT Doc, Ratio FROM AdbcJson ORDER BY Id")
+        .unwrap();
+    let reader = query.execute().expect("query json/float32");
+
+    let schema = reader.schema();
+    let doc_field = schema.field(0);
+    assert_eq!(doc_field.data_type(), &DataType::Utf8);
+    assert_eq!(
+        doc_field
+            .metadata()
+            .get("ARROW:extension:name")
+            .map(String::as_str),
+        Some("arrow.json"),
+        "JSON column must carry the arrow.json extension: {doc_field:?}"
+    );
+    assert_eq!(schema.field(1).data_type(), &DataType::Float32);
+
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect json/float32 batches");
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    let batch = &batches[0];
+    let docs = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let ratios = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap();
+
+    // Spanner stores JSON normalized; assert on key/value fragments rather than the exact text so
+    // the check is robust to whitespace/ordering differences between backends.
+    let doc = docs.value(0);
+    assert!(
+        doc.contains(r#""a":1"#) && doc.contains(r#""b":"x""#),
+        "unexpected JSON text: {doc:?}"
+    );
+    assert!(docs.is_null(1), "NULL JSON must come back null");
+    assert_eq!(ratios.value(0), 1.5f32);
+    assert!(ratios.is_null(1), "NULL FLOAT32 must come back null");
+
+    let mut drop = connection.new_statement().expect("new statement");
+    drop.set_sql_query("DROP TABLE AdbcJson").unwrap();
+    drop.execute_update().expect("drop json table");
 }
 
 #[test]
