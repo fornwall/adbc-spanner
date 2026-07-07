@@ -9,43 +9,36 @@ they are to bite a real user.
 
 ## P1 — fix soon (user-facing breakage or wrong deliverables)
 
-**1. Linux wheels are tagged `manylinux_2_35` but built on glibc 2.39** —
-`.github/workflows/libraries.yml:176` hardcodes the tag while the build runs on `ubuntu-latest`,
-which is now 24.04 (glibc 2.39). If the binary picks up any post-2.35 versioned symbol, pip on
-Ubuntu 22.04 / Debian 12 installs the wheel fine and then `dlopen` fails at connect time. Build in
-a manylinux container or pin `ubuntu-22.04`, and add an `auditwheel show` check so the tag can't
-silently drift again when runners move to 26.04.
-
-**2. `cancel()` is silently lost between chunk fetches** — `src/runtime.rs:40`:
+**1. `cancel()` is silently lost between chunk fetches** — `src/runtime.rs:40`:
 `Notify::notify_waiters()` wakes only currently-parked waiters and stores nothing. If a caller
 cancels while the streaming reader is between fetches (converting rows, or the consumer is
 processing a batch), the signal evaporates and the query streams to completion — contradicting the
 module docs. Make cancellation sticky (`AtomicBool` + `Notify`, or
 `tokio_util::sync::CancellationToken`).
 
-**3. Malformed values silently become NULL on the read path** — `src/conversion.rs`: parse
+**2. Malformed values silently become NULL on the read path** — `src/conversion.rs`: parse
 failures for INT64, FLOAT, DATE, NUMERIC and base64 BYTES all funnel through `Option` → null slot,
 so an unexpected wire value reads back as SQL NULL with no error. The timestamp path already does
 the right thing (errors loudly on unrepresentable values, `conversion.rs:353`); the other types
 should be consistent — corrupt-looking data should fail, not fabricate NULLs.
 
-**4. `INSERT/UPDATE/DELETE ... THEN RETURN` rows are discarded** — `src/statement.rs:369`:
+**3. `INSERT/UPDATE/DELETE ... THEN RETURN` rows are discarded** — `src/statement.rs:369`:
 anything classified as DML by `is_dml` returns an empty reader from `execute()`. Spanner supports
 `THEN RETURN`, so a client running `INSERT ... THEN RETURN id` gets an empty result with no error.
 Either detect `THEN RETURN` and route through a result-returning path, or reject it explicitly.
 
 ## P2 — real defects with narrower blast radius
 
-**5. SQL lexers miss GoogleSQL raw and triple-quoted strings** — `src/ddl.rs:51`: in `r'C:\'` the
+**4. SQL lexers miss GoogleSQL raw and triple-quoted strings** — `src/ddl.rs:51`: in `r'C:\'` the
 backslash isn't an escape, so the splitter eats the closing quote and mangles the batch;
 `'''don't; stop'''` splits mid-literal. Same blind spots in `named_parameters` (`src/bind.rs`).
 Handle `r`/`b` prefixes and `'''`/`"""`.
 
-**6. Statement hints defeat statement classification** — `first_keyword("@{HINT=X} UPDATE ...")`
+**5. Statement hints defeat statement classification** — `first_keyword("@{HINT=X} UPDATE ...")`
 returns `None` (`src/ddl.rs:112`), so hinted DML entering via `execute()` is sent to a read-only
 transaction, which Spanner rejects. Skip a leading `@{…}` block.
 
-**7. Identifier quoting is inconsistent and uses the wrong escape** — `qualified_table`
+**6. Identifier quoting is inconsistent and uses the wrong escape** — `qualified_table`
 (`src/connection.rs:995`) interpolates caller-supplied schema/table names with no escaping (a name
 with a backtick breaks `get_table_schema` and then gets mislabeled `NotFound`), while the one
 escape that exists (`connection.rs:367` and `bind::quote_ident`) uses MySQL-style backtick
@@ -55,28 +48,28 @@ sites. Related: `insert_sql` (`src/bind.rs:396`) writes parameter references as
 `` a`b `` test at `bind.rs:461` currently asserts the broken output. Binding ingest params
 positionally (`@p0, @p1`) would decouple param names from column names.
 
-**8. Release job can attach unchecksummed wheels** — `libraries.yml:94`: the `release` job
+**7. Release job can attach unchecksummed wheels** — `libraries.yml:94`: the `release` job
 downloads *all* artifacts with `merge-multiple` while `python-wheels` runs in parallel; depending
 on timing, wheels land in `dist/` and get attached to the GitHub Release without matching the
 `sha256sum adbc-spanner-*` glob. Add a `pattern:` filter.
 
-**9. CI supply-chain hygiene** — the release-critical actions are pinned to mutable refs
+**8. CI supply-chain hygiene** — the release-critical actions are pinned to mutable refs
 (`softprops/action-gh-release@v3` with `contents: write`, `pypa/gh-action-pypi-publish@release/v1`
 — a *branch* — with `id-token: write`); pin those to commit SHAs. And `ci.yml`,
 `adbc-validation.yml`, `fuzz.yml` have no `permissions:` block at all — add `contents: read` like
 the other two workflows already do.
 
-**10. gRPC error fidelity** — `src/error.rs`: `ABORTED` (Spanner's routine "retry me" signal) maps
+**9. gRPC error fidelity** — `src/error.rs`: `ABORTED` (Spanner's routine "retry me" signal) maps
 to `Status::Internal`, indistinguishable from a driver bug when the r/w runner exhausts retries
 under contention; and `from_spanner` leaves `vendor_code` at zero when it could carry the numeric
 gRPC code for callers' retry logic.
 
-**11. Untested data-loss path** — the "re-enabling autocommit commits buffered DML" branch
+**10. Untested data-loss path** — the "re-enabling autocommit commits buffered DML" branch
 (`src/connection.rs:721`) has zero coverage; the one toggle test deliberately buffers nothing
 (`tests/integration.rs:486`). A regression that *discarded* the buffer instead of committing would
 pass the whole suite.
 
-**12. Emulator scripts fail open** — `scripts/with-emulator.sh:44–64`: both readiness loops fall
+**11. Emulator scripts fail open** — `scripts/with-emulator.sh:44–64`: both readiness loops fall
 through silently on timeout and run the tests against a dead port (the ci.yml copy of this loop
 fails correctly). `run-foundry-validation.sh` also lacks `-e`, so a failed build validates a stale
 `.so`, and its `VALIDATION_REF` pin only applies on first install.

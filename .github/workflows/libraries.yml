@@ -20,11 +20,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The Linux runners are pinned to 22.04 (glibc 2.35) because the wheels
+          # built from these libraries are tagged manylinux_2_35 (see the
+          # python-wheels job); a "Verify glibc requirement" step below fails the
+          # build if the library ever needs newer glibc symbols than the tag
+          # promises. To support older distros, switch to building inside a
+          # manylinux container and lower the tags together.
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             lib: libadbc_spanner.so
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
             lib: libadbc_spanner.so
           - target: aarch64-apple-darwin
             runner: macos-14
@@ -58,6 +64,24 @@ jobs:
 
       - name: Build shared library
         run: cargo build --release --target ${{ matrix.target }}
+
+      # The Linux wheels are tagged manylinux_2_35, which promises pip that the
+      # bundled library loads on any glibc >= 2.35 system. Enforce that promise:
+      # fail if the built .so requires a newer glibc symbol version (e.g. after
+      # a runner image bump), instead of shipping a wheel that installs fine on
+      # Ubuntu 22.04 / Debian 12 and then fails at dlopen time.
+      - name: Verify glibc requirement matches the manylinux_2_35 wheel tag
+        if: contains(matrix.target, 'linux-gnu')
+        run: |
+          set -euo pipefail
+          lib="target/${{ matrix.target }}/release/${{ matrix.lib }}"
+          required="$(objdump -T "$lib" | { grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' || true; } \
+            | sed 's/^GLIBC_//' | sort -uV | tail -1)"
+          echo "highest glibc symbol version required by ${lib}: ${required}"
+          if [ "$(printf '%s\n' "$required" 2.35 | sort -V | tail -1)" != "2.35" ]; then
+            echo "::error::${{ matrix.lib }} requires glibc ${required}, which breaks the manylinux_2_35 wheel tag (see the python-wheels job)" >&2
+            exit 1
+          fi
 
       - name: Package
         shell: bash
@@ -169,9 +193,10 @@ jobs:
           set -euo pipefail
           mkdir -p wheelhouse
           # target | lib filename | wheel platform tag.
-          # NOTE: the manylinux tag reflects the ubuntu-latest build host's glibc;
-          # if you need to support older glibc, build the libs in a manylinux
-          # container and lower these tags to match.
+          # NOTE: the manylinux tag matches the pinned ubuntu-22.04 build
+          # runners (glibc 2.35), and the build job's "Verify glibc requirement"
+          # step enforces it. If you change either the runners or these tags,
+          # change the other (and the check) to match.
           rows=(
             "x86_64-unknown-linux-gnu|libadbc_spanner.so|manylinux_2_35_x86_64"
             "aarch64-unknown-linux-gnu|libadbc_spanner.so|manylinux_2_35_aarch64"
