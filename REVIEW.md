@@ -9,18 +9,13 @@ they are to bite a real user. (All P1 findings from the original review have bee
 
 ## P2 — real defects with narrower blast radius
 
-**1. Release job can attach unchecksummed wheels** — `libraries.yml:94`: the `release` job
-downloads *all* artifacts with `merge-multiple` while `python-wheels` runs in parallel; depending
-on timing, wheels land in `dist/` and get attached to the GitHub Release without matching the
-`sha256sum adbc-spanner-*` glob. Add a `pattern:` filter.
-
-**2. CI supply-chain hygiene** — the release-critical actions are pinned to mutable refs
+**1. CI supply-chain hygiene** — the release-critical actions are pinned to mutable refs
 (`softprops/action-gh-release@v3` with `contents: write`, `pypa/gh-action-pypi-publish@release/v1`
 — a *branch* — with `id-token: write`); pin those to commit SHAs. And `ci.yml`,
 `adbc-validation.yml`, `fuzz.yml` have no `permissions:` block at all — add `contents: read` like
 the other two workflows already do.
 
-**3. Emulator scripts fail open** — `scripts/with-emulator.sh:44–64`: both readiness loops fall
+**2. Emulator scripts fail open** — `scripts/with-emulator.sh:44–64`: both readiness loops fall
 through silently on timeout and run the tests against a dead port (the ci.yml copy of this loop
 fails correctly). `run-foundry-validation.sh` also lacks `-e`, so a failed build validates a stale
 `.so`, and its `VALIDATION_REF` pin only applies on first install.

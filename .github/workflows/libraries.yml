@@ -115,9 +115,16 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download all build artifacts
+      - name: Download the platform library artifacts
         uses: actions/download-artifact@v8
         with:
+          # Only the per-platform library archives the `build` job uploaded. Without this
+          # pattern the step downloads *every* artifact of the run — and since `python-wheels`
+          # runs concurrently (both jobs only need `build`), its `python-wheels` artifact could
+          # land in dist/ depending on timing and be attached to the GitHub Release without
+          # matching the `adbc-spanner-*` checksum glob below. Wheels are published to PyPI by
+          # `python-publish`, not attached to the release.
+          pattern: adbc-spanner-*
           path: dist
           merge-multiple: true
 
