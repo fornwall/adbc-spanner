@@ -1,0 +1,13 @@
+// Spanner override: idx PRIMARY KEY, native res type name.
+
+// part: setup_query
+
+CREATE TABLE test_int64 (
+    idx INT64,
+    res INT64,
+) PRIMARY KEY (idx);
+INSERT INTO test_int64 (idx, res) VALUES (1, 4294967296);
+INSERT INTO test_int64 (idx, res) VALUES (2, 9223372036854775807);
+INSERT INTO test_int64 (idx, res) VALUES (3, -9223372036854775808);
+INSERT INTO test_int64 (idx, res) VALUES (4, 0);
+INSERT INTO test_int64 (idx, res) VALUES (5, NULL);

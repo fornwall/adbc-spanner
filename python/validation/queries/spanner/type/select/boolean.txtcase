@@ -1,0 +1,11 @@
+// Spanner override: idx PRIMARY KEY, native res type name.
+
+// part: setup_query
+
+CREATE TABLE test_boolean (
+    idx INT64,
+    res BOOL,
+) PRIMARY KEY (idx);
+INSERT INTO test_boolean (idx, res) VALUES (1, TRUE);
+INSERT INTO test_boolean (idx, res) VALUES (2, FALSE);
+INSERT INTO test_boolean (idx, res) VALUES (3, NULL);

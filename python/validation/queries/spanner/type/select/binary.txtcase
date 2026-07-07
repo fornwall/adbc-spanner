@@ -1,0 +1,13 @@
+// Spanner override: idx PRIMARY KEY, BYTES(MAX); X'..' hex literals -> FROM_HEX(...).
+
+// part: setup_query
+
+CREATE TABLE test_binary (
+    idx INT64,
+    res BYTES(MAX),
+) PRIMARY KEY (idx);
+INSERT INTO test_binary (idx, res) VALUES (1, FROM_HEX('e38193e38293e381abe381a1e381afe38081e4b896e7958cefbc81'));  -- 'こんにちは、世界！' in UTF-8
+INSERT INTO test_binary (idx, res) VALUES (2, FROM_HEX('00'));
+INSERT INTO test_binary (idx, res) VALUES (3, FROM_HEX('deadbeef'));
+INSERT INTO test_binary (idx, res) VALUES (4, FROM_HEX(''));
+INSERT INTO test_binary (idx, res) VALUES (5, NULL);
