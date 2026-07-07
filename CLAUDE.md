@@ -177,6 +177,18 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   (`get_statistics` computes exact `ROW_COUNT`/`NULL_COUNT`/`DISTINCT_COUNT` via one aggregate scan
   per table — see `src/statistics.rs`; `approximate=true` returns nothing since Spanner has no cheap
   stats. `get_statistic_names` returns an empty, correctly-typed result set.)
-- Still returning `NotImplemented` (keep the pattern until implemented): Substrait and partitioned
-  execution (`execute_partitions`/`read_partition`).
+- Partitioned execution (`execute_partitions`/`read_partition`): `execute_partitions` opens a batch
+  read-only transaction (`DatabaseClient::batch_read_only_transaction`), calls `partition_query`, and
+  serialises each `google_cloud_spanner::batch::Partition` (which carries its session + transaction
+  id + partition token, and is `serde`-serializable) into an opaque ADBC descriptor. Schema comes
+  from a separate `QueryMode::Plan` probe. `read_partition` deserialises a descriptor and calls
+  `Partition::execute` on the connection's client, streaming rows to Arrow via the same
+  `stream_query` path as `execute`. This works because the client's session is **multiplexed** and
+  `Arc`-shared across the connection's cloned `DatabaseClient`s, so a descriptor stays valid after
+  the producing statement is gone. `adbc.spanner.data_boost_enabled` (statement option) bakes Data
+  Boost into each descriptor; `adbc.spanner.max_partitions` hints the partition count. The emulator
+  supports the Partition RPCs (it ignores Data Boost) — covered by `execute_partitions_round_trip` in
+  `tests/integration.rs`.
+- Still returning `NotImplemented` (keep the pattern until implemented): Substrait
+  (`set_substrait_plan`) — Spanner executes GoogleSQL/PostgreSQL text, not Substrait plans.
 - Commits in this environment may need `-c commit.gpgsign=false` if no signing agent is present.

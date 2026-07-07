@@ -1872,3 +1872,109 @@ fn execute_streams_in_batches() {
     drop.set_sql_query("DROP TABLE AdbcStream").unwrap();
     drop.execute_update().expect("drop stream table");
 }
+
+/// Partitioned execution: `Statement::execute_partitions` splits a query into opaque partition
+/// descriptors, and `Connection::read_partition` reads each one back as Arrow. The union of all
+/// partitions must reproduce the full result set exactly once.
+#[test]
+fn execute_partitions_round_trip() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping execute_partitions_round_trip");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    run(
+        &mut connection,
+        "DROP TABLE IF EXISTS AdbcPartition; \
+         CREATE TABLE AdbcPartition (Id INT64) PRIMARY KEY (Id)",
+    );
+    // 200 rows, so the query has enough data for the server to (potentially) split it.
+    run(
+        &mut connection,
+        "INSERT INTO AdbcPartition (Id) \
+         SELECT n FROM UNNEST(GENERATE_ARRAY(1, 200)) AS n",
+    );
+
+    let mut statement = connection.new_statement().expect("new statement");
+    // The Data Boost and max-partitions options round-trip through get_option. Data Boost is baked
+    // into each descriptor at partition-creation time (below), so it travels with the token.
+    let data_boost_key = || OptionStatement::Other(adbc_spanner::OPTION_DATA_BOOST.into());
+    let max_partitions_key = || OptionStatement::Other(adbc_spanner::OPTION_MAX_PARTITIONS.into());
+    statement
+        .set_option(data_boost_key(), OptionValue::String("true".into()))
+        .expect("set data_boost");
+    statement
+        .set_option(max_partitions_key(), OptionValue::Int(4))
+        .expect("set max_partitions");
+    assert_eq!(
+        statement
+            .get_option_string(data_boost_key())
+            .expect("get data_boost"),
+        "true"
+    );
+    assert_eq!(
+        statement
+            .get_option_int(max_partitions_key())
+            .expect("get max_partitions"),
+        4
+    );
+
+    // A simple single-table scan is root-partitionable. No ORDER BY: ordering is not partitionable,
+    // and partitions carry no inherent order relative to one another.
+    statement
+        .set_sql_query("SELECT Id FROM AdbcPartition")
+        .unwrap();
+    let partitioned = statement.execute_partitions().expect("execute_partitions");
+
+    // The schema is known up front, independent of how many partitions come back.
+    assert_eq!(partitioned.schema.fields().len(), 1);
+    assert_eq!(partitioned.schema.field(0).name(), "Id");
+    assert_eq!(partitioned.schema.field(0).data_type(), &DataType::Int64);
+    assert!(
+        !partitioned.partitions.is_empty(),
+        "expected at least one partition"
+    );
+    // A read query reports no affected-row count.
+    assert_eq!(partitioned.rows_affected, -1);
+
+    // Read every partition back through the connection and union the ids.
+    let mut seen: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    for token in &partitioned.partitions {
+        let reader = connection.read_partition(token).expect("read_partition");
+        assert_eq!(reader.schema().field(0).name(), "Id");
+        for batch in reader {
+            let batch = batch.expect("partition batch");
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..ids.len() {
+                assert!(
+                    seen.insert(ids.value(i)),
+                    "id {} appeared in more than one partition",
+                    ids.value(i)
+                );
+            }
+        }
+    }
+    // Every row appears exactly once across all partitions.
+    assert_eq!(seen.len(), 200);
+    assert_eq!(*seen.iter().next().unwrap(), 1);
+    assert_eq!(*seen.iter().next_back().unwrap(), 200);
+
+    let mut drop = connection.new_statement().expect("new statement");
+    drop.set_sql_query("DROP TABLE AdbcPartition").unwrap();
+    drop.execute_update().expect("drop partition table");
+}

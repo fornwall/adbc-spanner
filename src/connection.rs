@@ -28,16 +28,17 @@ use arrow_array::{
     Array, ArrayRef, Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema};
+use google_cloud_spanner::batch::Partition;
 use google_cloud_spanner::builder::BatchDmlBuilder;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
-use crate::conversion::result_set_to_batch;
+use crate::conversion::{result_set_to_batch, stream_query};
 use crate::driver::Connected;
-use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
+use crate::error::{err, from_spanner, invalid_argument, invalid_state};
 use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
-use crate::statement::SpannerStatement;
+use crate::statement::{SpannerStatement, DEFAULT_ROWS_PER_BATCH};
 
 /// Transaction state shared between a connection and the statements it creates.
 #[derive(Debug)]
@@ -952,13 +953,23 @@ impl Connection for SpannerConnection {
 
     fn read_partition(
         &self,
-        _partition: impl AsRef<[u8]>,
+        partition: impl AsRef<[u8]>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        // Pairs with Statement::execute_partitions; see the note there.
-        Err(not_implemented(
-            "partitioned execution: Spanner's Partition APIs are session-bound and unsupported by \
-             the emulator, so it is not implemented",
-        ))
+        // Decode the opaque descriptor produced by `Statement::execute_partitions`. It carries the
+        // session, transaction id, partition token and Data Boost flag, so it executes on this
+        // connection's client (which shares the same multiplexed session) with no further setup.
+        let partition: Partition = serde_json::from_slice(partition.as_ref())
+            .map_err(|e| invalid_argument(format!("invalid partition descriptor: {e}")))?;
+        let client = self.client.clone();
+        let runtime = self.runtime.clone();
+        let cancel = self.cancel.clone();
+        // Stream the partition's rows to Arrow exactly like `Statement::execute`. The connection has
+        // no per-statement batch-size option, so the default chunk size is used.
+        let reader = block_on_cancellable(&self.runtime, &self.cancel, async move {
+            let result_set = partition.execute(&client).await.map_err(from_spanner)?;
+            stream_query(runtime, cancel, result_set, DEFAULT_ROWS_PER_BATCH).await
+        })?;
+        Ok(Box::new(reader))
     }
 }
 

@@ -18,6 +18,7 @@ use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use google_cloud_lro::Poller as _;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::model::execute_sql_request::QueryMode;
+use google_cloud_spanner::model::PartitionOptions;
 use google_cloud_spanner::statement::Statement as SpannerSql;
 
 use crate::bind;
@@ -27,8 +28,10 @@ use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_imple
 use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
 
 /// Default number of rows converted into each streamed Arrow batch (see
-/// [`OPTION_ROWS_PER_BATCH`](crate::OPTION_ROWS_PER_BATCH)).
-const DEFAULT_ROWS_PER_BATCH: usize = 8192;
+/// [`OPTION_ROWS_PER_BATCH`](crate::OPTION_ROWS_PER_BATCH)). Also used by
+/// [`Connection::read_partition`](adbc_core::Connection::read_partition), which has no per-statement
+/// batch-size option.
+pub(crate) const DEFAULT_ROWS_PER_BATCH: usize = 8192;
 
 /// An ADBC statement bound to a Spanner [`DatabaseClient`].
 pub struct SpannerStatement {
@@ -48,6 +51,11 @@ pub struct SpannerStatement {
     ingest_mode: Option<String>,
     /// Rows converted into each streamed Arrow batch by `execute` (`adbc.spanner.rows_per_batch`).
     rows_per_batch: usize,
+    /// Enable Data Boost for partitioned execution (`adbc.spanner.data_boost_enabled`).
+    data_boost: bool,
+    /// Maximum number of partitions to request from `execute_partitions`
+    /// (`adbc.spanner.max_partitions`); `None` lets Spanner choose.
+    max_partitions: Option<i64>,
     /// Cancellation signal for this statement's in-flight execution (see [`Statement::cancel`]).
     cancel: CancelSignal,
 }
@@ -73,6 +81,8 @@ impl SpannerStatement {
             target_table: None,
             ingest_mode: None,
             rows_per_batch: DEFAULT_ROWS_PER_BATCH,
+            data_boost: false,
+            max_partitions: None,
             cancel: CancelSignal::new(),
         }
     }
@@ -217,6 +227,24 @@ impl SpannerStatement {
             .clone()
             .ok_or_else(|| invalid_state("no SQL query set on statement; call set_sql_query first"))
     }
+
+    /// Build a Spanner query statement for `sql`, binding the first bound row (if any) as named
+    /// parameters. With `plan = true` the statement is set to `QueryMode::Plan` so it returns column
+    /// metadata without scanning data. Used by `execute_partitions` for both the schema probe and the
+    /// partitioned query itself. Only the first bound row is used — partitioned execution has no
+    /// per-row fan-out, so extra bound rows are ignored.
+    fn build_query_statement(&self, sql: &str, plan: bool) -> Result<SpannerSql> {
+        let mut builder = SpannerSql::builder(sql);
+        if plan {
+            builder = builder.set_query_mode(QueryMode::Plan);
+        }
+        if let Some(batch) = self.bound.first() {
+            if batch.num_rows() > 0 {
+                builder = bind::bind_row(builder, batch, 0)?;
+            }
+        }
+        Ok(builder.build())
+    }
 }
 
 impl Optionable for SpannerStatement {
@@ -235,6 +263,12 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) if k == crate::OPTION_ROWS_PER_BATCH => {
                 self.rows_per_batch = rows_per_batch_option(value)?;
             }
+            OptionStatement::Other(k) if k == crate::OPTION_DATA_BOOST => {
+                self.data_boost = bool_option(value)?;
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_MAX_PARTITIONS => {
+                self.max_partitions = Some(max_partitions_option(value)?);
+            }
             other => {
                 return Err(not_implemented(&format!(
                     "statement option {}",
@@ -251,6 +285,12 @@ impl Optionable for SpannerStatement {
             OptionStatement::IngestMode => self.ingest_mode.clone(),
             OptionStatement::Other(k) if k == crate::OPTION_ROWS_PER_BATCH => {
                 Some(self.rows_per_batch.to_string())
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_DATA_BOOST => {
+                Some(self.data_boost.to_string())
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_MAX_PARTITIONS => {
+                self.max_partitions.map(|n| n.to_string())
             }
             _ => None,
         };
@@ -270,6 +310,11 @@ impl Optionable for SpannerStatement {
         if let OptionStatement::Other(k) = &key {
             if k == crate::OPTION_ROWS_PER_BATCH {
                 return Ok(self.rows_per_batch as i64);
+            }
+            if k == crate::OPTION_MAX_PARTITIONS {
+                if let Some(n) = self.max_partitions {
+                    return Ok(n);
+                }
             }
         }
         Err(err(
@@ -412,11 +457,75 @@ impl Statement for SpannerStatement {
     }
 
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
-        // Spanner does support partitioned queries via a batch read-only transaction, but the
-        // partitions are only valid within that live, session-bound transaction — which does not
-        // map onto ADBC's opaque-token / read_partition model — and the Spanner emulator does not
-        // implement the Partition RPCs, so this is intentionally left unimplemented.
-        Err(not_implemented("Statement::execute_partitions"))
+        let sql = self.sql()?;
+        if crate::ddl::is_ddl(&sql) {
+            return Err(invalid_state(
+                "execute_partitions is only valid for queries",
+            ));
+        }
+        // Probe the schema and create the partitions. The partition query runs inside a batch
+        // read-only transaction; each returned partition carries its session, transaction id and
+        // partition token and is independently serializable, so it maps directly onto ADBC's opaque
+        // partition descriptor. The (Arc-shared, multiplexed) session lives as long as the
+        // connection's `DatabaseClient`, so the descriptors stay valid after this statement is gone,
+        // to be executed later by `Connection::read_partition`.
+        let plan_stmt = self.build_query_statement(&sql, true)?;
+        let query_stmt = self.build_query_statement(&sql, false)?;
+        let client = self.client.clone();
+        let data_boost = self.data_boost;
+        let max_partitions = self.max_partitions;
+
+        let (schema, partitions) = block_on_cancellable(&self.runtime, &self.cancel, async move {
+            // Schema via a PLAN of the query: column metadata without scanning any data.
+            let plan_rs = client
+                .single_use()
+                .build()
+                .execute_query(plan_stmt)
+                .await
+                .map_err(from_spanner)?;
+            let (schema, _batch) = result_set_to_batch(plan_rs).await?;
+
+            // Partition the query across a batch read-only transaction.
+            let transaction = client
+                .batch_read_only_transaction()
+                .build()
+                .await
+                .map_err(from_spanner)?;
+            let mut options = PartitionOptions::default();
+            if let Some(n) = max_partitions {
+                options = options.set_max_partitions(n);
+            }
+            let partitions = transaction
+                .partition_query(query_stmt, options)
+                .await
+                .map_err(from_spanner)?;
+
+            // Serialize each partition into an opaque ADBC descriptor, baking in the Data Boost
+            // choice so it travels with the token (honoured wherever the partition is executed).
+            let mut tokens: Vec<Vec<u8>> = Vec::with_capacity(partitions.len());
+            for partition in partitions {
+                let partition = if data_boost {
+                    partition.set_data_boost(true)
+                } else {
+                    partition
+                };
+                let token = serde_json::to_vec(&partition).map_err(|e| {
+                    err(
+                        format!("failed to serialize partition descriptor: {e}"),
+                        Status::Internal,
+                    )
+                })?;
+                tokens.push(token);
+            }
+            Ok::<_, Error>((schema, tokens))
+        })?;
+
+        Ok(PartitionedResult {
+            partitions,
+            schema: (*schema).clone(),
+            // A read query has no affected-row count; ADBC uses -1 for "unknown".
+            rows_affected: -1,
+        })
     }
 
     fn get_parameter_schema(&self) -> Result<Schema> {
@@ -474,6 +583,44 @@ fn string_option(value: OptionValue) -> Result<String> {
     match value {
         OptionValue::String(s) => Ok(s),
         _ => Err(invalid_argument("statement option requires a string value")),
+    }
+}
+
+/// Parse a boolean statement option, accepted as a bool-ish string (`true`/`false`/`1`/`0`/…) or an
+/// integer (`0` = false, non-zero = true).
+fn bool_option(value: OptionValue) -> Result<bool> {
+    match value {
+        OptionValue::String(s) => match s.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Ok(true),
+            "false" | "0" | "no" => Ok(false),
+            other => Err(invalid_argument(format!(
+                "expected a boolean, got {other:?}"
+            ))),
+        },
+        OptionValue::Int(i) => Ok(i != 0),
+        _ => Err(invalid_argument("expected a boolean option value")),
+    }
+}
+
+/// Parse a positive `max_partitions` option, accepted as either an integer or a numeric string.
+fn max_partitions_option(value: OptionValue) -> Result<i64> {
+    let n = match value {
+        OptionValue::Int(i) => i,
+        OptionValue::String(s) => s
+            .parse::<i64>()
+            .map_err(|_| invalid_argument("max_partitions must be a positive integer"))?,
+        _ => {
+            return Err(invalid_argument(
+                "max_partitions must be a positive integer",
+            ))
+        }
+    };
+    if n > 0 {
+        Ok(n)
+    } else {
+        Err(invalid_argument(
+            "max_partitions must be a positive integer",
+        ))
     }
 }
 

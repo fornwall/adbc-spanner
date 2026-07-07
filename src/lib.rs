@@ -189,6 +189,19 @@ pub const OPTION_KEYFILE_JSON: &str = "adbc.spanner.keyfile_json";
 /// positive integer (via `set_option`/`set_option_int`); defaults to 8192.
 pub const OPTION_ROWS_PER_BATCH: &str = "adbc.spanner.rows_per_batch";
 
+/// Driver-specific statement option: enable **Data Boost** for
+/// [`Statement::execute_partitions`](adbc_core::Statement::execute_partitions). When `true`, each
+/// partition executes on Spanner's serverless, workload-isolated compute (independent of the
+/// provisioned instance). The flag is baked into every partition descriptor, so a partition read
+/// back with [`Connection::read_partition`](adbc_core::Connection::read_partition) — on any
+/// connection or worker — honours it. Accepts a boolean; defaults to `false`.
+pub const OPTION_DATA_BOOST: &str = "adbc.spanner.data_boost_enabled";
+
+/// Driver-specific statement option: the maximum number of partitions to request from
+/// [`Statement::execute_partitions`](adbc_core::Statement::execute_partitions). This is a hint —
+/// Spanner may return fewer. Accepts a positive integer; unset lets Spanner choose.
+pub const OPTION_MAX_PARTITIONS: &str = "adbc.spanner.max_partitions";
+
 /// The vendor name reported by [`Connection::get_info`](adbc_core::Connection::get_info).
 pub const VENDOR_NAME: &str = "Google Cloud Spanner";
 
