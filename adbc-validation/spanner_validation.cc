@@ -8,8 +8,8 @@
 //   SPANNER_EMULATOR_HOST  (read by the driver itself) selects the emulator
 //
 // `SpannerQuirks` describes Spanner's capabilities to the suite so tests that do
-// not apply to Spanner's model (temp tables, views, statistics, create-mode
-// ingest, ...) self-skip rather than fail.
+// not apply to Spanner's model (temp tables, views, float16 ingest, ...)
+// self-skip rather than fail.
 
 #include <cstdlib>
 #include <cstring>
@@ -127,12 +127,14 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
     return "@p" + std::to_string(index);
   }
 
-  // The driver also supports create/create_append/replace ingest (it synthesizes
-  // an `adbc_ingest_key` primary key), but this still declares append-only until
-  // the CREATE-gated cases (MetadataGetTableSchema{,Escaping}) are vetted and
-  // re-gated — see the README.
+  // The driver supports all four ingest modes; for the create modes it builds
+  // the table from the ingest data's Arrow schema with a synthetic
+  // `adbc_ingest_key` UUID primary key (Spanner mandates a primary key).
   bool supports_bulk_ingest(const char* mode) const override {
-    return std::strcmp(mode, "adbc.ingest.mode.append") == 0;
+    return std::strcmp(mode, "adbc.ingest.mode.append") == 0 ||
+           std::strcmp(mode, "adbc.ingest.mode.create") == 0 ||
+           std::strcmp(mode, "adbc.ingest.mode.create_append") == 0 ||
+           std::strcmp(mode, "adbc.ingest.mode.replace") == 0;
   }
 
   bool supports_execute_schema() const override { return true; }
