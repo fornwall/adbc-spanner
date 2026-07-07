@@ -1518,6 +1518,16 @@ fn query_and_dml_round_trip() {
         .unwrap();
     assert_eq!(column_name.value(0), "SingerId");
 
+    // xdbc_type_name carries the Spanner-native type (INFORMATION_SCHEMA.COLUMNS.SPANNER_TYPE).
+    let type_name = columns
+        .column_by_name("xdbc_type_name")
+        .expect("xdbc_type_name field")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let type_names: Vec<&str> = (0..type_name.len()).map(|i| type_name.value(i)).collect();
+    assert_eq!(type_names, ["INT64", "STRING(MAX)", "BOOL", "FLOAT64"]);
+
     // --- get_objects at Catalogs depth: the single unnamed catalog with a NULL db_schemas
     // list (this depth needs no INFORMATION_SCHEMA data and issues no queries at all).
     let catalogs = connection
