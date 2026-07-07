@@ -369,7 +369,7 @@ impl SpannerConnection {
         let mut exprs = vec!["COUNT(*)".to_string()];
         let mut plan: Vec<(String, i16)> = Vec::new();
         for (name, groupable) in columns {
-            let quoted = format!("`{}`", name.replace('`', "``"));
+            let quoted = crate::bind::quote_ident(name);
             exprs.push(format!("COUNTIF({quoted} IS NULL)"));
             plan.push((name.clone(), ADBC_STATISTIC_NULL_COUNT_KEY));
             if *groupable {
@@ -1010,11 +1010,17 @@ fn connection_option_name(key: &OptionConnection) -> String {
     key.as_ref().to_string()
 }
 
-/// Backtick-quote a table name, optionally qualified by a (named) schema.
+/// Backtick-quote a table name, optionally qualified by a (named) schema, with proper GoogleSQL
+/// identifier escaping (see [`crate::bind::quote_ident`]) so a hostile or mistyped name cannot
+/// leak into the surrounding SQL.
 fn qualified_table(db_schema: Option<&str>, table_name: &str) -> String {
     match db_schema.filter(|s| !s.is_empty()) {
-        Some(schema) => format!("`{schema}`.`{table_name}`"),
-        None => format!("`{table_name}`"),
+        Some(schema) => format!(
+            "{}.{}",
+            crate::bind::quote_ident(schema),
+            crate::bind::quote_ident(table_name)
+        ),
+        None => crate::bind::quote_ident(table_name),
     }
 }
 
@@ -1027,5 +1033,10 @@ mod tests {
         assert_eq!(qualified_table(None, "Users"), "`Users`");
         assert_eq!(qualified_table(Some(""), "Users"), "`Users`");
         assert_eq!(qualified_table(Some("app"), "Users"), "`app`.`Users`");
+        // Caller-supplied names are escaped, so a backtick cannot leak into the surrounding SQL
+        // (previously it was interpolated verbatim, breaking the query and mislabelling the
+        // resulting analyzer error as NotFound).
+        assert_eq!(qualified_table(None, "a`b"), r"`a\`b`");
+        assert_eq!(qualified_table(Some("s`x"), r"t\y"), r"`s\`x`.`t\\y`");
     }
 }

@@ -356,6 +356,13 @@ fn query_and_dml_round_trip() {
     assert_eq!(singers_schema.field(2).data_type(), &DataType::Boolean);
     assert_eq!(singers_schema.field(3).data_type(), &DataType::Float64);
 
+    // A name with an embedded backtick is escaped rather than interpolated into the SQL (which
+    // used to break the probe query), so it cleanly reports NotFound like any other absent table.
+    let hostile = connection
+        .get_table_schema(None, None, "no`such`table")
+        .expect_err("hostile table name must not resolve");
+    assert_eq!(hostile.status, adbc_core::error::Status::NotFound);
+
     // --- DDL through the driver (routed to the admin UpdateDatabaseDdl API) ---
 
     // A batch of two DDL statements submitted as one near-atomic schema change; idempotent so the
