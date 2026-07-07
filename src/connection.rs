@@ -15,6 +15,9 @@
 //! Consequences of this model, which callers should be aware of:
 //! - In manual mode, `execute_update` on DML returns `None` (the affected-row count is not known
 //!   until commit).
+//! - DML with a `THEN RETURN` clause is rejected in manual mode: it must run via `ExecuteSql` to
+//!   produce its rows, but buffered DML is applied through `ExecuteBatchDml` (which does not
+//!   support `THEN RETURN`) — and the rows would be unobtainable at commit time anyway.
 //! - Queries (`execute`) and DDL always run immediately (DDL is never transactional in Spanner), so
 //!   a query does not observe DML buffered earlier in the same manual transaction.
 

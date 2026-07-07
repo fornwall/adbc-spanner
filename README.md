@@ -28,7 +28,10 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   fully materialised in memory. The chunk size is tunable via the `spanner.rows_per_batch`
   statement option (default 8192).
 - DML (`execute_update`), returning the affected-row count. A `;`-separated batch (e.g. dbt's
-  `DELETE; INSERT`) runs atomically in one read/write transaction via `ExecuteBatchDml`.
+  `DELETE; INSERT`) runs atomically in one read/write transaction via `ExecuteBatchDml`. DML with
+  a [`THEN RETURN`](https://cloud.google.com/spanner/docs/dml-returning) clause returns its rows:
+  `execute()` yields them as an Arrow result (autocommit mode only — buffered manual transactions
+  cannot produce them).
 - DDL (`CREATE`/`ALTER`/`DROP`/`RENAME`/…), routed to the Database Admin `UpdateDatabaseDdl` API. A
   `;`-separated batch is submitted as a single schema change, so multi-step changes (e.g. dbt's
   intermediate-table build then rename swap) are near-atomic.

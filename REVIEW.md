@@ -5,27 +5,20 @@
 Overall: the driver is in very good shape — the type mapping, dense-union metadata assembly,
 transaction model, streaming reader, and test suite (property-based round-trips, FFI conformance,
 C++ validation, Python cookbook tests) are all solid. The issues below are ranked by how likely
-they are to bite a real user.
-
-## P1 — fix soon (user-facing breakage or wrong deliverables)
-
-**1. `INSERT/UPDATE/DELETE ... THEN RETURN` rows are discarded** — `src/statement.rs:369`:
-anything classified as DML by `is_dml` returns an empty reader from `execute()`. Spanner supports
-`THEN RETURN`, so a client running `INSERT ... THEN RETURN id` gets an empty result with no error.
-Either detect `THEN RETURN` and route through a result-returning path, or reject it explicitly.
+they are to bite a real user. (All P1 findings from the original review have been fixed.)
 
 ## P2 — real defects with narrower blast radius
 
-**2. SQL lexers miss GoogleSQL raw and triple-quoted strings** — `src/ddl.rs:51`: in `r'C:\'` the
+**1. SQL lexers miss GoogleSQL raw and triple-quoted strings** — `src/ddl.rs:51`: in `r'C:\'` the
 backslash isn't an escape, so the splitter eats the closing quote and mangles the batch;
 `'''don't; stop'''` splits mid-literal. Same blind spots in `named_parameters` (`src/bind.rs`).
 Handle `r`/`b` prefixes and `'''`/`"""`.
 
-**3. Statement hints defeat statement classification** — `first_keyword("@{HINT=X} UPDATE ...")`
+**2. Statement hints defeat statement classification** — `first_keyword("@{HINT=X} UPDATE ...")`
 returns `None` (`src/ddl.rs:112`), so hinted DML entering via `execute()` is sent to a read-only
 transaction, which Spanner rejects. Skip a leading `@{…}` block.
 
-**4. Identifier quoting is inconsistent and uses the wrong escape** — `qualified_table`
+**3. Identifier quoting is inconsistent and uses the wrong escape** — `qualified_table`
 (`src/connection.rs:995`) interpolates caller-supplied schema/table names with no escaping (a name
 with a backtick breaks `get_table_schema` and then gets mislabeled `NotFound`), while the one
 escape that exists (`connection.rs:367` and `bind::quote_ident`) uses MySQL-style backtick
@@ -35,28 +28,28 @@ sites. Related: `insert_sql` (`src/bind.rs:396`) writes parameter references as
 `` a`b `` test at `bind.rs:461` currently asserts the broken output. Binding ingest params
 positionally (`@p0, @p1`) would decouple param names from column names.
 
-**5. Release job can attach unchecksummed wheels** — `libraries.yml:94`: the `release` job
+**4. Release job can attach unchecksummed wheels** — `libraries.yml:94`: the `release` job
 downloads *all* artifacts with `merge-multiple` while `python-wheels` runs in parallel; depending
 on timing, wheels land in `dist/` and get attached to the GitHub Release without matching the
 `sha256sum adbc-spanner-*` glob. Add a `pattern:` filter.
 
-**6. CI supply-chain hygiene** — the release-critical actions are pinned to mutable refs
+**5. CI supply-chain hygiene** — the release-critical actions are pinned to mutable refs
 (`softprops/action-gh-release@v3` with `contents: write`, `pypa/gh-action-pypi-publish@release/v1`
 — a *branch* — with `id-token: write`); pin those to commit SHAs. And `ci.yml`,
 `adbc-validation.yml`, `fuzz.yml` have no `permissions:` block at all — add `contents: read` like
 the other two workflows already do.
 
-**7. gRPC error fidelity** — `src/error.rs`: `ABORTED` (Spanner's routine "retry me" signal) maps
+**6. gRPC error fidelity** — `src/error.rs`: `ABORTED` (Spanner's routine "retry me" signal) maps
 to `Status::Internal`, indistinguishable from a driver bug when the r/w runner exhausts retries
 under contention; and `from_spanner` leaves `vendor_code` at zero when it could carry the numeric
 gRPC code for callers' retry logic.
 
-**8. Untested data-loss path** — the "re-enabling autocommit commits buffered DML" branch
+**7. Untested data-loss path** — the "re-enabling autocommit commits buffered DML" branch
 (`src/connection.rs:721`) has zero coverage; the one toggle test deliberately buffers nothing
 (`tests/integration.rs:486`). A regression that *discarded* the buffer instead of committing would
 pass the whole suite.
 
-**9. Emulator scripts fail open** — `scripts/with-emulator.sh:44–64`: both readiness loops fall
+**8. Emulator scripts fail open** — `scripts/with-emulator.sh:44–64`: both readiness loops fall
 through silently on timeout and run the tests against a dead port (the ci.yml copy of this loop
 fails correctly). `run-foundry-validation.sh` also lacks `-e`, so a failed build validates a stale
 `.so`, and its `VALIDATION_REF` pin only applies on first install.

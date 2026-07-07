@@ -37,6 +37,90 @@ pub(crate) fn is_dml(sql: &str) -> bool {
     first_keyword(sql).is_some_and(|kw| DML_KEYWORDS.contains(&kw.as_str()))
 }
 
+/// Return `true` if `sql` contains a top-level `THEN RETURN` clause — DML that returns rows
+/// (`INSERT`/`UPDATE`/`DELETE ... THEN RETURN <columns>`).
+///
+/// Scans word tokens outside string/identifier literals and comments (the same lexical rules as
+/// [`split_statements`]) for the keyword `THEN` immediately followed by `RETURN`, case-insensitively.
+/// A `CASE WHEN … THEN …` whose branch expression happens to be a column named `return` is a
+/// (harmless) false positive: the caller then routes the DML through the read/write
+/// `execute_query` path, which executes plain DML just as correctly — it merely returns zero rows
+/// and reports the affected-row count from the result-set stats.
+pub(crate) fn is_dml_returning(sql: &str) -> bool {
+    let mut previous_was_then = false;
+    let mut word = String::new();
+    let mut chars = sql.chars().peekable();
+    let check_word = |word: &mut String, previous_was_then: &mut bool| -> bool {
+        if word.is_empty() {
+            return false;
+        }
+        let matched = *previous_was_then && word.eq_ignore_ascii_case("RETURN");
+        *previous_was_then = word.eq_ignore_ascii_case("THEN");
+        word.clear();
+        matched
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' | '`' => {
+                if check_word(&mut word, &mut previous_was_then) {
+                    return true;
+                }
+                // A quoted literal/identifier resets the keyword window.
+                previous_was_then = false;
+                while let Some(ch) = chars.next() {
+                    match ch {
+                        '\\' => {
+                            chars.next();
+                        }
+                        _ if ch == c => break,
+                        _ => {}
+                    }
+                }
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                if check_word(&mut word, &mut previous_was_then) {
+                    return true;
+                }
+                for ch in chars.by_ref() {
+                    if ch == '\n' {
+                        break;
+                    }
+                }
+            }
+            '#' => {
+                if check_word(&mut word, &mut previous_was_then) {
+                    return true;
+                }
+                for ch in chars.by_ref() {
+                    if ch == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                if check_word(&mut word, &mut previous_was_then) {
+                    return true;
+                }
+                chars.next(); // '*'
+                let mut prev = '\0';
+                for ch in chars.by_ref() {
+                    if prev == '*' && ch == '/' {
+                        break;
+                    }
+                    prev = ch;
+                }
+            }
+            _ if c == '_' || c.is_ascii_alphanumeric() => word.push(c),
+            _ => {
+                if check_word(&mut word, &mut previous_was_then) {
+                    return true;
+                }
+            }
+        }
+    }
+    check_word(&mut word, &mut previous_was_then)
+}
+
 /// Split a (possibly multi-statement) SQL string into individual, trimmed, non-empty statements.
 ///
 /// Splits on top-level `;`, ignoring semicolons inside string/identifier literals (`'…'`, `"…"`,
@@ -179,6 +263,34 @@ mod tests {
             "",
         ] {
             assert!(!is_dml(sql), "should not be DML: {sql}");
+        }
+    }
+
+    #[test]
+    fn detects_then_return() {
+        for sql in [
+            "INSERT INTO t (id) VALUES (1) THEN RETURN id",
+            "insert into t (id) values (1) then return *",
+            "UPDATE t SET c = 1 WHERE id = 1 THEN\n  RETURN c",
+            "DELETE FROM t WHERE id = 1 then /* keep */ return id",
+            "DELETE FROM t WHERE id = 1 THEN -- comment\n RETURN id",
+        ] {
+            assert!(is_dml_returning(sql), "should detect THEN RETURN: {sql}");
+        }
+        for sql in [
+            "INSERT INTO t (id) VALUES (1)",
+            "SELECT CASE WHEN a THEN b ELSE c END FROM t",
+            // `THEN RETURN` inside a literal or a quoted identifier is not a clause.
+            "INSERT INTO t (s) VALUES ('THEN RETURN')",
+            "UPDATE t SET `then return` = 1 WHERE true",
+            // Adjacent words, not the two keywords.
+            "UPDATE t SET a = thenreturn WHERE true",
+            "UPDATE t SET a = x_then WHERE return_value = 1",
+            // A literal between the words breaks the clause.
+            "UPDATE t SET a = CASE WHEN b THEN 'x' ELSE returns END WHERE true",
+            "",
+        ] {
+            assert!(!is_dml_returning(sql), "should not detect: {sql}");
         }
     }
 
