@@ -276,6 +276,48 @@ jobs:
           mv dist/*.whl wheelhouse/
           ls -l wheelhouse
 
+      # Inspect the freshly built wheels before the irreversible python-publish
+      # step (which needs: python-wheels) can ship them. All cheap and on the same
+      # runner; catches a wheel that packages fine but is broken or empty.
+      - name: Check wheel metadata and that each bundles its platform library
+        shell: bash
+        working-directory: python
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade twine
+          # Validate each wheel's metadata / long-description rendering.
+          python -m twine check wheelhouse/*.whl
+          # Assert the platform shared library is actually inside every wheel — a
+          # data-only wheel with no library installs fine and then fails at runtime.
+          for whl in wheelhouse/*.whl; do
+            case "$whl" in
+              *linux*) lib='adbc_driver_spanner/libadbc_spanner.so' ;;
+              *macosx*) lib='adbc_driver_spanner/libadbc_spanner.dylib' ;;
+              *win*) lib='adbc_driver_spanner/adbc_spanner.dll' ;;
+              *) echo "::error::unrecognised wheel platform tag: ${whl}" >&2; exit 1 ;;
+            esac
+            if ! python -m zipfile -l "$whl" | grep -qF "$lib"; then
+              echo "::error::${whl} does not bundle ${lib}" >&2
+              python -m zipfile -l "$whl" >&2
+              exit 1
+            fi
+            echo "OK: ${whl} bundles ${lib}"
+          done
+
+      - name: Install the built Linux wheel and smoke-test the import
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Only the native (x86_64 Linux) wheel is installable on this runner, so
+          # smoke-test that one. Install the actual built wheel — not the source
+          # tree the unit-test job uses — to confirm the bundled library resolves.
+          whl="$(ls python/wheelhouse/*manylinux_2_35_x86_64.whl)"
+          python -m pip install "$whl"
+          # Import from a directory without the source tree so the *installed*
+          # package is exercised; _driver_path() raises unless the lib is bundled.
+          cd "$RUNNER_TEMP"
+          python -c "import adbc_driver_spanner; print(adbc_driver_spanner._driver_path()); import adbc_driver_spanner.dbapi"
+
       - name: Upload wheels
         uses: actions/upload-artifact@v7
         with:
