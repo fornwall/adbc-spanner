@@ -313,10 +313,19 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   (`import adbc_driver_spanner; print(adbc_driver_spanner._driver_path()); import
   adbc_driver_spanner.dbapi`) — exercising the *installed* package, not the source tree, and
   `_driver_path()` raises unless the bundled library resolves.
-- **The tag-vs-version gate lives only in `python-wheels`**; the `release` job (GitHub assets)
+- ~~**The tag-vs-version gate lives only in `python-wheels`**; the `release` job (GitHub assets)
   has no gate, and `release` / `python-publish` are unordered siblings — a partial failure yields
   a PyPI version with no GitHub assets or vice versa. Hoist the check into a `version-gate` job
-  both need; run `python-publish` (the irreversible step) last.
+  both need; run `python-publish` (the irreversible step) last.~~ **Fixed.** A standalone,
+  tag-only `version-gate` job now performs the tag-vs-crate-version check once — deriving the crate
+  version with `cargo metadata --no-deps --format-version 1 | jq` (robust manifest parsing rather
+  than a positional Cargo.toml grep) and failing if the pushed `vX.Y.Z` tag disagrees. Both
+  `release` (GitHub Release assets) and `python-publish` (PyPI) now `needs:` it, so a mismatched tag
+  publishes nothing anywhere. Ordering is fixed too: `python-publish` — the irreversible PyPI step —
+  now also `needs: release`, so it runs strictly *after* the GitHub-Release assets are attached, and
+  a partial failure can no longer leave a PyPI version with no matching GitHub assets. The redundant
+  inline gate was removed from `python-wheels`, whose remaining "Sync wheel version to the crate"
+  step only stamps `_version.py` (no tag comparison), so the check is no longer duplicated.
 - **No CI ever touches real Cloud Spanner** — `SPANNER_GCP_DATABASE` support exists but appears in
   no workflow; auth paths (ADC, impersonation) are untested in CI since the emulator is anonymous.
   A scheduled non-gating workflow via GitHub OIDC → Workload Identity Federation would cover it.
