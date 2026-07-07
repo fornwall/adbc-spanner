@@ -1969,6 +1969,86 @@ fn execute_streams_in_batches() {
     drop.execute_update().expect("drop stream table");
 }
 
+/// A cancel that lands while the streamed reader is *between* chunk fetches — no `block_on` parked
+/// on the signal — must still cancel the next fetch: the signal is sticky rather than a transient
+/// wake-up. And a subsequent execute on the same statement must run normally, because starting a
+/// new operation resets the latch.
+#[test]
+fn cancel_between_stream_chunks_cancels_the_next_fetch() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping cancel_between_stream_chunks");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    run(
+        &mut connection,
+        "DROP TABLE IF EXISTS AdbcCancel; \
+         CREATE TABLE AdbcCancel (Id INT64) PRIMARY KEY (Id)",
+    );
+    run(
+        &mut connection,
+        "INSERT INTO AdbcCancel (Id) \
+         SELECT n FROM UNNEST(GENERATE_ARRAY(1, 300)) AS n",
+    );
+
+    let mut query = connection.new_statement().expect("new statement");
+    query
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionValue::Int(100),
+        )
+        .expect("set rows_per_batch");
+    query
+        .set_sql_query("SELECT Id FROM AdbcCancel ORDER BY Id")
+        .unwrap();
+    let mut reader = query.execute().expect("streaming query");
+
+    // The first chunk was prefetched by `execute` (it settles the schema), so this consumes it
+    // without touching the signal — leaving the stream idle between fetches.
+    let first = reader
+        .next()
+        .expect("first batch")
+        .expect("first batch is ok");
+    assert_eq!(first.num_rows(), 100);
+
+    // Cancel with no fetch in flight — exactly the window where a non-sticky signal was lost.
+    query.cancel().expect("cancel");
+
+    // The next chunk fetch must observe the latched cancel instead of streaming to completion.
+    let error = reader
+        .next()
+        .expect("the cancelled fetch yields an item")
+        .expect_err("the fetch after cancel must fail");
+    assert!(
+        error.to_string().to_lowercase().contains("cancel"),
+        "expected a cancellation error, got: {error}"
+    );
+
+    // Starting a new operation on the same statement clears the latch and runs normally.
+    let batches = query
+        .execute()
+        .expect("re-execute after cancel")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect re-executed batches");
+    let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(total, 300);
+
+    let mut drop = connection.new_statement().expect("new statement");
+    drop.set_sql_query("DROP TABLE AdbcCancel").unwrap();
+    drop.execute_update().expect("drop cancel table");
+}
+
 /// Partitioned execution: `Statement::execute_partitions` splits a query into opaque partition
 /// descriptors, and `Connection::read_partition` reads each one back as Arrow. The union of all
 /// partitions must reproduce the full result set exactly once.

@@ -194,8 +194,10 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   with a synthetic `adbc_ingest_key` UUID primary key, since Spanner requires one), `get_info` (static
   driver/vendor metadata),
   `get_objects` (incl. foreign-key `constraint_column_usage`), `get_table_types`/`get_table_schema`,
-  `get_parameter_schema`, best-effort `Connection`/`Statement::cancel` (a shared `CancelSignal`
-  interrupts an in-flight `block_on` op), keyfile/keyfile_json auth (credential-type auto-detected
+  `get_parameter_schema`, `Connection`/`Statement::cancel` (a shared, sticky `CancelSignal`
+  interrupts an in-flight `block_on` op and stays latched — so a cancel between the chunk fetches of
+  a streamed result still cancels the next fetch — until the object's next operation resets it),
+  keyfile/keyfile_json auth (credential-type auto-detected
   from the JSON `"type"`), and service-account impersonation
   (`spanner.impersonate.target_principal` enables it; optional `spanner.impersonate.delegates`
   [comma-separated chain], `spanner.impersonate.scopes` [comma-separated, defaults to

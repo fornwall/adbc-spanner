@@ -38,6 +38,15 @@ FULL=0
 # `SELECT 42`, but Spanner's partitionQuery may return more (the emulator returns
 # 2). The driver's partition round-trip is covered by execute_partitions_round_trip
 # in tests/integration.rs instead. See adbc-validation/README.md.
+#
+# NOTE: SqlQueryCancel is NOT gated even though cancellation is implemented (and
+# sticky): the case requires the C stream's get_next to return exactly ECANCELED
+# after a cancel, but arrow-rs's FFI stream exporter (used by adbc_ffi) can only
+# map errors to ENOSYS/ENOMEM/EIO/EINVAL — a Rust driver cannot emit ECANCELED
+# through it today. The case previously "passed" only because a cancel between
+# chunk fetches was silently lost and the stream completed normally. Cancel
+# semantics are covered natively by cancel_between_stream_chunks_cancels_the_next_fetch
+# in tests/integration.rs. See adbc-validation/README.md.
 GATED_FILTER='SpannerDatabaseTest.*:SpannerConnectionTest.*'
 GATED_FILTER+=':SpannerStatementTest.NewInit'
 GATED_FILTER+=':SpannerStatementTest.Release'
@@ -49,7 +58,6 @@ GATED_FILTER+=':SpannerStatementTest.SqlPrepareErrorParamCountMismatch'
 GATED_FILTER+=':SpannerStatementTest.SqlQueryInts'
 GATED_FILTER+=':SpannerStatementTest.SqlQueryStrings'
 GATED_FILTER+=':SpannerStatementTest.SqlQueryErrors'
-GATED_FILTER+=':SpannerStatementTest.SqlQueryCancel'
 GATED_FILTER+=':SpannerStatementTest.SqlSchemaInts'
 GATED_FILTER+=':SpannerStatementTest.SqlSchemaStrings'
 GATED_FILTER+=':SpannerStatementTest.SqlSchemaErrors'
