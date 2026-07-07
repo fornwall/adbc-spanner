@@ -16,6 +16,7 @@ dependencies = [
  "base64",
  "chrono",
  "google-cloud-auth",
+ "google-cloud-gax",
  "google-cloud-lro",
  "google-cloud-spanner",
  "google-cloud-spanner-admin-database-v1",
