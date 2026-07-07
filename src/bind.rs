@@ -9,9 +9,14 @@
 //! (Second/Millisecond/Microsecond/Nanosecond, → `TIMESTAMP`), `Decimal128` (→ `NUMERIC`), and
 //! their nulls. Other Arrow types are rejected with an `InvalidArguments` error.
 //!
-//! Spanner `TIMESTAMP` has microsecond precision, so a `Timestamp` parameter of any unit is
-//! normalised to microseconds since the epoch before binding; sub-microsecond digits (from a
-//! `Nanosecond` input) are truncated toward zero, matching the read path.
+//! Spanner `TIMESTAMP` has **nanosecond** precision (up to nine fractional digits), so a
+//! `Timestamp` parameter is bound at its full source precision: a `Nanosecond` input formats up to
+//! nine fractional digits, `Microsecond` six, `Millisecond` three, `Second` none — nothing is
+//! truncated. (The driver's own read path currently parses `TIMESTAMP` back at only microsecond
+//! precision — see [`crate::conversion::parse_timestamp_micros`] — so nanoseconds bound here are
+//! stored full-precision in Spanner but read back through this driver truncated to microseconds;
+//! promoting the read path to nanoseconds would change the reported Arrow `Timestamp` unit and is
+//! tracked separately.)
 //!
 //! Spanner encodes `DATE` / `TIMESTAMP` / `NUMERIC` values on the wire as strings, and query
 //! parameters are sent untyped (Spanner infers the type from the SQL). So these three are formatted
@@ -110,9 +115,9 @@ pub(crate) fn bind_row(
                     builder.add_param(name, &date.format("%Y-%m-%d").to_string())
                 }
             }
-            // Spanner `TIMESTAMP` is UTC with microsecond precision, so every Arrow timestamp unit
+            // Spanner `TIMESTAMP` is UTC with nanosecond precision, so every Arrow timestamp unit
             // is accepted; the four arms differ only in the typed array they read the raw i64 from,
-            // and `timestamp_string` scales it to microseconds and formats the Spanner value.
+            // and `timestamp_string` formats the Spanner value at the unit's full precision.
             DataType::Timestamp(unit, _) => {
                 if is_null {
                     builder.add_param(name, &None::<String>)
@@ -179,25 +184,40 @@ where
 }
 
 /// Convert an Arrow timestamp `value` in `unit` to the Spanner `TIMESTAMP` wire form — an RFC 3339
-/// string in UTC with microsecond precision, the same shape the read path parses back
-/// (`conversion::parse_timestamp_micros`).
+/// string in UTC, carrying the source unit's **full** precision so nothing is lost.
 ///
-/// Spanner stores microseconds, so the value is first normalised to microseconds since the Unix
-/// epoch: a `Nanosecond` input is divided by 1000, truncating any sub-microsecond digits toward
-/// zero (Spanner cannot represent them). `name` is used only for the out-of-range error message.
+/// Spanner `TIMESTAMP` has nanosecond precision (up to nine fractional digits), so the fractional
+/// second is formatted to exactly as many digits as the unit carries: nine for `Nanosecond`, six
+/// for `Microsecond`, three for `Millisecond`, none for `Second`. A `Nanosecond` value is decoded
+/// via [`DateTime::from_timestamp_nanos`], preserving its sub-microsecond digits (a negative value
+/// therefore renders as its exact instant, e.g. `-1 ns` → `…59.999999999Z`, not truncated toward
+/// zero). `name` is used only for the out-of-range error message.
 fn timestamp_string(name: &str, unit: &TimeUnit, value: i64) -> Result<String> {
-    let micros = match unit {
-        TimeUnit::Second => value * 1_000_000,
-        TimeUnit::Millisecond => value * 1_000,
-        TimeUnit::Microsecond => value,
-        TimeUnit::Nanosecond => value / 1_000,
+    let (ts, format) = match unit {
+        TimeUnit::Second => (
+            DateTime::<Utc>::from_timestamp(value, 0),
+            SecondsFormat::Secs,
+        ),
+        TimeUnit::Millisecond => (
+            DateTime::<Utc>::from_timestamp_millis(value),
+            SecondsFormat::Millis,
+        ),
+        TimeUnit::Microsecond => (
+            DateTime::<Utc>::from_timestamp_micros(value),
+            SecondsFormat::Micros,
+        ),
+        // `from_timestamp_nanos` is infallible: every `i64` nanosecond count is in range.
+        TimeUnit::Nanosecond => (
+            Some(DateTime::<Utc>::from_timestamp_nanos(value)),
+            SecondsFormat::Nanos,
+        ),
     };
-    let ts = DateTime::<Utc>::from_timestamp_micros(micros).ok_or_else(|| {
+    let ts = ts.ok_or_else(|| {
         invalid_argument(format!(
-            "cannot bind TIMESTAMP parameter {name:?}: {micros} is out of range"
+            "cannot bind TIMESTAMP parameter {name:?}: {value} ({unit:?}) is out of range"
         ))
     })?;
-    Ok(ts.to_rfc3339_opts(SecondsFormat::Micros, true))
+    Ok(ts.to_rfc3339_opts(format, true))
 }
 
 /// Format an unscaled `Decimal128` value at the given scale as a plain decimal string, exact across
@@ -381,33 +401,33 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_string_truncates_all_units_to_micros() {
-        // Microsecond is the baseline: 2024-01-15T12:34:56.789012Z.
+    fn timestamp_string_preserves_full_precision() {
+        // Microsecond formats six fractional digits: 2024-01-15T12:34:56.789012Z.
         let micros = 1_705_322_096_789_012i64;
-        let expected = "2024-01-15T12:34:56.789012Z";
         assert_eq!(
             timestamp_string("t", &TimeUnit::Microsecond, micros).unwrap(),
-            expected
+            "2024-01-15T12:34:56.789012Z"
         );
-        // Nanosecond: the extra sub-microsecond digits (…012_999 ns) are truncated toward zero, so
-        // the bound value equals the microsecond-truncated instant, not a rounded one.
+        // Nanosecond keeps all nine fractional digits — the sub-microsecond …012_999 ns is
+        // preserved (Spanner TIMESTAMP has nanosecond precision), not truncated to micros.
         assert_eq!(
             timestamp_string("t", &TimeUnit::Nanosecond, micros * 1_000 + 999).unwrap(),
-            expected
+            "2024-01-15T12:34:56.789012999Z"
         );
-        // Millisecond and Second scale up to the same instant (at their coarser precision).
+        // Millisecond formats three fractional digits, Second none — each unit's own precision.
         assert_eq!(
             timestamp_string("t", &TimeUnit::Millisecond, 1_705_322_096_789).unwrap(),
-            "2024-01-15T12:34:56.789000Z"
+            "2024-01-15T12:34:56.789Z"
         );
         assert_eq!(
             timestamp_string("t", &TimeUnit::Second, 1_705_322_096).unwrap(),
-            "2024-01-15T12:34:56.000000Z"
+            "2024-01-15T12:34:56Z"
         );
-        // A negative nanosecond value truncates toward zero as well (integer division).
+        // A negative nanosecond value renders as its exact instant (one ns before the epoch), with
+        // full nanosecond digits — not rounded/truncated toward zero.
         assert_eq!(
             timestamp_string("t", &TimeUnit::Nanosecond, -1).unwrap(),
-            "1970-01-01T00:00:00.000000Z"
+            "1969-12-31T23:59:59.999999999Z"
         );
     }
 
