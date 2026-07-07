@@ -175,11 +175,17 @@ into the three `single_use()` call sites plus the partition path. Low–medium e
   `STRING(MAX)`/`BYTES(MAX)` (up to 10MB each) can be tens of GB per chunk, held roughly twice
   during conversion. Track approximate cumulative bytes in `pull_chunk` and cut the chunk early at
   a byte budget (16–64MB) in addition to the row cap.
-- **`get_objects` assembles the hierarchy with quadratic rescans** (`src/connection.rs:218-267`,
+- ~~**`get_objects` assembles the hierarchy with quadratic rescans** (`src/connection.rs:218-267`,
   `:507-590`, `:598-665`). The RPC side is a fixed 6 queries (good), but per table the full
   COLUMNS/TABLE_CONSTRAINTS batches are rescanned and per constraint the full KEY_COLUMN_USAGE
   batch — O(10⁸) string comparisons for a 2k-table schema. Group each batch once into `HashMap`s,
-  exactly the pattern `collect_statistics` already uses (`connection.rs:329-335`).
+  exactly the pattern `collect_statistics` already uses (`connection.rs:329-335`).~~ **Fixed.**
+  `collect_objects` now groups each of the six `INFORMATION_SCHEMA` batches ONCE (`group_tables` by
+  schema; `group_columns`/`group_constraints` by (schema, table); `group_key_columns`/
+  `group_referential` by (constraint_schema, constraint_name)) into `HashMap`s, then assembles the
+  hierarchy by keyed lookup instead of rescanning. The per-group `Vec`s keep batch (`ORDER BY`)
+  order, so column and key-column ordering — and every catalog/schema/table/column filter — is
+  preserved exactly; this is a pure O(N²)→O(N) change with no behavioral difference.
 
 ### Security
 
