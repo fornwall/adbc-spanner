@@ -76,6 +76,22 @@ pub(crate) enum ReadBound {
 }
 
 impl ReadBound {
+    /// The equivalent bound for a **multi-use** read-only transaction.
+    ///
+    /// Spanner only accepts strong / exact-staleness / read-timestamp bounds when beginning a
+    /// multi-use read-only transaction — the bounded-staleness kinds are single-use only (the
+    /// server rejects them in `BeginTransaction`). Those two are therefore pinned to the *most
+    /// stale* timestamp their window allows, which is always a legal choice under the original
+    /// bound: `max:<d>` becomes exact staleness `<d>`, and `min:<t>` becomes read timestamp `<t>`.
+    /// The already-exact kinds pass through unchanged.
+    pub(crate) fn pinned_for_multi_use(&self) -> ReadBound {
+        match self {
+            ReadBound::MaxStaleness(d) => ReadBound::ExactStaleness(*d),
+            ReadBound::MinReadTimestamp(t) => ReadBound::ReadTimestamp(*t),
+            other => other.clone(),
+        }
+    }
+
     /// Build the client [`TimestampBound`] for this read bound.
     pub(crate) fn to_timestamp_bound(&self) -> Result<TimestampBound> {
         match self {
@@ -162,6 +178,16 @@ impl ReadStaleness {
         self.bound
             .as_ref()
             .map(ReadBound::to_timestamp_bound)
+            .transpose()
+    }
+
+    /// The client [`TimestampBound`] to apply to a **multi-use** read-only transaction, or `None`
+    /// for a strong read. The single-use-only bounded-staleness kinds are pinned to a legal
+    /// equivalent first — see [`ReadBound::pinned_for_multi_use`].
+    pub(crate) fn multi_use_timestamp_bound(&self) -> Result<Option<TimestampBound>> {
+        self.bound
+            .as_ref()
+            .map(|b| b.pinned_for_multi_use().to_timestamp_bound())
             .transpose()
     }
 }
@@ -357,6 +383,39 @@ mod tests {
             .unwrap();
         assert_eq!(s.timestamp_string(), Some("2026-07-07T00:00:00Z"));
         assert!(s.timestamp_bound().unwrap().is_some());
+    }
+
+    /// Pinning for a multi-use read-only transaction: the exact kinds pass through unchanged,
+    /// while the single-use-only bounded kinds are pinned to the most stale timestamp their window
+    /// allows (`max:<d>` → exact staleness `<d>`, `min:<t>` → read timestamp `<t>`).
+    #[test]
+    fn multi_use_pins_bounded_staleness_kinds() {
+        let d = Duration::from_secs(10);
+        let t = dt("2026-07-07T00:00:00Z");
+        assert_eq!(
+            ReadBound::ExactStaleness(d).pinned_for_multi_use(),
+            ReadBound::ExactStaleness(d)
+        );
+        assert_eq!(
+            ReadBound::ReadTimestamp(t).pinned_for_multi_use(),
+            ReadBound::ReadTimestamp(t)
+        );
+        assert_eq!(
+            ReadBound::MaxStaleness(d).pinned_for_multi_use(),
+            ReadBound::ExactStaleness(d)
+        );
+        assert_eq!(
+            ReadBound::MinReadTimestamp(t).pinned_for_multi_use(),
+            ReadBound::ReadTimestamp(t)
+        );
+
+        // Through ReadStaleness: a strong (unset) bound stays None, a bounded kind still builds a
+        // client TimestampBound.
+        let mut s = ReadStaleness::default();
+        assert!(s.multi_use_timestamp_bound().unwrap().is_none());
+        s.set_staleness(OptionValue::String("max:500ms".into()))
+            .unwrap();
+        assert!(s.multi_use_timestamp_bound().unwrap().is_some());
     }
 
     #[test]

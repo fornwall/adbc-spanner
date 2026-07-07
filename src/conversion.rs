@@ -49,6 +49,8 @@ use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 use base64::Engine;
 use google_cloud_spanner::result::{ResultSet, ResultSetMetadata, Row};
+use google_cloud_spanner::statement::Statement as SpannerSql;
+use google_cloud_spanner::transaction::MultiUseReadOnlyTransaction;
 use google_cloud_spanner::value::{Kind, Type, TypeCode, Value};
 
 use crate::error::{err, from_spanner, invalid_argument};
@@ -232,6 +234,149 @@ impl Iterator for SpannerBatchReader {
 }
 
 impl RecordBatchReader for SpannerBatchReader {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+/// Wrap a sequence of per-bound-row query statements as one streaming Arrow
+/// [`RecordBatchReader`], executing every statement inside the same **multi-use read-only
+/// transaction** so all bound rows see a single, mutually consistent snapshot.
+///
+/// The first statement is executed here and its first chunk pulled (settling the schema — every
+/// statement is the same SQL, so the schema is shared); the reader then streams the remaining
+/// chunks and statements lazily, executing each subsequent statement only once its predecessor's
+/// result set drains. Like [`stream_query`], rows are converted to Arrow in bounded chunks of
+/// `batch_size` (plus the [`CHUNK_BYTE_BUDGET`]), so the concatenated result is never fully
+/// materialised. The reader owns `transaction`, keeping the snapshot alive for as long as it is
+/// iterated; Spanner read-only transactions need no commit/rollback, so dropping it is cleanup
+/// enough.
+pub(crate) async fn stream_bound_query(
+    runtime: SharedRuntime,
+    cancel: CancelSignal,
+    transaction: MultiUseReadOnlyTransaction,
+    statements: Vec<SpannerSql>,
+    batch_size: usize,
+) -> Result<BoundQueryBatchReader> {
+    let mut statements = statements.into_iter();
+    let mut result_set = match statements.next() {
+        Some(statement) => Some(
+            transaction
+                .execute_query(statement)
+                .await
+                .map_err(from_spanner)?,
+        ),
+        // No statements at all: an empty reader with an empty schema.
+        None => None,
+    };
+    let (first, schema) = match result_set.as_mut() {
+        Some(rs) => {
+            let rows = pull_chunk(rs, batch_size).await?;
+            let schema = build_schema(rs.metadata(), rows.first());
+            (Some(rows), schema)
+        }
+        None => (None, Arc::new(Schema::empty())),
+    };
+    Ok(BoundQueryBatchReader {
+        runtime,
+        cancel,
+        schema,
+        transaction,
+        statements,
+        result_set,
+        first,
+        batch_size,
+    })
+}
+
+/// A streaming [`RecordBatchReader`] over the successive result sets of a bound (parameterized)
+/// query — one execution per bound row, all inside one shared read-only snapshot. See
+/// [`stream_bound_query`].
+pub(crate) struct BoundQueryBatchReader {
+    runtime: SharedRuntime,
+    cancel: CancelSignal,
+    schema: SchemaRef,
+    /// The shared snapshot every statement executes in; owned so it outlives lazy iteration.
+    transaction: MultiUseReadOnlyTransaction,
+    /// The not-yet-executed per-bound-row statements.
+    statements: std::vec::IntoIter<SpannerSql>,
+    /// The live result set of the statement currently being drained, if any.
+    result_set: Option<ResultSet>,
+    /// The first chunk of rows, fetched up front to settle the schema; emitted on the first `next`.
+    first: Option<Vec<Row>>,
+    batch_size: usize,
+}
+
+/// Pull the next non-empty chunk for [`BoundQueryBatchReader`]: drain the current result set in
+/// bounded chunks, and when it ends, execute the next statement in the same `transaction` —
+/// looping so a bound row with an empty result never surfaces as a spurious empty batch. `None`
+/// means everything is drained.
+async fn next_bound_chunk(
+    transaction: &MultiUseReadOnlyTransaction,
+    statements: &mut std::vec::IntoIter<SpannerSql>,
+    result_set: &mut Option<ResultSet>,
+    batch_size: usize,
+) -> Result<Option<Vec<Row>>> {
+    loop {
+        if let Some(rs) = result_set.as_mut() {
+            let rows = pull_chunk(rs, batch_size).await?;
+            if !rows.is_empty() {
+                return Ok(Some(rows));
+            }
+            *result_set = None;
+        }
+        match statements.next() {
+            Some(statement) => {
+                *result_set = Some(
+                    transaction
+                        .execute_query(statement)
+                        .await
+                        .map_err(from_spanner)?,
+                );
+            }
+            None => return Ok(None),
+        }
+    }
+}
+
+impl Iterator for BoundQueryBatchReader {
+    type Item = std::result::Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Emit the prefetched first chunk (which settled the schema) before pulling any more; as
+        // in `SpannerBatchReader`, this also yields the single (possibly empty) batch of a small
+        // or empty result.
+        if let Some(rows) = self.first.take() {
+            return Some(build_batch(self.schema.clone(), &rows).map_err(to_arrow_error));
+        }
+        let Self {
+            runtime,
+            cancel,
+            transaction,
+            statements,
+            result_set,
+            batch_size,
+            ..
+        } = self;
+        match block_on_cancellable(
+            runtime,
+            cancel,
+            next_bound_chunk(transaction, statements, result_set, *batch_size),
+        ) {
+            Ok(None) => None,
+            Ok(Some(rows)) => Some(build_batch(self.schema.clone(), &rows).map_err(to_arrow_error)),
+            Err(e) => {
+                // Stop after surfacing the error: drop the live result set and any statements
+                // still pending.
+                self.result_set = None;
+                self.statements = Vec::new().into_iter();
+                Some(Err(to_arrow_error(e)))
+            }
+        }
+    }
+}
+
+impl RecordBatchReader for BoundQueryBatchReader {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

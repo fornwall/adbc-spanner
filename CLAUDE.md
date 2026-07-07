@@ -77,7 +77,12 @@ Key design points:
   (`exact:<duration>` / `max:<duration>`) and `spanner.read.timestamp` (RFC3339, optionally prefixed
   `read:` / `min:`) request a non-strong `TimestampBound` — parsed in `src/staleness.rs` (`ReadBound`
   / `ReadStaleness`, unit-tested offline) and applied at the `single_use()` query sites plus the
-  partition batch read-only transaction via `staleness::single_use`. Both options exist at connection
+  partition batch read-only transaction via `staleness::single_use`. A bound (parameterized) query
+  over several bound rows runs all its per-row statements in **one** multi-use read-only
+  transaction pinned at the same bound (streaming via `BoundQueryBatchReader` in
+  `src/conversion.rs`); since Spanner accepts the bounded-staleness kinds only on single-use
+  transactions, `max:`/`min:` are pinned there to their most-stale legal equivalent
+  (`ReadBound::pinned_for_multi_use`). Both options exist at connection
   **and** statement level (statement inherits the connection's, then overrides); they are mutually
   exclusive (set one to `""` to unset), and round-trip through `get_option`.
 - **Arrow version.** `arrow-array`/`arrow-schema`/`arrow-buffer` are pinned to the range the (git)

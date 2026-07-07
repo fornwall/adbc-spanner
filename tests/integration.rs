@@ -2690,6 +2690,94 @@ fn execute_streams_in_batches() {
     drop.execute_update().expect("drop stream table");
 }
 
+/// A parameterized query over **several bound rows** streams through the same bounded-chunk
+/// machinery as a plain query: each bound row's result is converted to Arrow in chunks of
+/// `spanner.rows_per_batch` (not materialised whole), and all rows execute inside one shared
+/// read-only snapshot (a multi-use read-only transaction) rather than one single-use transaction
+/// per bound row.
+#[test]
+fn bound_query_streams_in_batches() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping bound_query_streams_in_batches");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    run(
+        &mut connection,
+        "DROP TABLE IF EXISTS AdbcBoundStream; \
+         CREATE TABLE AdbcBoundStream (Id INT64, Grp INT64) PRIMARY KEY (Id)",
+    );
+    // 1500 rows split across three groups of 500 via GENERATE_ARRAY.
+    run(
+        &mut connection,
+        "INSERT INTO AdbcBoundStream (Id, Grp) \
+         SELECT n, MOD(n, 3) FROM UNNEST(GENERATE_ARRAY(1, 1500)) AS n",
+    );
+
+    let mut query = connection.new_statement().expect("new statement");
+    // A small batch size so each bound row's 500-row result spans several batches.
+    query
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionValue::Int(200),
+        )
+        .expect("set rows_per_batch");
+    query
+        .set_sql_query("SELECT Id FROM AdbcBoundStream WHERE Grp = @Grp ORDER BY Id")
+        .unwrap();
+    // Three bound parameter rows: the query runs once per bound row, all in one snapshot.
+    let params = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("Grp", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(vec![0i64, 1, 2]))],
+    )
+    .unwrap();
+    query.bind(params).expect("bind three parameter rows");
+
+    let reader = query.execute().expect("bound streaming query");
+    let schema = reader.schema();
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect streamed batches");
+
+    // 500 rows per bound row at 200 per batch → (200, 200, 100) per bound row, nine batches in
+    // total; the previous implementation materialised one monolithic batch per bound row.
+    let sizes: Vec<usize> = batches.iter().map(RecordBatch::num_rows).collect();
+    assert_eq!(sizes, vec![200, 200, 100, 200, 200, 100, 200, 200, 100]);
+    assert!(batches.iter().all(|b| b.schema() == schema));
+
+    // The concatenation is each group's ids ascending, groups in bound-row order.
+    let ids: Vec<i64> = batches
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            (0..ids.len()).map(|i| ids.value(i)).collect::<Vec<_>>()
+        })
+        .collect();
+    let expected: Vec<i64> = (0..3)
+        .flat_map(|group| (1..=1500i64).filter(move |id| id % 3 == group))
+        .collect();
+    assert_eq!(ids, expected);
+
+    let mut drop = connection.new_statement().expect("new statement");
+    drop.set_sql_query("DROP TABLE AdbcBoundStream").unwrap();
+    drop.execute_update().expect("drop bound stream table");
+}
+
 /// A cancel that lands while the streamed reader is *between* chunk fetches — no `block_on` parked
 /// on the signal — must still cancel the next fetch: the signal is sticky rather than a transient
 /// wake-up. And a subsequent execute on the same statement must run normally, because starting a

@@ -30,7 +30,7 @@ use google_cloud_spanner::transaction::ReadWriteTransaction;
 
 use crate::bind;
 use crate::connection::{apply_isolation, SharedTxn};
-use crate::conversion::{result_set_to_batch, stream_query};
+use crate::conversion::{result_set_to_batch, stream_bound_query, stream_query};
 use crate::error::{
     err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
 };
@@ -517,34 +517,54 @@ impl SpannerStatement {
         })
     }
 
-    /// Run a parameterized query once per bound row, concatenating the result batches.
+    /// Run a parameterized query once per bound row, streaming the concatenated results.
+    ///
+    /// Every bound row executes in **one** read-only snapshot, so the per-row results are mutually
+    /// consistent: a single bound row keeps the cheap single-use transaction, while several bound
+    /// rows share one multi-use read-only transaction pinned at the statement's read bound. The
+    /// bounded-staleness kinds (`max:` / `min:`), which Spanner only accepts on single-use
+    /// transactions, are pinned to the most stale timestamp their window allows for the multi-row
+    /// case (see [`ReadStaleness::multi_use_timestamp_bound`]).
+    ///
+    /// Results stream through the same bounded-chunk machinery as `execute`: rows are converted to
+    /// Arrow in chunks of `spanner.rows_per_batch` (plus the byte budget) as the reader is
+    /// iterated, never materialised whole.
     fn execute_bound_query(
         &self,
         sql: &str,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        let statements = self.build_bound_statements(sql)?;
+        let mut statements = self.build_bound_statements(sql)?;
         let client = self.client.clone();
-        let bound = self.read_staleness.timestamp_bound()?;
-        let (schema, batches): (Option<SchemaRef>, Vec<RecordBatch>) =
-            block_on_cancellable(&self.runtime, &self.cancel, async move {
-                let mut schema = None;
-                let mut batches = Vec::new();
-                for statement in statements {
-                    let transaction = crate::staleness::single_use(&client, bound.clone());
-                    let result_set = transaction
-                        .execute_query(statement)
-                        .await
-                        .map_err(from_spanner)?;
-                    let (sch, batch) = result_set_to_batch(result_set).await?;
-                    schema.get_or_insert(sch);
-                    batches.push(batch);
-                }
-                Ok::<_, Error>((schema, batches))
+        let runtime = self.runtime.clone();
+        let cancel = self.cancel.clone();
+        let batch_size = self.rows_per_batch;
+        if statements.len() <= 1 {
+            // Zero or one bound row. One statement is one snapshot already, and the single-use
+            // transaction keeps the exact semantics of the bounded-staleness kinds.
+            let Some(statement) = statements.pop() else {
+                return Ok(Self::empty_reader());
+            };
+            let bound = self.read_staleness.timestamp_bound()?;
+            let reader = block_on_cancellable(&self.runtime, &self.cancel, async move {
+                let transaction = crate::staleness::single_use(&client, bound);
+                let result_set = transaction
+                    .execute_query(statement)
+                    .await
+                    .map_err(from_spanner)?;
+                stream_query(runtime, cancel, result_set, batch_size).await
             })?;
-        let schema = schema.unwrap_or_else(|| Arc::new(Schema::empty()));
-        let batches: Vec<std::result::Result<RecordBatch, ArrowError>> =
-            batches.into_iter().map(Ok).collect();
-        Ok(Box::new(RecordBatchIterator::new(batches, schema)))
+            return Ok(Box::new(reader));
+        }
+        let bound = self.read_staleness.multi_use_timestamp_bound()?;
+        let reader = block_on_cancellable(&self.runtime, &self.cancel, async move {
+            let mut builder = client.read_only_transaction();
+            if let Some(b) = bound {
+                builder = builder.set_timestamp_bound(b);
+            }
+            let transaction = builder.build().await.map_err(from_spanner)?;
+            stream_bound_query(runtime, cancel, transaction, statements, batch_size).await
+        })?;
+        Ok(Box::new(reader))
     }
 
     /// Apply one or more DDL statements as a single Spanner `UpdateDatabaseDdl` schema change.
