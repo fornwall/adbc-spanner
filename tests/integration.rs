@@ -756,6 +756,30 @@ fn query_and_dml_round_trip() {
             .unwrap(),
         "adbc.ingest.mode.append"
     );
+    // `adbc.ingest.temporary`: the spec default (`false`) is accepted as a no-op and round-trips
+    // as "false"; `true` is rejected — Spanner has no temporary tables.
+    ingest
+        .set_option(
+            OptionStatement::Temporary,
+            OptionValue::String("false".into()),
+        )
+        .expect("setting adbc.ingest.temporary=false is a no-op");
+    assert_eq!(
+        ingest
+            .get_option_string(OptionStatement::Temporary)
+            .unwrap(),
+        "false"
+    );
+    let temporary_err = ingest
+        .set_option(
+            OptionStatement::Temporary,
+            OptionValue::String("true".into()),
+        )
+        .expect_err("adbc.ingest.temporary=true must be rejected");
+    assert_eq!(
+        temporary_err.status,
+        adbc_core::error::Status::NotImplemented
+    );
     ingest.bind(rows).expect("bind ingest rows");
     assert_eq!(ingest.execute_update().expect("ingest"), Some(2));
     assert_eq!(count_rows(&mut connection, "AdbcBind"), 2);
