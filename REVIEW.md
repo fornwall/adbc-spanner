@@ -71,18 +71,16 @@ ingest, partitions and cancellation. Fix: an `ADBC_TEST_REQUIRE_TARGET=1` variab
 makes the gates `panic!`/`pytest.fail` instead of skipping (also apply it to the silently-optional
 cdylib-path skip in the FFI tests, `tests/integration.rs:1469-1485`).
 
-### 6. The README's Rust quickstart no longer compiles; the Python README documents the wrong ingest capability (docs)
+### ~~6. The README's Rust quickstart no longer compiles; the Python README documents the wrong ingest capability~~ (fixed) (docs)
 
-- `README.md` (Usage) tells users `adbc_core = "0.23"` from crates.io, but `Cargo.toml` now pins
-  `adbc_core`/`adbc_ffi` to a git fork (`fornwall/arrow-adbc`, rev `786e7f3…`). Cargo does not
-  unify a git source with a registry source, so the quickstart's trait imports are different types
-  from the ones `SpannerDriver` implements — it cannot compile, and the crate doesn't re-export
-  `adbc_core` as a workaround. Fix: pin the snippet to the same git rev or re-export `adbc_core`;
-  mention the arrow-adbc pin alongside the google-cloud one in the "not on crates.io" note.
-- `python/README.md:147` says "only append mode is supported" — stale; the driver supports
-  `append`/`create`/`create_append`/`replace` with a synthetic `adbc_ingest_key` UUID primary key
-  in the create modes (`src/statement.rs:407-420`, `src/bind.rs:655-712`). Document all four modes
-  and the synthetic-key caveat (it appears in `SELECT *`).
+**Fixed.** The `README.md` quickstart now pins `adbc_core` to the same `fornwall/arrow-adbc` git
+revision (`786e7f3…`) as `Cargo.toml`, with an inline comment explaining that Cargo will not unify a
+git source with the crates.io `= "0.23"` release, so downstream crates must take `adbc_core` from
+that same git rev; the "not on crates.io" note (Usage) and the *Type mapping* note now mention the
+arrow-adbc pin alongside the google-cloud one. `python/README.md` no longer claims "only append mode
+is supported": it documents all four modes (`append`/`create`/`create_append`/`replace`) and the
+synthetic `adbc_ingest_key` UUID primary key the create modes add (and that it appears in
+`SELECT *`).
 
 ### 7. Stale reads / timestamp bounds are unexposed (features)
 

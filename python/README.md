@@ -144,9 +144,21 @@ with spanner.connect(
     autocommit=True,                         # apply immediately; returns the row count
 ) as conn:
     with conn.cursor() as cur:
-        # The target table must already exist — only append mode is supported.
+        # `append` (the default) inserts into an existing table.
         rows = cur.adbc_ingest("Singers", pa.Table.from_pandas(frame), mode="append")
 ```
+
+Four ingest modes are supported, matching the ADBC `mode` values:
+
+- `append` — insert into an existing table (the default).
+- `create` — build the table from the Arrow schema first, erroring if it already exists.
+- `create_append` — build the table only if it is absent, then insert.
+- `replace` — drop any existing table, recreate it from the Arrow schema, then insert.
+
+Spanner requires every table to have a primary key, but an ingested Arrow batch has none, so the
+three create modes (`create`/`create_append`/`replace`) add a synthetic `adbc_ingest_key`
+`STRING(36)` column (defaulted to `GENERATE_UUID()`) as the primary key. It is not part of your
+data, but it is a real column, so it shows up in `SELECT *` on the created table.
 
 ## Partitioned reads and Data Boost
 
