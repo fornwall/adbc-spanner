@@ -138,10 +138,12 @@ into the three `single_use()` call sites plus the partition path. Low–medium e
 
 ### Performance
 
-- **`bind_params` re-lexes the entire SQL text once per bound row** (`src/statement.rs:113-122` →
+- ~~**`bind_params` re-lexes the entire SQL text once per bound row** (`src/statement.rs:113-122` →
   `src/bind.rs:73-109`). A 50k-row bound DML lexes the same SQL 50k times — O(rows × |sql|) CPU
   before the first RPC. Resolve the parameter-name mapping once per (sql, schema) and pass it into
-  a per-row loop.
+  a per-row loop.~~ **Fixed.** `resolve_parameter_names` is now `pub(crate)` and called once per
+  batch by `build_bound_statements`; `bind_params` takes the precomputed `names: &[String]` and only
+  binds values per row, so the SQL is lexed once per (sql, batch) rather than once per row.
 - ~~**String columns pay an extra allocation + copy per value in the read hot path**~~
   (`src/conversion.rs:450-456`). **Fixed.** The `Utf8`/fallback arm now builds with a `StringBuilder`
   and `append_value(&str)` (mirroring the `BinaryBuilder` arm), appending the wire string slice
