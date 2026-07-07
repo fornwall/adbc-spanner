@@ -52,7 +52,8 @@ jobs:
       - name: Docs (deny warnings / broken links)
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --no-deps
+        # --all-features to match how docs.rs builds the docs.
+        run: cargo doc --no-deps --all-features
 
       - name: Build without default features (ffi off)
         run: cargo build --no-default-features
@@ -78,6 +79,11 @@ jobs:
 
       - name: Unit tests
         run: cargo test --lib
+
+      - name: Doctests
+        # Neither `--lib` nor `--all-targets` runs doctests, so run them
+        # explicitly. --all-features so feature-gated examples compile too.
+        run: cargo test --doc --all-features
 
       - name: Integration tests (Spanner emulator)
         run: cargo test --test integration
