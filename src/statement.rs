@@ -51,12 +51,12 @@ pub struct SpannerStatement {
     /// Ingest mode (`adbc.ingest.mode`), stored in canonical form once set so it round-trips
     /// through `get_option`. Only `append` is accepted.
     ingest_mode: Option<String>,
-    /// Rows converted into each streamed Arrow batch by `execute` (`adbc.spanner.rows_per_batch`).
+    /// Rows converted into each streamed Arrow batch by `execute` (`spanner.rows_per_batch`).
     rows_per_batch: usize,
-    /// Enable Data Boost for partitioned execution (`adbc.spanner.data_boost_enabled`).
+    /// Enable Data Boost for partitioned execution (`spanner.data_boost_enabled`).
     data_boost: bool,
     /// Maximum number of partitions to request from `execute_partitions`
-    /// (`adbc.spanner.max_partitions`); `None` lets Spanner choose.
+    /// (`spanner.max_partitions`); `None` lets Spanner choose.
     max_partitions: Option<i64>,
     /// Cancellation signal for this statement's in-flight execution (see [`Statement::cancel`]).
     cancel: CancelSignal,

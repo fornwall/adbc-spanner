@@ -112,7 +112,7 @@ impl SpannerDatabase {
         let database = self.database.clone().ok_or_else(|| {
             invalid_state(
                 "Spanner database path is not set; provide the `uri` or \
-                 `adbc.spanner.database` option (projects/<p>/instances/<i>/databases/<d>)",
+                 `spanner.database` option (projects/<p>/instances/<i>/databases/<d>)",
             )
         })?;
 

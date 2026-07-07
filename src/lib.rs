@@ -160,34 +160,34 @@ pub mod fuzzing {
 /// `projects/<project>/instances/<instance>/databases/<database>`.
 ///
 /// Equivalent to setting [`OptionDatabase::Uri`](adbc_core::options::OptionDatabase::Uri).
-pub const OPTION_DATABASE: &str = "adbc.spanner.database";
+pub const OPTION_DATABASE: &str = "spanner.database";
 
 /// Driver-specific database option: an explicit gRPC endpoint (for example the address of a
 /// Spanner emulator, `http://localhost:9010`). When unset the client connects to the production
 /// Spanner service.
-pub const OPTION_ENDPOINT: &str = "adbc.spanner.endpoint";
+pub const OPTION_ENDPOINT: &str = "spanner.endpoint";
 
 /// Driver-specific database option: when set to `true`, connect with anonymous credentials
 /// (the mode used by the Spanner emulator). Automatically enabled when `SPANNER_EMULATOR_HOST`
 /// is present in the environment.
-pub const OPTION_EMULATOR: &str = "adbc.spanner.emulator";
+pub const OPTION_EMULATOR: &str = "spanner.emulator";
 
 /// Driver-specific database option: path to a service-account JSON key file to authenticate with
 /// (dbt's `keyfile`). Overridden by [`OPTION_KEYFILE_JSON`] if both are set.
-pub const OPTION_KEYFILE: &str = "adbc.spanner.keyfile";
+pub const OPTION_KEYFILE: &str = "spanner.keyfile";
 
 /// Driver-specific database option: an inline service-account JSON key (dbt's `keyfile_json`).
 ///
 /// When neither this nor [`OPTION_KEYFILE`] is set (and not connecting to an emulator), the driver
 /// falls back to Application Default Credentials.
-pub const OPTION_KEYFILE_JSON: &str = "adbc.spanner.keyfile_json";
+pub const OPTION_KEYFILE_JSON: &str = "spanner.keyfile_json";
 
 /// Driver-specific statement option: the number of rows converted into each Arrow
 /// [`RecordBatch`](arrow_array::RecordBatch) streamed by
 /// [`Statement::execute`](adbc_core::Statement::execute). Larger batches trade memory for fewer
 /// per-batch conversions; smaller batches lower first-batch latency and peak memory. Accepts a
 /// positive integer (via `set_option`/`set_option_int`); defaults to 8192.
-pub const OPTION_ROWS_PER_BATCH: &str = "adbc.spanner.rows_per_batch";
+pub const OPTION_ROWS_PER_BATCH: &str = "spanner.rows_per_batch";
 
 /// Driver-specific statement option: enable **Data Boost** for
 /// [`Statement::execute_partitions`](adbc_core::Statement::execute_partitions). When `true`, each
@@ -195,12 +195,12 @@ pub const OPTION_ROWS_PER_BATCH: &str = "adbc.spanner.rows_per_batch";
 /// provisioned instance). The flag is baked into every partition descriptor, so a partition read
 /// back with [`Connection::read_partition`](adbc_core::Connection::read_partition) — on any
 /// connection or worker — honours it. Accepts a boolean; defaults to `false`.
-pub const OPTION_DATA_BOOST: &str = "adbc.spanner.data_boost_enabled";
+pub const OPTION_DATA_BOOST: &str = "spanner.data_boost_enabled";
 
 /// Driver-specific statement option: the maximum number of partitions to request from
 /// [`Statement::execute_partitions`](adbc_core::Statement::execute_partitions). This is a hint —
 /// Spanner may return fewer. Accepts a positive integer; unset lets Spanner choose.
-pub const OPTION_MAX_PARTITIONS: &str = "adbc.spanner.max_partitions";
+pub const OPTION_MAX_PARTITIONS: &str = "spanner.max_partitions";
 
 /// The vendor name reported by [`Connection::get_info`](adbc_core::Connection::get_info).
 pub const VENDOR_NAME: &str = "Google Cloud Spanner";

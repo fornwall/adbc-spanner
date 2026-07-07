@@ -25,7 +25,7 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
 - Connecting to production Spanner or a Spanner emulator.
 - SQL queries (`execute`), streamed back as typed Arrow `RecordBatch`es: rows are pulled from Spanner
   and converted to Arrow in bounded chunks as the reader is iterated, so a large result set is never
-  fully materialised in memory. The chunk size is tunable via the `adbc.spanner.rows_per_batch`
+  fully materialised in memory. The chunk size is tunable via the `spanner.rows_per_batch`
   statement option (default 8192).
 - DML (`execute_update`), returning the affected-row count. A `;`-separated batch (e.g. dbt's
   `DELETE; INSERT`) runs atomically in one read/write transaction via `ExecuteBatchDml`.
@@ -124,20 +124,20 @@ Options are set on the database (via `new_database_with_opts` or `set_option`):
 
 | Option                                                    | Meaning                                                                 |
 | -------------------------------------------------------- | ----------------------------------------------------------------------- |
-| `OptionDatabase::Uri` / `adbc.spanner.database`          | The Spanner database path `projects/<p>/instances/<i>/databases/<d>`. Required. |
-| `adbc.spanner.endpoint`                                  | Explicit gRPC endpoint, e.g. `http://localhost:9010` for an emulator.   |
-| `adbc.spanner.emulator`                                  | `true` to connect with anonymous credentials (emulator mode).           |
-| `adbc.spanner.keyfile`                                   | Path to a service-account JSON key file (dbt's `keyfile`).              |
-| `adbc.spanner.keyfile_json`                             | Inline service-account JSON key (dbt's `keyfile_json`); wins over `keyfile`. |
+| `OptionDatabase::Uri` / `spanner.database`          | The Spanner database path `projects/<p>/instances/<i>/databases/<d>`. Required. |
+| `spanner.endpoint`                                  | Explicit gRPC endpoint, e.g. `http://localhost:9010` for an emulator.   |
+| `spanner.emulator`                                  | `true` to connect with anonymous credentials (emulator mode).           |
+| `spanner.keyfile`                                   | Path to a service-account JSON key file (dbt's `keyfile`).              |
+| `spanner.keyfile_json`                             | Inline service-account JSON key (dbt's `keyfile_json`); wins over `keyfile`. |
 
 ### Authentication
 
 Credentials are resolved in this order:
 
-1. **Emulator** — if `SPANNER_EMULATOR_HOST` is set (or `adbc.spanner.emulator` is `true`), anonymous
+1. **Emulator** — if `SPANNER_EMULATOR_HOST` is set (or `spanner.emulator` is `true`), anonymous
    credentials are used and the endpoint is taken from the environment.
-2. **Service account** — a key supplied inline via `adbc.spanner.keyfile_json` or read from the path
-   in `adbc.spanner.keyfile`.
+2. **Service account** — a key supplied inline via `spanner.keyfile_json` or read from the path
+   in `spanner.keyfile`.
 3. **[Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)**
    otherwise (e.g. `GOOGLE_APPLICATION_CREDENTIALS`, gcloud login, or the metadata server).
 

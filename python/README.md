@@ -33,15 +33,15 @@ with spanner.connect(
 
 ## Connection options
 
-Options mirror the driver's `adbc.spanner.*` keys:
+Options mirror the driver's `spanner.*` keys:
 
 | kwarg          | driver option               |
 | -------------- | --------------------------- |
-| `database=`    | `adbc.spanner.database`     |
-| `endpoint=`    | `adbc.spanner.endpoint`     |
-| `emulator=`    | `adbc.spanner.emulator`     |
-| `keyfile=`     | `adbc.spanner.keyfile`      |
-| `keyfile_json=`| `adbc.spanner.keyfile_json` |
+| `database=`    | `spanner.database`     |
+| `endpoint=`    | `spanner.endpoint`     |
+| `emulator=`    | `spanner.emulator`     |
+| `keyfile=`     | `spanner.keyfile`      |
+| `keyfile_json=`| `spanner.keyfile_json` |
 
 Credentials default to Application Default Credentials; pass `keyfile=` /
 `keyfile_json=` for a service account, or point at the emulator:
@@ -142,8 +142,8 @@ with spanner.connect(
     with conn.cursor() as cur:
         # Optional statement options, set on the underlying ADBC statement:
         cur.adbc_statement.set_options(**{
-            "adbc.spanner.data_boost_enabled": "true",  # run on Data Boost
-            "adbc.spanner.max_partitions": "8",          # cap the partition count
+            "spanner.data_boost_enabled": "true",  # run on Data Boost
+            "spanner.max_partitions": "8",          # cap the partition count
         })
         partitions, schema = cur.adbc_execute_partitions("SELECT SingerId FROM Singers")
 
