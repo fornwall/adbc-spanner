@@ -31,7 +31,9 @@ use google_cloud_spanner::transaction::ReadWriteTransaction;
 use crate::bind;
 use crate::connection::{apply_isolation, SharedTxn};
 use crate::conversion::{result_set_to_batch, stream_query};
-use crate::error::{err, from_builder, from_spanner, invalid_state, not_implemented};
+use crate::error::{
+    err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
+};
 use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
 use crate::staleness::ReadStaleness;
 
@@ -867,9 +869,7 @@ impl Statement for SpannerStatement {
         // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
         self.cancel.reset();
         let sql = self.sql()?;
-        if crate::ddl::is_ddl(&sql) {
-            return Err(invalid_state("execute_schema is only valid for queries"));
-        }
+        check_schema_query(&sql)?;
         let client = self.client.clone();
         let bound = self.bound.clone();
         let schema = block_on_cancellable(&self.runtime, &self.cancel, async move {
@@ -1043,6 +1043,24 @@ fn string_option(value: OptionValue) -> Result<String> {
     crate::options::string_option(value, "statement option")
 }
 
+/// Guard for `execute_schema`: only queries can be planned. The PLAN probe runs in a single-use
+/// read-only transaction, and letting DML reach it surfaces Spanner's raw "DML statements can only
+/// be performed in a read-write transaction" error, which misleads the caller into thinking the
+/// transaction mode is the problem. Catch DDL and DML up front with a clear message instead. (This
+/// also covers `THEN RETURN` DML — it does produce rows, but Spanner cannot plan it read-only.)
+fn check_schema_query(sql: &str) -> Result<()> {
+    if crate::ddl::is_ddl(sql) {
+        return Err(invalid_state("execute_schema is only valid for queries"));
+    }
+    if crate::ddl::is_dml(sql) {
+        return Err(invalid_argument(
+            "execute_schema only supports queries: DML (INSERT/UPDATE/DELETE) cannot be planned \
+             in a read-only schema probe; run it via execute or execute_update instead",
+        ));
+    }
+    Ok(())
+}
+
 /// Validate the `adbc.ingest.target_catalog` option. Spanner has a single, unnamed (`""`) catalog,
 /// so only the empty catalog is accepted; any other name is rejected as unsupported.
 fn check_target_catalog(catalog: String) -> Result<String> {
@@ -1212,6 +1230,41 @@ mod tests {
         // Malformed values fail boolean coercion, not the temporary-table check.
         let error = check_ingest_temporary(OptionValue::String("maybe".into())).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
+    }
+
+    #[test]
+    fn execute_schema_guard_rejects_ddl_and_dml() {
+        // Queries — plain, CTE, parenthesised, statement-hinted — pass through to the PLAN probe.
+        for sql in [
+            "SELECT 1",
+            "WITH cte AS (SELECT 1 AS a) SELECT a FROM cte",
+            "(SELECT 1)",
+            "@{USE_ADDITIONAL_PARALLELISM=true} SELECT 1",
+            "GRAPH g MATCH (n) RETURN n.id",
+        ] {
+            check_schema_query(sql).unwrap_or_else(|e| panic!("query should pass: {sql}: {e}"));
+        }
+        // DDL is rejected up front (unchanged behaviour).
+        let error = check_schema_query("CREATE TABLE t (id INT64) PRIMARY KEY (id)").unwrap_err();
+        assert_eq!(error.status, Status::InvalidState);
+        // DML — in any spelling, hinted, or with THEN RETURN — gets a clear `InvalidArguments`
+        // instead of Spanner's raw read-only-transaction error from the PLAN probe.
+        for sql in [
+            "INSERT INTO t (id) VALUES (1)",
+            "update t set c = 1 where true",
+            "Delete From t Where true",
+            "/* comment */ INSERT INTO t (id) VALUES (1)",
+            "@{PDML_MAX_PARALLELISM=1} DELETE FROM t WHERE true",
+            "INSERT INTO t (id) VALUES (1) THEN RETURN id",
+        ] {
+            let error = check_schema_query(sql).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "{sql}");
+            assert!(
+                error.message.contains("only supports queries"),
+                "unexpected message for {sql}: {}",
+                error.message
+            );
+        }
     }
 
     #[test]

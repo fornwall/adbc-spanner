@@ -1446,6 +1446,22 @@ fn query_and_dml_round_trip() {
     assert_eq!(planned.field(1).name(), "b");
     assert_eq!(planned.field(1).data_type(), &DataType::Utf8);
 
+    // DML through execute_schema is rejected up front with a clear InvalidArguments error rather
+    // than surfacing Spanner's raw read-only-transaction error from the PLAN probe.
+    let mut dml_schema = connection.new_statement().expect("new statement");
+    dml_schema
+        .set_sql_query("INSERT INTO Singers (SingerId, Name) VALUES (999, 'x')")
+        .unwrap();
+    let error = dml_schema
+        .execute_schema()
+        .expect_err("execute_schema must reject DML");
+    assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
+    assert!(
+        error.message.contains("only supports queries"),
+        "unexpected message: {}",
+        error.message
+    );
+
     // --- get_objects: catalog → schema → table → columns from INFORMATION_SCHEMA ---
 
     let objects = connection

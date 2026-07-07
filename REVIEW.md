@@ -544,8 +544,14 @@ have, matching the missing-table status). Covered by an offline unit test
 (`lookup_catalog_accepts_only_the_default_empty_catalog`) plus new `Some("")`-still-works /
 bogus-catalog-is-NotFound assertions in the `get_table_schema` section of
 `tests/integration.rs`); `get_objects` at
-`Catalogs` depth still runs the SCHEMATA query; `execute_schema` lets DML through to a PLAN probe
-whose read-only-transaction error is surfaced raw.
+`Catalogs` depth still runs the SCHEMATA query; ~~`execute_schema` lets DML through to a PLAN probe
+whose read-only-transaction error is surfaced raw~~ (**Fixed.** `execute_schema` now classifies the
+SQL up front via the shared `ddl::is_dml` lexer (`check_schema_query` in `src/statement.rs`) and
+rejects DML — including hinted and `THEN RETURN` forms — with a clear `InvalidArguments`
+"only supports queries" error instead of Spanner's raw read-only-transaction error; DDL keeps its
+existing `InvalidState` rejection. Unit-tested offline (`execute_schema_guard_rejects_ddl_and_dml`
+in `src/statement.rs`) plus a DML-rejection assertion in the execute_schema section of
+`tests/integration.rs`).
 
 **Testing.** ~~Doctests never run in CI (`cargo test --doc` is absent; CLAUDE.md implies otherwise —
 also flagged by the CI review, which notes `cargo doc` runs without `--all-features` unlike
