@@ -473,10 +473,18 @@ only recognises `THEN` followed by `RETURN` at depth zero, since GoogleSQL's `TH
 only appears at the top level at the end of a DML statement; a CASE branch expression that is a
 column literally named `return` no longer trips the check, while a genuine top-level `THEN RETURN`
 after a CASE expression is still detected. Unit-tested for nested CASE, mixed case, comments,
-`THEN RETURN`/`CASE` inside literals and quoted identifiers, and unbalanced `END`); `read_only`
+`THEN RETURN`/`CASE` inside literals and quoted identifiers, and unbalanced `END`); ~~`read_only`
 is snapshotted into statements at creation, so flipping the connection option leaves existing
 statements writable (`src/connection.rs:792-801` — flagged independently by correctness,
-conformance and maintainability; share via `SharedTxn`/`AtomicBool`); ~~the autocommit-enable path
+conformance and maintainability; share via `SharedTxn`/`AtomicBool`)~~ (**Fixed.** the connection's
+flag is now an `Arc<AtomicBool>` shared into every statement, and all four enforcement branches in
+`src/statement.rs` (DML via `execute`, DML via `execute_update`, DDL, bulk ingest) load it at
+execution time through one `is_read_only()` helper instead of a creation-time snapshot — so
+toggling `adbc.connection.readonly` immediately locks or frees existing statements in both
+directions. The `readonly_connection_rejects_writes` integration test's toggle section now asserts
+the live semantics both ways (clearing the flag lets a pre-existing statement write; re-enabling it
+immediately rejects the same statement with `InvalidState`), and the README.md / python/README.md /
+lib.rs / CLAUDE.md docs describe the live-toggle behavior); ~~the autocommit-enable path
 reads/takes/flips in separate lock acquisitions, so a concurrently-buffering statement can strand
 DML (`connection.rs:734-742`)~~ (**Fixed.** the enable path now flips the mode and takes the buffer
 in *one* lock acquisition (`TxnState::enter_autocommit`) — `run_or_buffer` checks-and-buffers under

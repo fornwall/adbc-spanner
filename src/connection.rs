@@ -33,6 +33,7 @@
 //!   the batch twice unless the DML is idempotent.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use adbc_core::error::{Error, Result, Status};
@@ -182,7 +183,10 @@ pub struct SpannerConnection {
     client: DatabaseClient,
     spanner: Spanner,
     database: String,
-    read_only: bool,
+    /// The standard `adbc.connection.readonly` flag. Shared (`Arc`) with every statement the
+    /// connection creates, and read by statements at *execution* time, so toggling the option
+    /// immediately affects existing statements in both directions.
+    read_only: Arc<AtomicBool>,
     /// Isolation level applied to read/write transactions (autocommit DML and manual-mode commit),
     /// set via the standard ADBC `adbc.connection.transaction.isolation_level` option.
     /// [`IsolationLevel::Unspecified`] (the default) leaves the client/database default in place.
@@ -204,7 +208,7 @@ impl SpannerConnection {
             client: connected.client,
             spanner: connected.spanner,
             database: connected.database,
-            read_only: false,
+            read_only: Arc::new(AtomicBool::new(false)),
             isolation: IsolationLevel::Unspecified,
             read_staleness: ReadStaleness::default(),
             txn: Arc::new(Mutex::new(TxnState::new())),
@@ -518,7 +522,9 @@ impl Optionable for SpannerConnection {
                     }
                 }
             }
-            OptionConnection::ReadOnly => self.read_only = parse_bool(value)?,
+            OptionConnection::ReadOnly => {
+                self.read_only.store(parse_bool(value)?, Ordering::Release)
+            }
             OptionConnection::IsolationLevel => self.isolation = parse_isolation_level(value)?,
             OptionConnection::Other(k) if k == crate::OPTION_READ_STALENESS => {
                 self.read_staleness.set_staleness(value)?;
@@ -539,7 +545,7 @@ impl Optionable for SpannerConnection {
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
         match &key {
             OptionConnection::AutoCommit => Ok(self.txn.lock().unwrap().autocommit.to_string()),
-            OptionConnection::ReadOnly => Ok(self.read_only.to_string()),
+            OptionConnection::ReadOnly => Ok(self.read_only.load(Ordering::Acquire).to_string()),
             OptionConnection::IsolationLevel => {
                 Ok(isolation_to_adbc_string(&self.isolation).to_string())
             }
@@ -602,7 +608,7 @@ impl Connection for SpannerConnection {
             self.client.clone(),
             self.spanner.clone(),
             self.database.clone(),
-            self.read_only,
+            self.read_only.clone(),
             self.isolation.clone(),
             self.read_staleness.clone(),
             self.txn.clone(),
