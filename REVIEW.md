@@ -231,9 +231,19 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   unboundedly; see the P3 timeout/retry-tuning feature), and truncated streams. (Faults during a
   manual-transaction commit are now covered by
   `commit_under_transport_fault_never_loses_the_write`.)
-- **`statement.rs` has zero unit tests**; the option-coercion error paths (`rows_per_batch=0`,
+- ~~**`statement.rs` has zero unit tests**; the option-coercion error paths (`rows_per_batch=0`,
   bad bools, negative `max_partitions`, unknown-option statuses) are pure functions guarding the
-  C-ABI boundary and are unit-testable offline.
+  C-ABI boundary and are unit-testable offline.~~
+  **Fixed.** `src/statement.rs`'s `#[cfg(test)] mod tests` now covers the pure option-coercion
+  helpers offline (no live connection/runtime): `string_option` (accepts strings, rejects other
+  value kinds → `InvalidArguments`), `bool_option` (all truthy/falsy string spellings + int
+  0/non-zero; rejects unrecognised strings and non-bool value kinds), `max_partitions_option`
+  (positive ints/strings; rejects zero, negatives, non-numeric/float strings and wrong value kinds),
+  and `rows_per_batch_option` (positive ints/strings; rejects `0`, negatives, malformed strings and
+  wrong value kinds) — asserting the `InvalidArguments` status on every error path. The
+  unknown-option statuses (`NotImplemented` on `set_option`, `NotFound` on an unset `get_option`) are
+  only reachable through `SpannerStatement`, which needs a live `DatabaseClient`, so they stay
+  covered by the emulator integration tests rather than fabricating a fake connection.
 
 ### CI / release / packaging
 
