@@ -873,6 +873,48 @@ fn query_and_dml_round_trip() {
     drop_reuse.set_sql_query("DROP TABLE AdbcReuse").unwrap();
     drop_reuse.execute_update().expect("drop reuse table");
 
+    // Bulk ingest driven through the query entry point (`execute`, not `execute_update`): an ADBC
+    // FFI caller supplying a non-null stream out-pointer must get the ingest performed and an empty
+    // stream back, not InvalidState ("no SQL query set"). Regression test for ingest only triggering
+    // through `execute_update`.
+    let mut ingest_via_execute = connection.new_statement().expect("new statement");
+    ingest_via_execute
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcBind".into()),
+        )
+        .unwrap();
+    ingest_via_execute
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .unwrap();
+    let ingest_via_execute_rows = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("Id", DataType::Int64, false),
+            Field::new("Name", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![4])),
+            Arc::new(StringArray::from(vec!["Dave"])),
+        ],
+    )
+    .unwrap();
+    ingest_via_execute
+        .bind(ingest_via_execute_rows)
+        .expect("bind rows for ingest via execute");
+    let ingest_stream = ingest_via_execute
+        .execute()
+        .expect("ingest via execute()")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        ingest_stream.iter().all(|b| b.num_rows() == 0),
+        "ingest via execute() must yield an empty result set"
+    );
+    assert_eq!(count_rows(&mut connection, "AdbcBind"), 4);
+
     // Create-mode bulk ingest: the driver builds the table from the bound Arrow schema (with a
     // synthetic UUID primary key), so no CREATE TABLE is needed first. Exercises create/append/replace.
     let mut drop_create = connection.new_statement().expect("new statement");
