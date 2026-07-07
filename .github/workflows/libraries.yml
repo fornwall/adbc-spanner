@@ -129,7 +129,10 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          # Only drives `setup.py bdist_wheel` to repackage the prebuilt libraries;
+          # the wheel tag is forced to py3-none-<platform>, so this version does not
+          # affect the artifact. Pinned (not "3.x") for a reproducible release host.
+          python-version: "3.13"
 
       - name: Install build tooling
         run: python -m pip install --upgrade setuptools wheel
