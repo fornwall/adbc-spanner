@@ -1,0 +1,11 @@
+// Spanner override: mandatory PRIMARY KEY, native type name, and an explicit INSERT column list.
+
+// part: setup_query
+
+CREATE TABLE test_int64 (
+    res INT64
+) PRIMARY KEY (res)
+
+// part: bind_query
+
+INSERT INTO test_int64 (res) VALUES ($1)

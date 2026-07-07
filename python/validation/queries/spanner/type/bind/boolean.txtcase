@@ -1,0 +1,11 @@
+// Spanner override: mandatory PRIMARY KEY, native type name, and an explicit INSERT column list.
+
+// part: setup_query
+
+CREATE TABLE test_boolean (
+    res BOOL
+) PRIMARY KEY (res)
+
+// part: bind_query
+
+INSERT INTO test_boolean (res) VALUES ($1)

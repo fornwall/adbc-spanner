@@ -717,6 +717,38 @@ fn query_and_dml_round_trip() {
         "Bob"
     );
 
+    // Positional binding: the bound column is *not* named after the query's `@parameter`, so the
+    // driver binds the (sole) column to the (sole) parameter by position — the ADBC ordinal contract
+    // that positional clients (and the Foundry validation suite) rely on. Reads Id = 2 -> "Bob".
+    let positional = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(Int64Array::from(vec![2]))],
+    )
+    .unwrap();
+    let mut pp = connection.new_statement().expect("new statement");
+    pp.set_sql_query("SELECT Name FROM AdbcBind WHERE Id = @p1")
+        .unwrap();
+    pp.bind(positional).expect("bind positional param");
+    let pp_batches = pp
+        .execute()
+        .expect("positional query")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(pp_batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    assert_eq!(
+        pp_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "Bob"
+    );
+
     // Parameterized DML: update by bound @Id / @Name.
     let upd = RecordBatch::try_new(
         Arc::new(Schema::new(vec![

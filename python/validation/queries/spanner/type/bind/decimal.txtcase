@@ -1,0 +1,3 @@
+// part: metadata
+
+skip = "Spanner NUMERIC is fixed precision/scale (38,9); it does not round-trip the case's DECIMAL(10,2)"

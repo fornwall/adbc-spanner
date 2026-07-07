@@ -94,7 +94,8 @@ impl SpannerStatement {
         let mut statements = Vec::new();
         for batch in &self.bound {
             for row in 0..batch.num_rows() {
-                statements.push(bind::bind_row(SpannerSql::builder(sql), batch, row)?.build());
+                statements
+                    .push(bind::bind_params(SpannerSql::builder(sql), sql, batch, row)?.build());
             }
         }
         Ok(statements)
@@ -242,7 +243,7 @@ impl SpannerStatement {
         }
         if let Some(batch) = self.bound.first() {
             if batch.num_rows() > 0 {
-                builder = bind::bind_row(builder, batch, 0)?;
+                builder = bind::bind_params(builder, sql, batch, 0)?;
             }
         }
         Ok(builder.build())
@@ -440,12 +441,12 @@ impl Statement for SpannerStatement {
             // QueryMode::Plan analyses the query and returns its column metadata without scanning
             // any data, so dbt can introspect a model's output columns without wrapping it in a
             // `SELECT ... WHERE false` subquery.
-            let mut builder = SpannerSql::builder(sql).set_query_mode(QueryMode::Plan);
+            let mut builder = SpannerSql::builder(sql.as_str()).set_query_mode(QueryMode::Plan);
             // Bind parameters if any were provided (values are irrelevant to the schema) so that
             // `@param` references resolve.
             if let Some(batch) = bound.first() {
                 if batch.num_rows() > 0 {
-                    builder = bind::bind_row(builder, batch, 0)?;
+                    builder = bind::bind_params(builder, &sql, batch, 0)?;
                 }
             }
             let result_set = transaction
