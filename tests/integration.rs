@@ -490,13 +490,52 @@ fn query_and_dml_round_trip() {
         "rolled-back parameterized row must not appear"
     );
 
-    // Re-enabling autocommit commits any pending work (none here) and restores per-statement commit.
+    // Re-enabling autocommit COMMITS any pending buffered work — it must never discard it. This
+    // is the data-loss path: buffer a row, toggle autocommit back on, and the row has to be there.
+    let mut pending = connection.new_statement().expect("new statement");
+    pending
+        .set_sql_query("INSERT INTO AdbcTxn (Id) VALUES (5)")
+        .unwrap();
+    assert_eq!(pending.execute_update().expect("buffered insert"), None);
+    assert_eq!(
+        count_rows(&mut connection, "AdbcTxn"),
+        3,
+        "the buffered row must not be visible before the autocommit toggle"
+    );
     connection
         .set_option(
             OptionConnection::AutoCommit,
             OptionValue::String("true".into()),
         )
         .expect("enable autocommit");
+    assert_eq!(
+        count_rows(&mut connection, "AdbcTxn"),
+        4,
+        "re-enabling autocommit must commit the buffered DML, not discard it"
+    );
+
+    // The toggle is idempotent (no pending work to re-commit), and per-statement commit is back:
+    // DML applies immediately, and commit/rollback without a transaction are errors again.
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("true".into()),
+        )
+        .expect("re-enable autocommit is a no-op");
+    let mut immediate = connection.new_statement().expect("new statement");
+    immediate
+        .set_sql_query("INSERT INTO AdbcTxn (Id) VALUES (6)")
+        .unwrap();
+    assert_eq!(
+        immediate.execute_update().expect("autocommit insert"),
+        Some(1),
+        "back in autocommit mode DML reports its count and applies immediately"
+    );
+    assert_eq!(count_rows(&mut connection, "AdbcTxn"), 5);
+    assert!(
+        connection.commit().is_err(),
+        "commit without an active manual transaction must fail"
+    );
 
     let mut drop_txn = connection.new_statement().expect("new statement");
     drop_txn.set_sql_query("DROP TABLE AdbcTxn").unwrap();
