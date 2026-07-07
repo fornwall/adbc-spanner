@@ -49,16 +49,21 @@ mutation src/` is empty). Fix, staged: (a) chunk the DML batch under the commit 
 is a correctness-at-scale fix, not just speed; (b) move ingest to mutations (append/replace map
 naturally), optionally BatchWrite behind an option for non-atomic firehose loads.
 
-### 4. Nothing in the tag→publish path runs a single test (CI/release)
+### ~~4. Nothing in the tag→publish path runs a single test (CI/release)~~ (fixed)
 
-`ci.yml` triggers on pushes to main and PRs only — not tags. `libraries.yml` (the only workflow
-tags trigger) contains zero test steps, and `python-publish` depends only on compile+repackage
-jobs; `cargo-release` has no `pre-release-hook`. Since `cargo release --execute` pushes commit and
-tag together, the pipeline will publish to PyPI (irreversible) and attach GitHub Release assets
-even if that commit is red on CI or CI hasn't finished. Fix (any of): a smoke test in the `build`
-job on tag refs (install the built lib into `python/`, run the emulator e2e suite on linux
-x86-64), make `python-publish` wait for the commit's `ci.yml` check to succeed, or minimally add
-`pre-release-hook = ["cargo", "test"]`.
+**Fixed.** Two independent guards now stand between a red commit and an irreversible publish. (1) A
+`pre-release-hook` in `[package.metadata.release]` (`Cargo.toml`) runs `cargo fmt --all --check &&
+cargo clippy --all-targets --all-features -- -D warnings && cargo test` before cargo-release mints
+the tag, so `cargo release --execute` refuses to commit/tag/push if the local checks CI enforces
+fail (the emulator-gated integration/resilience suites self-skip offline, so this covers the unit
+tests + doctests locally). (2) A new `ci-gate` job in `libraries.yml` — the only tag-triggered
+workflow — polls `ci.yml`'s run for the tagged `github.sha` (the branch push cargo-release makes
+alongside the tag triggers `ci.yml` on that same commit) and only succeeds once it has concluded
+`success`, timing out (and failing) after 30 minutes otherwise. Both `release` (GitHub Release
+assets) and `python-publish` (PyPI) now `needs: [..., ci-gate]`, so neither the asset upload nor
+the irreversible PyPI publish can proceed until the full CI run — emulator suites included — is
+green on that exact commit. The gate uses only `gh api` + `jq` with a job-scoped `actions: read`
+permission (no new third-party action in the publish path).
 
 ### 5. The emulator test suites can all silently skip: one YAML typo turns CI green with zero behavioral coverage (testing)
 
