@@ -37,9 +37,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use adbc_core::error::{Result, Status};
+use arrow_array::builder::{BinaryBuilder, BooleanBuilder, PrimitiveBuilder};
+use arrow_array::types::{
+    ArrowPrimitiveType, Date32Type, Decimal128Type, Float32Type, Float64Type, Int64Type,
+};
 use arrow_array::{
-    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int64Array, ListArray, RecordBatch, RecordBatchReader, StringArray, StructArray,
+    ArrayRef, ListArray, PrimitiveArray, RecordBatch, RecordBatchReader, StringArray, StructArray,
     TimestampNanosecondArray,
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -319,54 +322,95 @@ fn arrow_err(e: ArrowError) -> adbc_core::error::Error {
     )
 }
 
+/// The error for a present (non-NULL) wire value that cannot be decoded as its column's Spanner
+/// type. Decoding must fail loudly: mapping an undecodable value to NULL would silently corrupt
+/// data (a value the caller cannot distinguish from a genuine SQL NULL).
+fn decode_error(spanner_type: &str, value: &Value) -> adbc_core::error::Error {
+    err(
+        format!(
+            "cannot decode Spanner {spanner_type} wire value {}",
+            value_to_json(value)
+        ),
+        Status::InvalidData,
+    )
+}
+
+/// Build a primitive Arrow array from one Spanner value per row: SQL NULLs become null slots, and
+/// a present value that `parse` cannot decode is an error (see [`decode_error`]), never a null.
+fn build_primitive<T: ArrowPrimitiveType>(
+    values: &[Option<&Value>],
+    spanner_type: &str,
+    parse: impl Fn(&Value) -> Option<T::Native>,
+) -> Result<PrimitiveArray<T>> {
+    let mut builder = PrimitiveBuilder::<T>::with_capacity(values.len());
+    for &value in values {
+        match present(value) {
+            None => builder.append_null(),
+            Some(v) => builder.append_value(parse(v).ok_or_else(|| decode_error(spanner_type, v))?),
+        }
+    }
+    Ok(builder.finish())
+}
+
 /// Build an Arrow array of the given `data_type` from one Spanner value per row.
+///
+/// SQL NULLs map to null slots. A present value that cannot be decoded as the column's type is an
+/// **error**, not a null — every typed arm goes through [`build_primitive`]/[`decode_error`], so a
+/// wire-format surprise cannot silently masquerade as a SQL NULL.
 fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Result<ArrayRef> {
     Ok(match data_type {
-        DataType::Boolean => Arc::new(BooleanArray::from_iter(
-            values
-                .iter()
-                .map(|&v| present(v).and_then(Value::try_as_bool)),
-        )),
-        DataType::Int64 => Arc::new(Int64Array::from_iter(
-            values.iter().map(|&v| present(v).and_then(parse_int64)),
-        )),
-        DataType::Float64 => Arc::new(Float64Array::from_iter(
-            values.iter().map(|&v| present(v).and_then(parse_f64)),
-        )),
-        DataType::Float32 => Arc::new(Float32Array::from_iter(
-            values
-                .iter()
-                .map(|&v| present(v).and_then(parse_f64).map(|f| f as f32)),
-        )),
-        DataType::Date32 => Arc::new(Date32Array::from_iter(values.iter().map(|&v| {
-            present(v)
-                .and_then(Value::try_as_string)
-                .and_then(parse_date_days)
-        }))),
-        DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
-            // A genuine SQL NULL (or absent value) becomes a null slot; a present TIMESTAMP that
-            // falls outside the range representable as `Timestamp(Nanosecond)` is a real value we
-            // cannot encode, so it errors rather than silently collapsing to null.
-            let mut builder = TimestampNanosecondArray::builder(values.len());
-            for &v in values {
-                match present(v).and_then(Value::try_as_string) {
-                    Some(s) => builder.append_value(parse_timestamp_nanos(s).ok_or_else(|| {
-                        invalid_argument(format!(
-                            "TIMESTAMP value {s:?} is outside the range representable as an Arrow \
-                             Timestamp(Nanosecond) (~1677-09-21 to 2262-04-11)"
-                        ))
-                    })?),
+        DataType::Boolean => {
+            let mut builder = BooleanBuilder::with_capacity(values.len());
+            for &value in values {
+                match present(value) {
                     None => builder.append_null(),
+                    Some(v) => builder
+                        .append_value(v.try_as_bool().ok_or_else(|| decode_error("BOOL", v))?),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::Int64 => Arc::new(build_primitive::<Int64Type>(values, "INT64", parse_int64)?),
+        DataType::Float64 => Arc::new(build_primitive::<Float64Type>(
+            values, "FLOAT64", parse_f64,
+        )?),
+        DataType::Float32 => Arc::new(build_primitive::<Float32Type>(values, "FLOAT32", |v| {
+            parse_f64(v).map(|f| f as f32)
+        })?),
+        DataType::Date32 => Arc::new(build_primitive::<Date32Type>(values, "DATE", |v| {
+            v.try_as_string().and_then(parse_date_days)
+        })?),
+        DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+            // A genuine SQL NULL (or absent value) becomes a null slot. A present value errors if
+            // it is not a timestamp string at all, or — since Arrow stores nanoseconds as an
+            // `i64` — if it is a valid instant outside the representable range.
+            let mut builder = TimestampNanosecondArray::builder(values.len());
+            for &value in values {
+                match present(value) {
+                    None => builder.append_null(),
+                    Some(v) => {
+                        let s = v
+                            .try_as_string()
+                            .ok_or_else(|| decode_error("TIMESTAMP", v))?;
+                        builder.append_value(parse_timestamp_nanos(s).ok_or_else(|| {
+                            if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
+                                invalid_argument(format!(
+                                    "TIMESTAMP value {s:?} is outside the range representable as \
+                                     an Arrow Timestamp(Nanosecond) (~1677-09-21 to 2262-04-11)"
+                                ))
+                            } else {
+                                decode_error("TIMESTAMP", v)
+                            }
+                        })?)
+                    }
                 }
             }
             Arc::new(builder.finish().with_timezone_opt(tz.clone()))
         }
         DataType::Decimal128(precision, scale) => {
-            let array = Decimal128Array::from_iter(values.iter().map(|&v| {
-                present(v)
-                    .and_then(Value::try_as_string)
-                    .and_then(parse_numeric_i128)
-            }));
+            let array = build_primitive::<Decimal128Type>(values, "NUMERIC", |v| {
+                v.try_as_string().and_then(parse_numeric_i128)
+            })?;
             Arc::new(
                 array
                     .with_precision_and_scale(*precision, *scale)
@@ -374,11 +418,20 @@ fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Result<ArrayR
             )
         }
         // Spanner encodes BYTES as base64.
-        DataType::Binary => Arc::new(BinaryArray::from_iter(values.iter().map(|&v| {
-            present(v)
-                .and_then(Value::try_as_string)
-                .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
-        }))),
+        DataType::Binary => {
+            let mut builder = BinaryBuilder::new();
+            for &value in values {
+                match present(value) {
+                    None => builder.append_null(),
+                    Some(v) => builder.append_value(
+                        v.try_as_string()
+                            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+                            .ok_or_else(|| decode_error("BYTES", v))?,
+                    ),
+                }
+            }
+            Arc::new(builder.finish())
+        }
         DataType::List(field) => build_list(field, values)?,
         DataType::Struct(fields) => build_struct(fields, values)?,
         // Utf8 and every fallback (JSON, …): keep strings verbatim, render anything else (numbers,
@@ -690,5 +743,81 @@ mod tests {
         assert_eq!(parse_numeric_i128("0.0000000019"), Some(1));
         assert_eq!(parse_numeric_i128("abc"), None);
         assert_eq!(parse_numeric_i128(""), None);
+    }
+
+    /// A present wire value that cannot be decoded as the column's type must error (naming the
+    /// type and the offending value), never silently turn into a NULL slot the caller cannot
+    /// distinguish from a genuine SQL NULL.
+    #[test]
+    fn undecodable_values_error_instead_of_becoming_null() {
+        use google_cloud_spanner::value::ToValue;
+        let garbage = "not-a-value".to_value();
+        for (data_type, spanner_type) in [
+            (DataType::Boolean, "BOOL"),
+            (DataType::Int64, "INT64"),
+            (DataType::Float64, "FLOAT64"),
+            (DataType::Float32, "FLOAT32"),
+            (DataType::Date32, "DATE"),
+            (
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(TIMESTAMP_TZ.into())),
+                "TIMESTAMP",
+            ),
+            (
+                DataType::Decimal128(NUMERIC_PRECISION, NUMERIC_SCALE),
+                "NUMERIC",
+            ),
+        ] {
+            let err = build_array(&data_type, &[Some(&garbage)]).expect_err(spanner_type);
+            assert_eq!(err.status, Status::InvalidData, "{spanner_type}");
+            assert!(
+                err.message.contains(spanner_type) && err.message.contains("not-a-value"),
+                "{spanner_type}: {}",
+                err.message
+            );
+        }
+        // BYTES: a string that is not valid base64.
+        let bad_base64 = "!!!".to_value();
+        let err = build_array(&DataType::Binary, &[Some(&bad_base64)]).unwrap_err();
+        assert_eq!(err.status, Status::InvalidData);
+        assert!(err.message.contains("BYTES"), "{}", err.message);
+    }
+
+    /// SQL NULLs (and absent values) still map to null slots — strict decoding only applies to
+    /// values that are actually present.
+    #[test]
+    fn nulls_still_map_to_null_slots_under_strict_decoding() {
+        use arrow_array::Array;
+        use google_cloud_spanner::value::ToValue;
+        let null = None::<i64>.to_value();
+        for data_type in [
+            DataType::Boolean,
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Float32,
+            DataType::Date32,
+            DataType::Decimal128(NUMERIC_PRECISION, NUMERIC_SCALE),
+            DataType::Binary,
+        ] {
+            let array = build_array(&data_type, &[Some(&null), None]).unwrap();
+            assert_eq!(array.len(), 2, "{data_type}");
+            assert!(array.is_null(0) && array.is_null(1), "{data_type}");
+        }
+    }
+
+    /// A malformed TIMESTAMP string is a decode error; only a well-formed instant outside the
+    /// Arrow nanosecond range gets the more specific out-of-range message.
+    #[test]
+    fn malformed_timestamp_is_a_decode_error_not_out_of_range() {
+        use google_cloud_spanner::value::ToValue;
+        let ty = DataType::Timestamp(TimeUnit::Nanosecond, Some(TIMESTAMP_TZ.into()));
+        let malformed = "2024-13-45T99:99:99Z".to_value();
+        let err = build_array(&ty, &[Some(&malformed)]).unwrap_err();
+        assert_eq!(err.status, Status::InvalidData);
+        assert!(err.message.contains("cannot decode"), "{}", err.message);
+        assert!(
+            !err.message.contains("outside the range"),
+            "{}",
+            err.message
+        );
     }
 }
