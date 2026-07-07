@@ -184,7 +184,10 @@ authenticates as that target. The option group mirrors the BigQuery ADBC driver'
 | `ARRAY<T>`                                  | `List<T>` (recursive)             |
 | `STRUCT<..>`                                | `Struct<..>` (recursive)          |
 
-`NULL`s are represented as null slots in the corresponding Arrow array. `ARRAY` and `STRUCT` map to
+`NULL`s are represented as null slots in the corresponding Arrow array. Decoding is strict: a
+present (non-`NULL`) wire value that cannot be decoded as its column's type surfaces an
+`InvalidData` error naming the type and the offending value — it is never silently mapped to a
+null slot the caller could mistake for a genuine SQL `NULL`. `ARRAY` and `STRUCT` map to
 native Arrow `List`/`Struct` recursively, so nested shapes like `ARRAY<STRUCT<..>>` round-trip with
 full type fidelity.
 
