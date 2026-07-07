@@ -125,17 +125,26 @@ and on `v*` tags they are attached to the GitHub Release.
 
 ## Releasing
 
-Releases use [`cargo-release`](https://github.com/crate-ci/cargo-release), configured under
-`[package.metadata.release]` in `Cargo.toml`.
+**Always cut releases with [`cargo-release`](https://github.com/crate-ci/cargo-release)** (configured
+under `[package.metadata.release]` in `Cargo.toml`) — never bump the version / commit / tag by hand.
+Hand-rolling a release risks a malformed tag or a version that disagrees with `Cargo.toml` (which the
+`python-wheels` job rejects), and there is nothing to gain: cargo-release does the exact same steps
+deterministically.
 
 ```sh
 cargo release patch            # dry run (default) — preview only
-cargo release patch --execute  # bump + commit + publish to crates.io + tag vX.Y.Z + push
+cargo release patch --execute  # bump + commit "Release X.Y.Z" + tag vX.Y.Z + push
 ```
 
-Pushing the `vX.Y.Z` tag triggers `libraries.yml` to attach the platform shared libraries to the
-GitHub Release. So: `cargo release --execute` owns versioning + crates.io publish + tagging; CI owns
-building and attaching the binaries. They do not overlap.
+**crates.io publishing is off**, via `publish = false` in the release config (the git-pinned
+`google-cloud-*` deps can't be published — see the dependency note above). So `cargo release --execute`
+does **not** touch crates.io — it only versions, commits, tags and pushes. Note the dry-run still
+prints a `Publishing adbc-spanner` heading; that is just the step label, not an actual `cargo publish`,
+so it is not a reason to avoid cargo-release. Re-enable `publish` once those deps are versioned.
+
+Pushing the `vX.Y.Z` tag triggers `libraries.yml` to build + attach the platform shared libraries to
+the GitHub Release and to build + publish the Python wheels to PyPI. So: `cargo release --execute` owns
+versioning + tagging; CI owns building, attaching binaries, and publishing wheels. They do not overlap.
 
 ### Python package (`python/`)
 
