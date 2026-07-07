@@ -27,16 +27,13 @@ integration test (SQL-level failure: fail → retry fails again, not vacuous suc
 clean commit) and by `commit_under_transport_fault_never_loses_the_write` in
 `tests/resilience.rs`.
 
-### 2. `get_table_types` and `get_objects` disagree on table-type vocabulary; the spec round-trip returns zero tables (conformance + correctness, found independently by both)
+### ~~2. `get_table_types` and `get_objects` disagree on table-type vocabulary; the spec round-trip returns zero tables~~ (fixed)
 
-`src/connection.rs:899-913` returns `["TABLE", "VIEW"]`, but `get_objects` copies Spanner's
-`INFORMATION_SCHEMA.TABLES.TABLE_TYPE` through verbatim (`connection.rs:236-241`), which is
-`'BASE TABLE'` / `'VIEW'` — the driver's own statistics query filters on `'BASE TABLE'`
-(`connection.rs:306`). The ADBC spec says valid `table_type` filter values come from
-`get_table_types`, so a client doing the sanctioned thing — `get_objects(table_type=["TABLE"])` —
-silently gets **no tables**. The integration test only checks that `"TABLE"` is present, never the
-round trip. Fix: return `["BASE TABLE", "VIEW"]` (the smaller change, matching BigQuery/Postgres
-ADBC precedent), or normalize both sides; add the round-trip test.
+**Fixed.** `get_table_types` now returns `["BASE TABLE", "VIEW"]` — Spanner's own
+`INFORMATION_SCHEMA.TABLES.TABLE_TYPE` vocabulary, which is what `get_objects` reports per table
+and what the statistics query filters on — so every reported value round-trips as a `get_objects`
+`table_type` filter. Covered by a round-trip assertion in the main integration test (filter
+`get_objects` by the types `get_table_types` reports; the known base table must come back).
 
 ### 3. Bulk ingest is one DML statement per row in one unchunked transaction (performance + features, found independently by both)
 

@@ -914,14 +914,17 @@ impl Connection for SpannerConnection {
     }
 
     /// Return the table types supported by Spanner as a single-column (`table_type: utf8`) batch,
-    /// per the ADBC specification.
+    /// per the ADBC specification. The values are Spanner's own
+    /// `INFORMATION_SCHEMA.TABLES.TABLE_TYPE` vocabulary (`BASE TABLE` / `VIEW`), which is what
+    /// `get_objects` reports per table — so every value returned here round-trips as a
+    /// `get_objects` `table_type` filter.
     fn get_table_types(&self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "table_type",
             DataType::Utf8,
             false,
         )]));
-        let array = Arc::new(StringArray::from(vec!["TABLE", "VIEW"])) as ArrayRef;
+        let array = Arc::new(StringArray::from(vec!["BASE TABLE", "VIEW"])) as ArrayRef;
         let batch = RecordBatch::try_new(schema.clone(), vec![array]).map_err(|e| {
             err(
                 format!("failed to build table types batch: {e}"),

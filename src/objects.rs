@@ -275,7 +275,7 @@ mod tests {
             name: "".to_string(),
             tables: vec![Table {
                 name: "Users".to_string(),
-                table_type: "TABLE".to_string(),
+                table_type: "BASE TABLE".to_string(),
                 columns: vec![
                     Column {
                         name: "Id".into(),

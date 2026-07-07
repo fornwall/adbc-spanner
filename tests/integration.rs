@@ -1213,6 +1213,83 @@ fn query_and_dml_round_trip() {
         .downcast_ref::<StringArray>()
         .unwrap();
     assert_eq!(column_name.value(0), "SingerId");
+
+    // --- Round trip: every value get_table_types reports works as a get_objects table_type
+    // filter. The ADBC spec says valid filter values come from get_table_types, so the two
+    // vocabularies must agree — filtering on the reported type of a base table must find it.
+    let reported_types: Vec<String> = connection
+        .get_table_types()
+        .expect("get_table_types")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect table types")
+        .iter()
+        .flat_map(|b| {
+            let col = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            (0..col.len())
+                .map(|i| col.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        reported_types.contains(&"BASE TABLE".to_string()),
+        "get_table_types should report Spanner's INFORMATION_SCHEMA vocabulary: {reported_types:?}"
+    );
+    let filtered = connection
+        .get_objects(
+            ObjectDepth::Tables,
+            None,
+            None,
+            Some("Singers"),
+            Some(reported_types.iter().map(String::as_str).collect()),
+            None,
+        )
+        .expect("get_objects with table_type filter");
+    let filtered = filtered
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect filtered objects");
+    assert_eq!(
+        objects_table_names(&filtered),
+        vec!["Singers".to_string()],
+        "types reported by get_table_types must round-trip as get_objects filters"
+    );
+}
+
+/// Flatten a collected `get_objects` result into the table names it contains, across all
+/// catalogs and schemas.
+fn objects_table_names(batches: &[RecordBatch]) -> Vec<String> {
+    let mut names = Vec::new();
+    for batch in batches {
+        let schema_lists = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        for c in 0..batch.num_rows() {
+            let schemas = schema_lists.value(c);
+            let schemas = schemas.as_any().downcast_ref::<StructArray>().unwrap();
+            let table_lists = schemas
+                .column(1)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            for s in 0..schemas.len() {
+                if table_lists.is_null(s) {
+                    continue;
+                }
+                let tables = table_lists.value(s);
+                let tables = tables.as_any().downcast_ref::<StructArray>().unwrap();
+                let table_names = tables
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                for r in 0..tables.len() {
+                    names.push(table_names.value(r).to_string());
+                }
+            }
+        }
+    }
+    names
 }
 
 /// Number of generated cases per property. Each case is a full DELETE + INSERT + SELECT round trip
@@ -1689,7 +1766,7 @@ fn conformance_via_driver_manager() {
         .sum();
     assert_eq!(subset_rows, 2, "one row per explicitly requested code");
 
-    // --- get_table_types: canonical schema, TABLE and VIEW present. ---
+    // --- get_table_types: canonical schema, BASE TABLE and VIEW present. ---
     let reader = connection.get_table_types().expect("get_table_types");
     assert_eq!(reader.schema(), GET_TABLE_TYPES_SCHEMA.clone());
     let types: Vec<String> = reader
@@ -1703,7 +1780,7 @@ fn conformance_via_driver_manager() {
                 .collect::<Vec<_>>()
         })
         .collect();
-    assert!(types.contains(&"TABLE".to_string()) && types.contains(&"VIEW".to_string()));
+    assert!(types.contains(&"BASE TABLE".to_string()) && types.contains(&"VIEW".to_string()));
 
     // --- Scratch table for the metadata / DML / ingest checks. ---
     run_ffi(
