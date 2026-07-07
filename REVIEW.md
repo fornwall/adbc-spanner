@@ -13,38 +13,28 @@ they are to bite a real user. (All P1 findings from the original review have bee
 returns `None` (`src/ddl.rs:112`), so hinted DML entering via `execute()` is sent to a read-only
 transaction, which Spanner rejects. Skip a leading `@{…}` block.
 
-**2. Identifier quoting is inconsistent and uses the wrong escape** — `qualified_table`
-(`src/connection.rs:995`) interpolates caller-supplied schema/table names with no escaping (a name
-with a backtick breaks `get_table_schema` and then gets mislabeled `NotFound`), while the one
-escape that exists (`connection.rs:367` and `bind::quote_ident`) uses MySQL-style backtick
-doubling — GoogleSQL wants backslash escapes. One shared, correct `quote_ident` fixes all three
-sites. Related: `insert_sql` (`src/bind.rs:396`) writes parameter references as
-`@<raw column name>`, so a column name that isn't a valid identifier produces invalid SQL — the
-`` a`b `` test at `bind.rs:461` currently asserts the broken output. Binding ingest params
-positionally (`@p0, @p1`) would decouple param names from column names.
-
-**3. Release job can attach unchecksummed wheels** — `libraries.yml:94`: the `release` job
+**2. Release job can attach unchecksummed wheels** — `libraries.yml:94`: the `release` job
 downloads *all* artifacts with `merge-multiple` while `python-wheels` runs in parallel; depending
 on timing, wheels land in `dist/` and get attached to the GitHub Release without matching the
 `sha256sum adbc-spanner-*` glob. Add a `pattern:` filter.
 
-**4. CI supply-chain hygiene** — the release-critical actions are pinned to mutable refs
+**3. CI supply-chain hygiene** — the release-critical actions are pinned to mutable refs
 (`softprops/action-gh-release@v3` with `contents: write`, `pypa/gh-action-pypi-publish@release/v1`
 — a *branch* — with `id-token: write`); pin those to commit SHAs. And `ci.yml`,
 `adbc-validation.yml`, `fuzz.yml` have no `permissions:` block at all — add `contents: read` like
 the other two workflows already do.
 
-**5. gRPC error fidelity** — `src/error.rs`: `ABORTED` (Spanner's routine "retry me" signal) maps
+**4. gRPC error fidelity** — `src/error.rs`: `ABORTED` (Spanner's routine "retry me" signal) maps
 to `Status::Internal`, indistinguishable from a driver bug when the r/w runner exhausts retries
 under contention; and `from_spanner` leaves `vendor_code` at zero when it could carry the numeric
 gRPC code for callers' retry logic.
 
-**6. Untested data-loss path** — the "re-enabling autocommit commits buffered DML" branch
+**5. Untested data-loss path** — the "re-enabling autocommit commits buffered DML" branch
 (`src/connection.rs:721`) has zero coverage; the one toggle test deliberately buffers nothing
 (`tests/integration.rs:486`). A regression that *discarded* the buffer instead of committing would
 pass the whole suite.
 
-**7. Emulator scripts fail open** — `scripts/with-emulator.sh:44–64`: both readiness loops fall
+**6. Emulator scripts fail open** — `scripts/with-emulator.sh:44–64`: both readiness loops fall
 through silently on timeout and run the tests against a dead port (the ci.yml copy of this loop
 fails correctly). `run-foundry-validation.sh` also lacks `-e`, so a failed build validates a stale
 `.so`, and its `VALIDATION_REF` pin only applies on first install.
