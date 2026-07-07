@@ -56,7 +56,12 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
 - Parameter binding: `bind`/`bind_stream` an Arrow batch whose columns become Spanner named
   parameters (a column `id` binds `@id`); each bound row runs the statement once.
 - Bulk ingest: set `adbc.ingest.target_table`, bind an Arrow batch, and `execute_update` inserts the
-  rows into that table in one transaction. All four `adbc.ingest.mode` values are supported:
+  rows into that table — in one transaction when the ingest fits Spanner's per-commit limits (~80,000
+  mutations, counted roughly as rows × columns, and ~100 MB). A larger ingest is automatically split
+  into chunks that stay well under those limits, each committed in its own transaction, so it is
+  **not atomic as a whole**: a mid-ingest failure leaves earlier chunks committed. (An ingest that
+  large could not have committed as one transaction anyway.) All four `adbc.ingest.mode` values are
+  supported:
   `append` (the default — insert into an existing table), `create` (create the table first, failing
   if it exists), `create_append` (create if absent, then insert) and `replace` (drop and recreate).
   The three create modes build the table from the ingest data's Arrow schema, adding a synthetic
