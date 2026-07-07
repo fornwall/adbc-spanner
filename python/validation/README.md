@@ -75,11 +75,19 @@ Known remaining gaps (documented, not yet addressed):
   driver deliberately answers with an empty result (Spanner keeps no cheap pre-computed statistics;
   the exact aggregate scans only run for `approximate=false`), so the test's table lookup fails.
   The result schema itself matches the ADBC spec.
-- `test_get_objects_constraints_foreign` / `_primary` — the constraint-setup DDL is quirks-supplied
-  via the suite's `sample_ddl_constraints` hook, which `SpannerQuirks` does not implement yet, so
-  the fixture errors with `NotImplementedError`. Supplying Spanner DDL there (mandatory `PRIMARY
-  KEY`, `INT64`, table-level `FOREIGN KEY` — cf. the C++ harness's constraint DDL) should enable
-  these.
+- `test_get_objects_constraints_foreign` / `_primary` — `SpannerQuirks` now implements the suite's
+  `sample_ddl_constraints` hook (Spanner DDL: `INT64`, trailing `PRIMARY KEY`, table-level
+  `FOREIGN KEY`), so the fixture no longer errors, and the driver reports the constraints
+  faithfully — the FK shapes are exact, and declared key order is preserved (`PRIMARY KEY (b, a)`
+  reports `["b", "a"]`), matching the suite's non-normalized defaults. The tests stay skipped
+  (features gated off) because each has one remaining blocker:
+  - `_foreign`: upstream-unpassable for Spanner — every Spanner table has a mandatory primary key,
+    and even the empty `PRIMARY KEY ()` singleton form still produces a `PK_<table>` row in
+    `INFORMATION_SCHEMA.TABLE_CONSTRAINTS` (verified on the emulator), so the FK tables report two
+    constraints (PK + FK) where the suite asserts exactly one.
+  - `_primary`: the driver reports `constraint_column_usage` as an empty list for non-FK
+    constraints, while the suite expects null; a small driver change (null instead of `[]` when
+    the constraint is not a foreign key) would make this test pass.
 - `test_rows_affected` — the suite hardcodes portable `CREATE TABLE (id INT)` with no override hook;
   Spanner needs a `PRIMARY KEY` and `INT64` (an upstream suite limitation).
 
