@@ -88,6 +88,73 @@ spanner.connect(database="projects/p/instances/i/databases/d",
                 impersonate_scopes=["https://www.googleapis.com/auth/cloud-platform"])
 ```
 
+## Option reference
+
+The driver accepts options at three levels, each with its own place in the DBAPI:
+
+- **Database options** — the `connect()` kwargs in the table above, or raw keys via
+  `db_kwargs={...}`.
+- **Connection options** — raw keys via `conn_kwargs={...}` (as in the read-only example above).
+- **Statement options** — per cursor, via `conn.cursor(adbc_stmt_kwargs={...})` or
+  `cur.adbc_statement.set_options(**{...})` (as in the partitioned-reads example below).
+
+All values are passed as strings. Boolean options accept `"true"`/`"false"` (also
+`"1"`/`"0"`/`"yes"`/`"no"`, case-insensitive); integer options accept a numeric string.
+
+**Database options** (`connect()` kwargs or `db_kwargs=`):
+
+| Option                                       | Value                             | Default                           | Description                       |
+| -------------------------------------------- | --------------------------------- | --------------------------------- | --------------------------------- |
+| `spanner.database`                           | `projects/<p>/instances/<i>/databases/<d>` | — (required)             | The Spanner database path (the `database=` kwarg). |
+| `spanner.endpoint`                           | host or URL, e.g. `http://localhost:9010` | production Spanner        | Explicit gRPC endpoint (e.g. an emulator). |
+| `spanner.emulator`                           | boolean                           | `false` (`true` when `SPANNER_EMULATOR_HOST` is set) | Connect with anonymous credentials (emulator mode). |
+| `spanner.keyfile`                            | file path                         | unset (ADC)                       | Path to a service-account JSON key file. |
+| `spanner.keyfile_json`                       | JSON string                       | unset (ADC)                       | Inline service-account JSON key; wins over `spanner.keyfile`. |
+| `spanner.impersonate.target_principal`       | service-account email             | unset (no impersonation)          | Service account to impersonate; setting it enables impersonation on top of the base credentials. |
+| `spanner.impersonate.delegates`              | comma-separated emails            | unset (no delegation)             | Delegation chain for impersonation. |
+| `spanner.impersonate.scopes`                 | comma-separated scopes            | `cloud-platform`                  | OAuth scopes for the impersonated token. |
+| `spanner.impersonate.lifetime`               | non-negative integer (seconds)    | `3600`                            | Lifetime of the impersonated token. |
+
+**Connection options** (`conn_kwargs=`):
+
+| Option                                       | Value                             | Default                           | Description                       |
+| -------------------------------------------- | --------------------------------- | --------------------------------- | --------------------------------- |
+| `adbc.connection.autocommit`                 | boolean                           | `false` in DBAPI (the `autocommit=` kwarg; the driver's own default is `true`) | Autocommit off buffers DML until `conn.commit()` — see the manual-transactions section below. |
+| `adbc.connection.readonly`                   | boolean                           | `false`                           | Reject all writes on the connection — DML, DDL and ingest raise; queries still run. |
+| `adbc.connection.transaction.isolation_level` | `adbc.connection.transaction.isolation.` + `default` / `serializable` / `repeatable_read` | `…isolation.default` | Isolation level for read/write transactions. The other spec levels are rejected as unsupported. |
+| `spanner.read.staleness`                     | `exact:<duration>` or `max:<duration>` (`<duration>`: number + optional `s`/`ms`/`us`/`ns`/`m`/`h`, `s` default) | unset (strong read) | Stale-read bound for read-only queries; becomes the default for the connection's cursors. Mutually exclusive with `spanner.read.timestamp`; set to `""` to unset. |
+| `spanner.read.timestamp`                     | RFC 3339 timestamp, optionally prefixed `read:` (exact, default) or `min:` (bounded) | unset (strong read) | Absolute read timestamp for read-only queries; same inheritance and mutual exclusion as above. |
+
+**Statement options** (`conn.cursor(adbc_stmt_kwargs=...)` or `cur.adbc_statement.set_options(...)`):
+
+| Option                                       | Value                             | Default                           | Description                       |
+| -------------------------------------------- | --------------------------------- | --------------------------------- | --------------------------------- |
+| `spanner.rows_per_batch`                     | positive integer                  | `8192`                            | Rows converted into each Arrow record batch as a result streams; larger batches trade memory for fewer conversions. |
+| `spanner.data_boost_enabled`                 | boolean                           | `false`                           | Run partitioned reads on [Data Boost] (see below). |
+| `spanner.max_partitions`                     | positive integer                  | unset (Spanner chooses)           | Hint for the maximum partition count from `adbc_execute_partitions`. |
+| `spanner.read.staleness`                     | as the connection option          | inherited from the connection     | Per-cursor stale-read override. |
+| `spanner.read.timestamp`                     | as the connection option          | inherited from the connection     | Per-cursor read-timestamp override. |
+| `adbc.ingest.target_table`                   | table name                        | unset                             | Bulk-ingest target table — normally set for you by `cur.adbc_ingest(table, ...)`. |
+| `adbc.ingest.target_db_schema`               | schema name                       | unset (default schema)            | Named schema qualifying the ingest target table (`""` selects Spanner's default, unnamed schema); `cur.adbc_ingest(..., db_schema_name=...)`. |
+| `adbc.ingest.target_catalog`                 | `""` only                         | unset                             | Spanner has a single, unnamed catalog, so only the empty catalog is accepted. |
+| `adbc.ingest.temporary`                      | `false` only                      | `false`                           | Spanner has no temporary tables; `false` is accepted as a no-op, `true` is rejected. |
+| `adbc.ingest.mode`                           | `append` / `create` / `create_append` / `replace` | `append`         | Bulk-ingest mode — normally set for you by `cur.adbc_ingest(..., mode=...)`; see the ingest section below. |
+
+For example, to stream a large result in smaller Arrow batches:
+
+```python
+import adbc_driver_spanner.dbapi as spanner
+
+with spanner.connect(
+    database="projects/my-project/instances/my-instance/databases/my-db",
+) as conn:
+    with conn.cursor() as cur:
+        cur.adbc_statement.set_options(**{"spanner.rows_per_batch": "1024"})
+        cur.execute("SELECT SingerId, FirstName FROM Singers")
+        reader = cur.fetch_record_batch()    # batches of <= 1024 rows
+        table = reader.read_all()
+```
+
 ## Manual transactions: no read-your-writes
 
 DBAPI connections are **autocommit-off by default**, which puts the driver in manual
