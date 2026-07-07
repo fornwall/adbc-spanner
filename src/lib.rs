@@ -183,6 +183,26 @@ pub mod fuzzing {
     }
 }
 
+/// Internal conversion entry point exposed only for the criterion benchmarks in `benches/`
+/// (a bench target can only reach the crate's public API).
+///
+/// **Not** part of the public API — no stability guarantees.
+#[doc(hidden)]
+pub mod bench_support {
+    use arrow_array::ArrayRef;
+    use arrow_schema::DataType;
+    use google_cloud_spanner::value::Value;
+
+    /// Build an Arrow array of `data_type` from one Spanner wire [`Value`] per row — the core of
+    /// the row→Arrow conversion that `execute` performs for every streamed chunk.
+    pub fn build_array(
+        data_type: &DataType,
+        values: &[Option<&Value>],
+    ) -> adbc_core::error::Result<ArrayRef> {
+        crate::conversion::build_array(data_type, values)
+    }
+}
+
 /// Driver-specific database option: the fully-qualified Spanner database path,
 /// `projects/<project>/instances/<instance>/databases/<database>`.
 ///
