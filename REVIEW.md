@@ -258,9 +258,15 @@ batch read-only transaction so every partition executes at that bound. Parsing l
 - **Bool/int/string option parsing is copy-pasted three times** with slightly different error text
   (`src/driver.rs:506-522`, `src/connection.rs:1003-1015`, `src/statement.rs:789-826`); only the
   database copy is fuzzed. Extract a shared `src/options.rs`.
-- **`build.rs` panics without `Cargo.lock`, which is excluded from the published package**
+- ~~**`build.rs` panics without `Cargo.lock`, which is excluded from the published package**
   (`build.rs:14-15`, `Cargo.toml:17`) — a landmine wired to the planned "re-enable publish" step.
-  Fall back gracefully, or leave a loud comment next to `publish = false`.
+  Fall back gracefully, or leave a loud comment next to `publish = false`.~~ **Fixed.** `build.rs`
+  now `match`es on `fs::read_to_string(&lockfile)`: a present lockfile behaves exactly as before
+  (including the hard error on a surprising/duplicate/empty `arrow-array` version), but a missing or
+  unreadable `Cargo.lock` no longer panics — it emits `cargo:warning=...` and embeds
+  `ADBC_SPANNER_ARROW_VERSION="unknown"` (so `src/info.rs`'s `env!` still compiles and
+  `DriverArrowVersion` reports `vunknown`). This makes a source build from the published package —
+  which `exclude`s `Cargo.lock` — succeed instead of failing outright.
 - **CLAUDE.md has drifted from ground truth** (also found by the docs review): arrow is now
   `>=58, <60` not `>=53.1, <59`; `adbc_core`/`adbc_ffi` are git-pinned to `fornwall/arrow-adbc`
   (a second publish blocker the "temporary git pin" section doesn't mention); the library matrix

@@ -11,14 +11,31 @@ fn main() {
     let lockfile = Path::new(&manifest_dir).join("Cargo.lock");
     println!("cargo:rerun-if-changed={}", lockfile.display());
 
-    let lock = fs::read_to_string(&lockfile)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", lockfile.display()));
-    let version = arrow_array_version(&lock).unwrap_or_else(|| {
-        panic!(
-            "could not resolve a unique `arrow-array` version from {}",
-            lockfile.display()
-        )
-    });
+    // `Cargo.lock` is `exclude`d from the published package (see Cargo.toml), so a build from the
+    // crates.io/sdist tarball has no lockfile at all. Fall back gracefully instead of panicking:
+    // `src/info.rs` reads this value via `env!`, so it must always be set for the crate to compile.
+    let version = match fs::read_to_string(&lockfile) {
+        // A present-but-surprising lockfile (missing, duplicate or empty `arrow-array` version) is
+        // still a hard error — better to fail the build than embed a wrong or empty string.
+        Ok(lock) => arrow_array_version(&lock).unwrap_or_else(|| {
+            panic!(
+                "could not resolve a unique `arrow-array` version from {}",
+                lockfile.display()
+            )
+        }),
+        // No lockfile (e.g. a source build from the published package): warn and carry on with a
+        // placeholder, so `get_info`'s `DriverArrowVersion` reports "vunknown" rather than the
+        // build failing outright.
+        Err(e) => {
+            println!(
+                "cargo:warning=could not read {} ({e}); reporting arrow-array version as \
+                 \"unknown\" (expected for a source build from the published package, which \
+                 excludes Cargo.lock)",
+                lockfile.display()
+            );
+            "unknown".to_string()
+        }
+    };
     println!("cargo:rustc-env=ADBC_SPANNER_ARROW_VERSION={version}");
 }
 
