@@ -60,16 +60,20 @@ job on tag refs (install the built lib into `python/`, run the emulator e2e suit
 x86-64), make `python-publish` wait for the commit's `ci.yml` check to succeed, or minimally add
 `pre-release-hook = ["cargo", "test"]`.
 
-### 5. The emulator test suites can all silently skip: one YAML typo turns CI green with zero behavioral coverage (testing)
+### ~~5. The emulator test suites can all silently skip: one YAML typo turns CI green with zero behavioral coverage~~ (fixed) (testing)
 
-`tests/integration.rs:85-115`, `tests/resilience.rs:65-75`, `python/tests/conftest.py:75-77`.
-Every functional suite self-skips when `SPANNER_EMULATOR_HOST` / `TOXIPROXY_URL` is unset. CI
-guards emulator *liveness* but not the *env wiring*: drop or misspell the `env:` line in a
-workflow refactor and all 13 integration tests, the Python e2e/oracle suites, and both resilience
-tests pass vacuously — and these suites are the only coverage for `statement.rs`, transactions,
-ingest, partitions and cancellation. Fix: an `ADBC_TEST_REQUIRE_TARGET=1` variable set in CI that
-makes the gates `panic!`/`pytest.fail` instead of skipping (also apply it to the silently-optional
-cdylib-path skip in the FFI tests, `tests/integration.rs:1469-1485`).
+**Fixed.** A new opt-in env var, `ADBC_TEST_REQUIRE_TARGET`, flips every skip gate from
+self-skip to fail-loud. When it is truthy (`1`/`true`/`yes`) and the target env wiring is missing,
+the gates `panic!` (Rust) / `pytest.fail` (Python) with a clear message instead of returning; when
+it is unset the behavior is unchanged, so a plain `cargo test` / `pytest` stays green everywhere.
+Kept DRY by putting the check in the shared resolvers: `tests/integration.rs`'s `test_target()`
+(the single gate all 15+ integration tests funnel through) and `tests/resilience.rs`'s `toxi()` now
+delegate to an inner `resolve_*` and panic when it returns `None` under the flag; the FFI
+cdylib-path skip is covered by a new `required_cdylib_path()` wrapper used by both driver-manager
+tests; and `python/tests/conftest.py`'s `emulator_database` fixture calls `pytest.fail` under the
+flag. CI sets `ADBC_TEST_REQUIRE_TARGET: "1"` on the `test` and `python` jobs in `ci.yml` and on the
+`resilience` job in `resilience.yml`, so a dropped/misspelled `SPANNER_EMULATOR_HOST` / `TOXIPROXY_URL`
+now fails the run instead of passing vacuously.
 
 ### ~~6. The README's Rust quickstart no longer compiles; the Python README documents the wrong ingest capability~~ (fixed) (docs)
 

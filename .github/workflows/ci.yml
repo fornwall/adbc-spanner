@@ -27,6 +27,10 @@ jobs:
 
     env:
       SPANNER_EMULATOR_HOST: localhost:9010
+      # Make the emulator test gates fail LOUD (panic) instead of self-skipping if the target env
+      # wiring above is ever dropped/misspelled in a refactor — otherwise the whole integration
+      # suite would pass vacuously with zero behavioral coverage.
+      ADBC_TEST_REQUIRE_TARGET: "1"
 
     steps:
       - uses: actions/checkout@v7
@@ -104,6 +108,9 @@ jobs:
 
     env:
       SPANNER_EMULATOR_HOST: localhost:9010
+      # Fail loud (pytest.fail) rather than self-skip if the emulator env wiring is ever dropped, so
+      # the Python end-to-end / oracle suites can't turn CI green with zero coverage.
+      ADBC_TEST_REQUIRE_TARGET: "1"
 
     steps:
       - uses: actions/checkout@v7

@@ -70,11 +70,38 @@ fn database_path() -> String {
     format!("projects/{PROJECT}/instances/{INSTANCE}/databases/{DATABASE}")
 }
 
+/// Whether `ADBC_TEST_REQUIRE_TARGET` demands a configured target (CI sets it).
+///
+/// When truthy, [`toxi`] panics instead of returning `None` when the Toxiproxy / emulator env
+/// wiring is missing, so a broken workflow refactor fails loudly rather than passing vacuously.
+fn require_target() -> bool {
+    matches!(
+        std::env::var("ADBC_TEST_REQUIRE_TARGET").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
 /// The Toxiproxy admin API base and target proxy name, or `None` to skip the whole file.
 ///
 /// Requires the proxy (created by `scripts/with-toxiproxy.sh`) *and* `SPANNER_EMULATOR_HOST` to be
 /// set — the latter must point at the proxy listener, which the script guarantees.
+///
+/// When `ADBC_TEST_REQUIRE_TARGET` is truthy (CI) and either variable is missing, this panics
+/// instead of returning `None`, so the resilience suite cannot silently skip in CI.
 fn toxi() -> Option<Toxiproxy> {
+    let resolved = resolve_toxi();
+    if resolved.is_none() && require_target() {
+        panic!(
+            "ADBC_TEST_REQUIRE_TARGET is set but TOXIPROXY_URL / SPANNER_EMULATOR_HOST are not both \
+             configured — the resilience harness env wiring is missing, so this suite would skip \
+             all fault-injection coverage. Refusing to pass vacuously."
+        );
+    }
+    resolved
+}
+
+/// Inner resolver for [`toxi`]; returns `None` when the required env vars are unset.
+fn resolve_toxi() -> Option<Toxiproxy> {
     let url = std::env::var("TOXIPROXY_URL")
         .ok()
         .filter(|s| !s.is_empty())?;

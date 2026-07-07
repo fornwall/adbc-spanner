@@ -77,12 +77,41 @@ impl TestTarget {
     }
 }
 
+/// Whether the `ADBC_TEST_REQUIRE_TARGET` env var demands a configured target (CI sets it).
+///
+/// When set to a truthy value, the "no target configured" / "no cdylib built" skip branches
+/// `panic!` instead of quietly returning, so a broken env wiring (e.g. a dropped or misspelled
+/// `env:` line in a workflow refactor) fails the run loudly rather than passing vacuously with zero
+/// behavioral coverage.
+fn require_target() -> bool {
+    matches!(
+        std::env::var("ADBC_TEST_REQUIRE_TARGET").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
 /// Resolve the test target from the environment, or `None` to skip.
 ///
 /// `SPANNER_EMULATOR_HOST` selects the emulator with fixed identifiers. `SPANNER_GCP_DATABASE`, in
 /// `project.instance.database` form, points the tests at a real Cloud Spanner database reached with
 /// Application Default Credentials. The emulator takes precedence if both are set.
+///
+/// When `ADBC_TEST_REQUIRE_TARGET` is truthy (CI) and no target is configured, this panics instead
+/// of returning `None`, so the suite cannot silently skip all of its behavioral coverage.
 fn test_target() -> Option<TestTarget> {
+    let target = resolve_test_target();
+    if target.is_none() && require_target() {
+        panic!(
+            "ADBC_TEST_REQUIRE_TARGET is set but neither SPANNER_EMULATOR_HOST nor \
+             SPANNER_GCP_DATABASE is configured — the Spanner target env wiring is missing, so \
+             this suite would skip all behavioral coverage. Refusing to pass vacuously."
+        );
+    }
+    target
+}
+
+/// Inner resolver for [`test_target`]; returns `None` when no target env is set.
+fn resolve_test_target() -> Option<TestTarget> {
     if std::env::var("SPANNER_EMULATOR_HOST")
         .ok()
         .filter(|s| !s.is_empty())
@@ -1784,6 +1813,20 @@ fn cdylib_path() -> Option<std::path::PathBuf> {
     path.exists().then_some(path)
 }
 
+/// Locate the built cdylib, or `None` to skip — but panic instead of skipping when
+/// `ADBC_TEST_REQUIRE_TARGET` is set, so a missing build cannot silently pass the FFI tests in CI.
+fn required_cdylib_path() -> Option<std::path::PathBuf> {
+    let path = cdylib_path();
+    if path.is_none() && require_target() {
+        panic!(
+            "ADBC_TEST_REQUIRE_TARGET is set but the cdylib \
+             (libadbc_spanner.so / .dylib / adbc_spanner.dll) is not built next to the test \
+             binary — run `cargo build` first. Refusing to skip the FFI test vacuously."
+        );
+    }
+    path
+}
+
 /// Load the driver through the ADBC **driver manager** (i.e. via the C ABI / `AdbcSpannerInit`
 /// entrypoint of the built shared library) and run a query — a smoke test of the FFI export that
 /// the trait-level tests bypass.
@@ -1795,7 +1838,7 @@ fn ffi_driver_manager_smoke() {
         );
         return;
     };
-    let Some(cdylib) = cdylib_path() else {
+    let Some(cdylib) = required_cdylib_path() else {
         eprintln!("cdylib not built — skipping FFI smoke test (run `cargo build` first)");
         return;
     };
@@ -1864,7 +1907,7 @@ fn conformance_via_driver_manager() {
         eprintln!("no Spanner target set — skipping conformance_via_driver_manager");
         return;
     };
-    let Some(cdylib) = cdylib_path() else {
+    let Some(cdylib) = required_cdylib_path() else {
         eprintln!("cdylib not built — skipping conformance test (run `cargo build` first)");
         return;
     };

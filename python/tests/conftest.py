@@ -69,10 +69,26 @@ def _await_operation(op):
     raise RuntimeError(f"operation {name} did not complete in time")
 
 
+def _require_target():
+    """Whether ``ADBC_TEST_REQUIRE_TARGET`` demands a configured emulator (CI sets it).
+
+    When truthy, the emulator fixture fails the run instead of skipping when
+    ``SPANNER_EMULATOR_HOST`` is unset, so a broken workflow env wiring cannot turn the whole
+    end-to-end suite green with zero behavioral coverage.
+    """
+    return os.environ.get("ADBC_TEST_REQUIRE_TARGET", "").lower() in ("1", "true", "yes")
+
+
 @pytest.fixture(scope="session")
 def emulator_database():
     """Ensure the instance + database exist and return the database path."""
     if not os.environ.get("SPANNER_EMULATOR_HOST"):
+        if _require_target():
+            pytest.fail(
+                "ADBC_TEST_REQUIRE_TARGET is set but SPANNER_EMULATOR_HOST is not configured — "
+                "the emulator env wiring is missing, so the end-to-end suite would skip all "
+                "behavioral coverage. Refusing to pass vacuously."
+            )
         pytest.skip("SPANNER_EMULATOR_HOST not set; skipping emulator end-to-end tests")
 
     base = _rest_base()
