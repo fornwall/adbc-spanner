@@ -95,16 +95,67 @@ pub(crate) fn rows_to_batch(
     Ok((schema, batch))
 }
 
-/// Pull up to `max` rows from a Spanner result set, stopping early when the stream ends.
+/// Additional per-chunk byte budget for [`pull_chunk`], on top of the `max` (row-count) cap.
+///
+/// The row cap alone bounds rows, not bytes: 8192 rows of `STRING(MAX)`/`BYTES(MAX)` (up to ~10 MB
+/// each) would be tens of GB per chunk, and a chunk is held roughly twice — the [`Row`]s plus the
+/// Arrow batch built from them — during conversion. So `pull_chunk` also cuts a chunk once its
+/// accumulated (approximate) wire size crosses this budget. 32 MiB sits in the middle of the
+/// 16–64 MB range: large enough that ordinary rows still batch efficiently, small enough to cap
+/// peak memory. A single row larger than the whole budget still forms its own one-row chunk (the
+/// check runs *after* the row is buffered), so streaming never stalls or emits an empty chunk.
+const CHUNK_BYTE_BUDGET: usize = 32 * 1024 * 1024;
+
+/// Pull up to `max` rows from a Spanner result set, stopping early when the stream ends — or, as an
+/// additional cap, once the accumulated rows exceed [`CHUNK_BYTE_BUDGET`] approximate bytes.
 async fn pull_chunk(rs: &mut ResultSet, max: usize) -> Result<Vec<Row>> {
     let mut rows = Vec::with_capacity(max);
+    let mut bytes: usize = 0;
     while rows.len() < max {
         match rs.next().await {
-            Some(row) => rows.push(row.map_err(from_spanner)?),
+            Some(row) => {
+                let row = row.map_err(from_spanner)?;
+                // Approximate the row's wire size from the values already in hand (see
+                // `approx_row_bytes`); base64 BYTES over-estimate the decoded size, which only makes
+                // the budget slightly more conservative. This is a rough estimate, not exact.
+                bytes = bytes.saturating_add(approx_row_bytes(&row));
+                rows.push(row);
+                // The row is already buffered, so an oversized single row still yields a one-row
+                // chunk rather than looping forever or producing an empty chunk.
+                if bytes >= CHUNK_BYTE_BUDGET {
+                    break;
+                }
+            }
             None => break,
         }
     }
     Ok(rows)
+}
+
+/// Roughly estimate a row's byte size from its Spanner values, used only to drive the
+/// [`CHUNK_BYTE_BUDGET`] early-cut — never for correctness. It sums the string lengths of the
+/// values (recursively through lists and structs); scalars count as a few bytes each.
+fn approx_row_bytes(row: &Row) -> usize {
+    row.raw_values().iter().map(approx_value_bytes).sum()
+}
+
+/// Approximate the byte size of a single Spanner [`Value`] (see [`approx_row_bytes`]). Strings —
+/// which is how Spanner ships `STRING`, `BYTES` (base64), `INT64`, `NUMERIC`, `DATE`, `TIMESTAMP`,
+/// `JSON`, … over the wire — count their UTF-8 length; nested lists/structs recurse; other scalars
+/// count as a small fixed size. Deliberately cheap and approximate.
+fn approx_value_bytes(value: &Value) -> usize {
+    match value.kind() {
+        Kind::Null => 0,
+        Kind::Bool => 1,
+        Kind::Number => 8,
+        Kind::String => value.as_string().len(),
+        Kind::List => value.as_list().iter().map(approx_value_bytes).sum(),
+        Kind::Struct => value
+            .as_struct()
+            .fields()
+            .map(|(_, v)| approx_value_bytes(v))
+            .sum(),
+    }
 }
 
 /// Wrap a Spanner [`ResultSet`] as a streaming Arrow [`RecordBatchReader`].
@@ -792,6 +843,23 @@ mod tests {
         assert_eq!(parse_numeric_i128("0.0000000019"), Some(1));
         assert_eq!(parse_numeric_i128("abc"), None);
         assert_eq!(parse_numeric_i128(""), None);
+    }
+
+    /// The chunk byte-budget estimate: strings count their UTF-8 length, SQL NULLs contribute
+    /// nothing, lists recurse, and a single wide value dominates (so it drives the one-row early
+    /// cut in `pull_chunk`). The estimate is approximate — only its rough magnitude matters.
+    #[test]
+    fn approx_value_bytes_sums_string_lengths() {
+        assert_eq!(approx_value_bytes(&"hello".to_value()), 5);
+        assert_eq!(approx_value_bytes(&"".to_value()), 0);
+        // A SQL NULL contributes nothing to the budget.
+        assert_eq!(approx_value_bytes(&None::<&str>.to_value()), 0);
+        // Lists recurse over their elements.
+        assert_eq!(approx_value_bytes(&vec!["a", "bb", "ccc"].to_value()), 6);
+        // A single wide value dominates the estimate — this is what makes an oversized row cut the
+        // chunk after one row.
+        let wide = "x".repeat(2 * CHUNK_BYTE_BUDGET);
+        assert!(approx_value_bytes(&wide.as_str().to_value()) >= CHUNK_BYTE_BUDGET);
     }
 
     /// A present wire value that cannot be decoded as the column's type must error (naming the

@@ -190,10 +190,21 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   directly — no per-value owned `String` and no second copy from `StringArray::from_iter`. Only the
   non-string JSON-render fallback still allocates. Behavior is unchanged (null/empty handling
   preserved); covered by `string_array_round_trips_values_and_nulls`.
-- **`rows_per_batch` bounds rows, not bytes** (`src/conversion.rs:98-108`). 8192 rows of
+- ~~**`rows_per_batch` bounds rows, not bytes** (`src/conversion.rs:98-108`). 8192 rows of
   `STRING(MAX)`/`BYTES(MAX)` (up to 10MB each) can be tens of GB per chunk, held roughly twice
   during conversion. Track approximate cumulative bytes in `pull_chunk` and cut the chunk early at
-  a byte budget (16–64MB) in addition to the row cap.
+  a byte budget (16–64MB) in addition to the row cap.~~ **Fixed.** `pull_chunk` now tracks an
+  approximate cumulative byte size of the rows it has buffered and cuts the chunk once it crosses a
+  new `CHUNK_BYTE_BUDGET` constant (32 MiB, mid-range of the 16–64 MB guidance), in addition to the
+  existing `rows_per_batch` row cap. The per-row size is estimated cheaply from the wire values
+  already in hand via `approx_row_bytes`/`approx_value_bytes` — sum of string lengths (Spanner ships
+  `STRING`/`BYTES`(base64)/`INT64`/`NUMERIC`/`DATE`/`TIMESTAMP`/`JSON` as strings), recursing through
+  lists and structs, small fixed sizes for other scalars — so it is a rough (slightly conservative,
+  since base64 over-estimates decoded `BYTES`) upper estimate, not exact. The budget check runs
+  *after* the row is buffered and uses `saturating_add`, so a single row larger than the whole
+  budget still forms its own one-row chunk (never an infinite loop or empty chunk), and the
+  schema-settling / first-chunk semantics are otherwise unchanged. Covered by the
+  `approx_value_bytes_sums_string_lengths` unit test.
 - ~~**`get_objects` assembles the hierarchy with quadratic rescans** (`src/connection.rs:218-267`,
   `:507-590`, `:598-665`). The RPC side is a fixed 6 queries (good), but per table the full
   COLUMNS/TABLE_CONSTRAINTS batches are rescanned and per constraint the full KEY_COLUMN_USAGE
