@@ -517,18 +517,24 @@ fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Result<ArrayR
 }
 
 /// Build an Arrow `List` array: each Spanner value is a list (or null) of the element type.
+///
+/// The strict-decode policy of the scalar arms applies here too: a SQL NULL (or absent value)
+/// becomes a null slot, but a *present* value that is not a wire list is an error (see
+/// [`decode_error`]), never a silent null. Elements recurse through [`build_array`], so an
+/// undecodable element — at any nesting depth — errors as well.
 fn build_list(field: &FieldRef, values: &[Option<&Value>]) -> Result<ArrayRef> {
     let mut children: Vec<Option<&Value>> = Vec::new();
     let mut offsets: Vec<i32> = Vec::with_capacity(values.len() + 1);
     offsets.push(0);
     let mut validity: Vec<bool> = Vec::with_capacity(values.len());
-    for value in values {
-        match value {
+    for &value in values {
+        match present(value) {
+            None => validity.push(false),
             Some(v) if v.kind() == Kind::List => {
                 children.extend(v.as_list().iter().map(Some));
                 validity.push(true);
             }
-            _ => validity.push(false),
+            Some(v) => return Err(decode_error("ARRAY", v)),
         }
         offsets.push(children.len() as i32);
     }
@@ -545,12 +551,21 @@ fn build_list(field: &FieldRef, values: &[Option<&Value>]) -> Result<ArrayRef> {
 
 /// Build an Arrow `Struct` array. Spanner encodes struct values positionally (a `ListValue` whose
 /// elements match the struct's field order); a value delivered as a keyed struct is handled too.
+///
+/// The strict-decode policy of the scalar arms applies here too: a SQL NULL (or absent value)
+/// becomes a null slot, but a *present* value that is neither a wire list nor a keyed struct is an
+/// error (see [`decode_error`]), never a silent null. Field values recurse through
+/// [`build_array`], so an undecodable field — at any nesting depth — errors as well.
 fn build_struct(fields: &Fields, values: &[Option<&Value>]) -> Result<ArrayRef> {
     let mut children: Vec<Vec<Option<&Value>>> =
         vec![Vec::with_capacity(values.len()); fields.len()];
     let mut validity: Vec<bool> = Vec::with_capacity(values.len());
-    for value in values {
-        match value {
+    for &value in values {
+        match present(value) {
+            None => {
+                children.iter_mut().for_each(|child| child.push(None));
+                validity.push(false);
+            }
             Some(v) if v.kind() == Kind::List => {
                 let list = v.as_list();
                 for (i, child) in children.iter_mut().enumerate() {
@@ -565,10 +580,7 @@ fn build_struct(fields: &Fields, values: &[Option<&Value>]) -> Result<ArrayRef> 
                 }
                 validity.push(true);
             }
-            _ => {
-                children.iter_mut().for_each(|child| child.push(None));
-                validity.push(false);
-            }
+            Some(v) => return Err(decode_error("STRUCT", v)),
         }
     }
     let arrays = fields
@@ -936,6 +948,145 @@ mod tests {
             "{}",
             err.message
         );
+    }
+
+    /// The strict-decode policy applies inside `ARRAY` columns too: a present column value that is
+    /// not a wire list, and a present list *element* that cannot be decoded as the element type,
+    /// are both loud errors — never silent nulls.
+    #[test]
+    fn list_with_undecodable_element_errors() {
+        use google_cloud_spanner::value::ToValue;
+        let list_of_int64 = DataType::List(Arc::new(Field::new(LIST_ITEM, DataType::Int64, true)));
+
+        // A present element that is not a valid INT64 errors via the element's scalar arm.
+        let bad_element = vec!["42".to_value(), "not-an-int".to_value()].to_value();
+        let err = build_array(&list_of_int64, &[Some(&bad_element)]).unwrap_err();
+        assert_eq!(err.status, Status::InvalidData);
+        assert!(
+            err.message.contains("INT64") && err.message.contains("not-an-int"),
+            "{}",
+            err.message
+        );
+
+        // A present column value that is not a wire list at all errors as an ARRAY decode failure.
+        let not_a_list = "scalar".to_value();
+        let err = build_array(&list_of_int64, &[Some(&not_a_list)]).unwrap_err();
+        assert_eq!(err.status, Status::InvalidData);
+        assert!(
+            err.message.contains("ARRAY") && err.message.contains("scalar"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// The strict-decode policy applies inside `STRUCT` columns too: a present column value that is
+    /// neither a wire list (positional encoding) nor a keyed struct, and a present *field* value
+    /// that cannot be decoded as the field's type, are both loud errors — never silent nulls. This
+    /// also covers recursion: an undecodable struct nested inside a list errors as well.
+    #[test]
+    fn struct_with_undecodable_field_errors() {
+        use google_cloud_spanner::value::ToValue;
+        let struct_type = DataType::Struct(Fields::from(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        // A present field value that is not a valid INT64 errors via the field's scalar arm.
+        // (Spanner encodes struct values positionally, as a wire list in field order.)
+        let bad_field = vec!["nope".to_value(), "abc".to_value()].to_value();
+        let err = build_array(&struct_type, &[Some(&bad_field)]).unwrap_err();
+        assert_eq!(err.status, Status::InvalidData);
+        assert!(
+            err.message.contains("INT64") && err.message.contains("nope"),
+            "{}",
+            err.message
+        );
+
+        // A present column value that is neither a list nor a keyed struct errors as a STRUCT
+        // decode failure.
+        let not_a_struct = "scalar".to_value();
+        let err = build_array(&struct_type, &[Some(&not_a_struct)]).unwrap_err();
+        assert_eq!(err.status, Status::InvalidData);
+        assert!(
+            err.message.contains("STRUCT") && err.message.contains("scalar"),
+            "{}",
+            err.message
+        );
+
+        // Recursion: ARRAY<STRUCT<..>> whose element is not a struct errors too (the element
+        // recurses into the struct arm).
+        let list_of_struct =
+            DataType::List(Arc::new(Field::new(LIST_ITEM, struct_type.clone(), true)));
+        let bad_nested = vec!["not-a-struct".to_value()].to_value();
+        let err = build_array(&list_of_struct, &[Some(&bad_nested)]).unwrap_err();
+        assert_eq!(err.status, Status::InvalidData);
+        assert!(
+            err.message.contains("STRUCT") && err.message.contains("not-a-struct"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// Genuine wire NULLs still round-trip as nulls under strict list/struct decoding: SQL NULL
+    /// (and absent) column values become null list/struct slots, and NULL elements/fields become
+    /// null child slots — only *present* undecodable values error.
+    #[test]
+    fn list_and_struct_nulls_round_trip_as_nulls() {
+        use arrow_array::Array;
+        use google_cloud_spanner::value::ToValue;
+        let sql_null = None::<i64>.to_value();
+
+        // List column: NULL / absent column values and a NULL element inside a present list.
+        let list_of_int64 = DataType::List(Arc::new(Field::new(LIST_ITEM, DataType::Int64, true)));
+        let with_null_element = vec![1i64.to_value(), sql_null.clone(), 3i64.to_value()].to_value();
+        let array = build_array(
+            &list_of_int64,
+            &[Some(&sql_null), None, Some(&with_null_element)],
+        )
+        .unwrap();
+        let list = array.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list.len(), 3);
+        assert!(list.is_null(0)); // SQL NULL column value
+        assert!(list.is_null(1)); // missing slot
+        assert!(!list.is_null(2));
+        let elements = list.value(2);
+        let ints = elements
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap();
+        assert_eq!(ints.len(), 3);
+        assert_eq!(ints.value(0), 1);
+        assert!(ints.is_null(1)); // NULL element stays a null slot
+        assert_eq!(ints.value(2), 3);
+
+        // Struct column: NULL / absent column values and a NULL field inside a present struct.
+        let struct_type = DataType::Struct(Fields::from(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let with_null_field = vec![7i64.to_value(), sql_null.clone()].to_value();
+        let array = build_array(
+            &struct_type,
+            &[Some(&sql_null), None, Some(&with_null_field)],
+        )
+        .unwrap();
+        let structs = array.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(structs.len(), 3);
+        assert!(structs.is_null(0)); // SQL NULL column value
+        assert!(structs.is_null(1)); // missing slot
+        assert!(!structs.is_null(2));
+        let ids = structs
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap();
+        let names = structs
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(ids.value(2), 7);
+        assert!(names.is_null(2)); // NULL field stays a null slot
     }
 
     /// `INT64` arrives as a JSON string, so every `i64` — including magnitudes above 2^53 that an
