@@ -2549,7 +2549,8 @@ fn json_and_float32_round_trip() {
     run(
         &mut connection,
         "DROP TABLE IF EXISTS AdbcJson; \
-         CREATE TABLE AdbcJson (Id INT64, Doc JSON, Ratio FLOAT32) PRIMARY KEY (Id)",
+         CREATE TABLE AdbcJson (Id INT64, Doc JSON, Ratio FLOAT32, Docs ARRAY<JSON>) \
+         PRIMARY KEY (Id)",
     );
     run(
         &mut connection,
@@ -2603,9 +2604,149 @@ fn json_and_float32_round_trip() {
     assert_eq!(ratios.value(0), 1.5f32);
     assert!(ratios.is_null(1), "NULL FLOAT32 must come back null");
 
+    // --- Bind round trip: `arrow.json`-tagged parameters bind as JSON / ARRAY<JSON>. Spanner
+    // rejects a plain STRING parameter in a JSON column, so the inserts below only succeed if the
+    // driver sends the explicit JSON param type for tagged columns (this is also exactly what the
+    // driver's own read path produces, so read → bind round-trips).
+    let json_field = |name: &str| {
+        Field::new(name, DataType::Utf8, true).with_metadata(std::collections::HashMap::from([(
+            "ARROW:extension:name".to_string(),
+            "arrow.json".to_string(),
+        )]))
+    };
+    let docs_item = Arc::new(json_field("item"));
+    let mut docs_builder =
+        arrow_array::builder::ListBuilder::new(arrow_array::builder::StringBuilder::new())
+            .with_field(docs_item.clone());
+    docs_builder.values().append_value(r#"{"d":true}"#);
+    docs_builder.values().append_null();
+    docs_builder.append(true);
+    docs_builder.append(false); // whole-cell NULL array for the second row
+    let bind_batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("Id", DataType::Int64, false),
+            json_field("Doc"),
+            Field::new("Docs", DataType::List(docs_item), true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![3, 4])),
+            Arc::new(StringArray::from(vec![Some(r#"{"c":[1,2]}"#), None])),
+            Arc::new(docs_builder.finish()),
+        ],
+    )
+    .unwrap();
+    let mut insert = connection.new_statement().expect("new statement");
+    insert
+        .set_sql_query("INSERT INTO AdbcJson (Id, Doc, Docs) VALUES (@Id, @Doc, @Docs)")
+        .unwrap();
+    insert.bind(bind_batch.clone()).expect("bind json rows");
+    insert.execute_update().expect("insert bound json rows");
+
+    let mut verify = connection.new_statement().expect("new statement");
+    verify
+        .set_sql_query("SELECT Doc, Docs FROM AdbcJson WHERE Id >= 3 ORDER BY Id")
+        .unwrap();
+    let reader = verify.execute().expect("query bound json");
+    // ARRAY<JSON> reads back with the extension tag on the list's item field.
+    let bound_schema = reader.schema();
+    let DataType::List(read_item) = bound_schema.field(1).data_type() else {
+        panic!("Docs must read back as a List: {bound_schema:?}");
+    };
+    assert_eq!(
+        read_item
+            .metadata()
+            .get("ARROW:extension:name")
+            .map(String::as_str),
+        Some("arrow.json"),
+        "ARRAY<JSON> item must carry the arrow.json extension"
+    );
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect bound json batches");
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    let batch = &batches[0];
+    let doc_col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(
+        doc_col.value(0).contains(r#""c":[1,2]"#),
+        "unexpected bound JSON text: {:?}",
+        doc_col.value(0)
+    );
+    assert!(doc_col.is_null(1), "bound NULL JSON must come back null");
+    let docs_col = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let first_cell = docs_col.value(0);
+    let first_cell = first_cell.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(first_cell.len(), 2);
+    assert!(
+        first_cell.value(0).contains(r#""d":true"#),
+        "unexpected bound ARRAY<JSON> element: {:?}",
+        first_cell.value(0)
+    );
+    assert!(first_cell.is_null(1), "NULL array element must survive");
+    assert!(docs_col.is_null(1), "bound NULL array must come back null");
+
+    // --- Create-mode ingest maps tagged fields to JSON / ARRAY<JSON> columns (a STRING(MAX)
+    // column would reject the JSON-typed row params the ingest itself binds).
+    let mut ingest = connection.new_statement().expect("new statement");
+    ingest
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcJsonIngest".into()),
+        )
+        .unwrap();
+    ingest
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("create".into()),
+        )
+        .unwrap();
+    ingest.bind(bind_batch).expect("bind json ingest rows");
+    ingest.execute_update().expect("create-mode json ingest");
+    let mut cols = connection.new_statement().expect("new statement");
+    cols.set_sql_query(
+        "SELECT COLUMN_NAME, SPANNER_TYPE FROM INFORMATION_SCHEMA.COLUMNS \
+         WHERE TABLE_NAME = 'AdbcJsonIngest' AND COLUMN_NAME IN ('Doc', 'Docs') \
+         ORDER BY COLUMN_NAME",
+    )
+    .unwrap();
+    let cols_batches = cols
+        .execute()
+        .expect("query ingest column types")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect ingest column types");
+    let cols_batch = &cols_batches[0];
+    let names = cols_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let types = cols_batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        (names.value(0), types.value(0)),
+        ("Doc", "JSON"),
+        "tagged scalar ingest column"
+    );
+    assert_eq!(
+        (names.value(1), types.value(1)),
+        ("Docs", "ARRAY<JSON>"),
+        "tagged array ingest column"
+    );
+
     let mut drop = connection.new_statement().expect("new statement");
-    drop.set_sql_query("DROP TABLE AdbcJson").unwrap();
-    drop.execute_update().expect("drop json table");
+    drop.set_sql_query("DROP TABLE AdbcJson; DROP TABLE AdbcJsonIngest")
+        .unwrap();
+    drop.execute_update().expect("drop json tables");
 }
 
 #[test]

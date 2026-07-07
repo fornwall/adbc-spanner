@@ -282,6 +282,23 @@ fn arrow_field(name: impl Into<String>, ty: &Type, nullable: bool) -> Field {
     }
 }
 
+/// Whether an Arrow [`Field`] carries the canonical `arrow.json` extension on a string storage
+/// type — the tag this driver writes via [`json_extension_metadata`] and what other producers
+/// (pyarrow, polars) emit for logical JSON. The bind path uses this to send such values as
+/// Spanner `JSON`-typed parameters, and ingest create modes to create `JSON` columns. The storage
+/// check matters: `arrow.json` is only defined over utf8-family storage, so a tag on any other
+/// type is ignored rather than mis-bound.
+pub(crate) fn is_json_field(field: &Field) -> bool {
+    matches!(
+        field.data_type(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    ) && field
+        .metadata()
+        .get(ARROW_EXTENSION_NAME)
+        .map(String::as_str)
+        == Some(ARROW_JSON_EXTENSION)
+}
+
 /// The two `ARROW:extension:*` field-metadata keys that mark a Utf8 column as canonical `arrow.json`.
 /// The metadata value is the empty string, which is valid (and conventional) for `arrow.json`.
 fn json_extension_metadata() -> HashMap<String, String> {

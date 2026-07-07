@@ -27,6 +27,16 @@
 //! parameters are sent untyped (Spanner infers the type from the SQL). So these three are formatted
 //! straight to their Spanner string forms — `YYYY-MM-DD`, RFC 3339, and a plain decimal — which
 //! keeps the full `Decimal128` (`i128`) range rather than routing through a narrower decimal type.
+//!
+//! **JSON.** A string column tagged with the canonical `arrow.json` extension (the field metadata
+//! this driver itself emits when reading a `JSON` column — see [`crate::conversion`]) binds as a
+//! Spanner `JSON`-typed parameter instead of `STRING`, and a `List` whose element carries the tag
+//! binds as `ARRAY<JSON>`. The distinction matters because Spanner does not coerce `STRING`
+//! parameters into `JSON` columns: without the explicit type, `INSERT … VALUES (@doc)` into a
+//! `JSON` column fails with a type mismatch (the untagged workaround is `PARSE_JSON(@doc)` in the
+//! SQL). Tagged values therefore round-trip: what `execute` reads from a `JSON` column can be
+//! bound straight back into one. Unlike the untyped strings above, this uses `add_typed_param`,
+//! which sends an explicit `JSON` param type alongside the string-encoded value.
 
 use adbc_core::error::Result;
 use arrow_array::cast::AsArray;
@@ -36,10 +46,12 @@ use arrow_array::types::{
     TimestampNanosecondType, TimestampSecondType,
 };
 use arrow_array::{Array, ArrayRef, OffsetSizeTrait, RecordBatch};
-use arrow_schema::{DataType, TimeUnit};
+use arrow_schema::{DataType, Field, TimeUnit};
 use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Utc};
 use google_cloud_spanner::statement::StatementBuilder;
+use google_cloud_spanner::types;
 
+use crate::conversion::is_json_field;
 use crate::error::invalid_argument;
 
 /// Bind every column of `batch` at `row` as a synthetic positional parameter (`@p0`, `@p1`, …).
@@ -53,8 +65,14 @@ pub(crate) fn bind_row(
     batch: &RecordBatch,
     row: usize,
 ) -> Result<StatementBuilder> {
-    for (i, _field) in batch.schema().fields().iter().enumerate() {
-        builder = bind_one(builder, &format!("p{i}"), batch.column(i).as_ref(), row)?;
+    for (i, field) in batch.schema().fields().iter().enumerate() {
+        builder = bind_one(
+            builder,
+            &format!("p{i}"),
+            field,
+            batch.column(i).as_ref(),
+            row,
+        )?;
     }
     Ok(builder)
 }
@@ -73,8 +91,15 @@ pub(crate) fn bind_params(
     row: usize,
 ) -> Result<StatementBuilder> {
     let mut builder = builder;
+    let schema = batch.schema();
     for (i, name) in names.iter().enumerate() {
-        builder = bind_one(builder, name, batch.column(i).as_ref(), row)?;
+        builder = bind_one(
+            builder,
+            name,
+            schema.field(i),
+            batch.column(i).as_ref(),
+            row,
+        )?;
     }
     Ok(builder)
 }
@@ -116,14 +141,17 @@ pub(crate) fn resolve_parameter_names(sql: &str, batch: &RecordBatch) -> Result<
     Ok(params)
 }
 
-/// Bind a single `column` value at `row` as parameter `name`.
+/// Bind a single `column` value at `row` as parameter `name`. `field` is the column's schema
+/// field, consulted for the `arrow.json` extension tag (see the module doc's JSON section).
 fn bind_one(
     builder: StatementBuilder,
     name: &str,
+    field: &Field,
     column: &dyn Array,
     row: usize,
 ) -> Result<StatementBuilder> {
     let is_null = column.is_null(row);
+    let json = is_json_field(field);
     Ok(match column.data_type() {
         DataType::Int64 => {
             let a = column.as_primitive::<Int64Type>();
@@ -158,29 +186,17 @@ fn bind_one(
         // is what Arrow-native producers commonly emit (e.g. `pyarrow.Table.from_pandas`).
         DataType::Utf8 => {
             let a = column.as_string::<i32>();
-            if is_null {
-                builder.add_param(name, &None::<String>)
-            } else {
-                builder.add_param(name, &a.value(row))
-            }
+            bind_string(builder, name, json, (!is_null).then(|| a.value(row)))
         }
         DataType::LargeUtf8 => {
             let a = column.as_string::<i64>();
-            if is_null {
-                builder.add_param(name, &None::<String>)
-            } else {
-                builder.add_param(name, &a.value(row))
-            }
+            bind_string(builder, name, json, (!is_null).then(|| a.value(row)))
         }
         // `Utf8View`/`BinaryView` are the German-string layouts newer Arrow producers (polars,
         // pyarrow 16+ with view types) emit by default; same Spanner mapping as their offset kin.
         DataType::Utf8View => {
             let a = column.as_string_view();
-            if is_null {
-                builder.add_param(name, &None::<String>)
-            } else {
-                builder.add_param(name, &a.value(row))
-            }
+            bind_string(builder, name, json, (!is_null).then(|| a.value(row)))
         }
         DataType::Binary => {
             let a = column.as_binary::<i32>();
@@ -249,13 +265,13 @@ fn bind_one(
         // ARRAY<...> parameters: an Arrow `List`/`LargeList` column binds to a Spanner array. The
         // element type mirrors the scalar arms above (see [`bind_list`]); nested arrays and STRUCT
         // elements are out of scope and rejected there.
-        DataType::List(field) => {
+        DataType::List(item) => {
             let elem = (!is_null).then(|| column.as_list::<i32>().value(row));
-            bind_list(builder, name, field.data_type(), elem)?
+            bind_list(builder, name, item, elem)?
         }
-        DataType::LargeList(field) => {
+        DataType::LargeList(item) => {
             let elem = (!is_null).then(|| column.as_list::<i64>().value(row));
-            bind_list(builder, name, field.data_type(), elem)?
+            bind_list(builder, name, item, elem)?
         }
         other => {
             return Err(invalid_argument(format!(
@@ -283,21 +299,39 @@ where
     }
 }
 
+/// Bind a string value (or a typed null) as parameter `name` — as Spanner `JSON` when the column
+/// carries the `arrow.json` extension (`json`), else as plain `STRING` (see the module doc).
+fn bind_string(
+    builder: StatementBuilder,
+    name: &str,
+    json: bool,
+    value: Option<&str>,
+) -> StatementBuilder {
+    match (json, value) {
+        (true, Some(v)) => builder.add_typed_param(name, &v, types::json()),
+        (true, None) => builder.add_typed_param(name, &None::<String>, types::json()),
+        (false, Some(v)) => builder.add_param(name, &v),
+        (false, None) => builder.add_param(name, &None::<String>),
+    }
+}
+
 /// Bind an Arrow `List`/`LargeList` cell as a Spanner `ARRAY<...>` parameter.
 ///
-/// `elem_type` is the list's element type; `elem` is the child slice for this row, or `None` when
-/// the whole cell is null (→ a typed null array). The element-type mapping mirrors the scalar arms
-/// of [`bind_one`] (narrower ints widen to `INT64`, floats to `FLOAT64`, `DATE`/`TIMESTAMP`/`NUMERIC`
-/// format to their Spanner string forms), and each element keeps its own null. Spanner has no
-/// `ARRAY<ARRAY<…>>`, and `ARRAY<STRUCT>` is out of scope, so `List`/`LargeList`/`Struct` (and any
-/// otherwise-unsupported) element types are rejected.
+/// `item` is the list's element field (its data type drives the mapping; an `arrow.json` extension
+/// tag on it makes a string element bind as `ARRAY<JSON>`); `elem` is the child slice for this
+/// row, or `None` when the whole cell is null (→ a typed null array). The element-type mapping
+/// mirrors the scalar arms of [`bind_one`] (narrower ints widen to `INT64`, floats to `FLOAT64`,
+/// `DATE`/`TIMESTAMP`/`NUMERIC` format to their Spanner string forms), and each element keeps its
+/// own null. Spanner has no `ARRAY<ARRAY<…>>`, and `ARRAY<STRUCT>` is out of scope, so
+/// `List`/`LargeList`/`Struct` (and any otherwise-unsupported) element types are rejected.
 fn bind_list(
     builder: StatementBuilder,
     name: &str,
-    elem_type: &DataType,
+    item: &Field,
     elem: Option<ArrayRef>,
 ) -> Result<StatementBuilder> {
-    Ok(match elem_type {
+    let json = is_json_field(item);
+    Ok(match item.data_type() {
         DataType::Int64 => add_array(builder, name, list_primitive::<Int64Type, _>(elem, |v| v)),
         // Narrower Arrow ints widen to Spanner INT64, exactly like the scalar arms.
         DataType::Int32 => add_array(
@@ -332,8 +366,8 @@ fn bind_list(
             });
             add_array(builder, name, v)
         }
-        DataType::Utf8 => add_array(builder, name, list_string::<i32>(elem)),
-        DataType::LargeUtf8 => add_array(builder, name, list_string::<i64>(elem)),
+        DataType::Utf8 => add_string_array(builder, name, json, list_string::<i32>(elem)),
+        DataType::LargeUtf8 => add_string_array(builder, name, json, list_string::<i64>(elem)),
         DataType::Utf8View => {
             let v = elem.map(|a| {
                 let a = a.as_string_view();
@@ -341,7 +375,7 @@ fn bind_list(
                     .map(|i| (!a.is_null(i)).then(|| a.value(i).to_string()))
                     .collect()
             });
-            add_array(builder, name, v)
+            add_string_array(builder, name, json, v)
         }
         DataType::Binary => add_array(builder, name, list_binary::<i32>(elem)),
         DataType::LargeBinary => add_array(builder, name, list_binary::<i64>(elem)),
@@ -399,6 +433,22 @@ fn bind_list(
             )))
         }
     })
+}
+
+/// Bind an already-collected string array as parameter `name` — as Spanner `ARRAY<JSON>` when the
+/// list's element carries the `arrow.json` extension (`json`), else as `ARRAY<STRING>` like
+/// [`add_array`].
+fn add_string_array(
+    builder: StatementBuilder,
+    name: &str,
+    json: bool,
+    values: Option<Vec<Option<String>>>,
+) -> StatementBuilder {
+    if json {
+        builder.add_typed_param(name, &values, types::array(types::json()))
+    } else {
+        add_array(builder, name, values)
+    }
 }
 
 /// Bind an already-collected array (or a typed null array when `values` is `None`) as parameter
@@ -704,9 +754,25 @@ pub(crate) fn spanner_column_type(data_type: &DataType) -> Result<String> {
     })
 }
 
+/// Map an Arrow ingest field to the Spanner column type used when creating a table — like
+/// [`spanner_column_type`], but field-aware: a string field tagged with the `arrow.json` extension
+/// becomes a `JSON` column (and a tagged list element `ARRAY<JSON>`), matching how [`bind_one`]
+/// binds such values as `JSON`-typed parameters (which Spanner would reject in a `STRING` column).
+fn spanner_field_type(field: &Field) -> Result<String> {
+    if is_json_field(field) {
+        return Ok("JSON".to_string());
+    }
+    match field.data_type() {
+        DataType::List(item) | DataType::LargeList(item) => {
+            Ok(format!("ARRAY<{}>", spanner_field_type(item)?))
+        }
+        other => spanner_column_type(other),
+    }
+}
+
 /// Build a `CREATE TABLE` statement for bulk ingest from the data's Arrow `schema`.
 ///
-/// Every data column maps to its Spanner type via [`spanner_column_type`], and a hidden
+/// Every data column maps to its Spanner type via [`spanner_field_type`], and a hidden
 /// [`INGEST_KEY_COLUMN`] UUID key is appended as the primary key (Spanner requires one). Pass
 /// `if_not_exists` for `create_append` mode. `db_schema` (the `adbc.ingest.target_db_schema` option)
 /// optionally qualifies the created table with a named schema.
@@ -721,7 +787,7 @@ pub(crate) fn create_table_sql(
         columns.push(format!(
             "{} {}",
             quote_ident(field.name()),
-            spanner_column_type(field.data_type())?
+            spanner_field_type(field)?
         ));
     }
     columns.push(format!(
@@ -765,8 +831,8 @@ mod tests {
 
     use arrow_array::{
         Date32Array, Decimal128Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
-        ListArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray,
+        ListArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
     };
     use arrow_schema::{Field, Schema};
     use google_cloud_spanner::statement::Statement;
@@ -788,6 +854,116 @@ mod tests {
         );
         assert!(bind_row(Statement::builder("SELECT @a, @b"), &b, 0).is_ok());
         assert!(bind_row(Statement::builder("SELECT @a, @b"), &b, 1).is_ok());
+    }
+
+    /// A nullable string-family field tagged with the canonical `arrow.json` extension, as the
+    /// driver's own read path produces for Spanner `JSON` columns.
+    fn json_field(name: &str, data_type: DataType) -> Field {
+        Field::new(name, data_type, true).with_metadata(std::collections::HashMap::from([(
+            "ARROW:extension:name".to_string(),
+            "arrow.json".to_string(),
+        )]))
+    }
+
+    #[test]
+    fn binds_json_tagged_strings_as_json_params() {
+        let b = batch(
+            vec![
+                json_field("doc", DataType::Utf8),
+                Field::new("plain", DataType::Utf8, true),
+            ],
+            vec![
+                Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#), None])),
+                Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#), None])),
+            ],
+        );
+        // Value row: the tagged column binds with an explicit JSON param type, the untagged one
+        // stays untyped (Spanner infers STRING). Asserted via the built Statement's Debug
+        // rendering, since its params are not otherwise readable from outside the client crate.
+        let stmt = bind_row(Statement::builder("SELECT @p0, @p1"), &b, 0)
+            .unwrap()
+            .build();
+        let dbg = format!("{stmt:?}");
+        assert!(
+            dbg.contains(r#""p0": Type(Type { code: Json"#),
+            "no JSON param type for p0 in: {dbg}"
+        );
+        assert!(
+            !dbg.contains(r#""p1": Type"#),
+            "untagged p1 must stay untyped: {dbg}"
+        );
+        // Null row: the JSON type annotation must survive a typed null.
+        let stmt = bind_row(Statement::builder("SELECT @p0, @p1"), &b, 1)
+            .unwrap()
+            .build();
+        let dbg = format!("{stmt:?}");
+        assert!(
+            dbg.contains(r#""p0": Type(Type { code: Json"#),
+            "typed null lost JSON type: {dbg}"
+        );
+    }
+
+    #[test]
+    fn binds_json_tagged_list_elements_as_json_arrays() {
+        let docs = {
+            let mut b =
+                arrow_array::builder::ListBuilder::new(arrow_array::builder::StringBuilder::new())
+                    .with_field(Arc::new(json_field("item", DataType::Utf8)));
+            b.values().append_value(r#"{"a":1}"#);
+            b.values().append_null();
+            b.append(true);
+            b.finish()
+        };
+        let field = Field::new(
+            "docs",
+            DataType::List(Arc::new(json_field("item", DataType::Utf8))),
+            true,
+        );
+        let b = batch(vec![field], vec![Arc::new(docs)]);
+        let stmt = bind_row(Statement::builder("SELECT @p0"), &b, 0)
+            .unwrap()
+            .build();
+        let dbg = format!("{stmt:?}");
+        assert!(
+            dbg.contains(r#""p0": Type(Type { code: Array"#)
+                && dbg.contains("array_element_type: Some(Type { code: Json"),
+            "no ARRAY<JSON> param type in: {dbg}"
+        );
+    }
+
+    #[test]
+    fn json_tag_is_ignored_on_non_string_storage() {
+        // `arrow.json` is only defined over string storage; a tag on Int64 must bind as INT64.
+        let b = batch(
+            vec![json_field("n", DataType::Int64)],
+            vec![Arc::new(Int64Array::from(vec![Some(7)]))],
+        );
+        let stmt = bind_row(Statement::builder("SELECT @p0"), &b, 0)
+            .unwrap()
+            .build();
+        let dbg = format!("{stmt:?}");
+        assert!(
+            !dbg.contains("Json"),
+            "tagged Int64 mis-bound as JSON: {dbg}"
+        );
+    }
+
+    #[test]
+    fn creates_json_columns_for_tagged_ingest_fields() {
+        let schema = Schema::new(vec![
+            json_field("doc", DataType::Utf8),
+            Field::new(
+                "docs",
+                DataType::List(Arc::new(json_field("item", DataType::Utf8))),
+                true,
+            ),
+            Field::new("plain", DataType::Utf8, true),
+        ]);
+        let sql = create_table_sql("t", None, &schema, false).unwrap();
+        assert!(
+            sql.contains("`doc` JSON, `docs` ARRAY<JSON>, `plain` STRING(MAX)"),
+            "unexpected DDL: {sql}"
+        );
     }
 
     #[test]

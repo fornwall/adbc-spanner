@@ -252,7 +252,9 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   bounded row chunks to Arrow on demand; chunk size via `spanner.rows_per_batch`), DML, DDL (via
   admin `UpdateDatabaseDdl`), manual transactions
   (buffer-and-commit), native Arrow types for DATE/TIMESTAMP/NUMERIC and native `List`/`Struct` for
-  ARRAY/STRUCT, parameter binding (by column name, else positionally) + bulk ingest (append and
+  ARRAY/STRUCT, parameter binding (by column name, else positionally; an `arrow.json`-tagged string
+  column binds as a `JSON`-typed param — Spanner won't coerce STRING params into JSON columns — and
+  ingest create modes map it to a `JSON` column) + bulk ingest (append and
   create/create_append/replace — the create modes build the table from the ingest data's Arrow schema
   with a synthetic `adbc_ingest_key` UUID primary key, since Spanner requires one; autocommit ingests
   are built and shipped chunk by chunk under Spanner's per-commit limits — `IngestChunkBudget` in
