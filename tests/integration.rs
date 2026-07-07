@@ -2049,6 +2049,125 @@ fn cancel_between_stream_chunks_cancels_the_next_fetch() {
     drop.execute_update().expect("drop cancel table");
 }
 
+/// DML with a `THEN RETURN` clause returns its rows through `execute()` (previously they were
+/// silently discarded as an empty result), reports the stats-based affected count through
+/// `execute_update()`, fans out over bound parameters, and is rejected up front in manual
+/// transaction mode, where its rows would be unobtainable (commit goes through `ExecuteBatchDml`,
+/// which does not support `THEN RETURN`).
+#[test]
+fn dml_then_return_round_trip() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping dml_then_return_round_trip");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    run(
+        &mut connection,
+        "DROP TABLE IF EXISTS AdbcReturn; \
+         CREATE TABLE AdbcReturn (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
+    );
+
+    // execute(): the THEN RETURN rows come back as a typed Arrow result.
+    let mut insert = connection.new_statement().expect("new statement");
+    insert
+        .set_sql_query(
+            "INSERT INTO AdbcReturn (Id, Name) VALUES (1, 'a'), (2, 'b') THEN RETURN Id, Name",
+        )
+        .unwrap();
+    let reader = insert.execute().expect("insert then return");
+    let schema = reader.schema();
+    assert_eq!(schema.field(0).name(), "Id");
+    assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(schema.field(1).name(), "Name");
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect returned rows");
+    let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(total, 2, "one returned row per inserted row");
+    let ids = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!((ids.value(0), ids.value(1)), (1, 2));
+
+    // execute_update(): the rows are discarded, but the affected count is still reported.
+    let mut update = connection.new_statement().expect("new statement");
+    update
+        .set_sql_query("UPDATE AdbcReturn SET Name = 'x' WHERE Id <= 2 THEN RETURN Id")
+        .unwrap();
+    assert_eq!(
+        update.execute_update().expect("update then return"),
+        Some(2)
+    );
+
+    // Bound parameters fan out one execution per row; the returned batches concatenate.
+    let mut bound = connection.new_statement().expect("new statement");
+    bound
+        .set_sql_query("INSERT INTO AdbcReturn (Id, Name) VALUES (@id, @name) THEN RETURN Id")
+        .unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![10, 11])),
+            Arc::new(StringArray::from(vec!["x", "y"])),
+        ],
+    )
+    .unwrap();
+    bound.bind(batch).expect("bind");
+    let rows: usize = bound
+        .execute()
+        .expect("bound insert then return")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect bound returned rows")
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    assert_eq!(rows, 2);
+
+    // Manual transaction mode: rejected up front with a clear error; the buffer stays usable.
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("disable autocommit");
+    let mut manual = connection.new_statement().expect("new statement");
+    manual
+        .set_sql_query("DELETE FROM AdbcReturn WHERE true THEN RETURN Id")
+        .unwrap();
+    let error = manual
+        .execute_update()
+        .expect_err("THEN RETURN must be rejected in manual transaction mode");
+    assert_eq!(error.status, adbc_core::error::Status::InvalidState);
+    assert!(error.message.contains("THEN RETURN"), "{}", error.message);
+    connection.rollback().expect("rollback");
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("true".into()),
+        )
+        .expect("re-enable autocommit");
+
+    let mut drop = connection.new_statement().expect("new statement");
+    drop.set_sql_query("DROP TABLE AdbcReturn").unwrap();
+    drop.execute_update().expect("drop return table");
+}
+
 /// Partitioned execution: `Statement::execute_partitions` splits a query into opaque partition
 /// descriptors, and `Connection::read_partition` reads each one back as Arrow. The union of all
 /// partitions must reproduce the full result set exactly once.

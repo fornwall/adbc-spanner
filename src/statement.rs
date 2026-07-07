@@ -7,6 +7,11 @@
 //! iterates, so a large result set is not fully materialised in memory. Calling
 //! [`Statement::execute_update`] runs it as DML inside a read/write transaction and returns the
 //! number of affected rows.
+//!
+//! DML with a `THEN RETURN` clause returns rows: through [`Statement::execute`] they come back as
+//! an Arrow result (running via `ExecuteSql` in a read/write transaction, since `ExecuteBatchDml`
+//! does not support `THEN RETURN`); through [`Statement::execute_update`] the rows are discarded
+//! and the affected-row count is reported from the result-set stats.
 
 use std::sync::Arc;
 
@@ -20,6 +25,7 @@ use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::model::execute_sql_request::QueryMode;
 use google_cloud_spanner::model::PartitionOptions;
 use google_cloud_spanner::statement::Statement as SpannerSql;
+use google_cloud_spanner::transaction::ReadWriteTransaction;
 
 use crate::bind;
 use crate::connection::SharedTxn;
@@ -34,6 +40,19 @@ use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
 /// [`Connection::read_partition`](adbc_core::Connection::read_partition), which has no per-statement
 /// batch-size option.
 pub(crate) const DEFAULT_ROWS_PER_BATCH: usize = 8192;
+
+/// The result of routing DML through [`SpannerStatement::run_dml`].
+enum DmlOutcome {
+    /// Plain DML via `ExecuteBatchDml`: the affected-row count, or `None` when the statements
+    /// were buffered for a manual-transaction commit.
+    Plain(Option<i64>),
+    /// DML with `THEN RETURN`: the returned rows and the affected-row count from the stats.
+    Returning {
+        batches: Vec<RecordBatch>,
+        schema: SchemaRef,
+        affected: i64,
+    },
+}
 
 /// An ADBC statement bound to a Spanner [`DatabaseClient`].
 pub struct SpannerStatement {
@@ -195,6 +214,105 @@ impl SpannerStatement {
             statements,
         )?;
         Ok(Some(count))
+    }
+
+    /// Run DML with a `THEN RETURN` clause: one read/write transaction executes every statement
+    /// via `ExecuteSql` (not `ExecuteBatchDml`, which rejects `THEN RETURN`), draining each result
+    /// set **before** commit, as Spanner requires for returned rows.
+    ///
+    /// Returns the concatenated result batches (with the schema from the first) and the total
+    /// affected-row count from the result-set stats. The rows are drained *inside* the runner's
+    /// closure keeping the client's own error type, so a transaction abort still retries — the
+    /// (cloned) statement list is simply replayed, and only the last attempt's rows are returned.
+    /// Conversion to Arrow happens after the transaction commits.
+    fn execute_returning_dml(
+        &self,
+        statements: Vec<SpannerSql>,
+    ) -> Result<(Vec<RecordBatch>, SchemaRef, i64)> {
+        let client = self.client.clone();
+        let results = block_on_cancellable(&self.runtime, &self.cancel, async move {
+            let runner = client
+                .read_write_transaction()
+                .build()
+                .await
+                .map_err(from_spanner)?;
+            let outcome = runner
+                .run(move |transaction: ReadWriteTransaction| {
+                    let statements = statements.clone();
+                    async move {
+                        let mut results = Vec::with_capacity(statements.len());
+                        for statement in statements {
+                            let mut result_set = transaction.execute_query(statement).await?;
+                            let mut rows = Vec::new();
+                            while let Some(row) = result_set.next().await {
+                                rows.push(row?);
+                            }
+                            // Stats (including the affected-row count) arrive with the end of
+                            // the stream. `THEN RETURN` yields one row per affected row, so the
+                            // drained row count is the fallback.
+                            let count = result_set.update_count().unwrap_or(rows.len() as i64);
+                            results.push((result_set.metadata().cloned(), rows, count));
+                        }
+                        Ok(results)
+                    }
+                })
+                .await
+                .map_err(from_spanner)?;
+            Ok::<_, Error>(outcome.result)
+        })?;
+
+        let mut schema = None;
+        let mut batches = Vec::with_capacity(results.len());
+        let mut affected = 0i64;
+        for (metadata, rows, count) in &results {
+            let (sch, batch) = crate::conversion::rows_to_batch(metadata.as_ref(), rows)?;
+            schema.get_or_insert(sch);
+            batches.push(batch);
+            affected += count;
+        }
+        let schema = schema.unwrap_or_else(|| Arc::new(Schema::empty()));
+        Ok((batches, schema, affected))
+    }
+
+    /// Route DML through the right executor: `THEN RETURN` statements run individually in a
+    /// read/write transaction (returning their rows and count), everything else goes through
+    /// [`Self::run_or_buffer`].
+    ///
+    /// `THEN RETURN` is incompatible with manual transaction mode: buffered DML only executes at
+    /// `commit`, and `ExecuteBatchDml` — the commit path — rejects `THEN RETURN` outright, so the
+    /// returned rows would be silently unobtainable. It is rejected up front instead.
+    fn run_dml(&self, sql: &str) -> Result<DmlOutcome> {
+        if !crate::ddl::is_dml_returning(sql) {
+            let statements = self.build_dml_statements(sql)?;
+            return Ok(DmlOutcome::Plain(self.run_or_buffer(statements)?));
+        }
+        if !self.txn.lock().unwrap().autocommit() {
+            return Err(invalid_state(
+                "DML with THEN RETURN cannot run in a manual transaction: buffered DML is applied \
+                 via ExecuteBatchDml on commit, which does not support THEN RETURN. Re-enable \
+                 autocommit to run it",
+            ));
+        }
+        let statements = if self.bound.is_empty() {
+            let parts = crate::ddl::split_statements(sql);
+            if parts.len() > 1 {
+                return Err(not_implemented(
+                    "THEN RETURN in a multi-statement (`;`-separated) DML batch",
+                ));
+            }
+            parts
+                .into_iter()
+                .map(|s| SpannerSql::builder(s).build())
+                .collect()
+        } else {
+            self.build_bound_statements(sql)?
+        };
+        let (batches, schema, affected) = self.execute_returning_dml(statements)?;
+        Ok(DmlOutcome::Returning {
+            batches,
+            schema,
+            affected,
+        })
     }
 
     /// Run a parameterized query once per bound row, concatenating the result batches.
@@ -404,18 +522,27 @@ impl Statement for SpannerStatement {
         // DML arriving through the query entry point. Standard ADBC clients (the Python DBAPI, R,
         // etc.) issue every statement — including INSERT/UPDATE/DELETE — through `ExecuteQuery`, so
         // route DML onto the read/write path (or buffer it in manual mode) rather than the read-only
-        // single-use transaction below, which Spanner rejects for DML. This mirrors `execute_update`;
-        // the query interface just has nowhere to report the affected-row count, so it is discarded.
+        // single-use transaction below, which Spanner rejects for DML. This mirrors `execute_update`.
+        // DML with a `THEN RETURN` clause returns its rows; plain DML yields an empty result (the
+        // query interface has nowhere to report the affected-row count, so it is discarded).
         if crate::ddl::is_dml(&sql) {
             if self.read_only {
                 return Err(invalid_state(
                     "cannot execute DML: the connection is read-only",
                 ));
             }
-            let statements = self.build_dml_statements(&sql)?;
+            let result = self.run_dml(&sql);
             self.bound.clear();
-            self.run_or_buffer(statements)?;
-            return Ok(Self::empty_reader());
+            return match result? {
+                DmlOutcome::Returning {
+                    batches, schema, ..
+                } => {
+                    let batches: Vec<std::result::Result<RecordBatch, ArrowError>> =
+                        batches.into_iter().map(Ok).collect();
+                    Ok(Box::new(RecordBatchIterator::new(batches, schema)))
+                }
+                DmlOutcome::Plain(_) => Ok(Self::empty_reader()),
+            };
         }
         // Parameterized query: run once per bound row.
         if !self.bound.is_empty() {
@@ -475,9 +602,14 @@ impl Statement for SpannerStatement {
                 "cannot execute DML: the connection is read-only",
             ));
         }
-        let statements = self.build_dml_statements(&sql)?;
+        let result = self.run_dml(&sql);
         self.bound.clear();
-        self.run_or_buffer(statements)
+        match result? {
+            // THEN RETURN through the update entry point: the rows are discarded (this interface
+            // only reports a count), taken from the result-set stats.
+            DmlOutcome::Returning { affected, .. } => Ok(Some(affected)),
+            DmlOutcome::Plain(count) => Ok(count),
+        }
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {

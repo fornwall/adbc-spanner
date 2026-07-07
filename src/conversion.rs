@@ -79,8 +79,19 @@ pub(crate) async fn result_set_to_batch(mut rs: ResultSet) -> Result<(SchemaRef,
     }
     // Metadata (including the row type) is delivered with the first partial result set and retained
     // by the ResultSet, so it is available here even for empty results.
-    let schema = build_schema(rs.metadata(), rows.first());
-    let batch = build_batch(schema.clone(), &rows)?;
+    rows_to_batch(rs.metadata(), &rows)
+}
+
+/// Materialise already-drained Spanner rows (plus their result-set metadata) as a single Arrow
+/// [`RecordBatch`] together with its schema. Used where the rows had to be drained inside a
+/// read/write transaction runner (whose closure must keep the client's error type for abort/retry
+/// detection) and are converted afterwards — e.g. DML with `THEN RETURN`.
+pub(crate) fn rows_to_batch(
+    metadata: Option<&ResultSetMetadata>,
+    rows: &[Row],
+) -> Result<(SchemaRef, RecordBatch)> {
+    let schema = build_schema(metadata, rows.first());
+    let batch = build_batch(schema.clone(), rows)?;
     Ok((schema, batch))
 }
 
