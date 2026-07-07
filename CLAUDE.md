@@ -60,7 +60,13 @@ Key design points:
   batch atomically in one read/write transaction on `commit` (`rollback` discards it). The client
   exposes no manual begin/commit handle, so buffer-and-replay is what makes manual transactions both
   possible and retry-safe. In manual mode `execute_update` returns `None` (count unknown until
-  commit); queries and DDL still run immediately. The standard
+  commit); queries and DDL still run immediately — so a manual transaction has **no
+  read-your-writes** (`INSERT` → `SELECT COUNT(*)` returns the pre-insert count) and **DML/DDL
+  reorder** (DDL issued after buffered DML executes before it). Both consequences are documented
+  user-facing (README.md Transactions bullet, python/README.md "Manual transactions" section with a
+  CI-executed example, `SpannerConnection` rustdoc + lib.rs crate docs); rejecting/warning on
+  queries while DML is buffered was deliberately not done, and the proper fix waits on the client
+  exposing begin/commit handles. The standard
   `adbc.connection.transaction.isolation_level` option is honoured for read/write transactions:
   `serializable` and `repeatable_read` map to the client's `IsolationLevel` (applied via
   `TransactionRunnerBuilder::set_isolation_level`), `default` leaves the database default, and the

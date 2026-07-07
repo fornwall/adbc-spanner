@@ -18,8 +18,12 @@
 //! - DML with a `THEN RETURN` clause is rejected in manual mode: it must run via `ExecuteSql` to
 //!   produce its rows, but buffered DML is applied through `ExecuteBatchDml` (which does not
 //!   support `THEN RETURN`) — and the rows would be unobtainable at commit time anyway.
-//! - Queries (`execute`) and DDL always run immediately (DDL is never transactional in Spanner), so
-//!   a query does not observe DML buffered earlier in the same manual transaction.
+//! - **No read-your-writes:** queries (`execute`) always run immediately in a fresh single-use
+//!   read-only snapshot, so a query does not observe DML buffered earlier in the same manual
+//!   transaction — an `INSERT` followed by a `SELECT COUNT(*)` returns the *pre-insert* count.
+//!   Commit first if a statement needs to see earlier writes.
+//! - **DML and DDL reorder:** DDL also runs immediately (DDL is never transactional in Spanner),
+//!   so DDL issued after buffered DML executes before it.
 //! - A **failed** commit keeps the buffer and the transaction open: the caller can retry
 //!   [`Connection::commit`] (replaying the batch) or [`Connection::rollback`] to discard it. The
 //!   same holds when re-enabling autocommit fails to commit the buffer: the connection stays in
@@ -87,6 +91,21 @@ impl TxnState {
 pub(crate) type SharedTxn = Arc<Mutex<TxnState>>;
 
 /// An ADBC connection to a Spanner database.
+///
+/// # Transactions
+///
+/// The connection is in **autocommit** mode by default. Setting `adbc.connection.autocommit` to
+/// `false` enters **manual** transaction mode, in which DML is *buffered* and applied atomically
+/// in one read/write transaction on [`Connection::commit`] ([`Connection::rollback`] discards the
+/// buffer), because the Spanner client exposes read/write transactions only through a
+/// closure-based runner (no begin/commit handle). Two consequences callers must be aware of:
+///
+/// - **No read-your-writes:** queries always run immediately in a fresh read-only snapshot, so a
+///   query does not observe DML buffered earlier in the same manual transaction — an `INSERT`
+///   followed by a `SELECT COUNT(*)` returns the *pre-insert* count. Commit first if a statement
+///   needs to see earlier writes.
+/// - **DML and DDL reorder:** DDL also runs immediately (DDL is never transactional in Spanner),
+///   so DDL issued after buffered DML executes before it.
 pub struct SpannerConnection {
     runtime: SharedRuntime,
     client: DatabaseClient,

@@ -35,6 +35,18 @@
 //! round-trips through `get_option`. The flag is captured when a statement is created, so toggling
 //! it takes effect for statements created afterwards.
 //!
+//! ## Transactions
+//!
+//! Connections are in **autocommit** mode by default. Setting `adbc.connection.autocommit` to
+//! `false` enters manual transaction mode, in which DML is **buffered** and applied atomically in
+//! one read/write transaction on `commit` (the Spanner client exposes read/write transactions only
+//! through a closure-based runner, so there is no true open transaction to run statements in).
+//! Two consequences: a manual transaction has **no read-your-writes** — queries run immediately in
+//! a fresh read-only snapshot and do not see buffered DML, so an `INSERT` followed by a
+//! `SELECT COUNT(*)` returns the pre-insert count — and DDL issued after buffered DML **executes
+//! before it** (DDL runs immediately; it is never transactional in Spanner). See
+//! [`SpannerConnection`] for the full model.
+//!
 //! ## Example
 //!
 //! ```no_run

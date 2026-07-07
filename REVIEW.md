@@ -126,14 +126,26 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   comment-only segment produces no statement while `SELECT 1 -- done` (real SQL then a comment) is
   kept. `strip_trailing_terminators("SELECT 1; -- done")` now yields `"SELECT 1"` like
   `"SELECT 1;"`. Covered by the `split_drops_comment_only_segments` unit test in `src/ddl.rs`.
-- **Manual transactions have no read-your-writes, and DML/DDL reorder** (`src/connection.rs:8-23`,
+- ~~**Manual transactions have no read-your-writes, and DML/DDL reorder** (`src/connection.rs:8-23`,
   `src/statement.rs:200-217`; also flagged by the conformance review). DML is buffered while
   queries run immediately in a fresh read-only snapshot, so `INSERT` → `SELECT COUNT(*)` inside one
   "transaction" silently returns the pre-insert count, and DDL issued after buffered DML executes
   before it. This is a deliberate, documented consequence of the preview client's closure-only
   read/write API — but users reaching the cdylib via Python DBAPI/dbt never see the rustdoc.
   Mitigate now: document at the Python/README level, and consider rejecting (or warning on)
-  queries while DML is buffered. Fix properly when the client exposes begin/commit handles.
+  queries while DML is buffered. Fix properly when the client exposes begin/commit handles.~~ (fixed)
+  **Fixed** (the documentation mitigation; no behavior change). Both consequences are now spelled
+  out everywhere a cdylib/DBAPI user would look: `python/README.md` gained a "Manual transactions:
+  no read-your-writes" section — right where the autocommit-off DBAPI default is introduced — with
+  a CI-executed snippet (via `test_readme_cookbook.py`) showing `INSERT` → `SELECT COUNT(*)`
+  asserting the *pre-insert* count until `conn.commit()`, plus the DML/DDL-reordering note and a
+  cross-reference from the Cookbook's "Two things to know"; the `README.md` Transactions bullet
+  names both consequences; and since `mod connection` is private (its module docs never render on
+  docs.rs), the rustdoc now also lives on the public `SpannerConnection` struct and in the `lib.rs`
+  crate docs (new *Transactions* section), with the `connection.rs` module-doc bullet extended to
+  cover the DDL reordering. Rejecting (or warning on) queries while DML is buffered was considered
+  and deliberately **not** implemented — it would break legitimate read-then-buffered-write use;
+  the proper fix still waits on the client exposing begin/commit handles.
 
 ### ADBC conformance
 

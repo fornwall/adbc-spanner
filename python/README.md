@@ -88,6 +88,43 @@ spanner.connect(database="projects/p/instances/i/databases/d",
                 impersonate_scopes=["https://www.googleapis.com/auth/cloud-platform"])
 ```
 
+## Manual transactions: no read-your-writes
+
+DBAPI connections are **autocommit-off by default**, which puts the driver in manual
+transaction mode. Spanner's Rust client only exposes read/write transactions through a
+closure-based runner (there is no begin/commit handle yet), so the driver implements a manual
+transaction by **buffering** DML and applying the whole batch atomically in a single
+read/write transaction on `conn.commit()` (`conn.rollback()` discards it). Two consequences
+to be aware of:
+
+- **No read-your-writes.** Queries always run immediately in a fresh read-only snapshot, so a
+  query inside an open transaction does not see the DML buffered before it — an `INSERT`
+  followed by a `SELECT COUNT(*)` returns the *pre-insert* count.
+- **DML and DDL reorder.** DDL (`CREATE`/`ALTER`/…) also runs immediately (Spanner DDL is
+  never transactional), so DDL issued after buffered DML actually executes before it.
+
+```python
+import adbc_driver_spanner.dbapi as spanner
+
+with spanner.connect(
+    database="projects/my-project/instances/my-instance/databases/my-db",
+) as conn:  # DBAPI default: autocommit off => manual transaction
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS Albums")  # DDL runs immediately
+        cur.execute("CREATE TABLE Albums (Id INT64 NOT NULL) PRIMARY KEY (Id)")
+        cur.execute("INSERT INTO Albums (Id) VALUES (1)")  # DML: buffered, not applied
+        cur.execute("SELECT COUNT(*) FROM Albums")
+        assert cur.fetchone()[0] == 0  # pre-insert count: the INSERT is not visible yet
+    conn.commit()  # the buffered INSERT is applied here, atomically
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM Albums")
+        assert cur.fetchone()[0] == 1  # visible only after commit
+```
+
+If a statement needs to see earlier writes, `conn.commit()` first — or connect with
+`autocommit=True`, where every DML statement applies immediately. This will be fixed properly
+once the client exposes begin/commit transaction handles.
+
 ## Cookbook
 
 Every snippet below is executed against the Spanner emulator in CI, so they stay
@@ -96,7 +133,8 @@ correct. They assume a `Singers(SingerId INT64, FirstName STRING)` table.
 Two things to know:
 
 - **DBAPI is autocommit-off by default**, so **DML and ingest need a
-  `conn.commit()`** (or pass `autocommit=True`). Reads need neither.
+  `conn.commit()`** (or pass `autocommit=True`). Reads need neither — but note the
+  manual-transaction caveats above: buffered DML is invisible to queries until commit.
 - The DataFrame / Arrow paths need the `[dbapi]` extra (pyarrow).
 
 **pyarrow — results as a native Arrow table:**

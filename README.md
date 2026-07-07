@@ -39,7 +39,13 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   `adbc.connection.autocommit` to `false`, then `commit`/`rollback`). In manual mode DML is buffered
   and applied atomically in one read/write transaction on commit, so `execute_update` returns `None`
   rather than an affected-row count — the count is unknown until the buffered batch commits (queries
-  and DDL still run immediately).
+  and DDL still run immediately). Because only DML is buffered, a manual transaction has **no
+  read-your-writes** — a query runs immediately in a fresh read-only snapshot, so an `INSERT`
+  followed by a `SELECT COUNT(*)` in the same open transaction returns the *pre-insert* count — and
+  **DML and DDL reorder**: DDL issued after buffered DML executes before it (Spanner DDL is never
+  transactional). Commit first if a statement needs to see earlier writes. This follows from the
+  preview client exposing read/write transactions only through a closure-based runner; it will be
+  fixed properly once the client exposes begin/commit handles.
 - Read-only connections: set the standard `adbc.connection.readonly` connection option to `true` to
   reject all writes on that connection — DML, DDL and bulk ingest fail with an `InvalidState` error,
   while queries still run. Accepts `true`/`false` (default `false`) and round-trips through
