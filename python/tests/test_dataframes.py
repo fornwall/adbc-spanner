@@ -177,8 +177,8 @@ def test_pandas_read_dtypes_and_values(emulator_database):
 
 def test_bulk_ingest_from_dataframe(emulator_database):
     # Build a Polars frame, hand it to the ADBC bulk-ingest path via Arrow, and
-    # read it back. ARRAY isn't part of the bind/ingest surface, so the ingest
-    # frame uses the scalar column spread only.
+    # read it back. ARRAY is now part of the bind/ingest surface, so the frame
+    # carries the full column spread including an ARRAY<INT64> (Tags).
     conn = _connect(emulator_database)
     try:
         with conn.cursor() as cur:
@@ -192,6 +192,7 @@ def test_bulk_ingest_from_dataframe(emulator_database):
                 "  Ts TIMESTAMP,"
                 "  Dt DATE,"
                 "  Amount NUMERIC,"
+                "  Tags ARRAY<INT64>,"
                 ") PRIMARY KEY (Id)"
             )
 
@@ -204,6 +205,7 @@ def test_bulk_ingest_from_dataframe(emulator_database):
                 "Ts": [r["Ts"] for r in ROWS],
                 "Dt": [r["Dt"] for r in ROWS],
                 "Amount": [r["Amount"] for r in ROWS],
+                "Tags": [r["Tags"] for r in ROWS],
             },
             schema_overrides={
                 "Amount": pl.Decimal(38, 9),
@@ -211,6 +213,7 @@ def test_bulk_ingest_from_dataframe(emulator_database):
                 # ns Datetime; build the frame the same way for an exact round-trip
                 # (Polars' own default would be microseconds).
                 "Ts": pl.Datetime("ns", "UTC"),
+                "Tags": pl.List(pl.Int64),
             },
         )
 
@@ -218,9 +221,76 @@ def test_bulk_ingest_from_dataframe(emulator_database):
             count = cur.adbc_ingest("AdbcDfIngest", frame.to_arrow(), mode="append")
             assert count == len(ROWS)
 
-            cols = "Id, Name, Active, Score, Ts, Dt, Amount"
+            cols = "Id, Name, Active, Score, Ts, Dt, Amount, Tags"
             out = pl.read_database(
                 f"SELECT {cols} FROM AdbcDfIngest ORDER BY Id", connection=conn
+            )
+
+        assert_frame_equal(out, frame)
+    finally:
+        conn.close()
+
+
+def test_bulk_ingest_array_element_types(emulator_database):
+    # Exercise every now-supported ARRAY element type through the bind/ingest path,
+    # including per-element nulls and a fully-null array. The DATE / TIMESTAMP /
+    # NUMERIC elements bind as strings that Spanner coerces to ARRAY<DATE|TIMESTAMP|
+    # NUMERIC> from column context; assert they round-trip exactly.
+    conn = _connect(emulator_database)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS AdbcArrIngest")
+            cur.execute(
+                "CREATE TABLE AdbcArrIngest ("
+                "  Id INT64 NOT NULL,"
+                "  Ints ARRAY<INT64>,"
+                "  Strs ARRAY<STRING(MAX)>,"
+                "  Bools ARRAY<BOOL>,"
+                "  Floats ARRAY<FLOAT64>,"
+                "  Bytes ARRAY<BYTES(MAX)>,"
+                "  Dates ARRAY<DATE>,"
+                "  Stamps ARRAY<TIMESTAMP>,"
+                "  Nums ARRAY<NUMERIC>,"
+                ") PRIMARY KEY (Id)"
+            )
+
+        frame = pl.DataFrame(
+            {
+                "Id": [1, 2],
+                "Ints": [[1, 2, 3], None],  # a fully-null array
+                "Strs": [["a", None], ["c"]],  # a per-element null
+                "Bools": [[True, False], [None]],
+                "Floats": [[1.5, -2.25], None],
+                "Bytes": [[b"xy", None], [b"z"]],
+                "Dates": [
+                    [datetime.date(2024, 1, 15), datetime.date(2020, 6, 1)],
+                    [None],
+                ],
+                "Stamps": [
+                    [datetime.datetime(2024, 1, 15, 10, 30, tzinfo=datetime.timezone.utc)],
+                    None,
+                ],
+                "Nums": [[decimal.Decimal("1.5"), None], [decimal.Decimal("-0.5")]],
+            },
+            schema_overrides={
+                "Ints": pl.List(pl.Int64),
+                "Strs": pl.List(pl.String),
+                "Bools": pl.List(pl.Boolean),
+                "Floats": pl.List(pl.Float64),
+                "Bytes": pl.List(pl.Binary),
+                "Dates": pl.List(pl.Date),
+                "Stamps": pl.List(pl.Datetime("ns", "UTC")),
+                "Nums": pl.List(pl.Decimal(38, 9)),
+            },
+        )
+
+        cols = "Id, Ints, Strs, Bools, Floats, Bytes, Dates, Stamps, Nums"
+        with conn.cursor() as cur:
+            count = cur.adbc_ingest("AdbcArrIngest", frame.to_arrow(), mode="append")
+            assert count == 2
+
+            out = pl.read_database(
+                f"SELECT {cols} FROM AdbcArrIngest ORDER BY Id", connection=conn
             )
 
         assert_frame_equal(out, frame)

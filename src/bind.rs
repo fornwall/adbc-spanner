@@ -8,7 +8,10 @@
 //! `Float32`, `Boolean`, `Utf8`/`LargeUtf8`,
 //! `Binary`/`LargeBinary`, `Date32` (→ `DATE`), `Timestamp` at any `TimeUnit`
 //! (Second/Millisecond/Microsecond/Nanosecond, → `TIMESTAMP`), `Decimal128` (→ `NUMERIC`), and
-//! their nulls. Other Arrow types are rejected with an `InvalidArguments` error.
+//! their nulls. `List`/`LargeList` of any of those scalar element types binds to a Spanner
+//! `ARRAY<...>` (`ARRAY<INT64|FLOAT64|BOOL|STRING|BYTES|DATE|TIMESTAMP|NUMERIC>`), preserving
+//! per-element nulls and typed null arrays; `ARRAY<ARRAY<…>>` and `ARRAY<STRUCT>` element types are
+//! rejected. Other Arrow types are rejected with an `InvalidArguments` error.
 //!
 //! Spanner `TIMESTAMP` has **nanosecond** precision (up to nine fractional digits), so a
 //! `Timestamp` parameter is bound at its full source precision: a `Nanosecond` input formats up to
@@ -28,11 +31,11 @@
 use adbc_core::error::Result;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    Date32Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
-    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+    ArrowPrimitiveType, Date32Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type,
+    Int64Type, TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
     TimestampSecondType,
 };
-use arrow_array::{Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, OffsetSizeTrait, RecordBatch};
 use arrow_schema::{DataType, TimeUnit};
 use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Utc};
 use google_cloud_spanner::statement::StatementBuilder;
@@ -177,17 +180,7 @@ fn bind_one(
             if is_null {
                 builder.add_param(name, &None::<String>)
             } else {
-                // Arrow `Date32` is days since the Unix epoch; Spanner wants `YYYY-MM-DD`.
-                let days = a.value(row);
-                let date = NaiveDate::from_ymd_opt(1970, 1, 1)
-                    .unwrap()
-                    .checked_add_signed(Duration::days(i64::from(days)))
-                    .ok_or_else(|| {
-                        invalid_argument(format!(
-                            "cannot bind DATE parameter {name:?}: {days} is out of range"
-                        ))
-                    })?;
-                builder.add_param(name, &date.format("%Y-%m-%d").to_string())
+                builder.add_param(name, &date_string(name, a.value(row))?)
             }
         }
         // Spanner `TIMESTAMP` is UTC with nanosecond precision, so every Arrow timestamp unit
@@ -197,18 +190,7 @@ fn bind_one(
             if is_null {
                 builder.add_param(name, &None::<String>)
             } else {
-                let value = match unit {
-                    TimeUnit::Second => column.as_primitive::<TimestampSecondType>().value(row),
-                    TimeUnit::Millisecond => {
-                        column.as_primitive::<TimestampMillisecondType>().value(row)
-                    }
-                    TimeUnit::Microsecond => {
-                        column.as_primitive::<TimestampMicrosecondType>().value(row)
-                    }
-                    TimeUnit::Nanosecond => {
-                        column.as_primitive::<TimestampNanosecondType>().value(row)
-                    }
-                };
+                let value = timestamp_value(column, unit, row);
                 builder.add_param(name, &timestamp_string(name, unit, value)?)
             }
         }
@@ -217,17 +199,23 @@ fn bind_one(
             if is_null {
                 builder.add_param(name, &None::<String>)
             } else {
-                let scale = u32::try_from(*scale)
-                    .ok()
-                    .filter(|s| *s <= 38)
-                    .ok_or_else(|| {
-                        invalid_argument(format!(
-                            "cannot bind NUMERIC parameter {name:?}: unsupported scale {scale}"
-                        ))
-                    })?;
                 // Format the full i128 directly; no narrower decimal type in the way.
-                builder.add_param(name, &numeric_string(a.value(row), scale))
+                builder.add_param(
+                    name,
+                    &numeric_string(a.value(row), numeric_scale(name, *scale)?),
+                )
             }
+        }
+        // ARRAY<...> parameters: an Arrow `List`/`LargeList` column binds to a Spanner array. The
+        // element type mirrors the scalar arms above (see [`bind_list`]); nested arrays and STRUCT
+        // elements are out of scope and rejected there.
+        DataType::List(field) => {
+            let elem = (!is_null).then(|| column.as_list::<i32>().value(row));
+            bind_list(builder, name, field.data_type(), elem)?
+        }
+        DataType::LargeList(field) => {
+            let elem = (!is_null).then(|| column.as_list::<i64>().value(row));
+            bind_list(builder, name, field.data_type(), elem)?
         }
         other => {
             return Err(invalid_argument(format!(
@@ -253,6 +241,195 @@ where
     } else {
         builder.add_param(name, &value())
     }
+}
+
+/// Bind an Arrow `List`/`LargeList` cell as a Spanner `ARRAY<...>` parameter.
+///
+/// `elem_type` is the list's element type; `elem` is the child slice for this row, or `None` when
+/// the whole cell is null (→ a typed null array). The element-type mapping mirrors the scalar arms
+/// of [`bind_one`] (narrower ints widen to `INT64`, floats to `FLOAT64`, `DATE`/`TIMESTAMP`/`NUMERIC`
+/// format to their Spanner string forms), and each element keeps its own null. Spanner has no
+/// `ARRAY<ARRAY<…>>`, and `ARRAY<STRUCT>` is out of scope, so `List`/`LargeList`/`Struct` (and any
+/// otherwise-unsupported) element types are rejected.
+fn bind_list(
+    builder: StatementBuilder,
+    name: &str,
+    elem_type: &DataType,
+    elem: Option<ArrayRef>,
+) -> Result<StatementBuilder> {
+    Ok(match elem_type {
+        DataType::Int64 => add_array(builder, name, list_primitive::<Int64Type, _>(elem, |v| v)),
+        // Narrower Arrow ints widen to Spanner INT64, exactly like the scalar arms.
+        DataType::Int32 => add_array(
+            builder,
+            name,
+            list_primitive::<Int32Type, _>(elem, i64::from),
+        ),
+        DataType::Int16 => add_array(
+            builder,
+            name,
+            list_primitive::<Int16Type, _>(elem, i64::from),
+        ),
+        DataType::Float64 => {
+            add_array(builder, name, list_primitive::<Float64Type, _>(elem, |v| v))
+        }
+        DataType::Float32 => add_array(
+            builder,
+            name,
+            list_primitive::<Float32Type, _>(elem, f64::from),
+        ),
+        DataType::Boolean => {
+            let v = elem.map(|a| {
+                let a = a.as_boolean();
+                (0..a.len())
+                    .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+                    .collect()
+            });
+            add_array(builder, name, v)
+        }
+        DataType::Utf8 => add_array(builder, name, list_string::<i32>(elem)),
+        DataType::LargeUtf8 => add_array(builder, name, list_string::<i64>(elem)),
+        DataType::Binary => add_array(builder, name, list_binary::<i32>(elem)),
+        DataType::LargeBinary => add_array(builder, name, list_binary::<i64>(elem)),
+        // DATE / TIMESTAMP / NUMERIC bind as strings that Spanner coerces from the array element's
+        // SQL context, same as their scalar arms.
+        DataType::Date32 => {
+            let v = list_try(elem, |a| {
+                let a = a.as_primitive::<Date32Type>();
+                (0..a.len())
+                    .map(|i| {
+                        (!a.is_null(i))
+                            .then(|| date_string(name, a.value(i)))
+                            .transpose()
+                    })
+                    .collect()
+            })?;
+            add_array(builder, name, v)
+        }
+        DataType::Timestamp(unit, _) => {
+            let v = list_try(elem, |a| {
+                (0..a.len())
+                    .map(|i| {
+                        (!a.is_null(i))
+                            .then(|| {
+                                timestamp_string(name, unit, timestamp_value(a.as_ref(), unit, i))
+                            })
+                            .transpose()
+                    })
+                    .collect()
+            })?;
+            add_array(builder, name, v)
+        }
+        DataType::Decimal128(_precision, scale) => {
+            let scale = numeric_scale(name, *scale)?;
+            let v = elem.map(|a| {
+                let a = a.as_primitive::<Decimal128Type>();
+                (0..a.len())
+                    .map(|i| (!a.is_null(i)).then(|| numeric_string(a.value(i), scale)))
+                    .collect()
+            });
+            add_array(builder, name, v)
+        }
+        other => {
+            return Err(invalid_argument(format!(
+                "cannot bind ARRAY parameter {name:?}: unsupported element type {other:?}"
+            )))
+        }
+    })
+}
+
+/// Bind an already-collected array (or a typed null array when `values` is `None`) as parameter
+/// `name`. `None` produces a Spanner null array; each `Option<E>` keeps its own element null.
+fn add_array<E>(
+    builder: StatementBuilder,
+    name: &str,
+    values: Option<Vec<Option<E>>>,
+) -> StatementBuilder
+where
+    E: google_cloud_spanner::value::ToValue,
+{
+    builder.add_param(name, &values)
+}
+
+/// Collect a primitive Arrow child slice into `Vec<Option<E>>`, mapping each element through `f`
+/// and preserving per-element nulls. Returns `None` for a null array (`elem` is `None`).
+fn list_primitive<P, E>(
+    elem: Option<ArrayRef>,
+    f: impl Fn(P::Native) -> E,
+) -> Option<Vec<Option<E>>>
+where
+    P: ArrowPrimitiveType,
+{
+    elem.map(|a| {
+        let a = a.as_primitive::<P>();
+        (0..a.len())
+            .map(|i| (!a.is_null(i)).then(|| f(a.value(i))))
+            .collect()
+    })
+}
+
+/// Collect a `Utf8`/`LargeUtf8` child slice into `Vec<Option<String>>`, preserving per-element nulls.
+fn list_string<O: OffsetSizeTrait>(elem: Option<ArrayRef>) -> Option<Vec<Option<String>>> {
+    elem.map(|a| {
+        let a = a.as_string::<O>();
+        (0..a.len())
+            .map(|i| (!a.is_null(i)).then(|| a.value(i).to_string()))
+            .collect()
+    })
+}
+
+/// Collect a `Binary`/`LargeBinary` child slice into `Vec<Option<Vec<u8>>>`, per-element nulls kept.
+fn list_binary<O: OffsetSizeTrait>(elem: Option<ArrayRef>) -> Option<Vec<Option<Vec<u8>>>> {
+    elem.map(|a| {
+        let a = a.as_binary::<O>();
+        (0..a.len())
+            .map(|i| (!a.is_null(i)).then(|| a.value(i).to_vec()))
+            .collect()
+    })
+}
+
+/// Like [`Option::map`] but the mapping is fallible (used for the string-formatted element types).
+fn list_try<E>(
+    elem: Option<ArrayRef>,
+    f: impl FnOnce(ArrayRef) -> Result<Vec<Option<E>>>,
+) -> Result<Option<Vec<Option<E>>>> {
+    elem.map(f).transpose()
+}
+
+/// Format an Arrow `Date32` (days since the Unix epoch) as the Spanner `DATE` wire form,
+/// `YYYY-MM-DD`. `name` is used only for the out-of-range error message.
+fn date_string(name: &str, days: i32) -> Result<String> {
+    let date = NaiveDate::from_ymd_opt(1970, 1, 1)
+        .unwrap()
+        .checked_add_signed(Duration::days(i64::from(days)))
+        .ok_or_else(|| {
+            invalid_argument(format!(
+                "cannot bind DATE parameter {name:?}: {days} is out of range"
+            ))
+        })?;
+    Ok(date.format("%Y-%m-%d").to_string())
+}
+
+/// Read the raw `i64` at `row` from an Arrow timestamp `column` of the given `unit`.
+fn timestamp_value(column: &dyn Array, unit: &TimeUnit, row: usize) -> i64 {
+    match unit {
+        TimeUnit::Second => column.as_primitive::<TimestampSecondType>().value(row),
+        TimeUnit::Millisecond => column.as_primitive::<TimestampMillisecondType>().value(row),
+        TimeUnit::Microsecond => column.as_primitive::<TimestampMicrosecondType>().value(row),
+        TimeUnit::Nanosecond => column.as_primitive::<TimestampNanosecondType>().value(row),
+    }
+}
+
+/// Validate a `Decimal128` scale for Spanner `NUMERIC` (must be a non-negative `u32` `<= 38`).
+fn numeric_scale(name: &str, scale: i8) -> Result<u32> {
+    u32::try_from(scale)
+        .ok()
+        .filter(|s| *s <= 38)
+        .ok_or_else(|| {
+            invalid_argument(format!(
+                "cannot bind NUMERIC parameter {name:?}: unsupported scale {scale}"
+            ))
+        })
 }
 
 /// Convert an Arrow timestamp `value` in `unit` to the Spanner `TIMESTAMP` wire form — an RFC 3339
@@ -480,7 +657,7 @@ mod tests {
 
     use arrow_array::{
         Date32Array, Decimal128Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        ListArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
         TimestampSecondArray,
     };
     use arrow_schema::{Field, Schema};
@@ -808,5 +985,172 @@ mod tests {
             vec![Arc::new(arrow_array::UInt64Array::from(vec![1u64]))],
         );
         assert!(bind_row(Statement::builder("SELECT @x"), &b, 0).is_err());
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // ARRAY (List / LargeList) binding.
+    // ------------------------------------------------------------------------------------------
+
+    #[test]
+    fn list_primitive_widens_and_keeps_element_nulls() {
+        // Int32 elements widen to i64; a middle element null is preserved; a null cell -> None
+        // (a Spanner null array).
+        let arr = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1i32), None, Some(3)]),
+            None,
+        ]);
+        assert_eq!(
+            list_primitive::<Int32Type, _>(Some(arr.value(0)), i64::from),
+            Some(vec![Some(1i64), None, Some(3)])
+        );
+        assert_eq!(list_primitive::<Int32Type, i64>(None, i64::from), None);
+    }
+
+    #[test]
+    fn list_string_and_binary_keep_element_nulls() {
+        use arrow_array::builder::{BinaryBuilder, ListBuilder, StringBuilder};
+
+        let mut sb = ListBuilder::new(StringBuilder::new());
+        sb.values().append_value("a");
+        sb.values().append_null();
+        sb.append(true);
+        let strings = sb.finish();
+        assert_eq!(
+            list_string::<i32>(Some(strings.value(0))),
+            Some(vec![Some("a".to_string()), None])
+        );
+        assert_eq!(list_string::<i32>(None), None);
+
+        let mut bb = ListBuilder::new(BinaryBuilder::new());
+        bb.values().append_value(b"xy");
+        bb.values().append_null();
+        bb.append(true);
+        let bins = bb.finish();
+        assert_eq!(
+            list_binary::<i32>(Some(bins.value(0))),
+            Some(vec![Some(b"xy".to_vec()), None])
+        );
+    }
+
+    #[test]
+    fn binds_int64_array_including_null_array_and_null_element() {
+        // A row with a populated array (incl. a null element), a fully-null array, and an empty
+        // array all bind without error.
+        let arr = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(1i64), None, Some(3)]),
+            None,
+            Some(vec![]),
+        ]);
+        let b = batch(
+            vec![Field::new("tags", arr.data_type().clone(), true)],
+            vec![Arc::new(arr)],
+        );
+        for row in 0..3 {
+            assert!(bind_row(
+                Statement::builder("INSERT INTO t (tags) VALUES (@tags)"),
+                &b,
+                row
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn binds_arrays_of_each_supported_element_type() {
+        use arrow_array::builder::{
+            BooleanBuilder, Date32Builder, Decimal128Builder, Float64Builder, ListBuilder,
+            StringBuilder, TimestampMicrosecondBuilder,
+        };
+
+        let mut floats = ListBuilder::new(Float64Builder::new());
+        floats.values().append_value(1.5);
+        floats.values().append_null();
+        floats.append(true);
+        let floats = floats.finish();
+
+        let mut bools = ListBuilder::new(BooleanBuilder::new());
+        bools.values().append_value(true);
+        bools.append(true);
+        let bools = bools.finish();
+
+        let mut strs = ListBuilder::new(StringBuilder::new());
+        strs.values().append_value("hi");
+        strs.append(true);
+        let strs = strs.finish();
+
+        let mut dates = ListBuilder::new(Date32Builder::new());
+        dates.values().append_value(19737); // 2024-01-15
+        dates.append(true);
+        let dates = dates.finish();
+
+        let mut ts = ListBuilder::new(TimestampMicrosecondBuilder::new());
+        ts.values().append_value(1_705_322_096_789_012);
+        ts.append(true);
+        let ts = ts.finish();
+
+        let mut nums = ListBuilder::new(
+            Decimal128Builder::new()
+                .with_precision_and_scale(38, 9)
+                .unwrap(),
+        );
+        nums.values().append_value(1_500_000_000); // 1.5 at scale 9
+        nums.append(true);
+        let nums = nums.finish();
+
+        let b = batch(
+            vec![
+                Field::new("f", floats.data_type().clone(), true),
+                Field::new("bo", bools.data_type().clone(), true),
+                Field::new("s", strs.data_type().clone(), true),
+                Field::new("d", dates.data_type().clone(), true),
+                Field::new("t", ts.data_type().clone(), true),
+                Field::new("n", nums.data_type().clone(), true),
+            ],
+            vec![
+                Arc::new(floats),
+                Arc::new(bools),
+                Arc::new(strs),
+                Arc::new(dates),
+                Arc::new(ts),
+                Arc::new(nums),
+            ],
+        );
+        assert!(bind_row(Statement::builder("SELECT @f, @bo, @s, @d, @t, @n"), &b, 0).is_ok());
+    }
+
+    #[test]
+    fn rejects_nested_array_element_type() {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+
+        // ARRAY<ARRAY<INT64>> has no Spanner representation and must be rejected clearly.
+        let mut lb = ListBuilder::new(ListBuilder::new(Int64Builder::new()));
+        lb.values().values().append_value(1);
+        lb.values().append(true);
+        lb.append(true);
+        let arr = lb.finish();
+        let b = batch(
+            vec![Field::new("x", arr.data_type().clone(), true)],
+            vec![Arc::new(arr)],
+        );
+        let err = bind_row(Statement::builder("SELECT @x"), &b, 0).unwrap_err();
+        assert!(
+            err.message.contains("unsupported element type"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn spanner_column_type_maps_array_element_types() {
+        // The write-path DDL mapping already recurses into the element type.
+        let list = |dt: DataType| DataType::List(Arc::new(Field::new("item", dt, true)));
+        assert_eq!(
+            spanner_column_type(&list(DataType::Utf8)).unwrap(),
+            "ARRAY<STRING(MAX)>"
+        );
+        assert_eq!(
+            spanner_column_type(&list(DataType::Date32)).unwrap(),
+            "ARRAY<DATE>"
+        );
     }
 }
