@@ -228,13 +228,23 @@ batch read-only transaction so every partition executes at that bound. Parsing l
 
 ### Security
 
-- **`read_partition` executes an unauthenticated, attacker-suppliable request blob**
+- ~~**`read_partition` executes an unauthenticated, attacker-suppliable request blob**
   (`src/connection.rs:979-1000`; descriptor from `src/statement.rs:699-715`). The descriptor is
   plain serde-JSON of the client's `Partition`, whose inner `ExecuteSqlRequest` carries the SQL
   text itself — a crafted blob runs arbitrary SQL with the connection's credentials. This is
   inherent to the upstream serde format and to ADBC's portable-descriptor design, so the realistic
   fix is documentation (descriptors are executable request blobs; transport them only over trusted
-  channels), optionally an HMAC envelope for stronger guarantees.
+  channels), optionally an HMAC envelope for stronger guarantees.~~
+  **Fixed.** The trust caveat is now documented where it is actionable: a `# Security` rustdoc
+  section on `Connection::read_partition` (`src/connection.rs`) and on
+  `Statement::execute_partitions` (`src/statement.rs`) spells out that a partition descriptor is
+  opaque but *executable* — serde JSON carrying the SQL text plus session/transaction identity — so
+  `read_partition` runs whatever it contains with the connection's credentials, and therefore
+  descriptors must travel only over trusted channels and never be accepted from an untrusted source.
+  The CLAUDE.md Partitioned-execution bullet carries the same caveat as ground truth. Per the
+  review's own recommendation the optional HMAC envelope was deliberately **not** implemented: it is
+  a larger design change, and the realistic fix for an inherent portable-descriptor property is
+  documentation.
 
 ### Testing
 
@@ -248,9 +258,19 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   fail with `InvalidState`), and **toggle/snapshot** (the flag is captured into each statement at
   creation — a statement made while read-only stays read-only after the connection flips back to
   writable, while one created afterwards can write).
-- **`create_append` ingest mode is never executed end-to-end**, nor is the `create`-on-existing-table
+- ~~**`create_append` ingest mode is never executed end-to-end**, nor is the `create`-on-existing-table
   error path (`tests/integration.rs`). (The `append`-on-missing-table and schema-mismatch error paths
-  are now covered — see the ADBC-conformance fix above.)
+  are now covered — see the ADBC-conformance fix above.)~~
+  **Fixed.** The create-mode ingest section of `query_and_dml_round_trip` (in `tests/integration.rs`,
+  self-skipping like the others) now covers both. **`create_append`** is exercised end-to-end against
+  a fresh `AdbcCreateAppend` table: the first ingest (table absent) builds the table from the bound
+  Arrow schema and inserts 2 rows, and a second ingest (table now present) **appends** 2 more without
+  erroring — asserting counts of 2 then 4 and reading the data columns back through the synthetic
+  key. The **`create`-on-existing-table** error path re-runs a `create`-mode ingest against the
+  already-existing `AdbcCreate` table and asserts it fails (create-mode failures are not remapped, so
+  the underlying `CREATE TABLE` DDL error surfaces) and that the failed ingest left the table's row
+  count unchanged. The shared `ingest_into(table, mode)` helper (a small refactor of the former
+  `ingest_create`) backs all three cases.
 - **Resilience suite misses some likely production failures** (`tests/resilience.rs`):
   mid-stream disconnect after batches were consumed, latency/timeout toxics (nothing bounds the
   wait — building the commit-fault test confirmed the client marks all data-plane RPCs idempotent
@@ -293,10 +313,19 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   (`import adbc_driver_spanner; print(adbc_driver_spanner._driver_path()); import
   adbc_driver_spanner.dbapi`) — exercising the *installed* package, not the source tree, and
   `_driver_path()` raises unless the bundled library resolves.
-- **The tag-vs-version gate lives only in `python-wheels`**; the `release` job (GitHub assets)
+- ~~**The tag-vs-version gate lives only in `python-wheels`**; the `release` job (GitHub assets)
   has no gate, and `release` / `python-publish` are unordered siblings — a partial failure yields
   a PyPI version with no GitHub assets or vice versa. Hoist the check into a `version-gate` job
-  both need; run `python-publish` (the irreversible step) last.
+  both need; run `python-publish` (the irreversible step) last.~~ **Fixed.** A standalone,
+  tag-only `version-gate` job now performs the tag-vs-crate-version check once — deriving the crate
+  version with `cargo metadata --no-deps --format-version 1 | jq` (robust manifest parsing rather
+  than a positional Cargo.toml grep) and failing if the pushed `vX.Y.Z` tag disagrees. Both
+  `release` (GitHub Release assets) and `python-publish` (PyPI) now `needs:` it, so a mismatched tag
+  publishes nothing anywhere. Ordering is fixed too: `python-publish` — the irreversible PyPI step —
+  now also `needs: release`, so it runs strictly *after* the GitHub-Release assets are attached, and
+  a partial failure can no longer leave a PyPI version with no matching GitHub assets. The redundant
+  inline gate was removed from `python-wheels`, whose remaining "Sync wheel version to the crate"
+  step only stamps `_version.py` (no tag comparison), so the check is no longer duplicated.
 - **No CI ever touches real Cloud Spanner** — `SPANNER_GCP_DATABASE` support exists but appears in
   no workflow; auth paths (ADC, impersonation) are untested in CI since the emulator is anonymous.
   A scheduled non-gating workflow via GitHub OIDC → Workload Identity Federation would cover it.
