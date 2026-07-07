@@ -496,6 +496,29 @@ mod tests {
     }
 
     #[test]
+    fn split_drops_interleaved_comment_only_segment_in_ddl_batch() {
+        // The dbt "swap" DDL batch is submitted as one `UpdateDatabaseDdl` call, so a stray
+        // comment-only segment *between* two real DDL statements (not just trailing) must also be
+        // dropped — otherwise the empty `/* swap */` segment is sent as a DDL statement and Spanner
+        // rejects the whole schema change with INVALID_ARGUMENT. Here the block-comment-only segment
+        // sits between DROP and RENAME, and a trailing `# done` segment closes the batch; both
+        // vanish while the three real statements survive verbatim.
+        let batch = "CREATE TABLE tmp (id INT64) PRIMARY KEY (id);\n\
+                     DROP TABLE target;\n\
+                     /* swap in the rebuilt table */;\n\
+                     RENAME TABLE tmp TO target;\n\
+                     # done";
+        assert_eq!(
+            split_statements(batch),
+            vec![
+                "CREATE TABLE tmp (id INT64) PRIMARY KEY (id)",
+                "DROP TABLE target",
+                "RENAME TABLE tmp TO target",
+            ]
+        );
+    }
+
+    #[test]
     fn split_respects_raw_strings() {
         // In a raw string the backslash is an ordinary character, not an escape: `r'C:\'` ends at
         // the quote, so the `;` after it is a real separator. (The old lexer consumed the closing
