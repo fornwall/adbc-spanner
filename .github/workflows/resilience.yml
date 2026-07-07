@@ -1,0 +1,47 @@
+name: Resilience (fault injection)
+
+# Transport-level fault-injection / resilience harness: the driver talks to the Spanner emulator
+# THROUGH a Toxiproxy TCP proxy, and tests/resilience.rs injects latency/bandwidth/reset faults via
+# Toxiproxy's admin API and asserts the driver behaves sanely (cancel interrupts an in-flight query;
+# a connection reset surfaces a clean error and then recovers).
+#
+# Non-gating on purpose (modeled on foundry-validation.yml): fault injection is inherently a bit
+# heavy and timing-sensitive, so it must never block PRs. It runs on manual dispatch and on a nightly
+# schedule. The canonical functional suites (ci.yml / adbc-validation.yml) stay the gate.
+#
+# Honest scope: Toxiproxy injects TRANSPORT faults only — it cannot make the emulator emit a gRPC
+# status such as ABORTED, so this harness does NOT cover Spanner's ABORTED-driven transaction replay.
+# See tests/RESILIENCE.md.
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly at 04:30 UTC.
+    - cron: "30 4 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  resilience:
+    name: Resilience harness (emulator + Toxiproxy, non-gating)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Build first so the cdylib/test binary is ready; the harness script then only spins up Docker
+      # and runs the already-compiled test. `with-toxiproxy.sh` manages both containers (emulator with
+      # no host ports, reached by container IP so the admin port remap keeps working; Toxiproxy on the
+      # host network) and exports SPANNER_EMULATOR_HOST / SPANNER_EMULATOR_DIRECT / TOXIPROXY_URL.
+      - name: Build
+        run: cargo build --tests
+
+      - name: Run the resilience harness
+        run: |
+          scripts/with-toxiproxy.sh \
+            cargo test --test resilience -- --nocapture --test-threads=1
