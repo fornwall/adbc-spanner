@@ -1,0 +1,55 @@
+name: Foundry validation
+
+# The ADBC Driver Foundry validation suite (adbc-drivers/validation) as a type/feature coverage
+# harness. Manual-only (workflow_dispatch): the suite's base query corpus assumes a portable SQL
+# dialect that Spanner diverges from, so a chunk of type/* cases still error/fail pending
+# Spanner-dialect overrides (see python/validation/README.md). Kept non-gating until a category is
+# green, so it never blocks PRs. The canonical Apache C++ conformance suite runs in adbc-validation.yml.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  foundry-validation:
+    name: Foundry validation (emulator, non-gating)
+    runs-on: ubuntu-latest
+
+    services:
+      spanner:
+        image: gcr.io/cloud-spanner-emulator/emulator
+        ports:
+          - 9010:9010
+          - 9020:9020
+
+    env:
+      SPANNER_EMULATOR_HOST: localhost:9010
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Wait for the Spanner emulator
+        run: |
+          for _ in $(seq 1 60); do
+            if [ "$(curl -s -o /dev/null -w '%{http_code}' \
+                http://127.0.0.1:9020/v1/projects/emulator/instanceConfigs)" = "200" ]; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "emulator did not become ready" >&2
+          exit 1
+
+      # Report the coverage matrix without failing the job while dialect porting is in progress.
+      - name: Run the Foundry validation suite (informational)
+        run: PYTHON=python scripts/run-foundry-validation.sh || true
