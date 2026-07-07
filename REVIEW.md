@@ -226,7 +226,8 @@ batch read-only transaction so every partition executes at that bound. Parsing l
 
 - **`manylinux_2_35` floor excludes RHEL 9, Amazon Linux 2023, Debian 11, Ubuntu 20.04**
   (`libraries.yml:254-255`; the matrix comment already names the fix). Build in a
-  `manylinux_2_28` container and lower the tag + verify step together.
+  `manylinux_2_28` container and lower the tag + verify step together. **(wontfix — we don't care
+  about those old distributions.)**
 - **No musl (Alpine) build/wheel** — `pip install` fails on Alpine-based data-service images.
 - **Wheels are published without ever being installed or inspected** — no `twine check`, no
   unzip-and-assert-the-lib-is-inside, no `pip install` + import smoke test; the CI python job
