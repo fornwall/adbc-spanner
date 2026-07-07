@@ -59,7 +59,27 @@ pub(crate) fn bind_row(
     Ok(builder)
 }
 
-/// Bind the columns of `batch` at `row` to the parameters of `sql`.
+/// Bind the columns of `batch` at `row` to the query parameters named by `names`.
+///
+/// `names[i]` is the parameter that column `i` binds to; it is computed once per (sql, batch) by
+/// [`resolve_parameter_names`] and passed in, so binding many rows of the same batch does not re-lex
+/// the SQL per row (an O(rows × |sql|) cost that dominated large bound DML). See
+/// [`resolve_parameter_names`] for how the column→parameter pairing is decided (by name, else
+/// positionally).
+pub(crate) fn bind_params(
+    builder: StatementBuilder,
+    names: &[String],
+    batch: &RecordBatch,
+    row: usize,
+) -> Result<StatementBuilder> {
+    let mut builder = builder;
+    for (i, name) in names.iter().enumerate() {
+        builder = bind_one(builder, name, batch.column(i).as_ref(), row)?;
+    }
+    Ok(builder)
+}
+
+/// Work out which parameter name each column of `batch` binds to for `sql`.
 ///
 /// ADBC's parameter model is a batch of columns matched to the query's parameters. This driver
 /// resolves the pairing two ways:
@@ -70,22 +90,10 @@ pub(crate) fn bind_row(
 ///   distinct `@name` parameter in query order. This is what positional clients expect — most ADBC
 ///   drivers (PostgreSQL, Snowflake, …) bind by position, and the Python DBAPI / validation suites
 ///   pass parameters as `$1`/`?` with columns not named after the parameters.
-pub(crate) fn bind_params(
-    builder: StatementBuilder,
-    sql: &str,
-    batch: &RecordBatch,
-    row: usize,
-) -> Result<StatementBuilder> {
-    let names = resolve_parameter_names(sql, batch)?;
-    let mut builder = builder;
-    for (i, name) in names.iter().enumerate() {
-        builder = bind_one(builder, name, batch.column(i).as_ref(), row)?;
-    }
-    Ok(builder)
-}
-
-/// Work out which parameter name each column of `batch` binds to for `sql` (see [`bind_params`]).
-fn resolve_parameter_names(sql: &str, batch: &RecordBatch) -> Result<Vec<String>> {
+///
+/// Lexing the SQL to find its `@name` parameters is the expensive part, so callers resolve once per
+/// (sql, batch) and reuse the result across every row via [`bind_params`].
+pub(crate) fn resolve_parameter_names(sql: &str, batch: &RecordBatch) -> Result<Vec<String>> {
     let schema = batch.schema();
     let column_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     let params = named_parameters(sql);
@@ -884,6 +892,27 @@ mod tests {
             resolve_parameter_names("INSERT INTO t VALUES (@p1)", &one).unwrap(),
             vec!["p1"],
         );
+    }
+
+    #[test]
+    fn bind_params_reuses_resolved_names_across_rows() {
+        // The mapping is resolved once (lexing the SQL), then reused to bind every row — no
+        // re-lexing per row. Both rows of a two-row batch bind against the same `names`.
+        let b = batch(
+            vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Int64, false),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1, 3])),
+                Arc::new(Int64Array::from(vec![2, 4])),
+            ],
+        );
+        let names = resolve_parameter_names("SELECT @a, @b", &b).unwrap();
+        assert_eq!(names, vec!["a", "b"]);
+        for row in 0..b.num_rows() {
+            assert!(bind_params(Statement::builder("SELECT @a, @b"), &names, &b, row).is_ok());
+        }
     }
 
     #[test]
