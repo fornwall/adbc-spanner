@@ -102,6 +102,8 @@ impl SpannerConnection {
     /// Apply the buffered DML statements atomically in one read/write transaction, discarding the
     /// affected-row count (a commit reports no count).
     fn apply_transaction(&self, statements: Vec<SpannerSql>) -> Result<()> {
+        // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
+        self.cancel.reset();
         run_batch_dml(&self.runtime, &self.client, &self.cancel, statements)?;
         Ok(())
     }
@@ -784,9 +786,11 @@ impl Connection for SpannerConnection {
     }
 
     fn cancel(&mut self) -> Result<()> {
-        // Best-effort: wake an in-flight metadata/commit operation so it returns Cancelled. A
-        // cancel with nothing running is a no-op. Statements have their own signal, so this does
-        // not affect a query running on a statement from this connection.
+        // Latch the (sticky) signal: an in-flight metadata/commit operation wakes and returns
+        // Cancelled, and a cancel landing between two chunk fetches of a `read_partition` stream
+        // still cancels the next fetch. The latch is cleared when the connection starts its next
+        // operation. Statements have their own signal, so this does not affect a query running on
+        // a statement from this connection.
         self.cancel.signal();
         Ok(())
     }
@@ -817,6 +821,8 @@ impl Connection for SpannerConnection {
         table_type: Option<Vec<&str>>,
         column_name: Option<&str>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+        // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
+        self.cancel.reset();
         let out_schema = adbc_core::schemas::GET_OBJECTS_SCHEMA.clone();
         // Spanner has a single catalog (""); a catalog filter that excludes it yields no rows.
         if catalog.is_some_and(|c| !like_match(c, "")) {
@@ -842,6 +848,8 @@ impl Connection for SpannerConnection {
         db_schema: Option<&str>,
         table_name: &str,
     ) -> Result<Schema> {
+        // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
+        self.cancel.reset();
         let table = qualified_table(db_schema, table_name);
         let sql = format!("SELECT * FROM {table} LIMIT 0");
         let client = self.client.clone();
@@ -910,6 +918,8 @@ impl Connection for SpannerConnection {
         table_name: Option<&str>,
         approximate: bool,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+        // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
+        self.cancel.reset();
         let out_schema = adbc_core::schemas::GET_STATISTICS_SCHEMA.clone();
         // Spanner is a single unnamed catalog (""); a catalog filter that excludes it yields nothing.
         if catalog.is_some_and(|c| !like_match(c, "")) {
@@ -955,6 +965,8 @@ impl Connection for SpannerConnection {
         &self,
         partition: impl AsRef<[u8]>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+        // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
+        self.cancel.reset();
         // Decode the opaque descriptor produced by `Statement::execute_partitions`. It carries the
         // session, transaction id, partition token and Data Boost flag, so it executes on this
         // connection's client (which shares the same multiplexed session) with no further setup.

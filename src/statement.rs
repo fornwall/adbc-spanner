@@ -393,6 +393,8 @@ impl Statement for SpannerStatement {
     }
 
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+        // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
+        self.cancel.reset();
         let sql = self.sql()?;
         if crate::ddl::is_ddl(&sql) {
             self.run_ddl(crate::ddl::split_statements(&sql))?;
@@ -440,6 +442,8 @@ impl Statement for SpannerStatement {
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
+        // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
+        self.cancel.reset();
         // Bulk ingest: insert the bound rows into the target table (needs no SQL query).
         if let Some(table) = self.target_table.clone() {
             if self.read_only {
@@ -477,6 +481,8 @@ impl Statement for SpannerStatement {
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {
+        // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
+        self.cancel.reset();
         let sql = self.sql()?;
         if crate::ddl::is_ddl(&sql) {
             return Err(invalid_state("execute_schema is only valid for queries"));
@@ -507,6 +513,8 @@ impl Statement for SpannerStatement {
     }
 
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
+        // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
+        self.cancel.reset();
         let sql = self.sql()?;
         if crate::ddl::is_ddl(&sql) {
             return Err(invalid_state(
@@ -622,8 +630,10 @@ impl Statement for SpannerStatement {
     }
 
     fn cancel(&mut self) -> Result<()> {
-        // Best-effort: wake an in-flight execution so it returns Cancelled. A cancel with nothing
-        // running (e.g. after the eagerly-materialised result has been returned) is a no-op.
+        // Latch the (sticky) signal: an in-flight execution wakes and returns Cancelled, and a
+        // cancel landing between two chunk fetches of a streamed result still cancels the next
+        // fetch. The latch is cleared when the statement starts its next operation, so a cancel
+        // with nothing running does not affect later executions.
         self.cancel.signal();
         Ok(())
     }
