@@ -7,16 +7,14 @@
 
 use std::sync::Arc;
 
-use adbc_core::error::{Error, Result, Status};
+use adbc_core::error::Result;
 use adbc_core::options::ObjectDepth;
 use adbc_core::schemas::GET_OBJECTS_SCHEMA;
-use arrow_array::{
-    new_null_array, ArrayRef, Int32Array, ListArray, RecordBatch, StringArray, StructArray,
-};
-use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
-use arrow_schema::{DataType, FieldRef, Fields};
+use arrow_array::{new_null_array, ArrayRef, Int32Array, RecordBatch, StringArray, StructArray};
+use arrow_buffer::NullBuffer;
+use arrow_schema::Fields;
 
-use crate::error::err;
+use crate::nested::{arrow_err, field, list_item, list_of, list_of_nullable, struct_fields};
 
 /// A column of a table, as returned by `get_objects`.
 pub(crate) struct Column {
@@ -58,64 +56,6 @@ pub(crate) struct DbSchema {
     pub tables: Vec<Table>,
 }
 
-fn arrow_err(e: arrow_schema::ArrowError) -> Error {
-    err(
-        format!("failed to build get_objects batch: {e}"),
-        Status::Internal,
-    )
-}
-
-/// Extract the `Fields` of a named list-of-struct field from a struct's fields.
-fn list_struct_fields(fields: &Fields, name: &str) -> Fields {
-    match fields.find(name).map(|(_, f)| f.data_type()) {
-        Some(DataType::List(inner)) => match inner.data_type() {
-            DataType::Struct(fs) => fs.clone(),
-            _ => Fields::empty(),
-        },
-        _ => Fields::empty(),
-    }
-}
-
-/// The `Field` for a named field within `fields`.
-fn field(fields: &Fields, name: &str) -> FieldRef {
-    fields
-        .find(name)
-        .map(|(_, f)| f.clone())
-        .expect("adbc_core get_objects schema field")
-}
-
-/// Wrap `child` (one entry per element) into a `ListArray` grouping elements by `lengths`, one list
-/// per parent. All lists are non-null.
-fn list_of(item: FieldRef, lengths: &[usize], child: ArrayRef) -> Result<ArrayRef> {
-    list_of_nullable(item, lengths, child, None)
-}
-
-/// Like [`list_of`], but marks selected list entries null via `nulls` (a validity mask, one bool
-/// per entry — `false` = SQL NULL). A null entry still has a zero-length slice, so its `lengths`
-/// value must be 0.
-fn list_of_nullable(
-    item: FieldRef,
-    lengths: &[usize],
-    child: ArrayRef,
-    nulls: Option<NullBuffer>,
-) -> Result<ArrayRef> {
-    let mut offsets = Vec::with_capacity(lengths.len() + 1);
-    offsets.push(0i32);
-    let mut acc = 0i32;
-    for len in lengths {
-        acc += *len as i32;
-        offsets.push(acc);
-    }
-    let list = ListArray::try_new(
-        item,
-        OffsetBuffer::new(ScalarBuffer::from(offsets)),
-        child,
-        nulls,
-    )
-    .map_err(arrow_err)?;
-    Ok(Arc::new(list))
-}
-
 /// Build the single-catalog `get_objects` record batch.
 pub(crate) fn build(depth: ObjectDepth, schemas: Vec<DbSchema>) -> Result<RecordBatch> {
     let out_schema = GET_OBJECTS_SCHEMA.clone();
@@ -129,15 +69,9 @@ pub(crate) fn build(depth: ObjectDepth, schemas: Vec<DbSchema>) -> Result<Record
     let populate_columns = matches!(depth, ObjectDepth::All | ObjectDepth::Columns);
 
     // catalog_db_schemas: list<db_schema> — one entry (the single catalog).
-    let db_schemas_field = field(top_fields, "catalog_db_schemas");
-    let db_schema_item = match db_schemas_field.data_type() {
-        DataType::List(item) => item.clone(),
-        _ => unreachable!("catalog_db_schemas is a list"),
-    };
-    let db_schema_fields = match db_schema_item.data_type() {
-        DataType::Struct(fs) => fs.clone(),
-        _ => unreachable!("db_schema is a struct"),
-    };
+    let db_schemas_field = field(top_fields, "catalog_db_schemas")?;
+    let db_schema_item = list_item(&db_schemas_field)?;
+    let db_schema_fields = struct_fields(&db_schema_item)?;
 
     let catalog_db_schemas: ArrayRef = if !populate_schemas {
         new_null_array(db_schemas_field.data_type(), 1)
@@ -147,20 +81,14 @@ pub(crate) fn build(depth: ObjectDepth, schemas: Vec<DbSchema>) -> Result<Record
             schemas.iter().map(|s| Some(s.name.clone())),
         ));
 
+        let tables_field = field(&db_schema_fields, "db_schema_tables")?;
         let db_schema_tables: ArrayRef = if !populate_tables {
-            new_null_array(
-                field(&db_schema_fields, "db_schema_tables").data_type(),
-                schemas.len(),
-            )
+            new_null_array(tables_field.data_type(), schemas.len())
         } else {
             // Flatten tables across schemas; build the table struct.
             let tables: Vec<&Table> = schemas.iter().flat_map(|s| s.tables.iter()).collect();
-            let tables_field = field(&db_schema_fields, "db_schema_tables");
-            let table_item = match tables_field.data_type() {
-                DataType::List(item) => item.clone(),
-                _ => unreachable!(),
-            };
-            let table_fields = list_struct_fields(&db_schema_fields, "db_schema_tables");
+            let table_item = list_item(&tables_field)?;
+            let table_fields = struct_fields(&table_item)?;
 
             let table_name: ArrayRef = Arc::new(StringArray::from_iter(
                 tables.iter().map(|t| Some(t.name.clone())),
@@ -169,37 +97,25 @@ pub(crate) fn build(depth: ObjectDepth, schemas: Vec<DbSchema>) -> Result<Record
                 tables.iter().map(|t| Some(t.table_type.clone())),
             ));
 
+            let cols_field = field(&table_fields, "table_columns")?;
             let table_columns: ArrayRef = if !populate_columns {
-                new_null_array(
-                    field(&table_fields, "table_columns").data_type(),
-                    tables.len(),
-                )
+                new_null_array(cols_field.data_type(), tables.len())
             } else {
-                let cols_field = field(&table_fields, "table_columns");
-                let col_item = match cols_field.data_type() {
-                    DataType::List(item) => item.clone(),
-                    _ => unreachable!(),
-                };
-                let column_fields = list_struct_fields(&table_fields, "table_columns");
+                let col_item = list_item(&cols_field)?;
+                let column_fields = struct_fields(&col_item)?;
                 let columns: Vec<&Column> = tables.iter().flat_map(|t| t.columns.iter()).collect();
-                let column_struct = build_column_struct(&column_fields, &columns);
+                let column_struct = build_column_struct(&column_fields, &columns)?;
                 let lengths: Vec<usize> = tables.iter().map(|t| t.columns.len()).collect();
                 list_of(col_item, &lengths, column_struct)?
             };
             // table_constraints: a non-null (possibly empty) list per table at column depth,
             // otherwise a null list per table (like table_columns).
+            let cons_field = field(&table_fields, "table_constraints")?;
             let table_constraints: ArrayRef = if !populate_columns {
-                new_null_array(
-                    field(&table_fields, "table_constraints").data_type(),
-                    tables.len(),
-                )
+                new_null_array(cons_field.data_type(), tables.len())
             } else {
-                let cons_field = field(&table_fields, "table_constraints");
-                let cons_item = match cons_field.data_type() {
-                    DataType::List(item) => item.clone(),
-                    _ => unreachable!(),
-                };
-                let constraint_fields = list_struct_fields(&table_fields, "table_constraints");
+                let cons_item = list_item(&cons_field)?;
+                let constraint_fields = struct_fields(&cons_item)?;
                 let constraints: Vec<&Constraint> =
                     tables.iter().flat_map(|t| t.constraints.iter()).collect();
                 let constraint_struct = build_constraint_struct(&constraint_fields, &constraints)?;
@@ -236,7 +152,7 @@ pub(crate) fn build(depth: ObjectDepth, schemas: Vec<DbSchema>) -> Result<Record
 
 /// Build the column struct array, populating the fields we know and leaving the `xdbc_*` metadata
 /// null (all nullable in the ADBC schema).
-fn build_column_struct(column_fields: &Fields, columns: &[&Column]) -> ArrayRef {
+fn build_column_struct(column_fields: &Fields, columns: &[&Column]) -> Result<ArrayRef> {
     let n = columns.len();
     let arrays: Vec<ArrayRef> = column_fields
         .iter()
@@ -255,7 +171,9 @@ fn build_column_struct(column_fields: &Fields, columns: &[&Column]) -> ArrayRef 
             _ => new_null_array(f.data_type(), n),
         })
         .collect();
-    Arc::new(StructArray::new(column_fields.clone(), arrays, None))
+    Ok(Arc::new(
+        StructArray::try_new(column_fields.clone(), arrays, None).map_err(arrow_err)?,
+    ))
 }
 
 /// Build the constraint struct array: `constraint_name` / `constraint_type` / the key-column list
@@ -268,11 +186,8 @@ fn build_constraint_struct(
     let n = constraints.len();
 
     // constraint_column_names: one non-null list<utf8> per constraint, its key columns in order.
-    let names_field = field(constraint_fields, "constraint_column_names");
-    let name_item = match names_field.data_type() {
-        DataType::List(item) => item.clone(),
-        _ => unreachable!("constraint_column_names is a list"),
-    };
+    let names_field = field(constraint_fields, "constraint_column_names")?;
+    let name_item = list_item(&names_field)?;
     let flat_columns: Vec<&str> = constraints
         .iter()
         .flat_map(|c| c.columns.iter().map(String::as_str))
@@ -285,17 +200,11 @@ fn build_constraint_struct(
     // constraint_column_usage: a list<struct> of the referenced (parent) columns for a FOREIGN KEY,
     // and SQL NULL (not an empty list) for every other constraint type — matching the ADBC spec and
     // what the driver validation suite expects for PRIMARY KEY / CHECK / UNIQUE constraints.
-    let usage_field = field(constraint_fields, "constraint_column_usage");
-    let usage_item = match usage_field.data_type() {
-        DataType::List(item) => item.clone(),
-        _ => unreachable!("constraint_column_usage is a list"),
-    };
-    let usage_fields = match usage_item.data_type() {
-        DataType::Struct(fs) => fs.clone(),
-        _ => unreachable!("constraint_column_usage item is a struct"),
-    };
+    let usage_field = field(constraint_fields, "constraint_column_usage")?;
+    let usage_item = list_item(&usage_field)?;
+    let usage_fields = struct_fields(&usage_item)?;
     let flat_usages: Vec<&Usage> = constraints.iter().flat_map(|c| c.usages.iter()).collect();
-    let usage_struct = build_usage_struct(&usage_fields, &flat_usages);
+    let usage_struct = build_usage_struct(&usage_fields, &flat_usages)?;
     let usage_lengths: Vec<usize> = constraints.iter().map(|c| c.usages.len()).collect();
     // Only FOREIGN KEY constraints carry a usage list; the rest are NULL.
     let usage_valid: Vec<bool> = constraints
@@ -331,7 +240,7 @@ fn build_constraint_struct(
 /// Build the foreign-key `constraint_column_usage` struct array (one entry per referenced column):
 /// `fk_table` / `fk_column_name` from the parent side, `fk_db_schema` the parent schema, and an
 /// empty `fk_catalog` (Spanner has a single unnamed catalog).
-fn build_usage_struct(usage_fields: &Fields, usages: &[&Usage]) -> ArrayRef {
+fn build_usage_struct(usage_fields: &Fields, usages: &[&Usage]) -> Result<ArrayRef> {
     let n = usages.len();
     let arrays: Vec<ArrayRef> = usage_fields
         .iter()
@@ -351,13 +260,15 @@ fn build_usage_struct(usage_fields: &Fields, usages: &[&Usage]) -> ArrayRef {
             _ => new_null_array(f.data_type(), n),
         })
         .collect();
-    Arc::new(StructArray::new(usage_fields.clone(), arrays, None))
+    Ok(Arc::new(
+        StructArray::try_new(usage_fields.clone(), arrays, None).map_err(arrow_err)?,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::Array;
+    use arrow_array::{Array, ListArray};
 
     fn sample() -> Vec<DbSchema> {
         vec![DbSchema {

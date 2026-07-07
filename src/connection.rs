@@ -324,6 +324,16 @@ impl SpannerConnection {
             str_col(&column_batch, 3)?,
         );
 
+        // Group the COLUMNS rows by (schema, table) in one pass: (column name, whether its type is
+        // groupable → distinct-countable). The ORDER BY keeps each group in ordinal order.
+        let mut columns_by_table: HashMap<(&str, &str), Vec<(String, bool)>> = HashMap::new();
+        for c in 0..column_batch.num_rows() {
+            columns_by_table
+                .entry((cts.value(c), ctn.value(c)))
+                .or_default()
+                .push((ccn.value(c).to_string(), is_groupable(ctype.value(c))));
+        }
+
         let mut schemas: Vec<crate::statistics::SchemaStatistics> = Vec::new();
         for r in 0..table_batch.num_rows() {
             let schema = ts.value(r);
@@ -334,11 +344,9 @@ impl SpannerConnection {
             if table_name.is_some_and(|p| !like_match(p, table)) {
                 continue;
             }
-            // (column name, whether its type is groupable → distinct-countable), in ordinal order.
-            let columns: Vec<(String, bool)> = (0..column_batch.num_rows())
-                .filter(|&c| cts.value(c) == schema && ctn.value(c) == table)
-                .map(|c| (ccn.value(c).to_string(), is_groupable(ctype.value(c))))
-                .collect();
+            let columns = columns_by_table
+                .remove(&(schema, table))
+                .unwrap_or_default();
             let stats = self.table_statistics(schema, table, &columns)?;
             match schemas.iter_mut().find(|s| s.db_schema == schema) {
                 Some(s) => s.statistics.extend(stats),

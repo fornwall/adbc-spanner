@@ -62,6 +62,7 @@ mod error;
 #[cfg(feature = "ffi")]
 mod ffi;
 mod info;
+mod nested;
 mod objects;
 mod runtime;
 mod statement;
