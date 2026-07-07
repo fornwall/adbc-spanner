@@ -287,26 +287,17 @@ impl SpannerConnection {
     }
 
     /// Whether a table exists, via a parameterized `INFORMATION_SCHEMA.TABLES` lookup. The default
-    /// (unnamed) schema is the empty string in Spanner.
+    /// (unnamed) schema is the empty string in Spanner. Delegates to the shared [`table_exists`]
+    /// probe so the same query serves the connection's introspection and the statement's ingest
+    /// error path.
     fn table_exists(&self, db_schema: &str, table_name: &str) -> Result<bool> {
-        let client = self.client.clone();
-        let (schema, table) = (db_schema.to_string(), table_name.to_string());
-        block_on_cancellable(&self.runtime, &self.cancel, async move {
-            let statement = SpannerSql::builder(
-                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
-                 WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table",
-            )
-            .add_param("schema", &schema)
-            .add_param("table", &table)
-            .build();
-            let transaction = client.single_use().build();
-            let result_set = transaction
-                .execute_query(statement)
-                .await
-                .map_err(from_spanner)?;
-            let (_schema, batch) = result_set_to_batch(result_set).await?;
-            Ok::<bool, Error>(batch.num_rows() > 0)
-        })
+        table_exists(
+            &self.runtime,
+            &self.client,
+            &self.cancel,
+            db_schema,
+            table_name,
+        )
     }
 
     /// Compute exact statistics for the base tables matching the `LIKE` filters: `ROW_COUNT` per
@@ -553,6 +544,39 @@ pub(crate) fn run_batch_dml(
             .await
             .map_err(from_spanner)?;
         Ok::<i64, Error>(outcome.result)
+    })
+}
+
+/// Whether a table exists, via a parameterized `INFORMATION_SCHEMA.TABLES` lookup. The default
+/// (unnamed) schema is the empty string in Spanner.
+///
+/// A free function (rather than only a [`SpannerConnection`] method) so the statement's bulk-ingest
+/// error path can reuse the exact same probe to remap a failed `append` to the spec-mandated status
+/// (a missing table → `NotFound`, an existing-but-incompatible table → `AlreadyExists`).
+pub(crate) fn table_exists(
+    runtime: &SharedRuntime,
+    client: &DatabaseClient,
+    cancel: &CancelSignal,
+    db_schema: &str,
+    table_name: &str,
+) -> Result<bool> {
+    let client = client.clone();
+    let (schema, table) = (db_schema.to_string(), table_name.to_string());
+    block_on_cancellable(runtime, cancel, async move {
+        let statement = SpannerSql::builder(
+            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
+             WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table",
+        )
+        .add_param("schema", &schema)
+        .add_param("table", &table)
+        .build();
+        let transaction = client.single_use().build();
+        let result_set = transaction
+            .execute_query(statement)
+            .await
+            .map_err(from_spanner)?;
+        let (_schema, batch) = result_set_to_batch(result_set).await?;
+        Ok::<bool, Error>(batch.num_rows() > 0)
     })
 }
 

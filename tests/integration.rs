@@ -731,6 +731,78 @@ fn query_and_dml_round_trip() {
     assert_eq!(ingest.execute_update().expect("ingest"), Some(2));
     assert_eq!(count_rows(&mut connection, "AdbcBind"), 2);
 
+    // Append onto a missing target table must surface as the ADBC-mandated NotFound (not a generic
+    // mapped Spanner INVALID_ARGUMENT). The driver probes INFORMATION_SCHEMA on the failure path and
+    // remaps: table absent → NotFound.
+    let missing_rows = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(vec![1]))],
+    )
+    .unwrap();
+    let mut ingest_missing = connection.new_statement().expect("new statement");
+    ingest_missing
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcNoSuchIngestTable".into()),
+        )
+        .unwrap();
+    ingest_missing
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .unwrap();
+    ingest_missing
+        .bind(missing_rows)
+        .expect("bind rows for missing-table ingest");
+    let missing_err = ingest_missing
+        .execute_update()
+        .expect_err("append onto a missing table must fail");
+    assert_eq!(
+        missing_err.status,
+        adbc_core::error::Status::NotFound,
+        "append onto a missing table must be NotFound, got: {missing_err:?}"
+    );
+
+    // Append with a schema incompatible with the existing table must surface as AlreadyExists per
+    // the ADBC bulk-ingest contract. `AdbcBind` exists but has no `NoSuchColumn`, so the INSERT
+    // fails; the probe finds the table present and remaps the failure to AlreadyExists.
+    let mismatch_rows = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "NoSuchColumn",
+            DataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(Int64Array::from(vec![1]))],
+    )
+    .unwrap();
+    let mut ingest_mismatch = connection.new_statement().expect("new statement");
+    ingest_mismatch
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcBind".into()),
+        )
+        .unwrap();
+    ingest_mismatch
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .unwrap();
+    ingest_mismatch
+        .bind(mismatch_rows)
+        .expect("bind rows for schema-mismatch ingest");
+    let mismatch_err = ingest_mismatch
+        .execute_update()
+        .expect_err("append with an incompatible schema must fail");
+    assert_eq!(
+        mismatch_err.status,
+        adbc_core::error::Status::AlreadyExists,
+        "append with an incompatible schema must be AlreadyExists, got: {mismatch_err:?}"
+    );
+    // The rejected appends changed nothing.
+    assert_eq!(count_rows(&mut connection, "AdbcBind"), 2);
+
     // DML issued through the query entry point (`execute`, not the Rust-only `execute_update`) must
     // run on the read/write path and succeed. Every ADBC client — the Python DBAPI, R, etc. — issues
     // DML this way, since the C ABI exposes only `ExecuteQuery`. Regression test for routing it to a
