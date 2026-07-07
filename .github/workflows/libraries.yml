@@ -149,9 +149,58 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # Gate every tag-triggered publish step on the commit's CI run being green. This
+  # workflow (and only this one) triggers on tags, and it runs no tests itself — so
+  # without this job a `cargo release --execute` (which pushes the "Release X.Y.Z"
+  # commit and the vX.Y.Z tag together) would attach GitHub Release assets and publish
+  # to PyPI (irreversible) even if that exact commit is red on CI, or before CI has
+  # finished. The branch push that accompanies the tag triggers ci.yml on the same SHA;
+  # here we poll ci.yml's run for github.sha and only succeed once it has concluded
+  # `success`, failing (and thus blocking `release` / `python-publish`) otherwise.
+  ci-gate:
+    name: Require CI green on this commit
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # read ci.yml's workflow runs via the API.
+    steps:
+      - name: Wait for the CI workflow to succeed on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="${{ github.sha }}"
+          repo="${{ github.repository }}"
+          # 30-minute budget: the run may not be registered yet when the tag arrives, and
+          # the emulator suites take a few minutes; poll until it completes either way.
+          deadline=$(( SECONDS + 1800 ))
+          while true; do
+            resp="$(gh api \
+              "repos/${repo}/actions/workflows/ci.yml/runs?head_sha=${sha}&per_page=1" \
+              2>/dev/null || true)"
+            status="$(printf '%s' "$resp" | jq -r '.workflow_runs[0].status // "none"' 2>/dev/null || echo none)"
+            conclusion="$(printf '%s' "$resp" | jq -r '.workflow_runs[0].conclusion // "none"' 2>/dev/null || echo none)"
+            echo "ci.yml run for ${sha}: status=${status} conclusion=${conclusion}"
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "CI is green on ${sha}; allowing the release to proceed."
+                exit 0
+              fi
+              echo "::error::CI concluded '${conclusion}' on ${sha}; refusing to publish this tag." >&2
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::timed out after 30m waiting for ci.yml to complete on ${sha}" >&2
+              exit 1
+            fi
+            sleep 20
+          done
+
   release:
     name: Attach to GitHub Release
-    needs: build
+    needs: [build, ci-gate]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -332,7 +381,7 @@ jobs:
   # `libraries.yml` + the `pypi` environment below). See README/setup notes.
   python-publish:
     name: Publish wheels to PyPI
-    needs: python-wheels
+    needs: [python-wheels, ci-gate]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     environment:
