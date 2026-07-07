@@ -528,7 +528,14 @@ impl Optionable for SpannerStatement {
 
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
         match &key {
-            OptionStatement::TargetTable => self.target_table = Some(string_option(value)?),
+            OptionStatement::TargetTable => {
+                self.target_table = Some(string_option(value)?);
+                // Mutually exclusive with a SQL query (see `set_sql_query`): setting an ingest
+                // target clears any query left on a reused handle — e.g. the DBAPI `Cursor` reuses
+                // one statement, so `cur.execute("CREATE TABLE …")` then `cur.adbc_ingest(…)` would
+                // otherwise leave the stale CREATE set and skip the ingest.
+                self.sql = None;
+            }
             OptionStatement::TargetDbSchema => {
                 // Named schema for the ingest target table; qualifies the INSERT / CREATE TABLE via
                 // `qualified_table` (empty selects Spanner's default, unnamed schema).
@@ -664,8 +671,8 @@ impl Statement for SpannerStatement {
         // FFI caller may drive an ingest via `execute` with a non-null stream out-pointer. Run it
         // the same way `execute_update` does and return an empty stream — the query interface has
         // nowhere to report the affected-row count, so it is discarded. Gate on there being no SQL:
-        // `set_sql_query` does not clear `target_table`, so a statement handle reused for a query
-        // after an ingest must run that query, not re-enter ingest with no bound data.
+        // a query and an ingest target are mutually exclusive (each setter clears the other), so a
+        // reused handle whose most recent config was a query runs that query, not a data-less ingest.
         if self.sql.is_none() {
             if let Some(table) = self.target_table.clone() {
                 self.run_ingest(&table)?;
@@ -738,8 +745,9 @@ impl Statement for SpannerStatement {
         // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
         self.cancel.reset();
         // Bulk ingest: insert the bound rows into the target table (needs no SQL query). Gate on
-        // there being no SQL for the same reason as `execute` — a reused handle whose `target_table`
-        // is still set from a prior ingest must run its freshly-set statement, not re-enter ingest.
+        // there being no SQL for the same reason as `execute` — a query and an ingest target are
+        // mutually exclusive (each setter clears the other), so a reused handle runs whichever was
+        // configured most recently rather than the stale other one.
         if self.sql.is_none() {
             if let Some(table) = self.target_table.clone() {
                 return self.run_ingest(&table);
@@ -908,6 +916,10 @@ impl Statement for SpannerStatement {
 
     fn set_sql_query(&mut self, query: impl AsRef<str>) -> Result<()> {
         self.sql = Some(query.as_ref().to_string());
+        // A SQL query and a bulk-ingest target are mutually exclusive: setting a query clears any
+        // ingest target left on a reused handle, so `execute`/`execute_update` run this query rather
+        // than re-entering the (now data-less) ingest branch. See the matching clear in `set_option`.
+        self.target_table = None;
         Ok(())
     }
 

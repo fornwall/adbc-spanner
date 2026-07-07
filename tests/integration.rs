@@ -915,6 +915,46 @@ fn query_and_dml_round_trip() {
     );
     assert_eq!(count_rows(&mut connection, "AdbcBind"), 4);
 
+    // Statement handle reused for an ingest after a SQL query — the pattern the Python DBAPI
+    // `Cursor` produces (one statement per cursor: `cur.execute("CREATE TABLE …")` sets the query,
+    // then `cur.adbc_ingest(…)` sets the ingest target without clearing it). Setting the target must
+    // win over the stale query, so the bound rows are ingested rather than the query re-run.
+    // Regression test for the ingest branch being skipped while a prior query is still set.
+    let mut reuse_query_then_ingest = connection.new_statement().expect("new statement");
+    reuse_query_then_ingest
+        .set_sql_query("SELECT 1")
+        .expect("set stale query");
+    reuse_query_then_ingest
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcBind".into()),
+        )
+        .unwrap();
+    reuse_query_then_ingest
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .unwrap();
+    let reuse_rows = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("Id", DataType::Int64, false),
+            Field::new("Name", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![5])),
+            Arc::new(StringArray::from(vec!["Erin"])),
+        ],
+    )
+    .unwrap();
+    reuse_query_then_ingest
+        .bind(reuse_rows)
+        .expect("bind rows for reuse ingest");
+    reuse_query_then_ingest
+        .execute_update()
+        .expect("ingest after a prior query on a reused statement");
+    assert_eq!(count_rows(&mut connection, "AdbcBind"), 5);
+
     // Create-mode bulk ingest: the driver builds the table from the bound Arrow schema (with a
     // synthetic UUID primary key), so no CREATE TABLE is needed first. Exercises create/append/replace.
     let mut drop_create = connection.new_statement().expect("new statement");
