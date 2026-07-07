@@ -15,11 +15,6 @@ they are to bite a real user. (All P1 and P2 findings from the original review h
   (0.3.9 vs 0.5.0) — wire it into cargo-release's `pre-release-replacements`.
 - **macOS deployment target**: the `macosx_10_12` tag is asserted, not enforced — export
   `MACOSX_DEPLOYMENT_TARGET` in the build (aws-lc's cmake defaults from the host).
-- **Statistics performance**: `collect_statistics` rescans the whole COLUMNS batch per table,
-  O(tables × total columns) — the batch is already sorted, group it once. Also guard the `as i32`
-  list-offset accumulation in `statistics.rs`/`objects.rs` and replace the schema-shape
-  `expect`/`unreachable!` panics with `Status::Internal` errors (this is a cdylib; panics unwind
-  toward the C ABI).
 - **Test/fuzz upkeep**: `AdbcDdl` scratch table is never dropped (leaks into a real
   `SPANNER_GCP_DATABASE`); no integration round-trip for JSON/`arrow.json` or FLOAT32 columns;
   `ensure_database_once` poisons its mutex on setup panic (the file already solves this pattern

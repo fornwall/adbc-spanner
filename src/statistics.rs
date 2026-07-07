@@ -14,13 +14,14 @@ use std::sync::Arc;
 
 use adbc_core::error::{Result, Status};
 use arrow_array::{
-    new_empty_array, new_null_array, ArrayRef, BooleanArray, Int16Array, Int64Array, ListArray,
-    RecordBatch, StringArray, StructArray, UnionArray,
+    new_empty_array, new_null_array, ArrayRef, BooleanArray, Int16Array, Int64Array, RecordBatch,
+    StringArray, StructArray, UnionArray,
 };
-use arrow_buffer::{OffsetBuffer, ScalarBuffer};
-use arrow_schema::{ArrowError, DataType, FieldRef, Fields, SchemaRef, UnionFields};
+use arrow_buffer::ScalarBuffer;
+use arrow_schema::{DataType, Fields, SchemaRef, UnionFields};
 
 use crate::error::err;
+use crate::nested::{arrow_err, field, list_item, list_of, struct_fields};
 
 /// The `int64` branch of the `statistic_value` union (see `STATISTIC_VALUE_SCHEMA`).
 const INT64_BRANCH: i8 = 0;
@@ -42,65 +43,19 @@ pub(crate) struct SchemaStatistics {
     pub statistics: Vec<Statistic>,
 }
 
-fn arrow_err(e: ArrowError) -> adbc_core::error::Error {
-    err(
-        format!("failed to build get_statistics batch: {e}"),
-        Status::Internal,
-    )
-}
-
-/// The `Field` for a named field within `fields`.
-fn field(fields: &Fields, name: &str) -> FieldRef {
-    fields
-        .find(name)
-        .map(|(_, f)| f.clone())
-        .expect("adbc_core get_statistics schema field")
-}
-
-/// Wrap `child` into a `ListArray` grouping its elements by `lengths`, one non-null list per parent.
-fn list_of(item: FieldRef, lengths: &[usize], child: ArrayRef) -> Result<ArrayRef> {
-    let mut offsets = Vec::with_capacity(lengths.len() + 1);
-    offsets.push(0i32);
-    let mut acc = 0i32;
-    for len in lengths {
-        acc += *len as i32;
-        offsets.push(acc);
-    }
-    let list = ListArray::try_new(
-        item,
-        OffsetBuffer::new(ScalarBuffer::from(offsets)),
-        child,
-        None,
-    )
-    .map_err(arrow_err)?;
-    Ok(Arc::new(list))
-}
-
 /// Build the single-catalog `get_statistics` record batch from per-schema statistics.
 pub(crate) fn build(schemas: Vec<SchemaStatistics>, out_schema: SchemaRef) -> Result<RecordBatch> {
     let top_fields = out_schema.fields();
 
-    let db_schemas_field = field(top_fields, "catalog_db_schemas");
-    let db_schema_item = match db_schemas_field.data_type() {
-        DataType::List(item) => item.clone(),
-        _ => unreachable!("catalog_db_schemas is a list"),
-    };
-    let db_schema_fields = match db_schema_item.data_type() {
-        DataType::Struct(fs) => fs.clone(),
-        _ => unreachable!("db_schema is a struct"),
-    };
+    let db_schemas_field = field(top_fields, "catalog_db_schemas")?;
+    let db_schema_item = list_item(&db_schemas_field)?;
+    let db_schema_fields = struct_fields(&db_schema_item)?;
 
     // db_schema_statistics: list<statistic struct> per schema. Flatten the statistics across
     // schemas to build one struct array, then re-group by per-schema lengths.
-    let stats_field = field(&db_schema_fields, "db_schema_statistics");
-    let stat_item = match stats_field.data_type() {
-        DataType::List(item) => item.clone(),
-        _ => unreachable!("db_schema_statistics is a list"),
-    };
-    let stat_fields = match stat_item.data_type() {
-        DataType::Struct(fs) => fs.clone(),
-        _ => unreachable!("statistic is a struct"),
-    };
+    let stats_field = field(&db_schema_fields, "db_schema_statistics")?;
+    let stat_item = list_item(&stats_field)?;
+    let stat_fields = struct_fields(&stat_item)?;
     let flat: Vec<&Statistic> = schemas.iter().flat_map(|s| s.statistics.iter()).collect();
     let stat_struct = build_statistic_struct(&stat_fields, &flat)?;
     let lengths: Vec<usize> = schemas.iter().map(|s| s.statistics.len()).collect();
@@ -129,10 +84,15 @@ fn build_statistic_struct(stat_fields: &Fields, stats: &[&Statistic]) -> Result<
     let n = stats.len();
 
     // statistic_value: a dense union with every value in the `int64` branch.
-    let value_field = field(stat_fields, "statistic_value");
+    let value_field = field(stat_fields, "statistic_value")?;
     let union_fields = match value_field.data_type() {
         DataType::Union(fields, _) => fields.clone(),
-        _ => unreachable!("statistic_value is a union"),
+        _ => {
+            return Err(err(
+                "unexpected ADBC result schema shape: expected `statistic_value` to be a union",
+                Status::Internal,
+            ))
+        }
     };
     let int64_values: ArrayRef =
         Arc::new(Int64Array::from_iter(stats.iter().map(|s| Some(s.value))));
