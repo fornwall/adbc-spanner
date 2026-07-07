@@ -450,11 +450,18 @@ offline unit test); `execute_bound_query` runs each bound row in
 its own snapshot (mutually inconsistent results) and materialises everything ignoring
 `rows_per_batch` (`src/statement.rs:319-345`).
 
-**Performance.** `get_statistics` per-table scans run strictly sequentially — a small
-`buffer_unordered(4..8)` would cut wall-clock near-linearly (`connection.rs:337-359`);
-`execute_partitions` pays an extra PLAN round trip for the schema (unavoidable until the client
-surfaces partition metadata); binary parameters take a forced `to_vec()` copy (upstream `ToValue`
-limitation).
+**Performance.** ~~`get_statistics` per-table scans run strictly sequentially — a small
+`buffer_unordered(4..8)` would cut wall-clock near-linearly (`connection.rs:337-359`)~~ **Fixed.**
+The per-table aggregate scans now run with bounded concurrency (`buffer_unordered(8)`,
+`STATISTICS_SCAN_CONCURRENCY` in `src/statistics.rs`) inside the one shared runtime's single
+`block_on_cancellable`, cutting `get_statistics` wall-clock near-linearly on a many-table database.
+Output is unchanged: each table's query is prepared in deterministic `table_batch` order, and since
+`buffer_unordered` yields out of order the results are index-tagged and slotted back into that order
+before parsing, so the tables, schemas and statistics — and their ordering — match the old
+sequential loop. Cancellation (the shared `CancelSignal` interrupts the in-flight batch) and error
+propagation (any scan error surfaces as an overall `Err`) are preserved. `execute_partitions` pays
+an extra PLAN round trip for the schema (unavoidable until the client surfaces partition metadata);
+binary parameters take a forced `to_vec()` copy (upstream `ToValue` limitation).
 
 **Security.** Emulator mode (`SPANNER_EMULATOR_HOST`) silently forces anonymous credentials +
 plaintext `http://`, overriding configured keyfiles — an env-controlled downgrade footgun;
