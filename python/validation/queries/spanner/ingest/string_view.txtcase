@@ -1,3 +1,0 @@
-// part: metadata
-
-skip = "the driver does not ingest Arrow Utf8View"

@@ -9,12 +9,6 @@ they are to bite a real user. (All P1 and P2 findings from the original review h
 
 ## P3 — improvements worth queuing
 
-- **Bind coverage**: no `Utf8View`/`BinaryView` (increasingly what polars/new pyarrow emit), no
-  `List` → Spanner `ARRAY` params, no `Int8`/`Date64`. ARRAY binding is the most-asked-for gap for
-  a Spanner driver.
-- **Ingest modes**: only `append` is supported; `create`/`replace` (DDL from the Arrow schema) is
-  the highest-value feature add. At minimum, add a test that non-append modes get a clean
-  `NotImplemented` (currently untested).
 - **Python packaging polish**: wheel ships no LICENSE text despite embedding aws-lc etc.
   (Apache-2.0 §4 gap); `setuptools>=64` floor is too low for the PEP 639 string license (needs
   ≥77); `adbc-driver-manager` dependency has no version floor; dev `_version.py` has drifted
