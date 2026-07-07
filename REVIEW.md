@@ -524,9 +524,11 @@ ODBC bridges); `get_table_schema` ignores the catalog argument entirely; `get_ob
 `Catalogs` depth still runs the SCHEMATA query; `execute_schema` lets DML through to a PLAN probe
 whose read-only-transaction error is surfaced raw.
 
-**Testing.** Doctests never run in CI (`cargo test --doc` is absent; CLAUDE.md implies otherwise —
+**Testing.** ~~Doctests never run in CI (`cargo test --doc` is absent; CLAUDE.md implies otherwise —
 also flagged by the CI review, which notes `cargo doc` runs without `--all-features` unlike
-docs.rs); keyfile/impersonation auth is offline-unit-tested only, never exercised end-to-end;
+docs.rs)~~ (**Fixed.** `ci.yml` now has a dedicated `cargo test --doc --all-features` step after
+the unit tests, and the docs step runs `cargo doc --no-deps --all-features` to match docs.rs);
+keyfile/impersonation auth is offline-unit-tested only, never exercised end-to-end;
 weak assertions (`AdbcDdl` note value unchecked, `replace`-ingest values unchecked, only row
 counts); untested small surfaces: `rollback()` without a transaction, `get_statistic_names`,
 `read_partition` with a garbage descriptor (also a natural fuzz target), `Connection::cancel`;
