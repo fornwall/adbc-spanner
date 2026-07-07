@@ -1518,6 +1518,74 @@ fn query_and_dml_round_trip() {
         .unwrap();
     assert_eq!(column_name.value(0), "SingerId");
 
+    // --- get_objects at Catalogs depth: the single unnamed catalog with a NULL db_schemas
+    // list (this depth needs no INFORMATION_SCHEMA data and issues no queries at all).
+    let catalogs = connection
+        .get_objects(ObjectDepth::Catalogs, None, None, None, None, None)
+        .expect("get_objects at Catalogs depth")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect catalogs");
+    let cb = &catalogs[0];
+    assert_eq!(cb.num_rows(), 1, "single catalog");
+    let catalog_name = cb.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(
+        catalog_name.value(0),
+        "",
+        "Spanner's single unnamed catalog"
+    );
+    let cb_schemas = cb.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+    assert!(
+        cb_schemas.is_null(0),
+        "catalog_db_schemas must be NULL at Catalogs depth"
+    );
+
+    // A catalog filter that excludes "" yields zero rows even at Catalogs depth.
+    let none = connection
+        .get_objects(ObjectDepth::Catalogs, Some("nope"), None, None, None, None)
+        .expect("get_objects with excluding catalog filter")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect filtered catalogs");
+    assert_eq!(
+        none.iter().map(|b| b.num_rows()).sum::<usize>(),
+        0,
+        "a catalog filter excluding \"\" must match nothing"
+    );
+
+    // --- get_objects at Schemas depth: schemas are populated (the default "" schema is
+    // present) but each schema's table list is NULL.
+    let db_schemas = connection
+        .get_objects(ObjectDepth::Schemas, None, None, None, None, None)
+        .expect("get_objects at Schemas depth")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect db schemas");
+    let sb = &db_schemas[0];
+    assert_eq!(sb.num_rows(), 1, "single catalog");
+    let sb_schemas = sb.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+    assert!(
+        sb_schemas.is_valid(0),
+        "catalog_db_schemas must be populated at DBSchemas depth"
+    );
+    let sb_schemas = sb_schemas.value(0);
+    let sb_schemas = sb_schemas.as_any().downcast_ref::<StructArray>().unwrap();
+    let schema_names = sb_schemas
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(
+        (0..schema_names.len()).any(|i| schema_names.value(i).is_empty()),
+        "the default \"\" schema must be reported"
+    );
+    let schema_tables = sb_schemas
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert!(
+        (0..schema_tables.len()).all(|i| schema_tables.is_null(i)),
+        "db_schema_tables must be NULL at DBSchemas depth"
+    );
+
     // --- Round trip: every value get_table_types reports works as a get_objects table_type
     // filter. The ADBC spec says valid filter values come from get_table_types, so the two
     // vocabularies must agree — filtering on the reported type of a base table must find it.
