@@ -296,6 +296,17 @@ pub(crate) async fn query_batch(client: &DatabaseClient, sql: &str) -> Result<Re
 /// Extract column `index` of an `INFORMATION_SCHEMA` batch as a [`StringArray`]. Shared with the
 /// collectors in [`crate::objects`] and [`crate::statistics`].
 pub(crate) fn str_col(batch: &RecordBatch, index: usize) -> Result<&StringArray> {
+    // `RecordBatch::column` panics on an out-of-range index; a malformed / unexpectedly-shaped
+    // (e.g. zero-column) metadata batch must surface as an error, not a panic.
+    if index >= batch.num_columns() {
+        return Err(err(
+            format!(
+                "INFORMATION_SCHEMA batch has {} column(s); column {index} is out of range",
+                batch.num_columns()
+            ),
+            Status::Internal,
+        ));
+    }
     batch
         .column(index)
         .as_any()
@@ -806,5 +817,20 @@ mod tests {
             isolation_to_adbc_string(&IsolationLevel::Unspecified),
             ADBC_OPTION_ISOLATION_LEVEL_DEFAULT
         );
+    }
+
+    #[test]
+    fn str_col_errors_on_out_of_range_index() {
+        // A zero-column batch: any column index is out of range and must error, not panic.
+        let empty = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        let err = str_col(&empty, 0).unwrap_err();
+        assert_eq!(err.status, Status::Internal);
+
+        // A one-column batch: index 0 is fine, index 1 is out of range.
+        let schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Utf8, true)]));
+        let col: ArrayRef = Arc::new(StringArray::from(vec![Some("x")]));
+        let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
+        assert!(str_col(&batch, 0).is_ok());
+        assert_eq!(str_col(&batch, 1).unwrap_err().status, Status::Internal);
     }
 }
