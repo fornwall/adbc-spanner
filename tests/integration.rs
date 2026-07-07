@@ -1518,6 +1518,16 @@ fn query_and_dml_round_trip() {
         .unwrap();
     assert_eq!(column_name.value(0), "SingerId");
 
+    // xdbc_type_name carries the Spanner-native type (INFORMATION_SCHEMA.COLUMNS.SPANNER_TYPE).
+    let type_name = columns
+        .column_by_name("xdbc_type_name")
+        .expect("xdbc_type_name field")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let type_names: Vec<&str> = (0..type_name.len()).map(|i| type_name.value(i)).collect();
+    assert_eq!(type_names, ["INT64", "STRING(MAX)", "BOOL", "FLOAT64"]);
+
     // --- Round trip: every value get_table_types reports works as a get_objects table_type
     // filter. The ADBC spec says valid filter values come from get_table_types, so the two
     // vocabularies must agree — filtering on the reported type of a base table must find it.

@@ -75,7 +75,8 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   every table to have a primary key and the ingest data carries none. That column is a real column,
   so it shows up in a later `SELECT *` from the table.
 - Metadata: `get_table_types()`, `get_table_schema()`, and `get_objects()` (catalog/schema/table/
-  column introspection from `INFORMATION_SCHEMA`).
+  column introspection from `INFORMATION_SCHEMA`; columns report the Spanner-native type, e.g.
+  `STRING(MAX)`, as `xdbc_type_name`).
 - Statistics: `get_statistics()` computes exact table/column counts with one aggregate scan per table
   — `ROW_COUNT`, and per column `NULL_COUNT` (plus `DISTINCT_COUNT` for groupable types). Spanner has
   no cheap pre-computed statistics, so an `approximate` request returns nothing rather than scanning;

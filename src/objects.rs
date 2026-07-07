@@ -28,6 +28,9 @@ pub(crate) struct Column {
     pub name: String,
     pub ordinal: i32,
     pub nullable: bool,
+    /// The Spanner-native type name (`INFORMATION_SCHEMA.COLUMNS.SPANNER_TYPE`), e.g.
+    /// `STRING(MAX)` or `ARRAY<INT64>`; reported as `xdbc_type_name`.
+    pub type_name: String,
 }
 
 /// A column referenced by a foreign-key constraint (the parent side).
@@ -111,7 +114,8 @@ pub(crate) fn collect_objects(
             Some(
                 query_batch(
                     &client,
-                    "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, IS_NULLABLE \
+                    "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, \
+                     IS_NULLABLE, SPANNER_TYPE \
                      FROM INFORMATION_SCHEMA.COLUMNS \
                      ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION",
                 )
@@ -259,6 +263,7 @@ struct ColumnRow<'a> {
     name: &'a str,
     ordinal: i32,
     nullable: bool,
+    type_name: &'a str,
 }
 
 /// One grouped `INFORMATION_SCHEMA.TABLE_CONSTRAINTS` row (per (schema, table) group).
@@ -294,11 +299,12 @@ fn group_tables(batch: &RecordBatch) -> Result<HashMap<&str, Vec<TableRow<'_>>>>
 /// Group `INFORMATION_SCHEMA.COLUMNS` rows by (schema, table); each group keeps ordinal order (the
 /// query's `ORDER BY`).
 fn group_columns(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<ColumnRow<'_>>>> {
-    let (ts, tn, cn, nul) = (
+    let (ts, tn, cn, nul, typ) = (
         str_col(batch, 0)?,
         str_col(batch, 1)?,
         str_col(batch, 2)?,
         str_col(batch, 4)?,
+        str_col(batch, 5)?,
     );
     let ordinal = batch
         .column(3)
@@ -313,6 +319,7 @@ fn group_columns(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<Column
                 name: cn.value(r),
                 ordinal: ordinal.value(r) as i32,
                 nullable: nul.value(r).eq_ignore_ascii_case("YES"),
+                type_name: typ.value(r),
             });
     }
     Ok(map)
@@ -406,6 +413,7 @@ fn collect_columns<'a>(
             name: column.name.to_string(),
             ordinal: column.ordinal,
             nullable: column.nullable,
+            type_name: column.type_name.to_string(),
         });
     }
     columns
@@ -599,8 +607,8 @@ pub(crate) fn build(depth: ObjectDepth, schemas: Vec<DbSchema>) -> Result<Record
     RecordBatch::try_new(out_schema, vec![catalog_name, catalog_db_schemas]).map_err(arrow_err)
 }
 
-/// Build the column struct array, populating the fields we know and leaving the `xdbc_*` metadata
-/// null (all nullable in the ADBC schema).
+/// Build the column struct array, populating the fields we know and leaving the rest of the
+/// `xdbc_*` metadata null (all nullable in the ADBC schema).
 fn build_column_struct(column_fields: &Fields, columns: &[&Column]) -> Result<ArrayRef> {
     let n = columns.len();
     let arrays: Vec<ArrayRef> = column_fields
@@ -611,6 +619,9 @@ fn build_column_struct(column_fields: &Fields, columns: &[&Column]) -> Result<Ar
             )) as ArrayRef,
             "ordinal_position" => Arc::new(Int32Array::from_iter(
                 columns.iter().map(|c| Some(c.ordinal)),
+            )) as ArrayRef,
+            "xdbc_type_name" => Arc::new(StringArray::from_iter(
+                columns.iter().map(|c| Some(c.type_name.clone())),
             )) as ArrayRef,
             "xdbc_is_nullable" => Arc::new(StringArray::from_iter(
                 columns
@@ -730,11 +741,13 @@ mod tests {
                         name: "Id".into(),
                         ordinal: 1,
                         nullable: false,
+                        type_name: "INT64".into(),
                     },
                     Column {
                         name: "Name".into(),
                         ordinal: 2,
                         nullable: true,
+                        type_name: "STRING(MAX)".into(),
                     },
                 ],
                 constraints: vec![
@@ -772,6 +785,32 @@ mod tests {
         // One catalog with a non-null list of db schemas.
         assert!(schemas.is_valid(0));
         assert_eq!(schemas.value(0).len(), 1);
+    }
+
+    #[test]
+    fn columns_carry_xdbc_type_name_and_nullability() {
+        let batch = build(ObjectDepth::All, sample()).unwrap();
+        let list = |a: &dyn Array| a.as_any().downcast_ref::<ListArray>().unwrap().value(0);
+        let strukt = |a: ArrayRef| a.as_any().downcast_ref::<StructArray>().unwrap().clone();
+        let child = |s: &StructArray, name: &str| s.column_by_name(name).unwrap().clone();
+
+        let schemas = strukt(list(batch.column(1).as_ref()));
+        let tables = strukt(list(child(&schemas, "db_schema_tables").as_ref()));
+        let columns = strukt(list(child(&tables, "table_columns").as_ref()));
+        let string_child = |name: &str| {
+            child(&columns, name)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .clone()
+        };
+
+        let type_name = string_child("xdbc_type_name");
+        assert_eq!(type_name.value(0), "INT64");
+        assert_eq!(type_name.value(1), "STRING(MAX)");
+        let is_nullable = string_child("xdbc_is_nullable");
+        assert_eq!(is_nullable.value(0), "NO");
+        assert_eq!(is_nullable.value(1), "YES");
     }
 
     #[test]
