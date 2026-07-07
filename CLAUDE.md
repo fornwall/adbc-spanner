@@ -254,7 +254,11 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   (buffer-and-commit), native Arrow types for DATE/TIMESTAMP/NUMERIC and native `List`/`Struct` for
   ARRAY/STRUCT, parameter binding (by column name, else positionally) + bulk ingest (append and
   create/create_append/replace — the create modes build the table from the ingest data's Arrow schema
-  with a synthetic `adbc_ingest_key` UUID primary key, since Spanner requires one), `get_info` (static
+  with a synthetic `adbc_ingest_key` UUID primary key, since Spanner requires one; autocommit ingests
+  are built and shipped chunk by chunk under Spanner's per-commit limits — `IngestChunkBudget` in
+  `src/statement.rs`, ~rows × columns mutations + an approximate byte budget — so a multi-chunk
+  ingest commits per chunk and is not atomic as a whole, while manual-mode ingests stay buffered
+  unchunked for the commit like any other DML), `get_info` (static
   driver/vendor metadata),
   `get_objects` (incl. foreign-key `constraint_column_usage`), `get_table_types`/`get_table_schema`,
   `get_parameter_schema`, `Connection`/`Statement::cancel` (a shared, sticky `CancelSignal`

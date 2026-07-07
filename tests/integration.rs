@@ -1531,6 +1531,125 @@ fn query_and_dml_round_trip() {
     );
 }
 
+/// A bulk ingest big enough to cross the driver's per-chunk byte budget (~4 MiB) is split into
+/// several `ExecuteBatchDml` transactions. The split must be invisible in the result: the returned
+/// affected-row count is the sum across chunks, and every row lands exactly once with its full
+/// payload. (The mutation-count arithmetic that also cuts chunks is unit-tested offline in
+/// `src/statement.rs`; crossing it here would need thousands of rows, while the byte budget crosses
+/// with a handful of wide ones.)
+#[test]
+fn bulk_ingest_chunks_past_the_byte_budget() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping bulk_ingest_chunks_past_the_byte_budget");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    let mut ddl = connection.new_statement().expect("new statement");
+    ddl.set_sql_query(
+        "DROP TABLE IF EXISTS AdbcChunked; \
+         CREATE TABLE AdbcChunked (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
+    )
+    .unwrap();
+    ddl.execute_update().expect("create chunked table");
+
+    // Six ~1.1 MB rows: ~6.6 MB of bound data guarantees at least two chunks under the ~4 MiB
+    // budget without needing thousands of rows or a test-only override of the production constants,
+    // and lands 3 rows (~3.3 MB) per chunk — comfortably away from both the budget edge and gRPC
+    // 4 MB message-size defaults, whatever Arrow's buffer-capacity rounding does to the estimate.
+    const ROWS: usize = 6;
+    const VALUE_LEN: usize = 1_100_000;
+    let names: Vec<String> = (0..ROWS)
+        .map(|i| char::from(b'a' + i as u8).to_string().repeat(VALUE_LEN))
+        .collect();
+    let rows = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("Id", DataType::Int64, false),
+            Field::new("Name", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from((0..ROWS as i64).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(
+                names.iter().map(String::as_str).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    let mut ingest = connection.new_statement().expect("new statement");
+    ingest
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcChunked".into()),
+        )
+        .unwrap();
+    ingest
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .unwrap();
+    ingest.bind(rows).expect("bind chunked ingest rows");
+    assert_eq!(
+        ingest.execute_update().expect("chunked ingest"),
+        Some(ROWS as i64),
+        "the affected-row count must sum across the ingest's chunk transactions"
+    );
+
+    // Every row landed exactly once with its full payload (no chunk dropped or double-applied).
+    let mut read = connection.new_statement().expect("new statement");
+    read.set_sql_query(
+        "SELECT Id, CHAR_LENGTH(Name) AS Len, SUBSTR(Name, 1, 1) AS Head \
+         FROM AdbcChunked ORDER BY Id",
+    )
+    .unwrap();
+    let batches = read
+        .execute()
+        .expect("read chunked rows")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut seen = 0_usize;
+    for batch in &batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let lens = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let heads = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            assert_eq!(ids.value(row), seen as i64);
+            assert_eq!(lens.value(row), VALUE_LEN as i64);
+            assert_eq!(heads.value(row), char::from(b'a' + seen as u8).to_string());
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, ROWS, "all ingested rows must be readable back");
+
+    let mut drop_chunked = connection.new_statement().expect("new statement");
+    drop_chunked
+        .set_sql_query("DROP TABLE AdbcChunked")
+        .unwrap();
+    drop_chunked.execute_update().expect("drop chunked table");
+}
+
 /// Flatten a collected `get_objects` result into the table names it contains, across all
 /// catalogs and schemas.
 fn objects_table_names(batches: &[RecordBatch]) -> Vec<String> {

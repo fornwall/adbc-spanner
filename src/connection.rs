@@ -303,7 +303,9 @@ fn isolation_to_adbc_string(isolation: &IsolationLevel) -> &'static str {
 /// (a single RPC), returning the total affected-row count.
 ///
 /// The runner may retry the closure on abort, so the (cloned) statement list is replayed on each
-/// attempt. Shared by autocommit `execute_update` and the manual-mode commit path.
+/// attempt. Shared by autocommit `execute_update`, the manual-mode commit path, and each chunk of
+/// an autocommit bulk ingest (which calls this once per chunk so a retry only ever clones one
+/// chunk, not the whole ingest).
 pub(crate) fn run_batch_dml(
     runtime: &SharedRuntime,
     client: &DatabaseClient,

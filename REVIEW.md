@@ -35,19 +35,32 @@ and what the statistics query filters on — so every reported value round-trips
 `table_type` filter. Covered by a round-trip assertion in the main integration test (filter
 `get_objects` by the types `get_table_types` reports; the known base table must come back).
 
-### 3. Bulk ingest is one DML statement per row in one unchunked transaction (performance + features, found independently by both)
+### ~~3. Bulk ingest is one DML statement per row in one unchunked transaction~~ (fixed — stage (a); stage (b), the Mutation API, remains open) (performance + features, found independently by both)
 
-`src/statement.rs:155-170` (`build_ingest_statements`) + `src/connection.rs:449-481`
-(`run_batch_dml`). An N-row ingest materialises N `INSERT` statements up front (O(N × row width)
-memory before anything is sent, doubled by the retry closure's `statements.clone()`), then ships
-them all in a **single** `ExecuteBatchDml` transaction with no chunking against Spanner's hard
-limits (~80k mutations — DML counts roughly rows × columns — and the ~100MB commit cap). An ingest
-of 10k rows × 10 columns is already at the cliff: it fails outright and the user has no recourse
-but manual slicing. The Mutation API (`Mutation::new_insert_builder`, `apply`,
-`batch_write_transaction` — all exposed by the pinned client) is entirely unused (`grep -rni
-mutation src/` is empty). Fix, staged: (a) chunk the DML batch under the commit limits now — this
-is a correctness-at-scale fix, not just speed; (b) move ingest to mutations (append/replace map
-naturally), optionally BatchWrite behind an option for non-atomic firehose loads.
+**Fixed (stage (a): chunking).** Autocommit bulk ingest now builds and ships its `INSERT`s **chunk
+by chunk** (`SpannerStatement::run_ingest_dml` in `src/statement.rs`), each chunk applied in its own
+read/write `ExecuteBatchDml` transaction via the shared `run_batch_dml`. Chunk boundaries come from
+`IngestChunkBudget`, a pure offline-tested accumulator that cuts when the next row would exceed
+either a mutation budget (`INGEST_CHUNK_MUTATION_LIMIT` = 20,000, counted as rows × columns — a
+quarter of Spanner's ~80k commit cap, leaving headroom for the secondary-index entries the driver
+cannot see) or an approximate byte budget (`INGEST_CHUNK_BYTE_BUDGET` = 4 MiB, estimated from the
+Arrow batch's memory footprint per row — well under the ~100MB commit cap and gRPC request limits);
+a single row larger than the whole budget still forms its own one-row chunk. This also removes the
+up-front O(N) materialisation: only one chunk of statements exists (and is cloned by the runner's
+retry closure) at a time. The affected-row count is summed across chunks. An ingest that fits one
+chunk — the common case, and anything that could have committed before — is still a single atomic
+transaction; a multi-chunk ingest is **not atomic as a whole** (a mid-ingest failure leaves earlier
+chunks committed), documented in the rustdoc, README and CLAUDE.md. Manual-transaction mode is
+deliberately unchunked and unchanged: it buffers the rows for `commit`, which applies the user's
+whole transaction atomically (chunking there would break the transaction contract), and read-only
+enforcement and the append-mode NotFound/AlreadyExists remap are untouched. Covered by chunk-
+boundary unit tests in `src/statement.rs` (mutation-limit cut, byte-budget cut, oversized-row
+never-starves) and by `bulk_ingest_chunks_past_the_byte_budget` in `tests/integration.rs` (six
+~1 MiB rows cross the byte budget → multiple transactions; count sums and every row lands exactly
+once). **Still open — stage (b):** move ingest to the Mutation API (`Mutation::new_insert_builder`,
+`apply` — append/replace map naturally; mutations are cheaper than DML and raise the effective
+per-commit capacity), optionally `batch_write_transaction` (BatchWrite) behind an option for
+non-atomic firehose loads; all exposed by the pinned client and still unused.
 
 ### ~~4. Nothing in the tag→publish path runs a single test (CI/release)~~ (fixed)
 
