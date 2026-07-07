@@ -104,6 +104,9 @@ google-cloud-lro = { git = "https://github.com/fornwall/google-cloud-rust", rev 
 # The Spanner client is async; we bridge it to the synchronous ADBC traits with a
 # dedicated multi-thread runtime.
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+# `stream::iter` + `StreamExt::buffer_unordered` to run the per-table `get_statistics`
+# aggregate scans with bounded concurrency on the shared runtime.
+futures-util = "0.3"
 serde_json = "1"
 base64 = "0.22"
 # Parsing Spanner's string-encoded DATE / TIMESTAMP values into Arrow Date32 / Timestamp, and

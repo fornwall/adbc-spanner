@@ -20,6 +20,7 @@ use arrow_array::{
 };
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Fields, SchemaRef, UnionFields};
+use futures_util::stream::{self, StreamExt};
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::Statement as SpannerSql;
 
@@ -33,6 +34,12 @@ use crate::staleness::ReadStaleness;
 
 /// The `int64` branch of the `statistic_value` union (see `STATISTIC_VALUE_SCHEMA`).
 const INT64_BRANCH: i8 = 0;
+
+/// How many per-table aggregate statistics scans to run concurrently. Each scan is one independent
+/// read-only query, so running a small bounded batch of them at once (rather than strictly one after
+/// another) cuts the wall-clock of `get_statistics` near-linearly on a many-table database without
+/// unbounded fan-out against Spanner. They all share the driver's one Tokio runtime.
+const STATISTICS_SCAN_CONCURRENCY: usize = 8;
 
 /// One computed statistic for a table (or one of its columns).
 pub(crate) struct Statistic {
@@ -99,7 +106,13 @@ pub(crate) fn collect_statistics(
             .push((ccn.value(c).to_string(), is_groupable(ctype.value(c))));
     }
 
-    let mut schemas: Vec<SchemaStatistics> = Vec::new();
+    // Prepare each matching table's aggregate query up front, in deterministic `table_batch`
+    // order. The scans themselves run concurrently below, so the order the *results* arrive in is
+    // non-deterministic — we keep this prepared list as the canonical order and reassemble against
+    // it, so the output (tables, schemas and their statistics) is identical to the old sequential
+    // loop regardless of completion order.
+    let bound = read_staleness.timestamp_bound()?;
+    let mut prepared: Vec<PreparedTable> = Vec::new();
     for r in 0..table_batch.num_rows() {
         let schema = ts.value(r);
         let table = tn.value(r);
@@ -112,19 +125,54 @@ pub(crate) fn collect_statistics(
         let columns = columns_by_table
             .remove(&(schema, table))
             .unwrap_or_default();
-        let stats = table_statistics(
-            runtime,
-            client,
-            cancel,
-            read_staleness,
-            schema,
-            table,
-            &columns,
-        )?;
-        match schemas.iter_mut().find(|s| s.db_schema == schema) {
+        let (sql, plan) = build_table_query(schema, table, &columns);
+        prepared.push(PreparedTable {
+            schema: schema.to_string(),
+            table: table.to_string(),
+            sql,
+            plan,
+        });
+    }
+
+    // Run the per-table aggregate scans with bounded concurrency on the one shared runtime.
+    // `buffer_unordered` yields results as they finish (out of order), so tag each with its input
+    // index and slot it back into deterministic order. The whole stream is driven inside a single
+    // `block_on_cancellable`, so a `cancel` still interrupts an in-flight batch of scans, and any
+    // scan error propagates out (via `?`) as an overall `Err`.
+    let batches: Vec<RecordBatch> = block_on_cancellable(runtime, cancel, async {
+        let mut slots: Vec<Option<RecordBatch>> = (0..prepared.len()).map(|_| None).collect();
+        let mut scans = stream::iter(prepared.iter().enumerate().map(|(idx, p)| {
+            let client = client.clone();
+            let sql = p.sql.clone();
+            // The aggregate scans the user table, so honour the connection's read staleness.
+            let bound = bound.clone();
+            async move {
+                let transaction = crate::staleness::single_use(&client, bound);
+                let result_set = transaction
+                    .execute_query(SpannerSql::builder(sql).build())
+                    .await
+                    .map_err(from_spanner)?;
+                let (_schema, batch) = result_set_to_batch(result_set).await?;
+                Ok::<_, Error>((idx, batch))
+            }
+        }))
+        .buffer_unordered(STATISTICS_SCAN_CONCURRENCY);
+        while let Some(result) = scans.next().await {
+            let (idx, batch) = result?;
+            slots[idx] = Some(batch);
+        }
+        // Every prepared table produced exactly one batch (the loop consumed the whole stream).
+        Ok::<_, Error>(slots.into_iter().map(|b| b.unwrap()).collect())
+    })?;
+
+    // Parse each batch and re-group by schema, in the original deterministic order.
+    let mut schemas: Vec<SchemaStatistics> = Vec::new();
+    for (p, batch) in prepared.into_iter().zip(batches) {
+        let stats = parse_table_statistics(&batch, &p.table, p.plan)?;
+        match schemas.iter_mut().find(|s| s.db_schema == p.schema) {
             Some(s) => s.statistics.extend(stats),
             None => schemas.push(SchemaStatistics {
-                db_schema: schema.to_string(),
+                db_schema: p.schema,
                 statistics: stats,
             }),
         }
@@ -132,24 +180,26 @@ pub(crate) fn collect_statistics(
     Ok(schemas)
 }
 
-/// Run one aggregate scan over `table`, returning its `ROW_COUNT` and per-column `NULL_COUNT`
-/// (and `DISTINCT_COUNT` for groupable columns).
-fn table_statistics(
-    runtime: &SharedRuntime,
-    client: &DatabaseClient,
-    cancel: &CancelSignal,
-    read_staleness: &ReadStaleness,
+/// A per-table aggregate statistics query, prepared but not yet run.
+struct PreparedTable {
+    schema: String,
+    table: String,
+    /// The single-scan aggregate `SELECT`.
+    sql: String,
+    /// Maps each result column after the row count to its (column, statistic key).
+    plan: Vec<(String, i16)>,
+}
+
+/// Build the single-scan aggregate query for one table: `COUNT(*)` plus per-column
+/// `COUNTIF(... IS NULL)` and (for groupable columns) `COUNT(DISTINCT ...)`. Returns the SQL and a
+/// `plan` mapping each result column after the row count to its (column name, statistic key).
+fn build_table_query(
     schema: &str,
     table: &str,
     columns: &[(String, bool)],
-) -> Result<Vec<Statistic>> {
-    use adbc_core::constants::{
-        ADBC_STATISTIC_DISTINCT_COUNT_KEY, ADBC_STATISTIC_NULL_COUNT_KEY,
-        ADBC_STATISTIC_ROW_COUNT_KEY,
-    };
+) -> (String, Vec<(String, i16)>) {
+    use adbc_core::constants::{ADBC_STATISTIC_DISTINCT_COUNT_KEY, ADBC_STATISTIC_NULL_COUNT_KEY};
 
-    // Build one SELECT computing every count in a single scan; `plan` maps each result column
-    // after the row count to its (column, statistic key).
     let mut exprs = vec!["COUNT(*)".to_string()];
     let mut plan: Vec<(String, i16)> = Vec::new();
     for (name, groupable) in columns {
@@ -166,18 +216,17 @@ fn table_statistics(
         exprs.join(", "),
         qualified_table(Some(schema), table)
     );
-    let client = client.clone();
-    // The aggregate scans the user table, so honour the connection's read staleness.
-    let bound = read_staleness.timestamp_bound()?;
-    let batch = block_on_cancellable(runtime, cancel, async move {
-        let transaction = crate::staleness::single_use(&client, bound);
-        let result_set = transaction
-            .execute_query(SpannerSql::builder(sql).build())
-            .await
-            .map_err(from_spanner)?;
-        let (_schema, batch) = result_set_to_batch(result_set).await?;
-        Ok::<_, Error>(batch)
-    })?;
+    (sql, plan)
+}
+
+/// Extract the `ROW_COUNT` and per-column `NULL_COUNT`/`DISTINCT_COUNT` statistics from a table's
+/// single-row aggregate result, using the `plan` produced by [`build_table_query`].
+fn parse_table_statistics(
+    batch: &RecordBatch,
+    table: &str,
+    plan: Vec<(String, i16)>,
+) -> Result<Vec<Statistic>> {
+    use adbc_core::constants::ADBC_STATISTIC_ROW_COUNT_KEY;
 
     // The aggregate query always yields exactly one row of `Int64` counts.
     let value = |index: usize| -> Result<i64> {
