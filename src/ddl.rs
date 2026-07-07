@@ -62,20 +62,14 @@ pub(crate) fn is_dml_returning(sql: &str) -> bool {
     while let Some(c) = chars.next() {
         match c {
             '\'' | '"' | '`' => {
+                // The raw-prefix check must read `word` before `check_word` clears it.
+                let raw = c != '`' && is_raw_prefix(&word);
                 if check_word(&mut word, &mut previous_was_then) {
                     return true;
                 }
                 // A quoted literal/identifier resets the keyword window.
                 previous_was_then = false;
-                while let Some(ch) = chars.next() {
-                    match ch {
-                        '\\' => {
-                            chars.next();
-                        }
-                        _ if ch == c => break,
-                        _ => {}
-                    }
-                }
+                consume_quoted(&mut chars, c, raw, |_| {});
             }
             '-' if chars.peek() == Some(&'-') => {
                 if check_word(&mut word, &mut previous_was_then) {
@@ -121,36 +115,93 @@ pub(crate) fn is_dml_returning(sql: &str) -> bool {
     check_word(&mut word, &mut previous_was_then)
 }
 
+/// Whether `word` — the identifier run immediately (adjacently) before a quote — is a GoogleSQL
+/// literal prefix marking a **raw** literal (`r`, `rb` or `br`, any case), in which backslash is
+/// an ordinary character rather than an escape. A plain bytes prefix (`b`) keeps backslash
+/// escapes, so it needs no special handling.
+pub(crate) fn is_raw_prefix(word: &str) -> bool {
+    matches!(word.to_ascii_lowercase().as_str(), "r" | "rb" | "br")
+}
+
+/// Consume a string/bytes literal or quoted identifier whose opening `quote` has just been read,
+/// feeding every consumed character (excluding the already-read opening quote) to `sink`.
+///
+/// Handles the GoogleSQL lexical structure:
+/// - **triple-quoted** strings (`'''…'''` / `"""…"""`), which may contain unescaped quotes and
+///   newlines and close only on three consecutive quote characters;
+/// - **raw** literals (`raw` = true, from an `r`/`rb`/`br` prefix — see [`is_raw_prefix`]), in
+///   which `\` does not escape anything;
+/// - backslash escapes everywhere else, including quoted identifiers (`` ` ``, never triple/raw).
+pub(crate) fn consume_quoted(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    quote: char,
+    raw: bool,
+    mut sink: impl FnMut(char),
+) {
+    let triple = quote != '`' && chars.peek() == Some(&quote) && {
+        // Consume the second quote. If a third follows this is a triple-quoted string;
+        // otherwise the literal was empty (`''` / `""`) and is already closed.
+        sink(chars.next().unwrap());
+        if chars.peek() == Some(&quote) {
+            sink(chars.next().unwrap());
+            true
+        } else {
+            return;
+        }
+    };
+    let mut closing_run = 0usize;
+    while let Some(ch) = chars.next() {
+        sink(ch);
+        if !raw && ch == '\\' {
+            if let Some(escaped) = chars.next() {
+                sink(escaped);
+            }
+            closing_run = 0;
+        } else if ch == quote {
+            if !triple {
+                return;
+            }
+            closing_run += 1;
+            if closing_run == 3 {
+                return;
+            }
+        } else {
+            closing_run = 0;
+        }
+    }
+}
+
 /// Split a (possibly multi-statement) SQL string into individual, trimmed, non-empty statements.
 ///
-/// Splits on top-level `;`, ignoring semicolons inside string/identifier literals (`'…'`, `"…"`,
-/// `` `…` `` with backslash escapes) and comments (`-- …`, `# …`, `/* … */`). This is shared by DDL
+/// Splits on top-level `;`, ignoring semicolons inside string/bytes literals and quoted
+/// identifiers — including triple-quoted (`'''…'''`/`"""…"""`) and raw (`r'…'`, `rb'…'`, …) forms,
+/// see [`consume_quoted`] — and comments (`-- …`, `# …`, `/* … */`). This is shared by DDL
 /// batching (`UpdateDatabaseDdl`) and multi-statement DML batching (`ExecuteBatchDml`).
 pub(crate) fn split_statements(sql: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
+    // The trailing identifier run, tracked to recognise raw-literal prefixes (`r'…'`).
+    let mut word = String::new();
     let mut chars = sql.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '\'' | '"' | '`' => {
+                let raw = c != '`' && is_raw_prefix(&word);
+                word.clear();
                 // A quoted literal/identifier: copy through the matching close quote.
                 current.push(c);
-                while let Some(ch) = chars.next() {
-                    current.push(ch);
-                    match ch {
-                        '\\' => {
-                            if let Some(escaped) = chars.next() {
-                                current.push(escaped);
-                            }
-                        }
-                        _ if ch == c => break,
-                        _ => {}
-                    }
-                }
+                consume_quoted(&mut chars, c, raw, |ch| current.push(ch));
             }
-            '-' if chars.peek() == Some(&'-') => copy_line_comment(&mut current, c, &mut chars),
-            '#' => copy_line_comment(&mut current, c, &mut chars),
+            '-' if chars.peek() == Some(&'-') => {
+                word.clear();
+                copy_line_comment(&mut current, c, &mut chars)
+            }
+            '#' => {
+                word.clear();
+                copy_line_comment(&mut current, c, &mut chars)
+            }
             '/' if chars.peek() == Some(&'*') => {
+                word.clear();
                 current.push(c);
                 current.push(chars.next().unwrap()); // '*'
                 let mut prev = '\0';
@@ -162,8 +213,18 @@ pub(crate) fn split_statements(sql: &str) -> Vec<String> {
                     prev = ch;
                 }
             }
-            ';' => push_statement(&mut statements, &mut current),
-            _ => current.push(c),
+            ';' => {
+                word.clear();
+                push_statement(&mut statements, &mut current)
+            }
+            _ => {
+                if c == '_' || c.is_ascii_alphanumeric() {
+                    word.push(c);
+                } else {
+                    word.clear();
+                }
+                current.push(c);
+            }
         }
     }
     push_statement(&mut statements, &mut current);
@@ -277,11 +338,19 @@ mod tests {
         ] {
             assert!(is_dml_returning(sql), "should detect THEN RETURN: {sql}");
         }
+        // Raw strings end at their closing quote (`\` is not an escape), so a clause after one is
+        // still found.
+        assert!(is_dml_returning(
+            r"UPDATE t SET s = r'x\' WHERE true THEN RETURN Id"
+        ));
         for sql in [
             "INSERT INTO t (id) VALUES (1)",
             "SELECT CASE WHEN a THEN b ELSE c END FROM t",
-            // `THEN RETURN` inside a literal or a quoted identifier is not a clause.
+            // `THEN RETURN` inside a literal or a quoted identifier is not a clause — including
+            // the triple-quoted and raw literal forms.
             "INSERT INTO t (s) VALUES ('THEN RETURN')",
+            "INSERT INTO t (s) VALUES ('''THEN RETURN''')",
+            r"INSERT INTO t (s) VALUES (r'THEN RETURN\')",
             "UPDATE t SET `then return` = 1 WHERE true",
             // Adjacent words, not the two keywords.
             "UPDATE t SET a = thenreturn WHERE true",
@@ -308,6 +377,68 @@ mod tests {
             ]
         );
         assert_eq!(split_statements("   ;  ; "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn split_respects_raw_strings() {
+        // In a raw string the backslash is an ordinary character, not an escape: `r'C:\'` ends at
+        // the quote, so the `;` after it is a real separator. (The old lexer consumed the closing
+        // quote as escaped and shipped the whole thing as one malformed statement.)
+        assert_eq!(
+            split_statements(r"UPDATE t SET path = r'C:\'; DELETE FROM u WHERE stale"),
+            vec![r"UPDATE t SET path = r'C:\'", "DELETE FROM u WHERE stale"]
+        );
+        // All prefix spellings: rb / br / uppercase.
+        assert_eq!(
+            split_statements(r"INSERT INTO t (b) VALUES (rb'\'); SELECT 1"),
+            vec![r"INSERT INTO t (b) VALUES (rb'\')", "SELECT 1"]
+        );
+        assert_eq!(
+            split_statements(r#"SELECT BR"\"; SELECT R'\'"#),
+            vec![r#"SELECT BR"\""#, r"SELECT R'\'"]
+        );
+        // A plain bytes prefix (no r) keeps backslash escapes: `b'\';x'` is one literal.
+        assert_eq!(
+            split_statements(r"SELECT b'\';x'; SELECT 2"),
+            vec![r"SELECT b'\';x'", "SELECT 2"]
+        );
+        // A prefix only counts when adjacent: `r 'x'` and `xr'y'` are not raw strings — but both
+        // are still ordinary (escaped) literals, so the split is unchanged either way here.
+        assert_eq!(
+            split_statements("SELECT r ';'; SELECT xr';'"),
+            vec!["SELECT r ';'", "SELECT xr';'"]
+        );
+    }
+
+    #[test]
+    fn split_respects_triple_quoted_strings() {
+        // A triple-quoted string may contain unescaped quotes and semicolons.
+        assert_eq!(
+            split_statements("INSERT INTO t (s) VALUES ('''don't; stop'''); DELETE FROM t"),
+            vec![
+                "INSERT INTO t (s) VALUES ('''don't; stop''')",
+                "DELETE FROM t",
+            ]
+        );
+        assert_eq!(
+            split_statements(r#"SELECT """a;b"""; SELECT 2"#),
+            vec![r#"SELECT """a;b""""#, "SELECT 2"]
+        );
+        // Runs of quotes inside the literal don't close it early unless three long.
+        assert_eq!(
+            split_statements("SELECT '''a''b'''; SELECT 2"),
+            vec!["SELECT '''a''b'''", "SELECT 2"]
+        );
+        // Raw + triple combined: the backslash does not escape the closing quotes.
+        assert_eq!(
+            split_statements(r"SELECT r'''a\'''; SELECT 2"),
+            vec![r"SELECT r'''a\'''", "SELECT 2"]
+        );
+        // An empty literal ('' / "") is not the start of a triple-quoted string.
+        assert_eq!(
+            split_statements(r#"SELECT ''; SELECT """#),
+            vec!["SELECT ''", r#"SELECT """#]
+        );
     }
 
     #[test]

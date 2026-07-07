@@ -490,31 +490,35 @@ fn numeric_string(unscaled: i128, scale: u32) -> String {
 /// Extract the distinct named parameters (`@name`) referenced by `sql`, in order of first
 /// appearance.
 ///
-/// Skips `@name` occurrences inside string / identifier literals (`'…'`, `"…"`, `` `…` `` with
-/// backslash escapes) and comments (`-- …`, `# …`, `/* … */`), and does not treat statement hints
-/// (`@{…}`) or system variables (`@@var`) as parameters — the same lexical rules as
-/// [`crate::ddl::split_statements`]. Used by `get_parameter_schema` when no parameter data has been
-/// bound yet.
+/// Skips `@name` occurrences inside string / bytes literals and quoted identifiers — including
+/// triple-quoted (`'''…'''`/`"""…"""`) and raw (`r'…'`, `rb'…'`, …) forms, via
+/// [`crate::ddl::consume_quoted`] — and comments (`-- …`, `# …`, `/* … */`), and does not treat
+/// statement hints (`@{…}`) or system variables (`@@var`) as parameters — the same lexical rules
+/// as [`crate::ddl::split_statements`]. Used by `get_parameter_schema` when no parameter data has
+/// been bound yet.
 pub(crate) fn named_parameters(sql: &str) -> Vec<String> {
     let mut params: Vec<String> = Vec::new();
+    // The trailing identifier run, tracked to recognise raw-literal prefixes (`r'…'`).
+    let mut word = String::new();
     let mut chars = sql.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '\'' | '"' | '`' => {
-                // Skip a quoted literal/identifier, honouring backslash escapes.
-                while let Some(ch) = chars.next() {
-                    match ch {
-                        '\\' => {
-                            chars.next();
-                        }
-                        _ if ch == c => break,
-                        _ => {}
-                    }
-                }
+                let raw = c != '`' && crate::ddl::is_raw_prefix(&word);
+                word.clear();
+                // Skip the quoted literal/identifier.
+                crate::ddl::consume_quoted(&mut chars, c, raw, |_| {});
             }
-            '-' if chars.peek() == Some(&'-') => skip_line_comment(&mut chars),
-            '#' => skip_line_comment(&mut chars),
+            '-' if chars.peek() == Some(&'-') => {
+                word.clear();
+                skip_line_comment(&mut chars)
+            }
+            '#' => {
+                word.clear();
+                skip_line_comment(&mut chars)
+            }
             '/' if chars.peek() == Some(&'*') => {
+                word.clear();
                 chars.next(); // '*'
                 let mut prev = '\0';
                 for ch in chars.by_ref() {
@@ -524,28 +528,32 @@ pub(crate) fn named_parameters(sql: &str) -> Vec<String> {
                     prev = ch;
                 }
             }
-            '@' => match chars.peek() {
-                // `@@var` (system variable) or `@{…}` (statement hint): not a bind parameter.
-                Some('@') | Some('{') => {
-                    chars.next();
-                }
-                Some(&ch) if ch == '_' || ch.is_ascii_alphabetic() => {
-                    let mut name = String::new();
-                    while let Some(&ch) = chars.peek() {
-                        if ch == '_' || ch.is_ascii_alphanumeric() {
-                            name.push(ch);
-                            chars.next();
-                        } else {
-                            break;
+            _ if c == '_' || c.is_ascii_alphanumeric() => word.push(c),
+            '@' => {
+                word.clear();
+                match chars.peek() {
+                    // `@@var` (system variable) or `@{…}` (statement hint): not a bind parameter.
+                    Some('@') | Some('{') => {
+                        chars.next();
+                    }
+                    Some(&ch) if ch == '_' || ch.is_ascii_alphabetic() => {
+                        let mut name = String::new();
+                        while let Some(&ch) = chars.peek() {
+                            if ch == '_' || ch.is_ascii_alphanumeric() {
+                                name.push(ch);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                        if !params.iter().any(|p| p == &name) {
+                            params.push(name);
                         }
                     }
-                    if !params.iter().any(|p| p == &name) {
-                        params.push(name);
-                    }
+                    _ => {}
                 }
-                _ => {}
-            },
-            _ => {}
+            }
+            _ => word.clear(),
         }
     }
     params
@@ -975,6 +983,23 @@ mod tests {
         assert_eq!(named_parameters("SELECT @@rows"), Vec::<String>::new());
         // First-seen order is preserved across repeats.
         assert_eq!(named_parameters("@b @a @a @b @c"), vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn named_parameters_skip_raw_and_triple_quoted_strings() {
+        // In a raw string the backslash is not an escape: the literal ends at the first quote and
+        // scanning resumes correctly after it. (The old lexer consumed `\'` as escaped, stayed in
+        // string mode, and swallowed the parameters that followed.)
+        assert_eq!(named_parameters(r"SELECT r'\', @p"), vec!["p"]);
+        assert_eq!(named_parameters(r"SELECT rb'@x\', @p"), vec!["p"]);
+        // `@name` inside a triple-quoted string is not a parameter; one after it is.
+        assert_eq!(named_parameters("SELECT '''@x''', @y"), vec!["y"]);
+        assert_eq!(named_parameters(r#"SELECT """it's @x""", @y"#), vec!["y"]);
+        // An empty literal is not the start of a triple-quoted string.
+        assert_eq!(named_parameters("SELECT '', @z"), vec!["z"]);
+        // A non-adjacent or non-prefix word does not make the literal raw: `\'` stays an escape,
+        // so the literal runs to the *third* quote and @a is inside it.
+        assert_eq!(named_parameters(r"SELECT xr'\' @a ', @b"), vec!["b"]);
     }
 
     #[test]
