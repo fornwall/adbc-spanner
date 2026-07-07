@@ -211,11 +211,18 @@ fn table_statistics(
     Ok(out)
 }
 
-/// Whether a Spanner column type supports `COUNT(DISTINCT)`. `ARRAY`, `STRUCT` and `JSON` are not
-/// groupable, so distinct counts are skipped for them.
+/// Whether a Spanner column type supports `COUNT(DISTINCT)`. `ARRAY`, `STRUCT`, `JSON`, `TOKENLIST`
+/// and `PROTO<...>` are not groupable, so distinct counts are skipped for them. The names are the
+/// `SPANNER_TYPE` strings from `INFORMATION_SCHEMA.COLUMNS`; a non-groupable column left in the
+/// aggregate `COUNT(DISTINCT)` scan would make the whole per-table query fail, so it is important
+/// this list stays complete.
 fn is_groupable(spanner_type: &str) -> bool {
     let t = spanner_type.trim_start();
-    !(t.starts_with("ARRAY") || t.starts_with("STRUCT") || t == "JSON")
+    !(t.starts_with("ARRAY")
+        || t.starts_with("STRUCT")
+        || t.starts_with("PROTO")
+        || t == "JSON"
+        || t == "TOKENLIST")
 }
 
 /// Build the single-catalog `get_statistics` record batch from per-schema statistics.
@@ -349,6 +356,33 @@ mod tests {
         let batch = build(schemas, GET_STATISTICS_SCHEMA.clone()).unwrap();
         assert_eq!(batch.schema(), GET_STATISTICS_SCHEMA.clone());
         assert_eq!(batch.num_rows(), 1); // one catalog
+    }
+
+    #[test]
+    fn groupable_types() {
+        // Ordinary scalar types are distinct-countable.
+        for t in [
+            "INT64",
+            "STRING(MAX)",
+            "BOOL",
+            "BYTES(10)",
+            "NUMERIC",
+            "TIMESTAMP",
+            "DATE",
+        ] {
+            assert!(is_groupable(t), "{t} should be groupable");
+        }
+        // Non-groupable Spanner types: a COUNT(DISTINCT) over any of these fails the aggregate
+        // scan, which would otherwise break get_statistics for the whole database.
+        for t in [
+            "ARRAY<INT64>",
+            "STRUCT<a INT64>",
+            "JSON",
+            "TOKENLIST",
+            "PROTO<examples.spanner.music.SingerInfo>",
+        ] {
+            assert!(!is_groupable(t), "{t} should not be groupable");
+        }
     }
 
     #[test]
