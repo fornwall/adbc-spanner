@@ -40,7 +40,7 @@ use adbc_spanner::{SpannerConnection, SpannerDatabase, SpannerDriver};
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int16Array,
     Int64Array, ListArray, RecordBatch, RecordBatchReader, StringArray, StructArray,
-    TimestampMicrosecondArray, UnionArray,
+    TimestampMicrosecondArray, TimestampNanosecondArray, UnionArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::{NaiveDate, SecondsFormat};
@@ -524,7 +524,7 @@ fn query_and_dml_round_trip() {
     assert_eq!(types_schema.field(0).data_type(), &DataType::Date32);
     assert_eq!(
         types_schema.field(1).data_type(),
-        &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
     );
     assert_eq!(
         types_schema.field(2).data_type(),
@@ -539,7 +539,7 @@ fn query_and_dml_round_trip() {
     let ts = tb
         .column(1)
         .as_any()
-        .downcast_ref::<TimestampMicrosecondArray>()
+        .downcast_ref::<TimestampNanosecondArray>()
         .unwrap();
     let num = tb
         .column(2)
@@ -547,7 +547,7 @@ fn query_and_dml_round_trip() {
         .downcast_ref::<Decimal128Array>()
         .unwrap();
     assert_eq!(date.value(0), 19737); // days from 1970-01-01 to 2024-01-15
-    assert_eq!(ts.value(0), 1_705_322_096_789_012); // micros since epoch
+    assert_eq!(ts.value(0), 1_705_322_096_789_012_000); // nanos since epoch
     assert_eq!(num.value(0), 1_500_000_000); // 1.5 unscaled at scale 9
 
     let mut drop_types = connection.new_statement().expect("new statement");
@@ -1028,7 +1028,9 @@ fn run(connection: &mut SpannerConnection, sql: &str) {
 /// Property: arbitrary values bound as parameters (the `bind.rs` write path) survive a round trip
 /// through Spanner and come back byte-for-byte via the Arrow read path (`conversion.rs`), nulls
 /// included. Covers every Arrow type the bind path supports: Int64, Float64, Bool, Utf8, Binary,
-/// Date32, Timestamp(Microsecond), and Decimal128 across NUMERIC's full range.
+/// Date32, Timestamp (bound as Microsecond, read back as Nanosecond), and Decimal128 across
+/// NUMERIC's full range. Timestamps are confined to the Arrow nanosecond-representable window
+/// (~1678–2261) since the read path now returns `Timestamp(Nanosecond)`.
 #[test]
 fn prop_bind_round_trip() {
     let Some(target) = test_target() else {
@@ -1055,8 +1057,10 @@ fn prop_bind_round_trip() {
     // Date / timestamp components in Spanner's supported range; NUMERIC across its full range
     // (integer part < 10^28, well beyond what a 96-bit decimal could hold).
     let date = (1i32..=9999, 1u32..=12, 1u32..=28);
+    // Timestamps are constrained to the Arrow nanosecond-representable window (~1677-09-21 to
+    // 2262-04-11), well inside years 1678..=2261, so the nanosecond read path never overflows.
     let ts = (
-        1i32..=9999,
+        1678i32..=2261,
         1u32..=12,
         1u32..=28,
         0u32..24,
@@ -1162,7 +1166,7 @@ fn prop_bind_round_trip() {
         let t = b
             .column(6)
             .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
+            .downcast_ref::<TimestampNanosecondArray>()
             .unwrap();
         let n = b
             .column(7)
@@ -1194,8 +1198,10 @@ fn prop_bind_round_trip() {
             Some(v) => prop_assert_eq!(d.value(0), v),
             None => prop_assert!(d.is_null(0)),
         }
+        // The value was bound at microsecond precision; the read path returns nanoseconds, so the
+        // expected nanosecond count is exactly the microsecond count scaled by 1000.
         match exp_micros {
-            Some(v) => prop_assert_eq!(t.value(0), v),
+            Some(v) => prop_assert_eq!(t.value(0), v * 1_000),
             None => prop_assert!(t.is_null(0)),
         }
         match exp_unscaled {
@@ -1207,8 +1213,9 @@ fn prop_bind_round_trip() {
 
 /// Property: arbitrary DATE / TIMESTAMP / NUMERIC values, inserted as SQL literals (the bind path
 /// doesn't accept these Arrow types), come back through the read path as the exact Arrow encoding —
-/// epoch days, epoch micros, and unscaled scale-9 `i128` respectively. Values are confined to
-/// Spanner's supported ranges (years 1..=9999, NUMERIC magnitude < 10^28). Nulls included.
+/// epoch days, epoch nanos, and unscaled scale-9 `i128` respectively. Values are confined to
+/// Spanner's supported ranges (dates years 1..=9999, NUMERIC magnitude < 10^28); timestamps are
+/// further confined to the Arrow nanosecond-representable window (~1678–2261). Nulls included.
 #[test]
 fn prop_temporal_round_trip() {
     let Some(target) = test_target() else {
@@ -1230,7 +1237,7 @@ fn prop_temporal_round_trip() {
 
     proptest!(prop_config(), |(
         od in proptest::option::of((1i32..=9999, 1u32..=12, 1u32..=28)),
-        ot in proptest::option::of((1i32..=9999, 1u32..=12, 1u32..=28, 0u32..24, 0u32..60, 0u32..60, 0u32..1_000_000)),
+        ot in proptest::option::of((1678i32..=2261, 1u32..=12, 1u32..=28, 0u32..24, 0u32..60, 0u32..60, 0u32..1_000_000)),
         on in proptest::option::of((any::<bool>(), 0u128..10u128.pow(28), 0u32..1_000_000_000)),
     )| {
         let mut conn = connection.borrow_mut();
@@ -1244,7 +1251,7 @@ fn prop_temporal_round_trip() {
             }
             None => ("NULL".to_string(), None),
         };
-        let (t_lit, exp_micros) = match ot {
+        let (t_lit, exp_nanos) = match ot {
             Some((y, mo, d, h, mi, s, us)) => {
                 let dt = NaiveDate::from_ymd_opt(y, mo, d)
                     .unwrap()
@@ -1253,7 +1260,8 @@ fn prop_temporal_round_trip() {
                     .and_utc();
                 (
                     format!("TIMESTAMP '{}'", dt.to_rfc3339_opts(SecondsFormat::Micros, true)),
-                    Some(dt.timestamp_micros()),
+                    // In range by construction, so `timestamp_nanos_opt` is always `Some`.
+                    Some(dt.timestamp_nanos_opt().unwrap()),
                 )
             }
             None => ("NULL".to_string(), None),
@@ -1291,7 +1299,7 @@ fn prop_temporal_round_trip() {
         let t = b
             .column(1)
             .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
+            .downcast_ref::<TimestampNanosecondArray>()
             .unwrap();
         let n = b
             .column(2)
@@ -1303,7 +1311,7 @@ fn prop_temporal_round_trip() {
             Some(v) => prop_assert_eq!(d.value(0), v),
             None => prop_assert!(d.is_null(0)),
         }
-        match exp_micros {
+        match exp_nanos {
             Some(v) => prop_assert_eq!(t.value(0), v),
             None => prop_assert!(t.is_null(0)),
         }

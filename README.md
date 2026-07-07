@@ -150,7 +150,7 @@ Credentials are resolved in this order:
 | `FLOAT64`                                   | `Float64`                         |
 | `FLOAT32`                                   | `Float32`                         |
 | `DATE`                                      | `Date32`                          |
-| `TIMESTAMP`                                 | `Timestamp(Microsecond, "UTC")`   |
+| `TIMESTAMP`                                 | `Timestamp(Nanosecond, "UTC")`    |
 | `NUMERIC`                                   | `Decimal128(38, 9)`               |
 | `BYTES`                                     | `Binary`                          |
 | `STRING` / `JSON` / `UUID` / `INTERVAL` / `ENUM` | `Utf8`                       |
@@ -160,6 +160,12 @@ Credentials are resolved in this order:
 `NULL`s are represented as null slots in the corresponding Arrow array. `ARRAY` and `STRUCT` map to
 native Arrow `List`/`Struct` recursively, so nested shapes like `ARRAY<STRUCT<..>>` round-trip with
 full type fidelity.
+
+`TIMESTAMP` is read at full nanosecond precision (matching the bind/write path). Arrow stores
+`Timestamp(Nanosecond)` as an `i64` count of nanoseconds since the Unix epoch, which spans only
+~1677-09-21 to 2262-04-11 — a narrower window than Spanner's year 1–9999 range. A Spanner timestamp
+outside that window cannot be represented, so reading one surfaces an `InvalidArguments` error naming
+the offending value rather than silently truncating or wrapping it.
 
 > **Note:** native `STRUCT` mapping needs `Type::struct_type()`, which is on `google-cloud-rust`
 > `main` but not yet in a crates.io release. Until it ships, `Cargo.toml` pins the `google-cloud-*`

@@ -15,7 +15,7 @@
 //! | `FLOAT64`                                   | `Float64`                         |
 //! | `FLOAT32`                                   | `Float32`                         |
 //! | `DATE`                                      | `Date32`                          |
-//! | `TIMESTAMP`                                 | `Timestamp(Microsecond, "UTC")`   |
+//! | `TIMESTAMP`                                 | `Timestamp(Nanosecond, "UTC")`    |
 //! | `NUMERIC`                                   | `Decimal128(38, 9)`               |
 //! | `BYTES`                                     | `Binary`                          |
 //! | `STRING`/`JSON`/`UUID`/`INTERVAL`/`ENUM`    | `Utf8`                            |
@@ -32,7 +32,7 @@ use adbc_core::error::{Result, Status};
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int64Array, ListArray, RecordBatch, RecordBatchReader, StringArray, StructArray,
-    TimestampMicrosecondArray,
+    TimestampNanosecondArray,
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
@@ -40,7 +40,7 @@ use base64::Engine;
 use google_cloud_spanner::result::{ResultSet, ResultSetMetadata, Row};
 use google_cloud_spanner::value::{Kind, Type, TypeCode, Value};
 
-use crate::error::{err, from_spanner};
+use crate::error::{err, from_spanner, invalid_argument};
 use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
 
 /// Field name used for the element of an Arrow `List` (the Arrow convention).
@@ -195,9 +195,7 @@ fn arrow_type(ty: &Type) -> DataType {
         TypeCode::Float32 => DataType::Float32,
         TypeCode::Bytes => DataType::Binary,
         TypeCode::Date => DataType::Date32,
-        TypeCode::Timestamp => {
-            DataType::Timestamp(TimeUnit::Microsecond, Some(TIMESTAMP_TZ.into()))
-        }
+        TypeCode::Timestamp => DataType::Timestamp(TimeUnit::Nanosecond, Some(TIMESTAMP_TZ.into())),
         TypeCode::Numeric => DataType::Decimal128(NUMERIC_PRECISION, NUMERIC_SCALE),
         TypeCode::Struct => struct_arrow_type(ty),
         TypeCode::Array => match ty.array_element_type() {
@@ -300,13 +298,23 @@ fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Result<ArrayR
                 .and_then(Value::try_as_string)
                 .and_then(parse_date_days)
         }))),
-        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
-            let array = TimestampMicrosecondArray::from_iter(values.iter().map(|&v| {
-                present(v)
-                    .and_then(Value::try_as_string)
-                    .and_then(parse_timestamp_micros)
-            }));
-            Arc::new(array.with_timezone_opt(tz.clone()))
+        DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+            // A genuine SQL NULL (or absent value) becomes a null slot; a present TIMESTAMP that
+            // falls outside the range representable as `Timestamp(Nanosecond)` is a real value we
+            // cannot encode, so it errors rather than silently collapsing to null.
+            let mut builder = TimestampNanosecondArray::builder(values.len());
+            for &v in values {
+                match present(v).and_then(Value::try_as_string) {
+                    Some(s) => builder.append_value(parse_timestamp_nanos(s).ok_or_else(|| {
+                        invalid_argument(format!(
+                            "TIMESTAMP value {s:?} is outside the range representable as an Arrow \
+                             Timestamp(Nanosecond) (~1677-09-21 to 2262-04-11)"
+                        ))
+                    })?),
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish().with_timezone_opt(tz.clone()))
         }
         DataType::Decimal128(precision, scale) => {
             let array = Decimal128Array::from_iter(values.iter().map(|&v| {
@@ -435,12 +443,16 @@ pub(crate) fn parse_date_days(s: &str) -> Option<i32> {
     i32::try_from((date - epoch).num_days()).ok()
 }
 
-/// Parse a Spanner `TIMESTAMP` (RFC 3339, e.g. `2024-01-15T12:34:56.789Z`) into microseconds since
-/// the Unix epoch (Arrow `Timestamp(Microsecond)`).
-pub(crate) fn parse_timestamp_micros(s: &str) -> Option<i64> {
+/// Parse a Spanner `TIMESTAMP` (RFC 3339, e.g. `2024-01-15T12:34:56.789012345Z`) into nanoseconds
+/// since the Unix epoch (Arrow `Timestamp(Nanosecond)`), preserving full sub-microsecond precision.
+///
+/// Returns `None` for a malformed string, and — because Arrow stores nanoseconds as an `i64` — for
+/// any otherwise-valid instant outside the representable range (~1677-09-21 to 2262-04-11), via
+/// chrono's non-panicking [`DateTime::timestamp_nanos_opt`].
+pub(crate) fn parse_timestamp_nanos(s: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
-        .map(|dt| dt.timestamp_micros())
+        .and_then(|dt| dt.timestamp_nanos_opt())
 }
 
 /// Parse a Spanner `NUMERIC` (decimal string) into an unscaled `i128` at scale 9 (Arrow
@@ -509,22 +521,57 @@ mod tests {
     }
 
     #[test]
-    fn timestamps_to_epoch_micros() {
-        assert_eq!(parse_timestamp_micros("1970-01-01T00:00:00Z"), Some(0));
+    fn timestamps_to_epoch_nanos() {
+        assert_eq!(parse_timestamp_nanos("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(
-            parse_timestamp_micros("1970-01-01T00:00:00.000001Z"),
-            Some(1)
+            parse_timestamp_nanos("1970-01-01T00:00:00.000001Z"),
+            Some(1_000)
         );
         assert_eq!(
-            parse_timestamp_micros("2024-01-15T12:34:56.789012Z"),
-            Some(1_705_322_096_789_012)
+            parse_timestamp_nanos("2024-01-15T12:34:56.789012Z"),
+            Some(1_705_322_096_789_012_000)
         );
-        // Sub-microsecond precision is truncated.
+        // Sub-microsecond precision is preserved (not truncated): 999 nanoseconds stays 999.
         assert_eq!(
-            parse_timestamp_micros("1970-01-01T00:00:00.000000999Z"),
-            Some(0)
+            parse_timestamp_nanos("1970-01-01T00:00:00.000000999Z"),
+            Some(999)
         );
-        assert_eq!(parse_timestamp_micros("nope"), None);
+        // Full nine fractional digits round-trip.
+        assert_eq!(
+            parse_timestamp_nanos("2024-01-15T12:34:56.789012345Z"),
+            Some(1_705_322_096_789_012_345)
+        );
+        assert_eq!(parse_timestamp_nanos("nope"), None);
+        // Outside the i64-nanosecond range (~1677-09-21 to 2262-04-11): no representation, so None
+        // rather than a wrapped/panicking value.
+        assert_eq!(parse_timestamp_nanos("3000-01-01T00:00:00Z"), None);
+        assert_eq!(parse_timestamp_nanos("1000-01-01T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn timestamp_array_preserves_nulls_and_errors_out_of_range() {
+        use arrow_array::Array;
+        use google_cloud_spanner::value::ToValue;
+        let ty = DataType::Timestamp(TimeUnit::Nanosecond, Some(TIMESTAMP_TZ.into()));
+        let null = None::<&str>.to_value();
+        let in_range = "1970-01-01T00:00:00.000000999Z".to_value();
+        let out_of_range = "3000-01-01T00:00:00Z".to_value();
+
+        // A SQL NULL maps to a null slot; a present in-range value keeps full nanosecond precision.
+        let array = build_array(&ty, &[Some(&null), Some(&in_range), None]).unwrap();
+        let ts = array
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        assert!(ts.is_null(0));
+        assert_eq!(ts.value(1), 999);
+        assert!(ts.is_null(2));
+
+        // A present but out-of-range value is a real timestamp we cannot encode: it must error,
+        // not become a silent null.
+        let err = build_array(&ty, &[Some(&out_of_range)]).unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(err.message.contains("3000-01-01T00:00:00Z"));
     }
 
     #[test]
