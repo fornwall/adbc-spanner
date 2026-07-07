@@ -137,10 +137,16 @@ into the three `single_use()` call sites plus the partition path. Low–medium e
 - **`adbc.ingest.target_db_schema` is rejected although the driver supports named schemas
   everywhere else** (`src/statement.rs:405-437`). Accept it and qualify the ingest/CREATE TABLE
   statements via `qualified_table`; accept `target_catalog` when it names the `""` catalog.
-- **Standard isolation-level option rejected despite client support**
+- ~~**Standard isolation-level option rejected despite client support**
   (`adbc.connection.transaction.isolation.*` falls into the unknown-key arm,
   `src/connection.rs:745-750`). Spanner supports `REPEATABLE_READ` GA alongside `SERIALIZABLE`,
-  and the client exposes `TransactionRunnerBuilder::set_isolation_level`. Low effort.
+  and the client exposes `TransactionRunnerBuilder::set_isolation_level`. Low effort.~~
+  **Fixed.** `adbc.connection.transaction.isolation_level` is now accepted: `serializable` and
+  `repeatable_read` map to the client's `IsolationLevel` and are applied via
+  `TransactionRunnerBuilder::set_isolation_level` at every read/write runner site (autocommit DML,
+  `THEN RETURN` DML, and manual-mode commit); `default` leaves the database default; the other
+  spec levels (read_uncommitted / read_committed / snapshot / linearizable) are rejected with
+  `NotImplemented`. The stored level round-trips through `get_option`.
 
 ### Performance
 

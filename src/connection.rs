@@ -39,8 +39,9 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use google_cloud_spanner::batch::Partition;
-use google_cloud_spanner::builder::BatchDmlBuilder;
+use google_cloud_spanner::builder::{BatchDmlBuilder, TransactionRunnerBuilder};
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
+use google_cloud_spanner::model::transaction_options::IsolationLevel;
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
@@ -90,6 +91,10 @@ pub struct SpannerConnection {
     spanner: Spanner,
     database: String,
     read_only: bool,
+    /// Isolation level applied to read/write transactions (autocommit DML and manual-mode commit),
+    /// set via the standard ADBC `adbc.connection.transaction.isolation_level` option.
+    /// [`IsolationLevel::Unspecified`] (the default) leaves the client/database default in place.
+    isolation: IsolationLevel,
     txn: SharedTxn,
     /// Cancellation signal for this connection's in-flight metadata/commit operations
     /// (see [`Connection::cancel`]).
@@ -104,6 +109,7 @@ impl SpannerConnection {
             spanner: connected.spanner,
             database: connected.database,
             read_only: false,
+            isolation: IsolationLevel::Unspecified,
             txn: Arc::new(Mutex::new(TxnState::new())),
             cancel: CancelSignal::new(),
         }
@@ -114,7 +120,13 @@ impl SpannerConnection {
     fn apply_transaction(&self, statements: Vec<SpannerSql>) -> Result<()> {
         // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
         self.cancel.reset();
-        run_batch_dml(&self.runtime, &self.client, &self.cancel, statements)?;
+        run_batch_dml(
+            &self.runtime,
+            &self.client,
+            &self.cancel,
+            self.isolation.clone(),
+            statements,
+        )?;
         Ok(())
     }
 
@@ -448,6 +460,63 @@ fn is_groupable(spanner_type: &str) -> bool {
     !(t.starts_with("ARRAY") || t.starts_with("STRUCT") || t == "JSON")
 }
 
+/// Apply the connection's isolation level to a read/write transaction runner builder.
+///
+/// [`IsolationLevel::Unspecified`] leaves the builder untouched so the client/database default
+/// (`SERIALIZABLE`) stands; a specific level is forwarded to
+/// [`TransactionRunnerBuilder::set_isolation_level`].
+pub(crate) fn apply_isolation(
+    builder: TransactionRunnerBuilder,
+    isolation: IsolationLevel,
+) -> TransactionRunnerBuilder {
+    match isolation {
+        IsolationLevel::Unspecified => builder,
+        level => builder.set_isolation_level(level),
+    }
+}
+
+/// Map the standard ADBC `adbc.connection.transaction.isolation_level` value to the Spanner client's
+/// [`IsolationLevel`]. Spanner supports `SERIALIZABLE` (the default) and `REPEATABLE_READ`; the
+/// `default` value leaves the database default in place. Any other spec level (read uncommitted /
+/// read committed / snapshot / linearizable) is rejected with `NotImplemented` rather than silently
+/// ignored, so callers are not misled into thinking an unsupported guarantee is in effect.
+fn parse_isolation_level(value: OptionValue) -> Result<IsolationLevel> {
+    use adbc_core::constants::*;
+    let s = match value {
+        OptionValue::String(s) => s,
+        _ => {
+            return Err(invalid_argument(
+                "expected a string isolation-level option value",
+            ))
+        }
+    };
+    match s.as_str() {
+        ADBC_OPTION_ISOLATION_LEVEL_DEFAULT => Ok(IsolationLevel::Unspecified),
+        ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE => Ok(IsolationLevel::Serializable),
+        ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ => Ok(IsolationLevel::RepeatableRead),
+        ADBC_OPTION_ISOLATION_LEVEL_READ_UNCOMMITTED
+        | ADBC_OPTION_ISOLATION_LEVEL_READ_COMMITTED
+        | ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT
+        | ADBC_OPTION_ISOLATION_LEVEL_LINEARIZABLE => Err(not_implemented(&format!(
+            "Spanner does not support isolation level {s:?}; supported: {ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE:?}, {ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ:?}, {ADBC_OPTION_ISOLATION_LEVEL_DEFAULT:?}"
+        ))),
+        other => Err(invalid_argument(format!(
+            "unknown isolation level {other:?}"
+        ))),
+    }
+}
+
+/// The ADBC value string for the stored isolation level, so `get_option` round-trips what was set.
+fn isolation_to_adbc_string(isolation: &IsolationLevel) -> &'static str {
+    use adbc_core::constants::*;
+    match isolation {
+        IsolationLevel::Serializable => ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE,
+        IsolationLevel::RepeatableRead => ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ,
+        // Unspecified and any future variant report as the driver/database default.
+        _ => ADBC_OPTION_ISOLATION_LEVEL_DEFAULT,
+    }
+}
+
 /// Apply DML `statements` atomically in one read/write transaction via Spanner's `ExecuteBatchDml`
 /// (a single RPC), returning the total affected-row count.
 ///
@@ -457,6 +526,7 @@ pub(crate) fn run_batch_dml(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
     cancel: &CancelSignal,
+    isolation: IsolationLevel,
     statements: Vec<SpannerSql>,
 ) -> Result<i64> {
     if statements.is_empty() {
@@ -464,8 +534,7 @@ pub(crate) fn run_batch_dml(
     }
     let client = client.clone();
     block_on_cancellable(runtime, cancel, async move {
-        let runner = client
-            .read_write_transaction()
+        let runner = apply_isolation(client.read_write_transaction(), isolation)
             .build()
             .await
             .map_err(from_spanner)?;
@@ -761,6 +830,7 @@ impl Optionable for SpannerConnection {
                 st.autocommit = enable;
             }
             OptionConnection::ReadOnly => self.read_only = parse_bool(value)?,
+            OptionConnection::IsolationLevel => self.isolation = parse_isolation_level(value)?,
             other => {
                 return Err(not_implemented(&format!(
                     "unsupported Spanner connection option: {}",
@@ -775,6 +845,9 @@ impl Optionable for SpannerConnection {
         match &key {
             OptionConnection::AutoCommit => Ok(self.txn.lock().unwrap().autocommit.to_string()),
             OptionConnection::ReadOnly => Ok(self.read_only.to_string()),
+            OptionConnection::IsolationLevel => {
+                Ok(isolation_to_adbc_string(&self.isolation).to_string())
+            }
             // A Spanner database has a single, unnamed catalog and (default) schema — both the empty
             // string in INFORMATION_SCHEMA, which is what `get_objects` reports — so the "current"
             // catalog/schema are reported as "". (They can't be switched; setting them is unsupported.)
@@ -815,6 +888,7 @@ impl Connection for SpannerConnection {
             self.spanner.clone(),
             self.database.clone(),
             self.read_only,
+            self.isolation.clone(),
             self.txn.clone(),
         ))
     }
@@ -1080,5 +1154,69 @@ mod tests {
         // resulting analyzer error as NotFound).
         assert_eq!(qualified_table(None, "a`b"), r"`a\`b`");
         assert_eq!(qualified_table(Some("s`x"), r"t\y"), r"`s\`x`.`t\\y`");
+    }
+
+    #[test]
+    fn parses_supported_isolation_levels() {
+        use adbc_core::constants::*;
+        let parse = |s: &str| parse_isolation_level(OptionValue::String(s.to_string()));
+        assert_eq!(
+            parse(ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE).unwrap(),
+            IsolationLevel::Serializable
+        );
+        assert_eq!(
+            parse(ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ).unwrap(),
+            IsolationLevel::RepeatableRead
+        );
+        // `default` maps to the client's unspecified level, leaving the database default in place.
+        assert_eq!(
+            parse(ADBC_OPTION_ISOLATION_LEVEL_DEFAULT).unwrap(),
+            IsolationLevel::Unspecified
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_isolation_levels() {
+        use adbc_core::constants::*;
+        let parse = |s: &str| parse_isolation_level(OptionValue::String(s.to_string()));
+        // Spec levels Spanner cannot honour are rejected (NotImplemented), not silently ignored.
+        for level in [
+            ADBC_OPTION_ISOLATION_LEVEL_READ_UNCOMMITTED,
+            ADBC_OPTION_ISOLATION_LEVEL_READ_COMMITTED,
+            ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT,
+            ADBC_OPTION_ISOLATION_LEVEL_LINEARIZABLE,
+        ] {
+            let err = parse(level).unwrap_err();
+            assert_eq!(err.status, Status::NotImplemented, "level {level}");
+        }
+        // A completely unknown value is an invalid argument.
+        assert_eq!(
+            parse("not-a-level").unwrap_err().status,
+            Status::InvalidArguments
+        );
+        // A non-string option value is rejected.
+        assert_eq!(
+            parse_isolation_level(OptionValue::Int(1))
+                .unwrap_err()
+                .status,
+            Status::InvalidArguments
+        );
+    }
+
+    #[test]
+    fn isolation_level_round_trips_to_adbc_string() {
+        use adbc_core::constants::*;
+        assert_eq!(
+            isolation_to_adbc_string(&IsolationLevel::Serializable),
+            ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE
+        );
+        assert_eq!(
+            isolation_to_adbc_string(&IsolationLevel::RepeatableRead),
+            ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ
+        );
+        assert_eq!(
+            isolation_to_adbc_string(&IsolationLevel::Unspecified),
+            ADBC_OPTION_ISOLATION_LEVEL_DEFAULT
+        );
     }
 }
