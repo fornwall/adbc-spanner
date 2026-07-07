@@ -139,10 +139,23 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   `SpannerStatementTest.SqlIngestErrors` case now passes end-to-end against the emulator;
   `tests/integration.rs` also covers append-on-missing-table (NotFound) and append-with-mismatched-
   schema (AlreadyExists).
-- **Bulk ingest only triggers through `execute_update()`, not `execute()`**
+- ~~**Bulk ingest only triggers through `execute_update()`, not `execute()`**
   (`src/statement.rs:513-516`). An FFI caller doing ingest with a non-null stream out-pointer gets
   `InvalidState` ("no SQL query set") instead of an ingest + empty stream. Mirror the
-  `execute_update` ingest branch in `execute()` and return `Self::empty_reader()`.
+  `execute_update` ingest branch in `execute()` and return `Self::empty_reader()`.~~
+  **Fixed.** The ingest branch is now a shared `SpannerStatement::run_ingest` helper (extracted from
+  `execute_update`, so the two paths cannot drift), and `execute` dispatches to it before parsing
+  SQL: when a `target_table` is configured — and no SQL query has been set — it runs the ingest and
+  returns `Self::empty_reader()` (an empty Arrow stream) instead of erroring with `InvalidState`.
+  Both entry points gate the ingest branch on `sql.is_none()`. A SQL query and an ingest target are
+  kept **mutually exclusive** — `set_sql_query` clears any ingest target and `set_option(TargetTable)`
+  clears any SQL query — so a reused statement handle runs whichever was configured most recently,
+  in both directions: a query after an ingest runs the query, and (the pattern the Python DBAPI
+  `Cursor` produces, one statement per cursor) an ingest after a `CREATE TABLE`/query runs the ingest
+  rather than re-running the stale query. Read-only / no-data-bound guards and the `append`-mode
+  NotFound/AlreadyExists error remapping are unchanged, and `execute_update` still reports the
+  affected-row count. Covered by an ingest-via-`execute()` assertion and a query-then-ingest reuse
+  assertion in `tests/integration.rs`.
 - ~~**`adbc.ingest.target_db_schema` is rejected although the driver supports named schemas
   everywhere else** (`src/statement.rs:405-437`). Accept it and qualify the ingest/CREATE TABLE
   statements via `qualified_table`; accept `target_catalog` when it names the `""` catalog.~~

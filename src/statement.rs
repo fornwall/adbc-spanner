@@ -270,6 +270,40 @@ impl SpannerStatement {
         }
     }
 
+    /// Run a bulk ingest of the bound rows into `table`, honouring the configured ingest mode.
+    ///
+    /// Shared by `execute` and `execute_update` so both entry points ingest identically: an ingest
+    /// needs no SQL query, so an FFI caller reaches it through either the query out-pointer
+    /// (`execute`) or the affected-rows path (`execute_update`). In the create/replace modes the
+    /// table is first built from the ingest data's Arrow schema (with a synthetic UUID primary key)
+    /// via DDL, which Spanner runs immediately before the inserts. Returns the affected-row count,
+    /// or `None` when the inserts were buffered for a manual-transaction commit.
+    fn run_ingest(&mut self, table: &str) -> Result<Option<i64>> {
+        if self.read_only {
+            return Err(invalid_state("cannot ingest: the connection is read-only"));
+        }
+        if self.bound.is_empty() {
+            return Err(invalid_state("cannot ingest: no data has been bound"));
+        }
+        let mode = self.ingest_mode.as_deref();
+        let ingest_ddl = self.build_ingest_table_ddl(table, mode)?;
+        // `append` (the default) is the only mode that inserts into a pre-existing table, so it is
+        // the only one whose failure the ADBC spec wants remapped to NotFound / AlreadyExists.
+        // `build_ingest_table_ddl` returns `None` for exactly that mode.
+        let is_append = ingest_ddl.is_none();
+        if let Some(ddl) = ingest_ddl {
+            self.run_ddl(ddl)?;
+        }
+        let statements = self.build_ingest_statements(table)?;
+        self.bound.clear();
+        let result = self.run_or_buffer(statements);
+        if is_append {
+            self.remap_ingest_append_error(table, result)
+        } else {
+            result
+        }
+    }
+
     /// An empty result reader (empty schema, no rows), for statements that yield no result set.
     fn empty_reader() -> Box<dyn RecordBatchReader + Send + 'static> {
         let schema = Arc::new(Schema::empty());
@@ -494,7 +528,14 @@ impl Optionable for SpannerStatement {
 
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
         match &key {
-            OptionStatement::TargetTable => self.target_table = Some(string_option(value)?),
+            OptionStatement::TargetTable => {
+                self.target_table = Some(string_option(value)?);
+                // Mutually exclusive with a SQL query (see `set_sql_query`): setting an ingest
+                // target clears any query left on a reused handle — e.g. the DBAPI `Cursor` reuses
+                // one statement, so `cur.execute("CREATE TABLE …")` then `cur.adbc_ingest(…)` would
+                // otherwise leave the stale CREATE set and skip the ingest.
+                self.sql = None;
+            }
             OptionStatement::TargetDbSchema => {
                 // Named schema for the ingest target table; qualifies the INSERT / CREATE TABLE via
                 // `qualified_table` (empty selects Spanner's default, unnamed schema).
@@ -626,6 +667,18 @@ impl Statement for SpannerStatement {
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
         self.cancel.reset();
+        // Bulk ingest arriving through the query entry point (needs no SQL query): a standard ADBC
+        // FFI caller may drive an ingest via `execute` with a non-null stream out-pointer. Run it
+        // the same way `execute_update` does and return an empty stream — the query interface has
+        // nowhere to report the affected-row count, so it is discarded. Gate on there being no SQL:
+        // a query and an ingest target are mutually exclusive (each setter clears the other), so a
+        // reused handle whose most recent config was a query runs that query, not a data-less ingest.
+        if self.sql.is_none() {
+            if let Some(table) = self.target_table.clone() {
+                self.run_ingest(&table)?;
+                return Ok(Self::empty_reader());
+            }
+        }
         let sql = self.sql()?;
         if crate::ddl::is_ddl(&sql) {
             self.run_ddl(crate::ddl::split_statements(&sql))?;
@@ -691,33 +744,14 @@ impl Statement for SpannerStatement {
     fn execute_update(&mut self) -> Result<Option<i64>> {
         // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
         self.cancel.reset();
-        // Bulk ingest: insert the bound rows into the target table (needs no SQL query).
-        if let Some(table) = self.target_table.clone() {
-            if self.read_only {
-                return Err(invalid_state("cannot ingest: the connection is read-only"));
+        // Bulk ingest: insert the bound rows into the target table (needs no SQL query). Gate on
+        // there being no SQL for the same reason as `execute` — a query and an ingest target are
+        // mutually exclusive (each setter clears the other), so a reused handle runs whichever was
+        // configured most recently rather than the stale other one.
+        if self.sql.is_none() {
+            if let Some(table) = self.target_table.clone() {
+                return self.run_ingest(&table);
             }
-            if self.bound.is_empty() {
-                return Err(invalid_state("cannot ingest: no data has been bound"));
-            }
-            // In the create/replace modes, first build the table from the ingest data's Arrow schema
-            // (with a synthetic UUID primary key) — Spanner DDL runs immediately, before the inserts.
-            let mode = self.ingest_mode.as_deref();
-            let ingest_ddl = self.build_ingest_table_ddl(&table, mode)?;
-            // `append` (the default) is the only mode that inserts into a pre-existing table, so it
-            // is the only one whose failure the ADBC spec wants remapped to NotFound / AlreadyExists.
-            // `build_ingest_table_ddl` returns `None` for exactly that mode.
-            let is_append = ingest_ddl.is_none();
-            if let Some(ddl) = ingest_ddl {
-                self.run_ddl(ddl)?;
-            }
-            let statements = self.build_ingest_statements(&table)?;
-            self.bound.clear();
-            let result = self.run_or_buffer(statements);
-            return if is_append {
-                self.remap_ingest_append_error(&table, result)
-            } else {
-                result
-            };
         }
 
         let sql = self.sql()?;
@@ -882,6 +916,10 @@ impl Statement for SpannerStatement {
 
     fn set_sql_query(&mut self, query: impl AsRef<str>) -> Result<()> {
         self.sql = Some(query.as_ref().to_string());
+        // A SQL query and a bulk-ingest target are mutually exclusive: setting a query clears any
+        // ingest target left on a reused handle, so `execute`/`execute_update` run this query rather
+        // than re-entering the (now data-less) ingest branch. See the matching clear in `set_option`.
+        self.target_table = None;
         Ok(())
     }
 
