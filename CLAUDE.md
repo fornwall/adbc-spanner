@@ -250,7 +250,12 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   the producing statement is gone. `spanner.data_boost_enabled` (statement option) bakes Data
   Boost into each descriptor; `spanner.max_partitions` hints the partition count. The emulator
   supports the Partition RPCs (it ignores Data Boost) — covered by `execute_partitions_round_trip` in
-  `tests/integration.rs`.
+  `tests/integration.rs`. **Security caveat:** a descriptor is opaque but *executable* — its serde
+  JSON carries the SQL text plus session/transaction identity, so `read_partition` runs whatever it
+  contains with the connection's credentials. It is not authenticated (an HMAC envelope was
+  considered and deliberately not implemented). Transport descriptors only over trusted channels and
+  never execute one from an untrusted source; the `read_partition`/`execute_partitions` rustdoc
+  states the same.
 - Still returning `NotImplemented` (keep the pattern until implemented): Substrait
   (`set_substrait_plan`) — Spanner executes GoogleSQL/PostgreSQL text, not Substrait plans.
 - Commits in this environment may need `-c commit.gpgsign=false` if no signing agent is present.

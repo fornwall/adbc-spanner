@@ -1268,6 +1268,19 @@ impl Connection for SpannerConnection {
         Ok(())
     }
 
+    /// Execute a partition descriptor produced by `Statement::execute_partitions` and stream its
+    /// rows as Arrow.
+    ///
+    /// # Security
+    ///
+    /// A partition descriptor is **opaque but executable**: it is serde-JSON of the client's
+    /// `Partition`, whose inner `ExecuteSqlRequest` carries the SQL text itself along with the
+    /// session and transaction identity. `read_partition` runs whatever that blob contains against
+    /// this connection's `DatabaseClient`, with **this connection's credentials** — so a crafted
+    /// descriptor executes arbitrary SQL as the connection's principal. This is inherent to ADBC's
+    /// portable-descriptor design and the upstream serde format, and there is no in-band
+    /// authentication of the blob. Treat a descriptor as an executable request, not as opaque data:
+    /// transport it only over trusted channels and **never accept one from an untrusted source**.
     fn read_partition(
         &self,
         partition: impl AsRef<[u8]>,
