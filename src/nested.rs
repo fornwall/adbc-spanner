@@ -9,9 +9,9 @@
 use std::sync::Arc;
 
 use adbc_core::error::{Error, Result, Status};
-use arrow_array::{ArrayRef, ListArray};
+use arrow_array::{new_empty_array, ArrayRef, ListArray, UnionArray};
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
-use arrow_schema::{ArrowError, DataType, FieldRef, Fields};
+use arrow_schema::{ArrowError, DataType, FieldRef, Fields, UnionFields};
 
 use crate::error::err;
 
@@ -96,6 +96,37 @@ pub(crate) fn list_of_nullable(
     )
     .map_err(arrow_err)?;
     Ok(Arc::new(list))
+}
+
+/// Assemble a dense [`UnionArray`] matching `fields` exactly. `populated` supplies the child array
+/// for each branch this caller actually uses (keyed by its type id); every other branch is filled
+/// with an empty array of the right type, so the union type still matches its schema even though no
+/// row references those branches. `type_ids` / `offsets` select, per row, which branch and slot the
+/// value lives in.
+pub(crate) fn dense_union(
+    fields: &UnionFields,
+    populated: &[(i8, ArrayRef)],
+    type_ids: Vec<i8>,
+    offsets: Vec<i32>,
+) -> Result<ArrayRef> {
+    let children: Vec<ArrayRef> = fields
+        .iter()
+        .map(|(id, f)| {
+            populated
+                .iter()
+                .find(|(pid, _)| *pid == id)
+                .map(|(_, arr)| arr.clone())
+                .unwrap_or_else(|| new_empty_array(f.data_type()))
+        })
+        .collect();
+    let union = UnionArray::try_new(
+        fields.clone(),
+        ScalarBuffer::from(type_ids),
+        Some(ScalarBuffer::from(offsets)),
+        children,
+    )
+    .map_err(arrow_err)?;
+    Ok(Arc::new(union))
 }
 
 #[cfg(test)]
