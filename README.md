@@ -184,7 +184,10 @@ Options are set on the database (via `new_database_with_opts` or `set_option`):
 Credentials are resolved in this order:
 
 1. **Emulator** — if `SPANNER_EMULATOR_HOST` is set (or `spanner.emulator` is `true`), anonymous
-   credentials are used and the endpoint is taken from the environment.
+   credentials are used and the endpoint is taken from the environment. Combining emulator mode
+   with explicit credentials (`spanner.keyfile`, `spanner.keyfile_json`, or
+   `spanner.impersonate.target_principal`) is refused at connect time rather than silently
+   ignoring them; ambient ADC (e.g. `GOOGLE_APPLICATION_CREDENTIALS`) does not conflict.
 2. **Service account** — a key supplied inline via `spanner.keyfile_json` or read from the path
    in `spanner.keyfile`.
 3. **[Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)**
