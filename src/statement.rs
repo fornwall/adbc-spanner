@@ -31,9 +31,7 @@ use google_cloud_spanner::transaction::ReadWriteTransaction;
 use crate::bind;
 use crate::connection::{apply_isolation, SharedTxn};
 use crate::conversion::{result_set_to_batch, stream_query};
-use crate::error::{
-    err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
-};
+use crate::error::{err, from_builder, from_spanner, invalid_state, not_implemented};
 use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
 use crate::staleness::ReadStaleness;
 
@@ -942,10 +940,7 @@ impl Statement for SpannerStatement {
 }
 
 fn string_option(value: OptionValue) -> Result<String> {
-    match value {
-        OptionValue::String(s) => Ok(s),
-        _ => Err(invalid_argument("statement option requires a string value")),
-    }
+    crate::options::string_option(value, "statement option")
 }
 
 /// Validate the `adbc.ingest.target_catalog` option. Spanner has a single, unnamed (`""`) catalog,
@@ -963,58 +958,17 @@ fn check_target_catalog(catalog: String) -> Result<String> {
 /// Parse a boolean statement option, accepted as a bool-ish string (`true`/`false`/`1`/`0`/…) or an
 /// integer (`0` = false, non-zero = true).
 fn bool_option(value: OptionValue) -> Result<bool> {
-    match value {
-        OptionValue::String(s) => match s.to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" => Ok(true),
-            "false" | "0" | "no" => Ok(false),
-            other => Err(invalid_argument(format!(
-                "expected a boolean, got {other:?}"
-            ))),
-        },
-        OptionValue::Int(i) => Ok(i != 0),
-        _ => Err(invalid_argument("expected a boolean option value")),
-    }
+    crate::options::bool_option(value, "option")
 }
 
 /// Parse a positive `max_partitions` option, accepted as either an integer or a numeric string.
 fn max_partitions_option(value: OptionValue) -> Result<i64> {
-    let n = match value {
-        OptionValue::Int(i) => i,
-        OptionValue::String(s) => s
-            .parse::<i64>()
-            .map_err(|_| invalid_argument("max_partitions must be a positive integer"))?,
-        _ => {
-            return Err(invalid_argument(
-                "max_partitions must be a positive integer",
-            ))
-        }
-    };
-    if n > 0 {
-        Ok(n)
-    } else {
-        Err(invalid_argument(
-            "max_partitions must be a positive integer",
-        ))
-    }
+    crate::options::positive_i64(value, "max_partitions")
 }
 
 /// Parse a positive batch-size option, accepted as either an integer or a numeric string.
 fn rows_per_batch_option(value: OptionValue) -> Result<usize> {
-    let n = match value {
-        OptionValue::Int(i) => i,
-        OptionValue::String(s) => s
-            .parse::<i64>()
-            .map_err(|_| invalid_argument("rows_per_batch must be a positive integer"))?,
-        _ => {
-            return Err(invalid_argument(
-                "rows_per_batch must be a positive integer",
-            ))
-        }
-    };
-    usize::try_from(n)
-        .ok()
-        .filter(|&n| n > 0)
-        .ok_or_else(|| invalid_argument("rows_per_batch must be a positive integer"))
+    crate::options::positive_usize(value, "rows_per_batch")
 }
 
 #[cfg(test)]

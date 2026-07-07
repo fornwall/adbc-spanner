@@ -72,6 +72,7 @@ mod ffi;
 mod info;
 mod nested;
 mod objects;
+mod options;
 mod runtime;
 mod staleness;
 mod statement;
