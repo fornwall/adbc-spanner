@@ -37,7 +37,9 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   intermediate-table build then rename swap) are near-atomic.
 - Transactions: autocommit by default, or manual multi-statement transactions (set
   `adbc.connection.autocommit` to `false`, then `commit`/`rollback`). In manual mode DML is buffered
-  and applied atomically in one read/write transaction on commit.
+  and applied atomically in one read/write transaction on commit, so `execute_update` returns `None`
+  rather than an affected-row count — the count is unknown until the buffered batch commits (queries
+  and DDL still run immediately).
 - Read-only connections: set the standard `adbc.connection.readonly` connection option to `true` to
   reject all writes on that connection — DML, DDL and bulk ingest fail with an `InvalidState` error,
   while queries still run. Accepts `true`/`false` (default `false`) and round-trips through
@@ -54,7 +56,13 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
 - Parameter binding: `bind`/`bind_stream` an Arrow batch whose columns become Spanner named
   parameters (a column `id` binds `@id`); each bound row runs the statement once.
 - Bulk ingest: set `adbc.ingest.target_table`, bind an Arrow batch, and `execute_update` inserts the
-  rows into that table in one transaction.
+  rows into that table in one transaction. All four `adbc.ingest.mode` values are supported:
+  `append` (the default — insert into an existing table), `create` (create the table first, failing
+  if it exists), `create_append` (create if absent, then insert) and `replace` (drop and recreate).
+  The three create modes build the table from the ingest data's Arrow schema, adding a synthetic
+  `adbc_ingest_key` `STRING` primary key populated with a UUID per row, because Spanner requires
+  every table to have a primary key and the ingest data carries none. That column is a real column,
+  so it shows up in a later `SELECT *` from the table.
 - Metadata: `get_table_types()`, `get_table_schema()`, and `get_objects()` (catalog/schema/table/
   column introspection from `INFORMATION_SCHEMA`).
 - Statistics: `get_statistics()` computes exact table/column counts with one aggregate scan per table
@@ -246,6 +254,12 @@ against Cloud Spanner. It is **skipped automatically** unless a target is config
 above stays green everywhere. Two targets are supported:
 
 - `SPANNER_EMULATOR_HOST` — a local [Cloud Spanner emulator](https://cloud.google.com/spanner/docs/emulator).
+  The host may be anything, but the **gRPC port must be `9010`**: the pinned `google-cloud-rust`
+  client derives the admin/REST endpoint by literally substituting `9010`→`9020` in the gRPC
+  endpoint, so on any other port the admin requests (DDL, `create_database`) are sent to the gRPC
+  port and fail cryptically (`error sending request … /ddl`), while plain queries keep working. Move
+  the *host* freely (e.g. a docker-network IP to run several emulators at once), but leave the port
+  at `9010` (admin REST then lands on `9020`).
 - `SPANNER_GCP_DATABASE` — a real Cloud Spanner database, given as `project.instance.database`,
   reached with [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)
   (e.g. after `gcloud auth application-default login`).

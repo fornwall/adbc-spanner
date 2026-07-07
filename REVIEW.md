@@ -356,10 +356,20 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   confirmed behavior: default `false`; `true` rejects DML/DDL/ingest with `InvalidState` while
   queries still run; it round-trips through `get_option`; and the flag is snapshotted into each
   statement at creation, so a runtime toggle applies to statements created afterwards.
-- **Ingest modes + synthetic `adbc_ingest_key` PK missing from the main README**; the emulator
+- ~~**Ingest modes + synthetic `adbc_ingest_key` PK missing from the main README**; the emulator
   port-9010 requirement lives only in CLAUDE.md (users on another port get working queries and
   cryptic DDL failures); manual-mode `execute_update` returning `None` is in CLAUDE.md but not
-  the README.
+  the README.~~
+  **Fixed.** All three are now in `README.md`. The bulk-ingest feature bullet documents the four
+  `adbc.ingest.mode` values (`append`/`create`/`create_append`/`replace`) and that the three create
+  modes build the table from the ingest data's Arrow schema with a synthetic `adbc_ingest_key`
+  `STRING` UUID primary key (Spanner requires a PK) that shows up in a later `SELECT *`. The
+  Testing section's `SPANNER_EMULATOR_HOST` bullet spells out the port-`9010` requirement — the
+  pinned client derives the admin/REST endpoint by literally substituting `9010`→`9020`, so any
+  other gRPC port sends admin (DDL/`create_database`) requests to the gRPC port and fails cryptically
+  (`error sending request … /ddl`) while queries keep working; move the host freely but keep the port
+  `9010`. The Transactions feature bullet now states that manual-mode `execute_update` returns `None`
+  (row count unknown until the buffered batch commits; queries and DDL still run immediately).
 
 ---
 
