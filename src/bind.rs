@@ -4,9 +4,10 @@
 //! column is one parameter, and each row is one set of bindings. Spanner uses **named** query
 //! parameters (`@name`), so a bind column named `id` binds to `@id` in the SQL.
 //!
-//! Supported Arrow parameter types are `Int64`, `Float64`, `Float32`, `Boolean`, `Utf8`, `Binary`,
-//! `Date32` (→ `DATE`), `Timestamp(Microsecond)` (→ `TIMESTAMP`), `Decimal128` (→ `NUMERIC`), and
-//! their nulls. Other Arrow types are rejected with an `InvalidArguments` error.
+//! Supported Arrow parameter types are `Int64`, `Float64`, `Float32`, `Boolean`, `Utf8`/`LargeUtf8`,
+//! `Binary`/`LargeBinary`, `Date32` (→ `DATE`), `Timestamp(Microsecond)` (→ `TIMESTAMP`),
+//! `Decimal128` (→ `NUMERIC`), and their nulls. Other Arrow types are rejected with an
+//! `InvalidArguments` error.
 //!
 //! Spanner encodes `DATE` / `TIMESTAMP` / `NUMERIC` values on the wire as strings, and query
 //! parameters are sent untyped (Spanner infers the type from the SQL). So these three are formatted
@@ -52,6 +53,8 @@ pub(crate) fn bind_row(
                 let a = column.as_boolean();
                 bind_scalar(builder, name, is_null, || a.value(row))
             }
+            // `Utf8`/`LargeUtf8` differ only in offset width; both map to Spanner STRING. LargeUtf8
+            // is what Arrow-native producers commonly emit (e.g. `pyarrow.Table.from_pandas`).
             DataType::Utf8 => {
                 let a = column.as_string::<i32>();
                 if is_null {
@@ -60,8 +63,24 @@ pub(crate) fn bind_row(
                     builder.add_param(name, &a.value(row))
                 }
             }
+            DataType::LargeUtf8 => {
+                let a = column.as_string::<i64>();
+                if is_null {
+                    builder.add_param(name, &None::<String>)
+                } else {
+                    builder.add_param(name, &a.value(row))
+                }
+            }
             DataType::Binary => {
                 let a = column.as_binary::<i32>();
+                if is_null {
+                    builder.add_param(name, &None::<Vec<u8>>)
+                } else {
+                    builder.add_param(name, &a.value(row).to_vec())
+                }
+            }
+            DataType::LargeBinary => {
+                let a = column.as_binary::<i64>();
                 if is_null {
                     builder.add_param(name, &None::<Vec<u8>>)
                 } else {
@@ -268,7 +287,10 @@ pub(crate) fn insert_sql(table: &str, columns: &[String]) -> String {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Date32Array, Decimal128Array, Int32Array, TimestampMicrosecondArray};
+    use arrow_array::{
+        Date32Array, Decimal128Array, Int32Array, LargeBinaryArray, LargeStringArray,
+        TimestampMicrosecondArray,
+    };
     use arrow_schema::{Field, Schema};
     use google_cloud_spanner::statement::Statement;
 
@@ -369,6 +391,24 @@ mod tests {
             )],
         );
         assert!(bind_row(Statement::builder("SELECT @n"), &b, 0).is_ok());
+    }
+
+    #[test]
+    fn binds_large_string_and_binary() {
+        // LargeUtf8 / LargeBinary (what pyarrow.Table.from_pandas emits) bind like their 32-bit
+        // offset counterparts, including typed nulls.
+        let b = batch(
+            vec![
+                Field::new("s", DataType::LargeUtf8, true),
+                Field::new("b", DataType::LargeBinary, true),
+            ],
+            vec![
+                Arc::new(LargeStringArray::from(vec![Some("hello"), None])),
+                Arc::new(LargeBinaryArray::from(vec![Some(b"bytes".as_ref()), None])),
+            ],
+        );
+        assert!(bind_row(Statement::builder("SELECT @s, @b"), &b, 0).is_ok());
+        assert!(bind_row(Statement::builder("SELECT @s, @b"), &b, 1).is_ok());
     }
 
     #[test]
