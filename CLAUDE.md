@@ -65,6 +65,13 @@ Key design points:
   `serializable` and `repeatable_read` map to the client's `IsolationLevel` (applied via
   `TransactionRunnerBuilder::set_isolation_level`), `default` leaves the database default, and the
   other spec levels are rejected with `NotImplemented`.
+- **Stale reads.** Read-only queries default to a strong bound. `spanner.read.staleness`
+  (`exact:<duration>` / `max:<duration>`) and `spanner.read.timestamp` (RFC3339, optionally prefixed
+  `read:` / `min:`) request a non-strong `TimestampBound` — parsed in `src/staleness.rs` (`ReadBound`
+  / `ReadStaleness`, unit-tested offline) and applied at the `single_use()` query sites plus the
+  partition batch read-only transaction via `staleness::single_use`. Both options exist at connection
+  **and** statement level (statement inherits the connection's, then overrides); they are mutually
+  exclusive (set one to `""` to unset), and round-trip through `get_option`.
 - **Arrow version.** `arrow-array`/`arrow-schema` are pinned to the range `adbc_core` allows
   (`>=53.1, <59`) so the `RecordBatch`/`Schema`/`RecordBatchReader` types unify across crates.
 

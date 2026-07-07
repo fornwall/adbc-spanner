@@ -38,6 +38,14 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
 - Transactions: autocommit by default, or manual multi-statement transactions (set
   `adbc.connection.autocommit` to `false`, then `commit`/`rollback`). In manual mode DML is buffered
   and applied atomically in one read/write transaction on commit.
+- [Stale reads](https://cloud.google.com/spanner/docs/timestamp-bounds): queries read at a **strong**
+  bound by default, but the `spanner.read.staleness` and `spanner.read.timestamp` options (settable on
+  a connection — where they become the default for its statements — or per statement) request a
+  cheaper, lock-free stale read. `spanner.read.staleness` is `exact:<duration>` (read exactly that far
+  in the past) or `max:<duration>` (bounded staleness), where `<duration>` is a number with an
+  optional unit suffix (`s` default, `ms`, `us`, `ns`, `m`, `h`); `spanner.read.timestamp` is an RFC
+  3339 timestamp, optionally prefixed `read:` (exact, the default) or `min:` (bounded). The two are
+  mutually exclusive. The staleness/timestamp is also baked into `execute_partitions()` descriptors.
 - Parameter binding: `bind`/`bind_stream` an Arrow batch whose columns become Spanner named
   parameters (a column `id` binds `@id`); each bound row runs the statement once.
 - Bulk ingest: set `adbc.ingest.target_table`, bind an Arrow batch, and `execute_update` inserts the

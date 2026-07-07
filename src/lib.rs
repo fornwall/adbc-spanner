@@ -65,6 +65,7 @@ mod info;
 mod nested;
 mod objects;
 mod runtime;
+mod staleness;
 mod statement;
 mod statistics;
 
@@ -227,6 +228,38 @@ pub const OPTION_DATA_BOOST: &str = "spanner.data_boost_enabled";
 /// [`Statement::execute_partitions`](adbc_core::Statement::execute_partitions). This is a hint —
 /// Spanner may return fewer. Accepts a positive integer; unset lets Spanner choose.
 pub const OPTION_MAX_PARTITIONS: &str = "spanner.max_partitions";
+
+/// Driver-specific connection **and** statement option: the **read staleness** for read-only
+/// queries, as `"exact:<duration>"` or `"max:<duration>"`.
+///
+/// - `exact:<duration>` reads exactly `<duration>` in the past
+///   ([`TimestampBound::exact_staleness`](https://docs.cloud.google.com/spanner/docs/timestamp-bounds#exact_staleness)) —
+///   a single, repeatable timestamp, cheaper and lock-free.
+/// - `max:<duration>` reads at any timestamp within `<duration>` of now (bounded staleness; the
+///   server picks — single-use reads only).
+///
+/// `<duration>` is a non-negative number with an optional unit suffix: `s` (seconds, the default),
+/// `ms`, `us`/`µs`, `ns`, `m` (minutes) or `h` (hours). Examples: `exact:10`, `exact:2.5s`,
+/// `max:500ms`, `max:1m`.
+///
+/// Mutually exclusive with [`OPTION_READ_TIMESTAMP`]; set the other to an empty string to unset it.
+/// Set on a connection it becomes the default for statements it creates; a statement may override
+/// it. Unset (the default) means a **strong** read.
+pub const OPTION_READ_STALENESS: &str = "spanner.read.staleness";
+
+/// Driver-specific connection **and** statement option: an **absolute read timestamp** for
+/// read-only queries — an RFC 3339 timestamp, optionally prefixed to select the mode:
+///
+/// - `read:<rfc3339>` (or a bare `<rfc3339>`) reads exactly as of that timestamp
+///   ([`TimestampBound::read_timestamp`](https://docs.cloud.google.com/spanner/docs/timestamp-bounds#exact_staleness)).
+/// - `min:<rfc3339>` reads at that timestamp or later (bounded staleness; single-use reads only).
+///
+/// Examples: `2026-07-07T00:00:00Z`, `read:2026-07-07T00:00:00Z`, `min:2026-07-07T00:00:00+02:00`.
+///
+/// Mutually exclusive with [`OPTION_READ_STALENESS`]; set the other to an empty string to unset it.
+/// Set on a connection it becomes the default for statements it creates; a statement may override
+/// it. Unset (the default) means a **strong** read.
+pub const OPTION_READ_TIMESTAMP: &str = "spanner.read.timestamp";
 
 /// The vendor name reported by [`Connection::get_info`](adbc_core::Connection::get_info).
 pub const VENDOR_NAME: &str = "Google Cloud Spanner";
