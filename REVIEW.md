@@ -274,8 +274,16 @@ batch read-only transaction so every partition executes at that bound. Parsing l
 
 ### Docs
 
-- **`adbc.connection.readonly` is accepted but documented nowhere** (README, python/README,
-  CLAUDE.md, `src/lib.rs` — all silent).
+- ~~**`adbc.connection.readonly` is accepted but documented nowhere** (README, python/README,
+  CLAUDE.md, `src/lib.rs` — all silent).~~
+  **Fixed.** The read-only connection option is now documented in all four places: `README.md`
+  (a feature bullet), `python/README.md` (a `conn_kwargs={"adbc.connection.readonly": "true"}`
+  example — it is a spec `adbc.connection.*` option, so the DBAPI passes it via `conn_kwargs`, not
+  `db_kwargs`), `src/lib.rs` (the module-level *Configuration* docs, linking
+  `OptionConnection::ReadOnly`), and the CLAUDE.md Transactions design point. All four state the
+  confirmed behavior: default `false`; `true` rejects DML/DDL/ingest with `InvalidState` while
+  queries still run; it round-trips through `get_option`; and the flag is snapshotted into each
+  statement at creation, so a runtime toggle applies to statements created afterwards.
 - **Ingest modes + synthetic `adbc_ingest_key` PK missing from the main README**; the emulator
   port-9010 requirement lives only in CLAUDE.md (users on another port get working queries and
   cryptic DDL failures); manual-mode `execute_update` returning `None` is in CLAUDE.md but not

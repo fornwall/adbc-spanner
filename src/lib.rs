@@ -27,6 +27,14 @@
 //! driver picks it up automatically and uses anonymous credentials) or set the [`OPTION_ENDPOINT`]
 //! and [`OPTION_EMULATOR`] options explicitly.
 //!
+//! The standard `adbc.connection.readonly`
+//! ([`OptionConnection::ReadOnly`](adbc_core::options::OptionConnection::ReadOnly)) connection
+//! option opens a **read-only** connection: when set to `true` the connection rejects all writes —
+//! DML, DDL and bulk ingest fail with [`Status::InvalidState`](adbc_core::error::Status::InvalidState),
+//! while read-only queries still run. It defaults to `false`, accepts `true`/`false`, and
+//! round-trips through `get_option`. The flag is captured when a statement is created, so toggling
+//! it takes effect for statements created afterwards.
+//!
 //! ## Example
 //!
 //! ```no_run
