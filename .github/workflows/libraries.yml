@@ -115,3 +115,120 @@ jobs:
           # dist/* now also includes the generated SHA256SUMS file.
           files: dist/*
           generate_release_notes: true
+
+  # Repackage the per-platform shared libraries built above into Python wheels.
+  # No compilation happens here — a Spanner ADBC wheel is "data-only" (it ships
+  # the prebuilt cdylib and links nothing against Python), so a single Linux
+  # runner can stamp out every platform's wheel by forcing the platform tag.
+  python-wheels:
+    name: Python wheels
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade setuptools wheel
+
+      - name: Download platform libraries
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Sync wheel version to the crate / tag
+        shell: bash
+        working-directory: python
+        run: |
+          set -euo pipefail
+          # Single source of truth for the version is Cargo.toml; on a vX.Y.Z tag
+          # the tag must match it. Fail loudly on drift so a release can't ship a
+          # wheel whose version disagrees with the crate.
+          crate_version="$(grep -m1 '^version' ../Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            tag_version="${GITHUB_REF#refs/tags/v}"
+            if [[ "$tag_version" != "$crate_version" ]]; then
+              echo "::error::tag v$tag_version != Cargo.toml version $crate_version" >&2
+              exit 1
+            fi
+          fi
+          echo "__version__ = \"${crate_version}\"" > adbc_driver_spanner/_version.py
+          echo "wheel version: ${crate_version}"
+
+      - name: Build wheels
+        shell: bash
+        working-directory: python
+        run: |
+          set -euo pipefail
+          mkdir -p wheelhouse
+          # target | lib filename | wheel platform tag.
+          # NOTE: the manylinux tag reflects the ubuntu-latest build host's glibc;
+          # if you need to support older glibc, build the libs in a manylinux
+          # container and lower these tags to match.
+          rows=(
+            "x86_64-unknown-linux-gnu|libadbc_spanner.so|manylinux_2_35_x86_64"
+            "aarch64-unknown-linux-gnu|libadbc_spanner.so|manylinux_2_35_aarch64"
+            "aarch64-apple-darwin|libadbc_spanner.dylib|macosx_11_0_arm64"
+            "x86_64-apple-darwin|libadbc_spanner.dylib|macosx_10_12_x86_64"
+            "x86_64-pc-windows-msvc|adbc_spanner.dll|win_amd64"
+            "aarch64-pc-windows-msvc|adbc_spanner.dll|win_arm64"
+          )
+          for row in "${rows[@]}"; do
+            IFS="|" read -r target lib plat <<< "$row"
+            staging="adbc-spanner-${target}"
+            work="$(mktemp -d)"
+            if [ -f "../artifacts/${staging}.tar.gz" ]; then
+              tar -xzf "../artifacts/${staging}.tar.gz" -C "$work"
+            else
+              unzip -q "../artifacts/${staging}.zip" -d "$work"
+            fi
+            # Exactly one platform's library must be present per wheel build.
+            rm -f adbc_driver_spanner/*.so adbc_driver_spanner/*.dylib adbc_driver_spanner/*.dll
+            cp "$work/${staging}/${lib}" adbc_driver_spanner/
+            python setup.py bdist_wheel --plat-name "$plat"
+            rm -rf build adbc_driver_spanner/*.so adbc_driver_spanner/*.dylib adbc_driver_spanner/*.dll
+          done
+          mv dist/*.whl wheelhouse/
+          ls -l wheelhouse
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-wheels
+          path: python/wheelhouse/*.whl
+          if-no-files-found: error
+
+  # Publish the wheels to PyPI on a vX.Y.Z tag via PyPI Trusted Publishing
+  # (OIDC) — no API token or long-lived secret. Authentication is proven by the
+  # short-lived `id-token` GitHub mints for this job, which must match the
+  # trusted publisher configured on PyPI (owner + repo + this workflow filename
+  # `libraries.yml` + the `pypi` environment below). See README/setup notes.
+  python-publish:
+    name: Publish wheels to PyPI
+    needs: python-wheels
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/adbc-driver-spanner
+    permissions:
+      id-token: write # mandatory for trusted publishing; nothing else needed.
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@v8
+        with:
+          name: python-wheels
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # No username/password: presence of the OIDC token triggers the
+          # trusted-publishing flow. PEP 740 attestations are generated by
+          # default. skip-existing keeps re-runs idempotent.
+          packages-dir: dist
+          skip-existing: true
