@@ -1,6 +1,6 @@
 #![no_main]
 
-use adbc_spanner::fuzzing::{parse_date_days, parse_numeric_i128, parse_timestamp_micros};
+use adbc_spanner::fuzzing::{parse_date_days, parse_numeric_i128, parse_timestamp_nanos};
 use chrono::{DateTime, Datelike, Duration, NaiveDate};
 use libfuzzer_sys::fuzz_target;
 
@@ -30,14 +30,14 @@ fuzz_target!(|s: String| {
         }
     }
 
-    if let Some(micros) = parse_timestamp_micros(&s) {
-        // `micros` came from a parsed timestamp, so it is representable.
-        let dt: DateTime<chrono::Utc> = DateTime::from_timestamp_micros(micros).unwrap();
+    if let Some(nanos) = parse_timestamp_nanos(&s) {
+        // `nanos` came from a parsed timestamp, so it is representable (and thus in range).
+        let dt: DateTime<chrono::Utc> = DateTime::from_timestamp_nanos(nanos);
         if (1..=9999).contains(&dt.year()) {
             let canonical = dt.to_rfc3339();
             assert_eq!(
-                parse_timestamp_micros(&canonical),
-                Some(micros),
+                parse_timestamp_nanos(&canonical),
+                Some(nanos),
                 "timestamp round-trip: {s:?}"
             );
         }

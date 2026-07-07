@@ -89,9 +89,9 @@ pub mod fuzzing {
     pub fn parse_date_days(s: &str) -> Option<i32> {
         crate::conversion::parse_date_days(s)
     }
-    /// Parse a Spanner `TIMESTAMP` string into epoch microseconds.
-    pub fn parse_timestamp_micros(s: &str) -> Option<i64> {
-        crate::conversion::parse_timestamp_micros(s)
+    /// Parse a Spanner `TIMESTAMP` string into epoch nanoseconds.
+    pub fn parse_timestamp_nanos(s: &str) -> Option<i64> {
+        crate::conversion::parse_timestamp_nanos(s)
     }
     /// Parse a Spanner `NUMERIC` string into an unscaled `i128` (scale 9).
     pub fn parse_numeric_i128(s: &str) -> Option<i128> {
