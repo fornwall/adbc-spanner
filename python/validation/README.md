@@ -49,11 +49,16 @@ Spanner (`X'..'` → `FROM_HEX('..')`, `\`/`'` escaping in strings). Because `id
 `DECIMAL` (fixed 38,9), `TIME` (no type), and `timestamp`/`timestamptz` (the cases include
 `9999-12-31`, outside Arrow's nanosecond range).
 
-Still to port, each the same shape — a Spanner `setup_query` override (`PRIMARY KEY` + native type
-names) plus `skip`s for unsupported types:
+**`ingest/*` is done** (all pass or `skip`): this one needed a *driver* change, not fixtures — the
+suite ingests with `mode="create"`, so the driver now builds the table from the ingest data's Arrow
+schema, adding a synthetic `adbc_ingest_key` UUID primary key (Spanner requires one; the ingest
+`INSERT`s omit it so the `DEFAULT (GENERATE_UUID())` fills it). `append`/`create`/`create_append`/
+`replace` are all supported. `skip`ped: narrower integers (→ `INT64`), all `DECIMAL` variants (fixed
+38,9), `TIME`/view/fixed-size-binary (no type), tz-naive `timestamp` (Spanner `TIMESTAMP` is
+UTC-aware), and `timestamptz` at non-nanosecond units (Spanner returns nanosecond).
 
-- `queries/spanner/ingest/*` — bulk-ingest cases (the driver builds the `INSERT` from the bound
-  data's column names, so mostly the table DDL needs the dialect override).
+Still to port — the last remaining group:
+
 - A handful of `connection`/`statement` metadata cases.
 
 Once a category is green, consider a gating CI job for that subset.

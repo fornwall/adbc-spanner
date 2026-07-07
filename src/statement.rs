@@ -49,7 +49,8 @@ pub struct SpannerStatement {
     /// Target table for bulk ingest (`adbc.ingest.target_table`), if set.
     target_table: Option<String>,
     /// Ingest mode (`adbc.ingest.mode`), stored in canonical form once set so it round-trips
-    /// through `get_option`. Only `append` is accepted.
+    /// through `get_option`. `append` (default), `create`, `create_append`, and `replace` are
+    /// accepted; the create/replace modes build the table from the ingest data's Arrow schema.
     ingest_mode: Option<String>,
     /// Rows converted into each streamed Arrow batch by `execute` (`spanner.rows_per_batch`).
     rows_per_batch: usize,
@@ -99,6 +100,36 @@ impl SpannerStatement {
             }
         }
         Ok(statements)
+    }
+
+    /// DDL to run before an ingest, for the create/replace ingest modes (`None` for append).
+    ///
+    /// `create` builds the table (erroring if it exists), `create_append` builds it if absent, and
+    /// `replace` drops any existing table first. The schema comes from the bound ingest data.
+    fn build_ingest_table_ddl(
+        &self,
+        table: &str,
+        mode: Option<&str>,
+    ) -> Result<Option<Vec<String>>> {
+        let (if_not_exists, drop_first) = match mode {
+            // Append (the default) into an existing table: no DDL.
+            None | Some("adbc.ingest.mode.append") => return Ok(None),
+            Some("adbc.ingest.mode.create") => (false, false),
+            Some("adbc.ingest.mode.create_append") => (true, false),
+            Some("adbc.ingest.mode.replace") => (false, true),
+            Some(other) => return Err(not_implemented(&format!("ingest mode {other:?}"))),
+        };
+        let schema = self
+            .bound
+            .first()
+            .ok_or_else(|| invalid_state("cannot create the ingest table: no data is bound"))?
+            .schema();
+        let mut statements = Vec::new();
+        if drop_first {
+            statements.push(format!("DROP TABLE IF EXISTS {}", bind::quote_ident(table)));
+        }
+        statements.push(bind::create_table_sql(table, &schema, if_not_exists)?);
+        Ok(Some(statements))
     }
 
     /// Build one `INSERT` statement per bound row for bulk ingest into `table`.
@@ -256,13 +287,20 @@ impl Optionable for SpannerStatement {
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
         match &key {
             OptionStatement::TargetTable => self.target_table = Some(string_option(value)?),
-            OptionStatement::IngestMode => match string_option(value)?.as_str() {
-                // Only appending into an existing table is supported.
-                "adbc.ingest.mode.append" | "append" => {
-                    self.ingest_mode = Some("adbc.ingest.mode.append".to_string());
-                }
-                other => return Err(not_implemented(&format!("ingest mode {other:?}"))),
-            },
+            OptionStatement::IngestMode => {
+                // Append into an existing table, or create it (from the ingest data's Arrow schema,
+                // with a synthetic UUID primary key) in the create/replace modes.
+                let canonical = match string_option(value)?.as_str() {
+                    "adbc.ingest.mode.append" | "append" => "adbc.ingest.mode.append",
+                    "adbc.ingest.mode.create" | "create" => "adbc.ingest.mode.create",
+                    "adbc.ingest.mode.create_append" | "create_append" => {
+                        "adbc.ingest.mode.create_append"
+                    }
+                    "adbc.ingest.mode.replace" | "replace" => "adbc.ingest.mode.replace",
+                    other => return Err(not_implemented(&format!("ingest mode {other:?}"))),
+                };
+                self.ingest_mode = Some(canonical.to_string());
+            }
             OptionStatement::Other(k) if k == crate::OPTION_ROWS_PER_BATCH => {
                 self.rows_per_batch = rows_per_batch_option(value)?;
             }
@@ -406,6 +444,15 @@ impl Statement for SpannerStatement {
         if let Some(table) = self.target_table.clone() {
             if self.read_only {
                 return Err(invalid_state("cannot ingest: the connection is read-only"));
+            }
+            if self.bound.is_empty() {
+                return Err(invalid_state("cannot ingest: no data has been bound"));
+            }
+            // In the create/replace modes, first build the table from the ingest data's Arrow schema
+            // (with a synthetic UUID primary key) — Spanner DDL runs immediately, before the inserts.
+            let mode = self.ingest_mode.as_deref();
+            if let Some(ddl) = self.build_ingest_table_ddl(&table, mode)? {
+                self.run_ddl(ddl)?;
             }
             let statements = self.build_ingest_statements(&table)?;
             self.bound.clear();

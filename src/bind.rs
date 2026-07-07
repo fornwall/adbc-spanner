@@ -385,8 +385,72 @@ fn skip_line_comment(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
 /// Backtick-quote a Spanner identifier, escaping embedded backticks. Keeps reserved words
 /// (`create`, `index`, …) and otherwise-unsafe names valid, and closes the identifier-injection
 /// vector when a caller's table/column names reach the generated SQL.
-fn quote_ident(ident: &str) -> String {
+pub(crate) fn quote_ident(ident: &str) -> String {
     format!("`{}`", ident.replace('`', "``"))
+}
+
+/// Synthetic primary-key column added to tables created by bulk ingest (see [`create_table_sql`]).
+/// Spanner requires a primary key, but Arrow ingest data carries none, so we add a hidden
+/// UUID-defaulted key. Spanner forbids leading-underscore identifiers, hence the `adbc_`-prefixed
+/// (rather than `_adbc_`) name. Ingest `INSERT`s omit it, so the `DEFAULT` fills it per row.
+pub(crate) const INGEST_KEY_COLUMN: &str = "adbc_ingest_key";
+
+/// Map an Arrow parameter/ingest type to the Spanner column type used when creating a table.
+///
+/// This mirrors the read path's Spanner→Arrow mapping. Narrower integers collapse to `INT64`
+/// (Spanner's only integer type); `List` becomes a Spanner `ARRAY<...>`. Types with no Spanner
+/// column representation are rejected.
+pub(crate) fn spanner_column_type(data_type: &DataType) -> Result<String> {
+    Ok(match data_type {
+        DataType::Int16 | DataType::Int32 | DataType::Int64 => "INT64".to_string(),
+        DataType::Float32 => "FLOAT32".to_string(),
+        DataType::Float64 => "FLOAT64".to_string(),
+        DataType::Boolean => "BOOL".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 => "STRING(MAX)".to_string(),
+        DataType::Binary | DataType::LargeBinary => "BYTES(MAX)".to_string(),
+        DataType::Date32 => "DATE".to_string(),
+        DataType::Timestamp(_, _) => "TIMESTAMP".to_string(),
+        DataType::Decimal128(_, _) => "NUMERIC".to_string(),
+        DataType::List(field) | DataType::LargeList(field) => {
+            format!("ARRAY<{}>", spanner_column_type(field.data_type())?)
+        }
+        other => {
+            return Err(invalid_argument(format!(
+                "cannot create a Spanner column for Arrow type {other:?}"
+            )))
+        }
+    })
+}
+
+/// Build a `CREATE TABLE` statement for bulk ingest from the data's Arrow `schema`.
+///
+/// Every data column maps to its Spanner type via [`spanner_column_type`], and a hidden
+/// [`INGEST_KEY_COLUMN`] UUID key is appended as the primary key (Spanner requires one). Pass
+/// `if_not_exists` for `create_append` mode.
+pub(crate) fn create_table_sql(
+    table: &str,
+    schema: &arrow_schema::Schema,
+    if_not_exists: bool,
+) -> Result<String> {
+    let mut columns: Vec<String> = Vec::with_capacity(schema.fields().len() + 1);
+    for field in schema.fields() {
+        columns.push(format!(
+            "{} {}",
+            quote_ident(field.name()),
+            spanner_column_type(field.data_type())?
+        ));
+    }
+    columns.push(format!(
+        "{} STRING(36) DEFAULT (GENERATE_UUID())",
+        quote_ident(INGEST_KEY_COLUMN)
+    ));
+    let guard = if if_not_exists { "IF NOT EXISTS " } else { "" };
+    Ok(format!(
+        "CREATE TABLE {guard}{} ({}) PRIMARY KEY ({})",
+        quote_ident(table),
+        columns.join(", "),
+        quote_ident(INGEST_KEY_COLUMN),
+    ))
 }
 
 /// Build an `` INSERT INTO `table` (`cols`) VALUES (@cols) `` statement for bulk ingest.
@@ -439,6 +503,43 @@ mod tests {
         );
         assert!(bind_row(Statement::builder("SELECT @a, @b"), &b, 0).is_ok());
         assert!(bind_row(Statement::builder("SELECT @a, @b"), &b, 1).is_ok());
+    }
+
+    #[test]
+    fn maps_arrow_to_spanner_column_types() {
+        assert_eq!(spanner_column_type(&DataType::Int32).unwrap(), "INT64");
+        assert_eq!(spanner_column_type(&DataType::Int64).unwrap(), "INT64");
+        assert_eq!(spanner_column_type(&DataType::Float32).unwrap(), "FLOAT32");
+        assert_eq!(spanner_column_type(&DataType::Utf8).unwrap(), "STRING(MAX)");
+        assert_eq!(
+            spanner_column_type(&DataType::LargeBinary).unwrap(),
+            "BYTES(MAX)"
+        );
+        assert_eq!(
+            spanner_column_type(&DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap(),
+            "TIMESTAMP"
+        );
+        let list = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+        assert_eq!(spanner_column_type(&list).unwrap(), "ARRAY<INT64>");
+        // No Spanner column type for unsigned integers.
+        assert!(spanner_column_type(&DataType::UInt32).is_err());
+    }
+
+    #[test]
+    fn builds_create_table_sql() {
+        let schema = Schema::new(vec![
+            Field::new("idx", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        assert_eq!(
+            create_table_sql("my_table", &schema, false).unwrap(),
+            "CREATE TABLE `my_table` (`idx` INT64, `name` STRING(MAX), \
+             `adbc_ingest_key` STRING(36) DEFAULT (GENERATE_UUID())) \
+             PRIMARY KEY (`adbc_ingest_key`)"
+        );
+        assert!(create_table_sql("t", &schema, true)
+            .unwrap()
+            .starts_with("CREATE TABLE IF NOT EXISTS `t`"));
     }
 
     #[test]
