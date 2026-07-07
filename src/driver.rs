@@ -4,7 +4,11 @@ use adbc_core::error::{Result, Status};
 use adbc_core::options::{OptionDatabase, OptionValue};
 use adbc_core::{Database, Driver, Optionable};
 use google_cloud_auth::credentials::anonymous::Builder as AnonymousCredentials;
+use google_cloud_auth::credentials::external_account::Builder as ExternalAccountCredentials;
+use google_cloud_auth::credentials::impersonated::Builder as ImpersonatedCredentials;
 use google_cloud_auth::credentials::service_account::Builder as ServiceAccountCredentials;
+use google_cloud_auth::credentials::user_account::Builder as UserAccountCredentials;
+use google_cloud_auth::credentials::Credentials;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 
 use crate::connection::SpannerConnection;
@@ -86,7 +90,8 @@ impl SpannerDatabase {
         }
     }
 
-    /// Resolve the inline service-account JSON to use, reading the key file if a path was given.
+    /// Resolve the inline credential JSON to use, reading the key file if a path was given. The
+    /// credential flow is auto-detected from the JSON's `"type"` field in [`build_credentials_from_json`].
     /// Inline JSON ([`OPTION_KEYFILE_JSON`]) takes precedence over a file path ([`OPTION_KEYFILE`]).
     fn credentials_json(&self) -> Result<Option<String>> {
         if let Some(json) = &self.keyfile_json {
@@ -127,8 +132,8 @@ impl SpannerDatabase {
             }
         }
 
-        // Resolve service-account credentials up front (reads the key file, if any). Ignored in
-        // emulator mode, which always uses anonymous credentials.
+        // Resolve the credential JSON up front (reads the key file, if any); the flow is detected
+        // from its `"type"` below. Ignored in emulator mode, which always uses anonymous credentials.
         let credentials_json = if emulator {
             None
         } else {
@@ -143,14 +148,7 @@ impl SpannerDatabase {
             if emulator {
                 builder = builder.with_credentials(AnonymousCredentials::new().build());
             } else if let Some(json) = credentials_json {
-                let key = parse_service_account_key(&json)?;
-                let credentials = ServiceAccountCredentials::new(key).build().map_err(|e| {
-                    err(
-                        format!("failed to build service-account credentials: {e}"),
-                        Status::InvalidArguments,
-                    )
-                })?;
-                builder = builder.with_credentials(credentials);
+                builder = builder.with_credentials(build_credentials_from_json(&json)?);
             }
             // Otherwise: Application Default Credentials.
             let spanner = builder.build().await.map_err(from_spanner)?;
@@ -293,11 +291,64 @@ fn string_value(key: &OptionDatabase, value: OptionValue) -> Result<String> {
     }
 }
 
-/// Parse a service-account JSON key, mapping errors to `InvalidArguments`.
-fn parse_service_account_key(json: &str) -> Result<serde_json::Value> {
-    serde_json::from_str(json).map_err(|e| {
+/// The credential `type` values we accept in a keyfile JSON, for use in error messages.
+const SUPPORTED_CREDENTIAL_TYPES: &str =
+    "service_account, authorized_user, impersonated_service_account, external_account";
+
+/// Build Google credentials from an inline JSON key, auto-detecting the credential flow from the
+/// JSON's top-level `"type"` field, mirroring the BigQuery ADBC driver and Google's own auth
+/// libraries.
+///
+/// Standard Google credential JSON carries a `"type"` discriminator; each value maps to a distinct
+/// auth flow with its own required fields:
+///
+/// - `service_account` — a service-account key (`private_key` / `client_email`).
+/// - `authorized_user` — end-user Application Default Credentials from `gcloud auth
+///   application-default login`.
+/// - `impersonated_service_account` — impersonation of a target service account.
+/// - `external_account` — Workload/Workforce Identity Federation.
+///
+/// The underlying `google-cloud-auth` top-level `Builder` already dispatches on this field, but only
+/// for credentials it loads itself from the environment (the `GOOGLE_APPLICATION_CREDENTIALS` var or
+/// the well-known ADC file). It offers no entry point that takes inline JSON, so the dispatch has to
+/// happen here for the JSON supplied through the `adbc.spanner.keyfile` / `adbc.spanner.keyfile_json`
+/// options. Previously every keyfile was forced through the `service_account` builder, which failed
+/// (or misbehaved) for any other credential type.
+fn build_credentials_from_json(json: &str) -> Result<Credentials> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|e| {
         err(
-            format!("invalid service-account JSON key: {e}"),
+            format!("invalid credential JSON key: {e}"),
+            Status::InvalidArguments,
+        )
+    })?;
+
+    let credential_type = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            invalid_argument(format!(
+                "credential JSON is missing a string `type` field; expected one of \
+                 {SUPPORTED_CREDENTIAL_TYPES}"
+            ))
+        })?
+        .to_owned();
+
+    let result = match credential_type.as_str() {
+        "service_account" => ServiceAccountCredentials::new(value).build(),
+        "authorized_user" => UserAccountCredentials::new(value).build(),
+        "impersonated_service_account" => ImpersonatedCredentials::new(value).build(),
+        "external_account" => ExternalAccountCredentials::new(value).build(),
+        other => {
+            return Err(invalid_argument(format!(
+                "unsupported credential `type` {other:?}; expected one of \
+                 {SUPPORTED_CREDENTIAL_TYPES}"
+            )));
+        }
+    };
+
+    result.map_err(|e| {
+        err(
+            format!("failed to build {credential_type} credentials: {e}"),
             Status::InvalidArguments,
         )
     })
@@ -443,13 +494,65 @@ mod tests {
     }
 
     #[test]
-    fn invalid_service_account_json_is_rejected() {
-        assert_eq!(
-            parse_service_account_key("{ not valid json")
-                .unwrap_err()
-                .status,
-            Status::InvalidArguments
-        );
-        assert!(parse_service_account_key("{\"type\":\"service_account\"}").is_ok());
+    fn malformed_credential_json_is_rejected() {
+        let error = build_credentials_from_json("{ not valid json").unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("invalid credential JSON key"));
+    }
+
+    #[test]
+    fn credential_json_without_a_type_is_rejected() {
+        let error = build_credentials_from_json("{\"private_key\":\"x\"}").unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("missing a string `type` field"));
+        assert!(error.message.contains("service_account"));
+    }
+
+    #[test]
+    fn credential_json_with_a_non_string_type_is_rejected() {
+        let error = build_credentials_from_json("{\"type\":42}").unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("missing a string `type` field"));
+    }
+
+    #[test]
+    fn credential_json_with_an_unknown_type_is_rejected() {
+        let error = build_credentials_from_json("{\"type\":\"gdch_service_account\"}").unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("unsupported credential `type`"));
+        assert!(error.message.contains("gdch_service_account"));
+        assert!(error.message.contains("external_account"));
+    }
+
+    // An `authorized_user` (end-user ADC) keyfile with all required fields is accepted and routed to
+    // the user-account flow — no service-account private key required, and no network is touched
+    // (token exchange happens lazily on first use). This is exactly the case the previous
+    // service-account-only code path mishandled. The builder spawns a token-cache task, so it must
+    // run inside a Tokio runtime — exactly as `connect()` does inside its `block_on`.
+    #[test]
+    fn authorized_user_credential_json_is_accepted() {
+        let json = r#"{
+            "type": "authorized_user",
+            "client_id": "test-client-id.apps.googleusercontent.com",
+            "client_secret": "test-client-secret",
+            "refresh_token": "test-refresh-token"
+        }"#;
+        let runtime = new_runtime().unwrap();
+        runtime.block_on(async { assert!(build_credentials_from_json(json).is_ok()) });
+    }
+
+    // A `service_account` keyfile is still routed to the service-account flow. A key with an invalid
+    // private key fails inside that builder — and, crucially, the error names the detected type,
+    // proving the dispatch reached the service-account path rather than being rejected as unknown.
+    #[test]
+    fn service_account_credential_json_is_routed_to_the_service_account_flow() {
+        let error = build_credentials_from_json(
+            "{\"type\":\"service_account\",\"private_key\":\"not-a-key\"}",
+        )
+        .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error
+            .message
+            .contains("failed to build service_account credentials"));
     }
 }
