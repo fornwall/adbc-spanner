@@ -1,0 +1,3 @@
+// part: metadata
+
+skip = "Spanner has no TIME-of-day type"

@@ -1,0 +1,5 @@
+// Spanner override: native FLOAT32 cast (Spanner has no REAL keyword).
+
+// part: query
+
+SELECT CAST(3.14 AS FLOAT32) AS res

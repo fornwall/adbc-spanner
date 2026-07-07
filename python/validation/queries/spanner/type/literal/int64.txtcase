@@ -1,0 +1,5 @@
+// Spanner override: native INT64 cast (Spanner has no BIGINT keyword).
+
+// part: query
+
+SELECT CAST(4294967296 AS INT64) AS res

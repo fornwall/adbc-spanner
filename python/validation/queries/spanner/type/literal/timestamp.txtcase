@@ -1,0 +1,24 @@
+// Spanner override: Spanner's only TIMESTAMP type is an absolute instant in UTC,
+// mapped to Arrow Timestamp(Nanosecond, "UTC"). The literal value (2023-05-15) is
+// inside Arrow's nanosecond range, so pin the offset to UTC and expect UTC nanos.
+
+// part: query
+
+SELECT TIMESTAMP '2023-05-15 13:45:30+00' AS res
+
+// part: expected_schema
+
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "res",
+            "format": "tsn:UTC",
+            "flags": ["nullable"]
+        }
+    ]
+}
+
+// part: expected
+
+{"res": 1684158330000000000}

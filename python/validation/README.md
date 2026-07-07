@@ -49,6 +49,16 @@ Spanner (`X'..'` → `FROM_HEX('..')`, `\`/`'` escaping in strings). Because `id
 `DECIMAL` (fixed 38,9), `TIME` (no type), and `timestamp`/`timestamptz` (the cases include
 `9999-12-31`, outside Arrow's nanosecond range).
 
+**`type/literal/*` is done** (all pass or `skip`): each case selects a typed literal/cast; the base
+corpus uses portable-SQL type names Spanner rejects (`SMALLINT`/`INT`/`BIGINT`/`REAL`/`DOUBLE
+PRECISION`/`NUMERIC(p,s)`/`TIME`/`TIMESTAMP WITH TIME ZONE`), so each override supplies the
+Spanner-native equivalent. Ported: `int64` (`CAST(.. AS INT64)`), `float32` (`FLOAT32`), `float64`
+(`FLOAT64`), and — unlike `type/select`, whose values hit `9999-12-31` — `timestamp`/`timestamptz`,
+whose literals (`2023-05-15`) are inside Arrow's nanosecond range; both map to Spanner's only
+timestamp type (a UTC-aware absolute instant → Arrow `Timestamp(Nanosecond, "UTC")`), so the override
+pins the literal to `+00` and expects UTC nanoseconds. `skip`ped: narrower integers (→ `INT64`),
+`DECIMAL` (fixed 38,9), and `TIME` (no type).
+
 **`ingest/*` is done** (all pass or `skip`): this one needed a *driver* change, not fixtures — the
 suite ingests with `mode="create"`, so the driver now builds the table from the ingest data's Arrow
 schema, adding a synthetic `adbc_ingest_key` UUID primary key (Spanner requires one; the ingest
