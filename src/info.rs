@@ -31,6 +31,10 @@ const INT64_VALUE: i8 = 2;
 /// The ADBC API revision this driver targets (`1.1.0`), reported for `DriverAdbcVersion`.
 const ADBC_VERSION_1_1_0: i64 = 1_001_000;
 
+/// The version of the `arrow-array` crate this driver is built against (resolved from `Cargo.lock`
+/// by `build.rs`), reported for `DriverArrowVersion` with the conventional leading `v`.
+const ARROW_VERSION: &str = concat!("v", env!("ADBC_SPANNER_ARROW_VERSION"));
+
 /// The codes reported when the caller requests *all* info (`get_info(None)`): the ones with a
 /// stable, meaningful value. Requesting a specific code outside this set still yields a row (with a
 /// null value) — see [`value_for`].
@@ -40,6 +44,7 @@ const REPORTED: &[InfoCode] = &[
     InfoCode::VendorSubstrait,
     InfoCode::DriverName,
     InfoCode::DriverVersion,
+    InfoCode::DriverArrowVersion,
     InfoCode::DriverAdbcVersion,
 ];
 
@@ -62,9 +67,10 @@ fn value_for(code: InfoCode) -> InfoValue {
         InfoCode::VendorSubstrait => InfoValue::Bool(false),
         InfoCode::DriverName => InfoValue::Str(DRIVER_NAME.to_string()),
         InfoCode::DriverVersion => InfoValue::Str(DRIVER_VERSION.to_string()),
+        InfoCode::DriverArrowVersion => InfoValue::Str(ARROW_VERSION.to_string()),
         InfoCode::DriverAdbcVersion => InfoValue::Int(ADBC_VERSION_1_1_0),
-        // Recognised codes without a stable value (product/Arrow versions, Substrait bounds), plus
-        // any future `#[non_exhaustive]` variant.
+        // Recognised codes without a stable value (vendor product/Arrow versions, Substrait
+        // bounds), plus any future `#[non_exhaustive]` variant.
         _ => InfoValue::Null,
     }
 }
@@ -229,6 +235,29 @@ mod tests {
         let value = union.value(vendor_row);
         let s = value.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(s.value(0), VENDOR_NAME);
+    }
+
+    #[test]
+    fn driver_arrow_version_is_reported_with_a_leading_v() {
+        // Part of the default `get_info(None)` set.
+        assert!(REPORTED.contains(&InfoCode::DriverArrowVersion));
+
+        // Requested explicitly, it carries the arrow crate version as a `v`-prefixed string.
+        let batch = build(Some([InfoCode::DriverArrowVersion].into_iter().collect())).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let union = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UnionArray>()
+            .unwrap();
+        let value = union.value(0);
+        let s = value.as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(!s.is_null(0));
+        let version = s.value(0);
+        assert!(
+            version.starts_with('v') && version.len() > 1,
+            "expected a v-prefixed arrow version, got {version:?}"
+        );
     }
 
     #[test]
