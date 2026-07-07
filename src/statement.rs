@@ -663,10 +663,14 @@ impl Statement for SpannerStatement {
         // Bulk ingest arriving through the query entry point (needs no SQL query): a standard ADBC
         // FFI caller may drive an ingest via `execute` with a non-null stream out-pointer. Run it
         // the same way `execute_update` does and return an empty stream — the query interface has
-        // nowhere to report the affected-row count, so it is discarded.
-        if let Some(table) = self.target_table.clone() {
-            self.run_ingest(&table)?;
-            return Ok(Self::empty_reader());
+        // nowhere to report the affected-row count, so it is discarded. Gate on there being no SQL:
+        // `set_sql_query` does not clear `target_table`, so a statement handle reused for a query
+        // after an ingest must run that query, not re-enter ingest with no bound data.
+        if self.sql.is_none() {
+            if let Some(table) = self.target_table.clone() {
+                self.run_ingest(&table)?;
+                return Ok(Self::empty_reader());
+            }
         }
         let sql = self.sql()?;
         if crate::ddl::is_ddl(&sql) {
@@ -733,9 +737,13 @@ impl Statement for SpannerStatement {
     fn execute_update(&mut self) -> Result<Option<i64>> {
         // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
         self.cancel.reset();
-        // Bulk ingest: insert the bound rows into the target table (needs no SQL query).
-        if let Some(table) = self.target_table.clone() {
-            return self.run_ingest(&table);
+        // Bulk ingest: insert the bound rows into the target table (needs no SQL query). Gate on
+        // there being no SQL for the same reason as `execute` — a reused handle whose `target_table`
+        // is still set from a prior ingest must run its freshly-set statement, not re-enter ingest.
+        if self.sql.is_none() {
+            if let Some(table) = self.target_table.clone() {
+                return self.run_ingest(&table);
+            }
         }
 
         let sql = self.sql()?;
