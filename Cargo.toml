@@ -66,6 +66,10 @@ ffi = ["dep:adbc_ffi"]
 fuzzing = ["dep:arbitrary"]
 
 [dependencies]
+# Two dependency families are pinned to git revisions (temporary). When reverting either to a
+# versioned crates.io release, follow the single revert checklist in CLAUDE.md "Temporary git
+# pins" — it enumerates every location (all these Cargo.toml lines, deny.toml, README.md, the
+# `publish = false` release gate) and the invariant that the three arrow-adbc crates share one rev.
 # --- adbc_core / adbc_ffi pinned to a git revision (temporary) ---
 # The abstract ADBC driver traits, and the C FFI driver exporter that generates the
 # `AdbcSpannerInit` entrypoint for the shared library. Pinned to a fork of

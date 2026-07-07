@@ -103,6 +103,31 @@ and **each is independently a crates.io publish blocker** — the crate cannot b
    with the crates.io `= "0.23"` release, downstream crates must also take `adbc_core` from this
    same git rev (see `README.md`).
 
+**Revert checklist — the single anchor.** The two revs are spread across ~9 `Cargo.toml` dependency
+lines plus `deny.toml` plus the docs; this list is the one place that enumerates every edit needed to
+revert a family to versioned crates.io releases. Current pinned revs:
+
+- `google-cloud-rust`: `3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1`
+- `fornwall/arrow-adbc`: `786e7f3488eb71b200ece775b027a647cf42db9e`
+
+**Invariant:** the three arrow-adbc crates (`adbc_core`, `adbc_ffi`, `adbc_driver_manager`) must
+always share ONE rev; the six `google-cloud-*` crates likewise share ONE rev. When reverting, touch
+*every* location for that family in lockstep:
+
+- `Cargo.toml` `[dependencies]` — arrow-adbc: `adbc_core`, `adbc_ffi`; google-cloud:
+  `google-cloud-spanner`, `google-cloud-auth`, `google-cloud-lro`.
+- `Cargo.toml` `[dev-dependencies]` — arrow-adbc: `adbc_driver_manager`; google-cloud:
+  `google-cloud-spanner-admin-instance-v1`, `google-cloud-spanner-admin-database-v1`,
+  `google-cloud-gax`. (There is no `[patch]` section.)
+- `deny.toml` `allow-git` — drop the repo URL for each family once it no longer has any git dep.
+- `README.md` — the quickstart `adbc_core = { git = … rev = "786e7f3…" }` block and the surrounding
+  "not on crates.io" / *Type mapping* notes that name the pins.
+- `CLAUDE.md` — this section (both the "Temporary git pins" note and this checklist); once *both*
+  families are versioned, also re-enable `publish` (below) and revisit the `arrow-array`/`-schema`/
+  `-buffer` `>=58, <60` range, which exists only to unify with the git `adbc_core`.
+- `Cargo.toml` `[package.metadata.release]` `publish = false` — flip back to `true` only after
+  *both* families are off git (each is independently a publish blocker).
+
 Locally, this machine's global git config rewrites `https://github.com` to SSH, so cargo fetches
 fail unless you set `CARGO_NET_GIT_FETCH_WITH_CLI=true` plus a `GIT_CONFIG_*` identity `insteadOf`
 override for the fork URLs (see the session notes / the `with-emulator.sh` invocations). CI is
