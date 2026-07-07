@@ -196,7 +196,9 @@ pub const OPTION_ENDPOINT: &str = "spanner.endpoint";
 
 /// Driver-specific database option: when set to `true`, connect with anonymous credentials
 /// (the mode used by the Spanner emulator). Automatically enabled when `SPANNER_EMULATOR_HOST`
-/// is present in the environment.
+/// is present in the environment. Combining emulator mode with explicitly configured credentials
+/// ([`OPTION_KEYFILE`], [`OPTION_KEYFILE_JSON`], or [`OPTION_IMPERSONATE_TARGET_PRINCIPAL`]) is
+/// refused at connect time instead of silently ignoring them.
 pub const OPTION_EMULATOR: &str = "spanner.emulator";
 
 /// Driver-specific database option: path to a service-account JSON key file to authenticate with

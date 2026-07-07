@@ -510,10 +510,19 @@ propagation (any scan error surfaces as an overall `Err`) are preserved. `execut
 an extra PLAN round trip for the schema (unavoidable until the client surfaces partition metadata);
 binary parameters take a forced `to_vec()` copy (upstream `ToValue` limitation).
 
-**Security.** Emulator mode (`SPANNER_EMULATOR_HOST`) silently forces anonymous credentials +
+**Security.** ~~Emulator mode (`SPANNER_EMULATOR_HOST`) silently forces anonymous credentials +
 plaintext `http://`, overriding configured keyfiles — an env-controlled downgrade footgun;
 consider refusing (or warning) when explicit credentials were also configured
-(`src/driver.rs:150-187`). Credential-building errors interpolate the auth crate's `Display`
+(`src/driver.rs:150-187`)~~ (**Fixed.** `connect()` now refuses with `InvalidState` when emulator
+mode — via `SPANNER_EMULATOR_HOST` *or* `spanner.emulator` — is combined with explicit driver
+credentials (`spanner.keyfile`, `spanner.keyfile_json`, or
+`spanner.impersonate.target_principal`); the error names the offending option and what enabled
+emulator mode. Ambient ADC (e.g. `GOOGLE_APPLICATION_CREDENTIALS`) and inert `spanner.impersonate.*`
+options without a target do not trip the guard, so the plain emulator path — the integration-test
+path — is unchanged. Offline unit tests in `src/driver.rs`
+(`emulator_mode_with_an_explicit_keyfile_is_refused` and siblings) cover keyfile / keyfile_json /
+impersonation-target refusal plus the ambient-ADC negative case; documented in README's
+Authentication list and the `OPTION_EMULATOR` rustdoc.) Credential-building errors interpolate the auth crate's `Display`
 output, which is outside this crate's control (`driver.rs:436-473`); scrub or verify it never
 embeds key material.
 

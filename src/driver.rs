@@ -133,10 +133,31 @@ impl SpannerDatabase {
         }
     }
 
+    /// The name of the first explicitly-configured credential option, if any.
+    ///
+    /// Only *driver-level* credential configuration counts: a keyfile (path or inline JSON) or an
+    /// impersonation target. Ambient Application Default Credentials (e.g. the
+    /// `GOOGLE_APPLICATION_CREDENTIALS` environment variable or a gcloud login) are deliberately
+    /// *not* reported — they are the environment's business, not an explicit driver option, and
+    /// must not prevent emulator use. The remaining `spanner.impersonate.*` options are inert
+    /// without a target principal, so they do not count either.
+    fn explicit_credential_option(&self) -> Option<&'static str> {
+        if self.keyfile_json.is_some() {
+            Some(OPTION_KEYFILE_JSON)
+        } else if self.keyfile.is_some() {
+            Some(OPTION_KEYFILE)
+        } else if self.impersonate_target_principal.is_some() {
+            Some(OPTION_IMPERSONATE_TARGET_PRINCIPAL)
+        } else {
+            None
+        }
+    }
+
     /// Resolve the effective configuration and establish a connection.
     ///
     /// Emulator handling: if `SPANNER_EMULATOR_HOST` is set it supplies the endpoint (unless one was
-    /// given explicitly) and forces anonymous credentials.
+    /// given explicitly) and forces anonymous credentials. Combining emulator mode with explicitly
+    /// configured credentials is refused (see below) instead of silently downgrading them.
     pub(crate) fn connect(&self) -> Result<Connected> {
         let database = self.database.clone().ok_or_else(|| {
             invalid_state(
@@ -156,21 +177,33 @@ impl SpannerDatabase {
             }
         }
 
+        // Emulator mode forces anonymous credentials over plaintext `http://`. Silently dropping
+        // credentials the user explicitly configured would be an environment-controlled security
+        // downgrade (a stray `SPANNER_EMULATOR_HOST` redirecting real-database traffic, sans auth,
+        // to an attacker-chosen endpoint), so the combination is refused instead. Ambient ADC does
+        // not trip this — only explicit driver options do.
+        if emulator {
+            if let Some(option) = self.explicit_credential_option() {
+                let cause = if self.emulator {
+                    "the `spanner.emulator` option"
+                } else {
+                    "the `SPANNER_EMULATOR_HOST` environment variable"
+                };
+                return Err(invalid_state(format!(
+                    "emulator mode (enabled by {cause}) forces anonymous plaintext credentials \
+                     and would silently ignore the configured `{option}` option; unset the \
+                     credential option(s) or disable emulator mode"
+                )));
+            }
+        }
+
         // Resolve the credential JSON up front (reads the key file, if any); the flow is detected
-        // from its `"type"` below. Ignored in emulator mode, which always uses anonymous credentials.
-        let credentials_json = if emulator {
-            None
-        } else {
-            self.credentials_json()?
-        };
+        // from its `"type"` below. In emulator mode the guard above guarantees these are unset, so
+        // both resolve to `None` and anonymous credentials win.
+        let credentials_json = self.credentials_json()?;
 
         // Impersonation config, applied on top of the base credentials below when a target is set.
-        // Ignored in emulator mode (which uses anonymous credentials and does no real auth).
-        let impersonate_target = if emulator {
-            None
-        } else {
-            self.impersonate_target_principal.clone()
-        };
+        let impersonate_target = self.impersonate_target_principal.clone();
         let impersonate_delegates = self.impersonate_delegates.clone();
         let impersonate_scopes = self.impersonate_scopes.clone();
         let impersonate_lifetime = Duration::from_secs(
@@ -615,6 +648,62 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.status, Status::NotImplemented);
+    }
+
+    // Emulator mode + explicitly configured credentials is refused at connect() time instead of
+    // silently downgrading to anonymous plaintext credentials. The guard fires before any network
+    // or runtime work, so these tests run offline. `spanner.emulator=true` is used to enter
+    // emulator mode (env vars cannot be mutated safely in parallel tests); the
+    // `SPANNER_EMULATOR_HOST` path resolves to the same `emulator` flag and hits the same guard.
+    #[test]
+    fn emulator_mode_with_an_explicit_keyfile_is_refused() {
+        let mut db = new_database();
+        db.database = Some("projects/p/instances/i/databases/d".into());
+        db.emulator = true;
+        db.keyfile = Some("/path/to/key.json".into());
+        let error = db.connect().unwrap_err();
+        assert_eq!(error.status, Status::InvalidState);
+        assert!(error.message.contains("emulator mode"));
+        assert!(error.message.contains(OPTION_KEYFILE));
+        assert!(error.message.contains("`spanner.emulator` option"));
+    }
+
+    #[test]
+    fn emulator_mode_with_explicit_keyfile_json_is_refused() {
+        let mut db = new_database();
+        db.database = Some("projects/p/instances/i/databases/d".into());
+        db.emulator = true;
+        db.keyfile_json = Some("{\"type\":\"service_account\"}".into());
+        let error = db.connect().unwrap_err();
+        assert_eq!(error.status, Status::InvalidState);
+        assert!(error.message.contains(OPTION_KEYFILE_JSON));
+    }
+
+    #[test]
+    fn emulator_mode_with_an_impersonation_target_is_refused() {
+        let mut db = new_database();
+        db.database = Some("projects/p/instances/i/databases/d".into());
+        db.emulator = true;
+        db.impersonate_target_principal = Some("target@project.iam.gserviceaccount.com".into());
+        let error = db.connect().unwrap_err();
+        assert_eq!(error.status, Status::InvalidState);
+        assert!(error.message.contains(OPTION_IMPERSONATE_TARGET_PRINCIPAL));
+    }
+
+    // Only explicit driver options count as credentials: a fresh database (which would fall back to
+    // ambient ADC, e.g. GOOGLE_APPLICATION_CREDENTIALS) reports none, so plain emulator use — the
+    // integration-test path — is not refused. Inert `spanner.impersonate.*` options (no target
+    // principal) do not count either.
+    #[test]
+    fn ambient_adc_and_inert_impersonation_options_do_not_trip_the_emulator_guard() {
+        let mut db = new_database();
+        assert_eq!(db.explicit_credential_option(), None);
+        db.impersonate_delegates = vec!["delegate@p.iam.gserviceaccount.com".into()];
+        db.impersonate_scopes = vec!["https://www.googleapis.com/auth/cloud-platform".into()];
+        db.impersonate_lifetime_secs = Some(900);
+        assert_eq!(db.explicit_credential_option(), None);
+        db.keyfile = Some("/path/to/key.json".into());
+        assert_eq!(db.explicit_credential_option(), Some(OPTION_KEYFILE));
     }
 
     #[test]
