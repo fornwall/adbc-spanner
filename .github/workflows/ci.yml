@@ -111,8 +111,9 @@ jobs:
           set -euo pipefail
           cp target/debug/libadbc_spanner.so python/adbc_driver_spanner/
           python -m pip install --upgrade pip
-          # adbc_driver_manager + pyarrow/pandas exercise the Arrow + DataFrame paths.
-          python -m pip install ./python pyarrow pandas pytest
+          # pyarrow/pandas/polars/duckdb exercise the Arrow + DataFrame paths, including the
+          # README cookbook snippets that import them.
+          python -m pip install ./python pyarrow pandas polars duckdb pytest
 
       - name: Wait for the Spanner emulator
         run: |

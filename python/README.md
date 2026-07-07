@@ -11,14 +11,14 @@ ready for pandas, polars, DuckDB, or PyArrow with no per-row conversion.
 
 ```sh
 pip install adbc-driver-spanner
-# for the DataFrame helpers used below:
+# for the DataFrame / Arrow helpers used below:
 pip install adbc-driver-spanner[dbapi] pandas
 ```
 
 Prebuilt wheels are published for Linux (x86-64, aarch64), macOS (arm64,
 x86-64), and Windows (x86-64, arm64).
 
-## Usage
+## Quickstart
 
 ```python
 import adbc_driver_spanner.dbapi as spanner
@@ -29,12 +29,11 @@ with spanner.connect(
     with conn.cursor() as cur:
         cur.execute("SELECT SingerId, FirstName FROM Singers")
         df = cur.fetch_df()          # -> pandas.DataFrame
-        table = cur.fetch_arrow_table()  # -> pyarrow.Table
-
-    conn.commit()  # DBAPI is autocommit-off; commit applies buffered DML
 ```
 
-Connection options mirror the driver's `adbc.spanner.*` keys:
+## Connection options
+
+Options mirror the driver's `adbc.spanner.*` keys:
 
 | kwarg          | driver option               |
 | -------------- | --------------------------- |
@@ -48,8 +47,83 @@ Credentials default to Application Default Credentials; pass `keyfile=` /
 `keyfile_json=` for a service account, or point at the emulator:
 
 ```python
+# docs-test: skip
 spanner.connect(database="projects/p/instances/i/databases/d",
                 endpoint="localhost:9010", emulator=True)
+```
+
+## Cookbook
+
+Every snippet below is executed against the Spanner emulator in CI, so they stay
+correct. They assume a `Singers(SingerId INT64, FirstName STRING)` table.
+
+Two things to know:
+
+- **DBAPI is autocommit-off by default**, so **DML and ingest need a
+  `conn.commit()`** (or pass `autocommit=True`). Reads need neither.
+- The DataFrame / Arrow paths need the `[dbapi]` extra (pyarrow).
+
+**pyarrow — zero-copy Arrow:**
+
+```python
+import adbc_driver_spanner.dbapi as spanner
+
+with spanner.connect(
+    database="projects/my-project/instances/my-instance/databases/my-db",
+) as conn:
+    with conn.cursor() as cur:
+        cur.execute("SELECT SingerId, FirstName FROM Singers ORDER BY SingerId")
+        table = cur.fetch_arrow_table()      # -> pyarrow.Table
+```
+
+**polars — read straight from the connection:**
+
+```python
+import polars as pl
+import adbc_driver_spanner.dbapi as spanner
+
+with spanner.connect(
+    database="projects/my-project/instances/my-instance/databases/my-db",
+) as conn:
+    df = pl.read_database(
+        "SELECT SingerId, FirstName FROM Singers ORDER BY SingerId",
+        connection=conn,                     # an ADBC connection, not a URI
+    )
+```
+
+**DuckDB — query the fetched Arrow table in-process:**
+
+```python
+import duckdb
+import adbc_driver_spanner.dbapi as spanner
+
+with spanner.connect(
+    database="projects/my-project/instances/my-instance/databases/my-db",
+) as conn:
+    with conn.cursor() as cur:
+        cur.execute("SELECT SingerId, FirstName FROM Singers")
+        singers = cur.fetch_arrow_table()
+
+# `singers` is a pyarrow.Table; DuckDB queries it by variable name, no copy.
+top = duckdb.sql("SELECT COUNT(*) AS n, MIN(FirstName) AS first FROM singers").fetchone()
+```
+
+**Insert a DataFrame (bulk ingest):**
+
+```python
+import pandas as pd
+import pyarrow as pa
+import adbc_driver_spanner.dbapi as spanner
+
+frame = pd.DataFrame({"SingerId": [10, 11], "FirstName": ["Carol", "Dave"]})
+
+with spanner.connect(
+    database="projects/my-project/instances/my-instance/databases/my-db",
+    autocommit=True,                         # apply immediately; returns the row count
+) as conn:
+    with conn.cursor() as cur:
+        # The target table must already exist — only append mode is supported.
+        rows = cur.adbc_ingest("Singers", pa.Table.from_pandas(frame), mode="append")
 ```
 
 ## Partitioned reads and Data Boost
@@ -62,14 +136,16 @@ extension (`adbc_execute_partitions` / `adbc_read_partition`):
 ```python
 import adbc_driver_spanner.dbapi as spanner
 
-with spanner.connect(database="projects/p/instances/i/databases/d") as conn:
+with spanner.connect(
+    database="projects/my-project/instances/my-instance/databases/my-db",
+) as conn:
     with conn.cursor() as cur:
         # Optional statement options, set on the underlying ADBC statement:
         cur.adbc_statement.set_options(**{
             "adbc.spanner.data_boost_enabled": "true",  # run on Data Boost
             "adbc.spanner.max_partitions": "8",          # cap the partition count
         })
-        partitions, schema = cur.adbc_execute_partitions("SELECT * FROM Singers")
+        partitions, schema = cur.adbc_execute_partitions("SELECT SingerId FROM Singers")
 
     # Each descriptor is opaque bytes; it can be shipped to another worker,
     # process, or connection and read independently.
