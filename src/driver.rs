@@ -369,13 +369,7 @@ fn option_name(key: &OptionDatabase) -> String {
 }
 
 fn string_value(key: &OptionDatabase, value: OptionValue) -> Result<String> {
-    match value {
-        OptionValue::String(s) => Ok(s),
-        _ => Err(invalid_argument(format!(
-            "option {} requires a string value",
-            option_name(key)
-        ))),
-    }
+    crate::options::string_option(value, &format!("option {}", option_name(key)))
 }
 
 /// The credential `type` values we accept in a keyfile JSON, for use in error messages.
@@ -504,21 +498,7 @@ fn u64_seconds_value(key: &OptionDatabase, value: OptionValue) -> Result<u64> {
 }
 
 fn bool_value(key: &OptionDatabase, value: OptionValue) -> Result<bool> {
-    match value {
-        OptionValue::String(s) => match s.to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" => Ok(true),
-            "false" | "0" | "no" => Ok(false),
-            other => Err(invalid_argument(format!(
-                "option {} expects a boolean, got {other:?}",
-                option_name(key)
-            ))),
-        },
-        OptionValue::Int(i) => Ok(i != 0),
-        _ => Err(invalid_argument(format!(
-            "option {} requires a boolean value",
-            option_name(key)
-        ))),
-    }
+    crate::options::bool_option(value, &format!("option {}", option_name(key)))
 }
 
 #[cfg(test)]

@@ -1293,17 +1293,7 @@ impl Connection for SpannerConnection {
 }
 
 fn parse_bool(value: OptionValue) -> Result<bool> {
-    match value {
-        OptionValue::String(s) => match s.to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" => Ok(true),
-            "false" | "0" | "no" => Ok(false),
-            other => Err(invalid_argument(format!(
-                "expected a boolean, got {other:?}"
-            ))),
-        },
-        OptionValue::Int(i) => Ok(i != 0),
-        _ => Err(invalid_argument("expected a boolean option value")),
-    }
+    crate::options::bool_option(value, "option")
 }
 
 fn connection_option_name(key: &OptionConnection) -> String {

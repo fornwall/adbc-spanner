@@ -303,9 +303,18 @@ batch read-only transaction so every partition executes at that bound. Parsing l
 
 ### Maintainability
 
-- **Bool/int/string option parsing is copy-pasted three times** with slightly different error text
+- ~~**Bool/int/string option parsing is copy-pasted three times** with slightly different error text
   (`src/driver.rs:506-522`, `src/connection.rs:1003-1015`, `src/statement.rs:789-826`); only the
-  database copy is fuzzed. Extract a shared `src/options.rs`.
+  database copy is fuzzed. Extract a shared `src/options.rs`.~~ **Fixed.** A new `src/options.rs`
+  holds the shared coercions — `bool_option` (bool-ish strings + integer 0/non-zero), `string_option`,
+  and `positive_i64`/`positive_usize` (integer or numeric string, strictly positive) — each taking a
+  `what` label so the `InvalidArguments` message names the offending option. The three sites now
+  delegate: `driver.rs`'s `bool_value`/`string_value` pass `option {name}` (preserving their exact
+  messages, which are the fuzzed copy), `connection.rs`'s `parse_bool`, and `statement.rs`'s
+  `bool_option`/`string_option`/`max_partitions_option`/`rows_per_batch_option` (kept as thin
+  same-signature wrappers so the existing `statement.rs` unit tests still exercise them by name).
+  Behavior — accepted spellings, positive-int semantics, and the `InvalidArguments` status on every
+  error path — is unchanged; the driver-options fuzz target still builds and drives the same code.
 - ~~**`build.rs` panics without `Cargo.lock`, which is excluded from the published package**
   (`build.rs:14-15`, `Cargo.toml:17`) — a landmine wired to the planned "re-enable publish" step.
   Fall back gracefully, or leave a loud comment next to `publish = false`.~~ **Fixed.** `build.rs`
