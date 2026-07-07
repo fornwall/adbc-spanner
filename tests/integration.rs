@@ -2095,6 +2095,104 @@ fn cancel_between_stream_chunks_cancels_the_next_fetch() {
     drop.execute_update().expect("drop cancel table");
 }
 
+/// The view-layout and remaining narrow Arrow types bind end-to-end: `Utf8View`/`BinaryView`
+/// (what polars and newer pyarrow emit by default), `Int8` (widened to INT64), and `Date64`
+/// (ms-at-day-boundary → DATE). Values inserted through bound parameters read back exactly.
+#[test]
+fn view_and_narrow_types_bind_round_trip() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping view_and_narrow_types_bind_round_trip");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    run(
+        &mut connection,
+        "DROP TABLE IF EXISTS AdbcView; \
+         CREATE TABLE AdbcView (Id INT64, S STRING(MAX), B BYTES(MAX), D DATE) PRIMARY KEY (Id)",
+    );
+
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int8, false),
+            Field::new("s", DataType::Utf8View, true),
+            Field::new("b", DataType::BinaryView, true),
+            Field::new("d", DataType::Date64, true),
+        ])),
+        vec![
+            Arc::new(arrow_array::Int8Array::from(vec![1i8, 2])),
+            Arc::new(arrow_array::StringViewArray::from(vec![
+                Some("view-hello"),
+                None,
+            ])),
+            Arc::new(arrow_array::BinaryViewArray::from(vec![
+                Some(b"view-bytes".as_ref()),
+                None,
+            ])),
+            // 19737 days = 2024-01-15, at the exact millisecond day boundary.
+            Arc::new(arrow_array::Date64Array::from(vec![
+                Some(19_737i64 * 86_400_000),
+                None,
+            ])),
+        ],
+    )
+    .unwrap();
+
+    let mut insert = connection.new_statement().expect("new statement");
+    insert
+        .set_sql_query("INSERT INTO AdbcView (Id, S, B, D) VALUES (@id, @s, @b, @d)")
+        .unwrap();
+    insert.bind(batch).expect("bind view-typed batch");
+    assert_eq!(insert.execute_update().expect("insert"), Some(2));
+
+    let mut query = connection.new_statement().expect("new statement");
+    query
+        .set_sql_query("SELECT S, B, D FROM AdbcView ORDER BY Id")
+        .unwrap();
+    let batches = query
+        .execute()
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect");
+    let all = &batches[0];
+    assert_eq!(all.num_rows(), 2);
+    let s = all
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(s.value(0), "view-hello");
+    assert!(s.is_null(1));
+    let b = all
+        .column(1)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    assert_eq!(b.value(0), b"view-bytes");
+    assert!(b.is_null(1));
+    let d = all
+        .column(2)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .unwrap();
+    assert_eq!(d.value(0), 19_737);
+    assert!(d.is_null(1));
+
+    let mut drop = connection.new_statement().expect("new statement");
+    drop.set_sql_query("DROP TABLE AdbcView").unwrap();
+    drop.execute_update().expect("drop view table");
+}
+
 /// DML behind a leading `@{…}` statement hint is still classified as DML and routed to the
 /// read/write path. Previously `first_keyword` saw no keyword at all, so hinted DML entering via
 /// `execute()` was sent to a read-only single-use transaction, which Spanner rejects.

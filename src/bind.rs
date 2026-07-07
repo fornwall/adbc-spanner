@@ -4,9 +4,9 @@
 //! column is one parameter, and each row is one set of bindings. Spanner uses **named** query
 //! parameters (`@name`), so a bind column named `id` binds to `@id` in the SQL.
 //!
-//! Supported Arrow parameter types are `Int16`/`Int32`/`Int64` (all → Spanner `INT64`), `Float64`,
-//! `Float32`, `Boolean`, `Utf8`/`LargeUtf8`,
-//! `Binary`/`LargeBinary`, `Date32` (→ `DATE`), `Timestamp` at any `TimeUnit`
+//! Supported Arrow parameter types are `Int8`/`Int16`/`Int32`/`Int64` (all → Spanner `INT64`),
+//! `Float64`, `Float32`, `Boolean`, `Utf8`/`LargeUtf8`/`Utf8View`,
+//! `Binary`/`LargeBinary`/`BinaryView`, `Date32`/`Date64` (→ `DATE`), `Timestamp` at any `TimeUnit`
 //! (Second/Millisecond/Microsecond/Nanosecond, → `TIMESTAMP`), `Decimal128` (→ `NUMERIC`), and
 //! their nulls. `List`/`LargeList` of any of those scalar element types binds to a Spanner
 //! `ARRAY<...>` (`ARRAY<INT64|FLOAT64|BOOL|STRING|BYTES|DATE|TIMESTAMP|NUMERIC>`), preserving
@@ -31,9 +31,9 @@
 use adbc_core::error::Result;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    ArrowPrimitiveType, Date32Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type,
-    Int64Type, TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-    TimestampSecondType,
+    ArrowPrimitiveType, Date32Type, Date64Type, Decimal128Type, Float32Type, Float64Type,
+    Int16Type, Int32Type, Int64Type, Int8Type, TimestampMicrosecondType, TimestampMillisecondType,
+    TimestampNanosecondType, TimestampSecondType,
 };
 use arrow_array::{Array, ArrayRef, OffsetSizeTrait, RecordBatch};
 use arrow_schema::{DataType, TimeUnit};
@@ -130,6 +130,10 @@ fn bind_one(
             let a = column.as_primitive::<Int16Type>();
             bind_scalar(builder, name, is_null, || i64::from(a.value(row)))
         }
+        DataType::Int8 => {
+            let a = column.as_primitive::<Int8Type>();
+            bind_scalar(builder, name, is_null, || i64::from(a.value(row)))
+        }
         DataType::Float64 => {
             let a = column.as_primitive::<Float64Type>();
             bind_scalar(builder, name, is_null, || a.value(row))
@@ -160,6 +164,16 @@ fn bind_one(
                 builder.add_param(name, &a.value(row))
             }
         }
+        // `Utf8View`/`BinaryView` are the German-string layouts newer Arrow producers (polars,
+        // pyarrow 16+ with view types) emit by default; same Spanner mapping as their offset kin.
+        DataType::Utf8View => {
+            let a = column.as_string_view();
+            if is_null {
+                builder.add_param(name, &None::<String>)
+            } else {
+                builder.add_param(name, &a.value(row))
+            }
+        }
         DataType::Binary => {
             let a = column.as_binary::<i32>();
             if is_null {
@@ -176,12 +190,29 @@ fn bind_one(
                 builder.add_param(name, &a.value(row).to_vec())
             }
         }
+        DataType::BinaryView => {
+            let a = column.as_binary_view();
+            if is_null {
+                builder.add_param(name, &None::<Vec<u8>>)
+            } else {
+                builder.add_param(name, &a.value(row).to_vec())
+            }
+        }
         DataType::Date32 => {
             let a = column.as_primitive::<Date32Type>();
             if is_null {
                 builder.add_param(name, &None::<String>)
             } else {
                 builder.add_param(name, &date_string(name, a.value(row))?)
+            }
+        }
+        // `Date64` is milliseconds since the Unix epoch, constrained by Arrow to whole days.
+        DataType::Date64 => {
+            let a = column.as_primitive::<Date64Type>();
+            if is_null {
+                builder.add_param(name, &None::<String>)
+            } else {
+                builder.add_param(name, &date_string(name, date64_days(name, a.value(row))?)?)
             }
         }
         // Spanner `TIMESTAMP` is UTC with nanosecond precision, so every Arrow timestamp unit
@@ -271,6 +302,11 @@ fn bind_list(
             name,
             list_primitive::<Int16Type, _>(elem, i64::from),
         ),
+        DataType::Int8 => add_array(
+            builder,
+            name,
+            list_primitive::<Int8Type, _>(elem, i64::from),
+        ),
         DataType::Float64 => {
             add_array(builder, name, list_primitive::<Float64Type, _>(elem, |v| v))
         }
@@ -290,8 +326,26 @@ fn bind_list(
         }
         DataType::Utf8 => add_array(builder, name, list_string::<i32>(elem)),
         DataType::LargeUtf8 => add_array(builder, name, list_string::<i64>(elem)),
+        DataType::Utf8View => {
+            let v = elem.map(|a| {
+                let a = a.as_string_view();
+                (0..a.len())
+                    .map(|i| (!a.is_null(i)).then(|| a.value(i).to_string()))
+                    .collect()
+            });
+            add_array(builder, name, v)
+        }
         DataType::Binary => add_array(builder, name, list_binary::<i32>(elem)),
         DataType::LargeBinary => add_array(builder, name, list_binary::<i64>(elem)),
+        DataType::BinaryView => {
+            let v = elem.map(|a| {
+                let a = a.as_binary_view();
+                (0..a.len())
+                    .map(|i| (!a.is_null(i)).then(|| a.value(i).to_vec()))
+                    .collect()
+            });
+            add_array(builder, name, v)
+        }
         // DATE / TIMESTAMP / NUMERIC bind as strings that Spanner coerces from the array element's
         // SQL context, same as their scalar arms.
         DataType::Date32 => {
@@ -395,6 +449,16 @@ fn list_try<E>(
     f: impl FnOnce(ArrayRef) -> Result<Vec<Option<E>>>,
 ) -> Result<Option<Vec<Option<E>>>> {
     elem.map(f).transpose()
+}
+
+/// Convert an Arrow `Date64` value (milliseconds since the Unix epoch, at a whole-day boundary
+/// per the Arrow spec) to `Date32` days, erroring on values outside the `Date32` range.
+fn date64_days(name: &str, millis: i64) -> Result<i32> {
+    i32::try_from(millis.div_euclid(86_400_000)).map_err(|_| {
+        invalid_argument(format!(
+            "cannot bind DATE parameter {name:?}: {millis}ms is out of range"
+        ))
+    })
 }
 
 /// Format an Arrow `Date32` (days since the Unix epoch) as the Spanner `DATE` wire form,
@@ -602,13 +666,13 @@ pub(crate) const INGEST_KEY_COLUMN: &str = "adbc_ingest_key";
 /// column representation are rejected.
 pub(crate) fn spanner_column_type(data_type: &DataType) -> Result<String> {
     Ok(match data_type {
-        DataType::Int16 | DataType::Int32 | DataType::Int64 => "INT64".to_string(),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => "INT64".to_string(),
         DataType::Float32 => "FLOAT32".to_string(),
         DataType::Float64 => "FLOAT64".to_string(),
         DataType::Boolean => "BOOL".to_string(),
-        DataType::Utf8 | DataType::LargeUtf8 => "STRING(MAX)".to_string(),
-        DataType::Binary | DataType::LargeBinary => "BYTES(MAX)".to_string(),
-        DataType::Date32 => "DATE".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "STRING(MAX)".to_string(),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "BYTES(MAX)".to_string(),
+        DataType::Date32 | DataType::Date64 => "DATE".to_string(),
         DataType::Timestamp(_, _) => "TIMESTAMP".to_string(),
         DataType::Decimal128(_, _) => "NUMERIC".to_string(),
         DataType::List(field) | DataType::LargeList(field) => {
@@ -989,6 +1053,91 @@ mod tests {
         );
         assert!(bind_row(Statement::builder("SELECT @s, @b"), &b, 0).is_ok());
         assert!(bind_row(Statement::builder("SELECT @s, @b"), &b, 1).is_ok());
+    }
+
+    #[test]
+    fn binds_view_strings_and_binaries() {
+        // Utf8View / BinaryView (the German-string layouts polars and newer pyarrow emit) bind
+        // like their offset-based counterparts, including typed nulls.
+        let b = batch(
+            vec![
+                Field::new("s", DataType::Utf8View, true),
+                Field::new("b", DataType::BinaryView, true),
+            ],
+            vec![
+                Arc::new(arrow_array::StringViewArray::from(vec![
+                    Some("hello view"),
+                    None,
+                ])),
+                Arc::new(arrow_array::BinaryViewArray::from(vec![
+                    Some(b"view bytes".as_ref()),
+                    None,
+                ])),
+            ],
+        );
+        assert!(bind_row(Statement::builder("SELECT @s, @b"), &b, 0).is_ok());
+        assert!(bind_row(Statement::builder("SELECT @s, @b"), &b, 1).is_ok());
+    }
+
+    #[test]
+    fn binds_int8_and_date64() {
+        // Int8 widens to INT64 like the other narrow ints; Date64 (ms at day boundaries) binds as
+        // a DATE string.
+        let b = batch(
+            vec![
+                Field::new("i", DataType::Int8, true),
+                Field::new("d", DataType::Date64, true),
+            ],
+            vec![
+                Arc::new(arrow_array::Int8Array::from(vec![Some(7i8), None])),
+                // 19737 days = 2024-01-15, at the exact millisecond day boundary.
+                Arc::new(arrow_array::Date64Array::from(vec![
+                    Some(19_737i64 * 86_400_000),
+                    None,
+                ])),
+            ],
+        );
+        assert!(bind_row(Statement::builder("SELECT @i, @d"), &b, 0).is_ok());
+        assert!(bind_row(Statement::builder("SELECT @i, @d"), &b, 1).is_ok());
+    }
+
+    #[test]
+    fn date64_converts_to_days() {
+        assert_eq!(date64_days("d", 0).unwrap(), 0);
+        assert_eq!(date64_days("d", 19_737i64 * 86_400_000).unwrap(), 19737);
+        // Negative dates land on the correct (floored) day.
+        assert_eq!(date64_days("d", -86_400_000).unwrap(), -1);
+        assert_eq!(date64_days("d", -1).unwrap(), -1);
+        // Out of Date32 range errors instead of wrapping.
+        assert!(date64_days("d", i64::MAX).is_err());
+    }
+
+    #[test]
+    fn binds_view_arrays_as_list_elements() {
+        use arrow_array::builder::{BinaryViewBuilder, ListBuilder, StringViewBuilder};
+        let mut strings = ListBuilder::new(StringViewBuilder::new());
+        strings.values().append_value("a");
+        strings.values().append_null();
+        strings.append(true);
+        let mut bytes = ListBuilder::new(BinaryViewBuilder::new());
+        bytes.values().append_value(b"b");
+        bytes.append(true);
+        let b = batch(
+            vec![
+                Field::new(
+                    "s",
+                    DataType::List(Arc::new(Field::new("item", DataType::Utf8View, true))),
+                    true,
+                ),
+                Field::new(
+                    "b",
+                    DataType::List(Arc::new(Field::new("item", DataType::BinaryView, true))),
+                    true,
+                ),
+            ],
+            vec![Arc::new(strings.finish()), Arc::new(bytes.finish())],
+        );
+        assert!(bind_row(Statement::builder("SELECT @s, @b"), &b, 0).is_ok());
     }
 
     #[test]
