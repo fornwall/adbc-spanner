@@ -8,7 +8,9 @@ use google_cloud_auth::credentials::service_account::Builder as ServiceAccountCr
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 
 use crate::connection::SpannerConnection;
-use crate::error::{err, from_builder, from_spanner, invalid_argument, invalid_state};
+use crate::error::{
+    err, from_builder, from_spanner, invalid_argument, invalid_state, redact_url_query,
+};
 use crate::runtime::{new_runtime, SharedRuntime};
 use crate::{
     OPTION_DATABASE, OPTION_EMULATOR, OPTION_ENDPOINT, OPTION_KEYFILE, OPTION_KEYFILE_JSON,
@@ -146,7 +148,10 @@ impl SpannerDatabase {
                 let key = parse_service_account_key(&json)?;
                 let credentials = ServiceAccountCredentials::new(key).build().map_err(|e| {
                     err(
-                        format!("failed to build service-account credentials: {e}"),
+                        format!(
+                            "failed to build service-account credentials: {}",
+                            redact_url_query(&e.to_string())
+                        ),
                         Status::InvalidArguments,
                     )
                 })?;
