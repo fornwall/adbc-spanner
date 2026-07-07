@@ -42,11 +42,18 @@ integers (read back as `INT64`), `DECIMAL(p,s)` (Spanner `NUMERIC` is fixed 38,9
 a primary key), `TIME`-of-day / `float16` / `fixed_size_binary` / Arrow view types (no Spanner type),
 and timestamps outside Arrow's nanosecond range.
 
-Still to port (the two remaining `type/*` families), each the same shape — a Spanner `setup_query`
-override (`PRIMARY KEY` + native type names) plus `skip`s for unsupported types:
+**`type/select/*` is done** (all pass or `skip`): each override supplies a Spanner `setup_query` —
+`idx` is the `PRIMARY KEY` and `res` the native-typed value column, with literals adjusted for
+Spanner (`X'..'` → `FROM_HEX('..')`, `\`/`'` escaping in strings). Because `idx` is the key here,
+`FLOAT32`/`FLOAT64` round-trip (unlike in `type/bind`). `skip`ped: narrower integers (→ `INT64`),
+`DECIMAL` (fixed 38,9), `TIME` (no type), and `timestamp`/`timestamptz` (the cases include
+`9999-12-31`, outside Arrow's nanosecond range).
 
-- `queries/spanner/type/select/*`
-- `queries/spanner/type/ingest/*` (bulk-ingest cases largely work already — the driver builds the
-  `INSERT` from the bound data's column names — but their table DDL still needs the dialect override)
+Still to port, each the same shape — a Spanner `setup_query` override (`PRIMARY KEY` + native type
+names) plus `skip`s for unsupported types:
+
+- `queries/spanner/ingest/*` — bulk-ingest cases (the driver builds the `INSERT` from the bound
+  data's column names, so mostly the table DDL needs the dialect override).
+- A handful of `connection`/`statement` metadata cases.
 
 Once a category is green, consider a gating CI job for that subset.
