@@ -1030,4 +1030,97 @@ mod tests {
         let error = check_target_catalog("main".to_string()).unwrap_err();
         assert_eq!(error.status, Status::NotImplemented);
     }
+
+    #[test]
+    fn string_option_requires_a_string_value() {
+        assert_eq!(
+            string_option(OptionValue::String("hi".into())).unwrap(),
+            "hi"
+        );
+        // A non-string value kind is rejected as an invalid argument.
+        for value in [OptionValue::Int(1), OptionValue::Double(1.0)] {
+            let error = string_option(value).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+        }
+    }
+
+    #[test]
+    fn bool_option_parses_bool_ish_strings_and_ints() {
+        // Accepted truthy / falsy spellings, case-insensitive.
+        for truthy in ["true", "TRUE", "True", "1", "yes", "YES"] {
+            assert!(bool_option(OptionValue::String(truthy.into())).unwrap());
+        }
+        for falsy in ["false", "FALSE", "False", "0", "no", "NO"] {
+            assert!(!bool_option(OptionValue::String(falsy.into())).unwrap());
+        }
+        // Integers: zero is false, any non-zero is true.
+        assert!(!bool_option(OptionValue::Int(0)).unwrap());
+        assert!(bool_option(OptionValue::Int(1)).unwrap());
+        assert!(bool_option(OptionValue::Int(-1)).unwrap());
+    }
+
+    #[test]
+    fn bool_option_rejects_non_bool_values() {
+        // A string that is not a recognised boolean spelling.
+        for bad in ["maybe", "", "2", "t", "on"] {
+            let error = bool_option(OptionValue::String(bad.into())).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+        }
+        // A non-string, non-int value kind is rejected outright.
+        let error = bool_option(OptionValue::Double(1.0)).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+    }
+
+    #[test]
+    fn max_partitions_option_accepts_positive_ints_and_strings() {
+        assert_eq!(max_partitions_option(OptionValue::Int(4)).unwrap(), 4);
+        assert_eq!(
+            max_partitions_option(OptionValue::String("16".into())).unwrap(),
+            16
+        );
+    }
+
+    #[test]
+    fn max_partitions_option_rejects_non_positive_and_malformed() {
+        // Zero and negatives are not positive partition counts.
+        for bad in [OptionValue::Int(0), OptionValue::Int(-1)] {
+            let error = max_partitions_option(bad).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+        }
+        // Strings must parse to a positive integer.
+        for bad in ["0", "-3", "abc", "1.5", ""] {
+            let error = max_partitions_option(OptionValue::String(bad.into())).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+        }
+        // A non-int, non-string value kind is rejected.
+        let error = max_partitions_option(OptionValue::Double(2.0)).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+    }
+
+    #[test]
+    fn rows_per_batch_option_accepts_positive_ints_and_strings() {
+        assert_eq!(rows_per_batch_option(OptionValue::Int(1)).unwrap(), 1);
+        assert_eq!(
+            rows_per_batch_option(OptionValue::String("8192".into())).unwrap(),
+            8192
+        );
+    }
+
+    #[test]
+    fn rows_per_batch_option_rejects_zero_negative_and_malformed() {
+        // Zero is explicitly invalid (a batch must hold at least one row).
+        let error = rows_per_batch_option(OptionValue::Int(0)).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        // Negatives fail the `usize::try_from` / positivity filter.
+        let error = rows_per_batch_option(OptionValue::Int(-8192)).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        // Strings must parse to a positive integer.
+        for bad in ["0", "-1", "abc", "1.5", ""] {
+            let error = rows_per_batch_option(OptionValue::String(bad.into())).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+        }
+        // A non-int, non-string value kind is rejected.
+        let error = rows_per_batch_option(OptionValue::Double(3.0)).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+    }
 }
