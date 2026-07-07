@@ -5,14 +5,7 @@
 Overall: the driver is in very good shape — the type mapping, dense-union metadata assembly,
 transaction model, streaming reader, and test suite (property-based round-trips, FFI conformance,
 C++ validation, Python cookbook tests) are all solid. The issues below are ranked by how likely
-they are to bite a real user. (All P1 findings from the original review have been fixed.)
-
-## P2 — real defects with narrower blast radius
-
-**1. Emulator scripts fail open** — `scripts/with-emulator.sh:44–64`: both readiness loops fall
-through silently on timeout and run the tests against a dead port (the ci.yml copy of this loop
-fails correctly). `run-foundry-validation.sh` also lacks `-e`, so a failed build validates a stale
-`.so`, and its `VALIDATION_REF` pin only applies on first install.
+they are to bite a real user. (All P1 and P2 findings from the original review have been fixed.)
 
 ## P3 — improvements worth queuing
 
