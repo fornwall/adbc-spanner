@@ -543,6 +543,12 @@ impl Optionable for SpannerStatement {
                 // Spanner exposes a single, unnamed catalog, so only the empty catalog is accepted.
                 self.target_catalog = Some(check_target_catalog(string_option(value)?)?);
             }
+            OptionStatement::Temporary => {
+                // Spanner has no temporary tables. The spec default (`false`) is accepted as a
+                // no-op so generic clients that always set the option keep working; `true` is
+                // rejected as unsupported.
+                check_ingest_temporary(value)?;
+            }
             OptionStatement::IngestMode => {
                 // Append into an existing table, or create it (from the ingest data's Arrow schema,
                 // with a synthetic UUID primary key) in the create/replace modes.
@@ -587,6 +593,9 @@ impl Optionable for SpannerStatement {
             OptionStatement::TargetTable => self.target_table.clone(),
             OptionStatement::TargetDbSchema => self.target_db_schema.clone(),
             OptionStatement::TargetCatalog => self.target_catalog.clone(),
+            // Only the spec default (`false`) is ever accepted (see `check_ingest_temporary`), so
+            // the driver's state is always `false` — report exactly that.
+            OptionStatement::Temporary => Some(false.to_string()),
             OptionStatement::IngestMode => self.ingest_mode.clone(),
             OptionStatement::Other(k) if k == crate::OPTION_ROWS_PER_BATCH => {
                 Some(self.rows_per_batch.to_string())
@@ -966,6 +975,19 @@ fn check_target_catalog(catalog: String) -> Result<String> {
     }
 }
 
+/// Validate the `adbc.ingest.temporary` option. Spanner has no temporary tables, so only the spec
+/// default (`false`, in any of the shared boolean spellings) is accepted — as a no-op; `true` is
+/// rejected as unsupported.
+fn check_ingest_temporary(value: OptionValue) -> Result<()> {
+    if bool_option(value)? {
+        Err(not_implemented(
+            "temporary ingest target tables: Spanner has no temporary tables",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Parse a boolean statement option, accepted as a bool-ish string (`true`/`false`/`1`/`0`/…) or an
 /// integer (`0` = false, non-zero = true).
 fn bool_option(value: OptionValue) -> Result<bool> {
@@ -994,6 +1016,25 @@ mod tests {
         // Any named catalog is rejected as unsupported.
         let error = check_target_catalog("main".to_string()).unwrap_err();
         assert_eq!(error.status, Status::NotImplemented);
+    }
+
+    #[test]
+    fn ingest_temporary_accepts_false_and_rejects_true() {
+        // The spec default (`false`, in any accepted boolean spelling) is a no-op.
+        for falsy in ["false", "FALSE", "0", "no"] {
+            check_ingest_temporary(OptionValue::String(falsy.into())).unwrap();
+        }
+        check_ingest_temporary(OptionValue::Int(0)).unwrap();
+        // Spanner has no temporary tables: any truthy value is rejected as unimplemented.
+        for truthy in ["true", "TRUE", "1", "yes"] {
+            let error = check_ingest_temporary(OptionValue::String(truthy.into())).unwrap_err();
+            assert_eq!(error.status, Status::NotImplemented);
+        }
+        let error = check_ingest_temporary(OptionValue::Int(1)).unwrap_err();
+        assert_eq!(error.status, Status::NotImplemented);
+        // Malformed values fail boolean coercion, not the temporary-table check.
+        let error = check_ingest_temporary(OptionValue::String("maybe".into())).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
     }
 
     #[test]

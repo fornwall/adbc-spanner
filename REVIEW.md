@@ -472,8 +472,14 @@ consider refusing (or warning) when explicit credentials were also configured
 output, which is outside this crate's control (`driver.rs:436-473`); scrub or verify it never
 embeds key material.
 
-**Conformance.** `adbc.ingest.temporary="false"` (the default value) is rejected instead of
-no-op'd; `get_info` could report a vendor version instead of null; the upstream `adbc_ffi` shim
+**Conformance.** ~~`adbc.ingest.temporary="false"` (the default value) is rejected instead of
+no-op'd~~ (**Fixed.** `set_option("adbc.ingest.temporary", …)` now accepts any falsy spelling of
+the shared bool coercion (`false`/`0`/`no`/int 0) as a no-op — the spec default — and rejects only
+truthy values with `NotImplemented` ("Spanner has no temporary tables"); `get_option` round-trips
+it as `"false"`, which is always the driver's state. Unit-tested offline
+(`ingest_temporary_accepts_false_and_rejects_true` in `src/statement.rs`) plus
+set-false/round-trip/set-true-fails assertions in the ingest section of `tests/integration.rs`);
+`get_info` could report a vendor version instead of null; the upstream `adbc_ffi` shim
 rejects 1.0.0 driver managers and errors on unknown `get_info` codes (both stricter than the C
 spec — upstream issues, worth tracking); no `sqlstate` on errors (a coarse mapping would help
 ODBC bridges); `get_table_schema` ignores the catalog argument entirely; `get_objects` at
