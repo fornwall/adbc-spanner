@@ -60,7 +60,12 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   3339 timestamp, optionally prefixed `read:` (exact, the default) or `min:` (bounded). The two are
   mutually exclusive. The staleness/timestamp is also baked into `execute_partitions()` descriptors.
 - Parameter binding: `bind`/`bind_stream` an Arrow batch whose columns become Spanner named
-  parameters (a column `id` binds `@id`); each bound row runs the statement once.
+  parameters (a column `id` binds `@id`); each bound row runs the statement once. A bound *query*
+  over several rows executes all of them in one shared read-only snapshot (a multi-use read-only
+  transaction at the configured staleness bound), so the per-row results are mutually consistent,
+  and its results stream in `spanner.rows_per_batch` chunks like any other query. Because Spanner
+  accepts the bounded-staleness kinds only on single-use transactions, a `max:<d>`/`min:<t>` bound
+  is pinned there to its most-stale legal equivalent (exact staleness `<d>` / read timestamp `<t>`).
 - Bulk ingest: set `adbc.ingest.target_table`, bind an Arrow batch, and `execute_update` inserts the
   rows into that table — in one transaction when the ingest fits Spanner's per-commit limits (~80,000
   mutations, counted roughly as rows × columns, and ~100 MB). A larger ingest is automatically split

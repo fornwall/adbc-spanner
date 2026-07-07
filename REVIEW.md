@@ -501,9 +501,25 @@ existing ARRAY/STRUCT/JSON handling; ~~`str_col`'s `RecordBatch::column(i)` can 
 zero-column metadata batch (`connection.rs:494-505`)~~ (**Fixed.** `str_col` now bounds-checks the
 column index against `batch.num_columns()` and returns a `Status::Internal` error for an
 out-of-range/zero-column batch instead of letting `RecordBatch::column` panic; covered by a new
-offline unit test); `execute_bound_query` runs each bound row in
+offline unit test); ~~`execute_bound_query` runs each bound row in
 its own snapshot (mutually inconsistent results) and materialises everything ignoring
-`rows_per_batch` (`src/statement.rs:319-345`).
+`rows_per_batch` (`src/statement.rs:319-345`)~~ (**Fixed**, both halves. *Materialisation*: bound
+queries now stream through the same bounded-chunk machinery as `execute` — a single bound row goes
+through `stream_query`, and several bound rows through the new `BoundQueryBatchReader`
+(`stream_bound_query` in `src/conversion.rs`), which executes each per-row statement lazily and
+converts rows in chunks of `spanner.rows_per_batch` plus the shared `CHUNK_BYTE_BUDGET`, so the
+concatenated result is never materialised whole. *Snapshot consistency*: with several bound rows
+every statement now executes inside **one** multi-use read-only transaction
+(`DatabaseClient::read_only_transaction()`), pinned at the statement's configured read bound, so
+the per-row results are mutually consistent; a single bound row keeps the cheap single-use
+transaction, which is one snapshot already. One documented semantic nuance remains: Spanner only
+accepts the bounded-staleness kinds (`max:<d>` / `min:<t>`) on single-use transactions, so for the
+multi-row case they are pinned to the most stale timestamp their window allows — `max:<d>` → exact
+staleness `<d>`, `min:<t>` → read timestamp `<t>` (`ReadBound::pinned_for_multi_use` /
+`ReadStaleness::multi_use_timestamp_bound` in `src/staleness.rs`, unit-tested offline); always a
+legal choice under the original bound. Emulator-covered by `bound_query_streams_in_batches` in
+`tests/integration.rs`: three bound rows × 500 rows each at `rows_per_batch=200` yield exactly
+nine 200/200/100-row batches in bound-row order).
 
 **Performance.** ~~`get_statistics` per-table scans run strictly sequentially — a small
 `buffer_unordered(4..8)` would cut wall-clock near-linearly (`connection.rs:337-359`)~~ **Fixed.**
