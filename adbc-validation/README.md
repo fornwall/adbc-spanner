@@ -39,7 +39,7 @@ The **C++** validation library and driver manager come from `ARROW_ADBC_TAG`;
 they interoperate with the driver over the C ABI.
 
 `SpannerQuirks` (in `spanner_validation.cc`) describes Spanner's capabilities to
-the suite — named `@p` parameters, DDL via the admin API, append-only ingest,
+the suite — named `@p` parameters, DDL via the admin API, all four ingest modes,
 mandatory (NULL-permitting) primary keys — so tests that do not apply to
 Spanner's model self-skip rather than fail.
 
@@ -48,33 +48,28 @@ Spanner's model self-skip rather than fail.
 - **`SpannerDatabaseTest` + `SpannerConnectionTest`** in full — lifecycle +
   metadata: `get_info`, `get_objects` (table columns, primary-key/constraint
   metadata, and foreign-key `constraint_column_usage`), `get_table_types`,
-  `get_table_schema` (`NOT_FOUND` for a missing table, and a named-schema-qualified
-  table — Spanner has `CREATE SCHEMA`), autocommit/transaction options.
+  `get_table_schema` (a plain table, `NOT_FOUND` for missing and query-shaped
+  table names, and a named-schema-qualified table — Spanner has `CREATE SCHEMA`),
+  autocommit/transaction options.
 - **The `SpannerStatementTest` cases that pass cleanly** — `execute` and
   `execute_schema` for int/string columns and their error paths, `prepare` /
   `get_parameter_schema` / parameter-count / no-query validation, query error
   handling, query cancellation, concurrent statements, and result
   independence/invalidation.
 
-**40 tests pass, 2 self-skip.** The `StatementTest` cases are an explicit
-allowlist in `scripts/run-adbc-validation.sh`. The 2 remaining `ConnectionTest`
-skips are gated on `supports_bulk_ingest(CREATE)`, which `SpannerQuirks` still
-declares unsupported. That declaration is stale: the driver *does* support
-create-mode ingest (it builds the table from the ingest data's Arrow schema,
-with a synthetic `adbc_ingest_key` UUID primary key satisfying Spanner's
-mandatory-key rule). Neither case actually ingests — their fixture is the
-quirks' DDL `CreateSampleTable` — so flipping the quirk should un-skip them and
-let them pass (`MetadataGetTableSchemaDbSchema` runs the same fixture and
-schema comparison against a named schema and is already gated green).
+**All 41 gated tests pass, 0 self-skip.** `DatabaseTest` and `ConnectionTest` run in
+full; the `StatementTest` cases are an explicit allowlist in
+`scripts/run-adbc-validation.sh`. `SpannerQuirks::supports_bulk_ingest` declares
+all four ingest modes (append, create, create_append, replace — the create
+modes build the table from the ingest data's Arrow schema with a synthetic
+`adbc_ingest_key` UUID primary key satisfying Spanner's mandatory-key rule),
+which un-skipped the last two `ConnectionTest` cases, `MetadataGetTableSchema`
+and `MetadataGetTableSchemaEscaping` (both gated upstream on
+`supports_bulk_ingest(CREATE)`, though their fixtures only use plain DDL).
 
-| Skipped test | Why |
-|---|---|
-| `MetadataGetTableSchema` | skip gated on `supports_bulk_ingest(CREATE)`, though its fixture is plain DDL |
-| `MetadataGetTableSchemaEscaping` | same gate; the case itself only checks `NOT_FOUND` for a query-shaped table name |
-
-(`MetadataGetStatisticNames` is now gated: `get_statistic_names` returns a valid
-empty catalog — Spanner has no per-column statistics to name, which the suite
-accepts.)
+(`MetadataGetStatisticNames` is gated too: `get_statistic_names` returns a
+valid empty catalog — Spanner has no per-column statistics to name, which the
+suite accepts.)
 
 ## Follow-up work: the remaining `StatementTest` cases
 
@@ -91,8 +86,9 @@ incremental driver work:
   `SqlSchemaFloats`, `SqlQueryRowsAffectedDelete`, `Transactions`.
 - **Ingest readback** — the driver supports create-mode ingest (with a
   synthetic `adbc_ingest_key` UUID primary key, since Spanner mandates one),
-  but the suite's `SqlIngest*` cases remain blocked: they read the data back
-  via a hardcoded double-quoted `SELECT * FROM "bulk_ingest" ORDER BY "col" …`
+  and since the quirks declare it the `SqlIngest*` cases now *run* under
+  `--full` instead of skipping — but they remain blocked: they read the data
+  back via a hardcoded double-quoted `SELECT * FROM "bulk_ingest" ORDER BY "col" …`
   (not valid GoogleSQL, no quirks hook), and `SELECT *` would also surface the
   synthetic key column, breaking the single-column result assertions. Where the
   value is separable — the ingest **identifier-escaping** tests (reserved-word
