@@ -2056,6 +2056,63 @@ fn cancel_between_stream_chunks_cancels_the_next_fetch() {
     drop.execute_update().expect("drop cancel table");
 }
 
+/// DML behind a leading `@{…}` statement hint is still classified as DML and routed to the
+/// read/write path. Previously `first_keyword` saw no keyword at all, so hinted DML entering via
+/// `execute()` was sent to a read-only single-use transaction, which Spanner rejects.
+#[test]
+fn hinted_dml_routes_to_the_read_write_path() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping hinted_dml_routes_to_the_read_write_path");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    run(
+        &mut connection,
+        "DROP TABLE IF EXISTS AdbcHint; \
+         CREATE TABLE AdbcHint (Id INT64, N INT64) PRIMARY KEY (Id)",
+    );
+
+    // Through the query entry point (`execute`), exactly as ADBC clients issue DML.
+    // `LOCK_SCANNED_RANGES` is a documented statement hint for read/write transactions, accepted
+    // by both real Cloud Spanner and the emulator (which rejects most other statement hints as
+    // "Unsupported hint"). Before the fix this INSERT never reached a read/write transaction:
+    // `first_keyword` saw no keyword behind the hint, so the statement went to the read-only
+    // single-use query path and failed.
+    let mut insert = connection.new_statement().expect("new statement");
+    insert
+        .set_sql_query(
+            "@{LOCK_SCANNED_RANGES=exclusive} INSERT INTO AdbcHint (Id, N) VALUES (1, 0)",
+        )
+        .unwrap();
+    insert.execute().expect("hinted INSERT via execute");
+
+    // And through execute_update, with the affected-row count intact.
+    let mut update = connection.new_statement().expect("new statement");
+    update
+        .set_sql_query("@{LOCK_SCANNED_RANGES=exclusive} UPDATE AdbcHint SET N = 1 WHERE true")
+        .unwrap();
+    assert_eq!(
+        update.execute_update().expect("hinted UPDATE"),
+        Some(1),
+        "the hinted INSERT committed exactly one row"
+    );
+
+    let mut drop = connection.new_statement().expect("new statement");
+    drop.set_sql_query("DROP TABLE AdbcHint").unwrap();
+    drop.execute_update().expect("drop hint table");
+}
+
 /// DML with a `THEN RETURN` clause returns its rows through `execute()` (previously they were
 /// silently discarded as an empty result), reports the stats-based affected count through
 /// `execute_update()`, fans out over bound parameters, and is rejected up front in manual

@@ -253,7 +253,11 @@ fn push_statement(statements: &mut Vec<String>, current: &mut String) {
     current.clear();
 }
 
-/// The first SQL keyword, uppercased, skipping leading whitespace and `--`/`#`/`/* */` comments.
+/// The first SQL keyword, uppercased, skipping leading whitespace, `--`/`#`/`/* */` comments, and
+/// [statement hints](https://cloud.google.com/spanner/docs/reference/standard-sql/query-syntax#statement_hints)
+/// (`@{HINT=value, …}`), which GoogleSQL allows before the statement proper — so hinted DML/DDL is
+/// classified by its real leading keyword, not misread as "no keyword" and routed to the wrong
+/// execution path.
 fn first_keyword(sql: &str) -> Option<String> {
     let mut rest = sql.trim_start();
     loop {
@@ -267,12 +271,35 @@ fn first_keyword(sql: &str) -> Option<String> {
                 .find("*/")
                 .map_or("", |i| &after[i + 2..])
                 .trim_start();
+        } else if let Some(after) = rest.strip_prefix("@{") {
+            rest = skip_hint_body(after).trim_start();
         } else {
             break;
         }
     }
     let word: String = rest.chars().take_while(char::is_ascii_alphabetic).collect();
     (!word.is_empty()).then(|| word.to_ascii_uppercase())
+}
+
+/// Skip the body of a statement hint whose opening `@{` has already been consumed, returning the
+/// remainder after the matching `}`. A `}` inside a string literal within the hint (hint values
+/// may be literals) does not close it — literals are consumed via [`consume_quoted`]. An
+/// unterminated hint consumes the rest of the input, mirroring how unterminated comments are
+/// handled above.
+fn skip_hint_body(after: &str) -> &str {
+    let mut chars = after.chars().peekable();
+    let mut consumed = 0usize;
+    while let Some(c) = chars.next() {
+        consumed += c.len_utf8();
+        match c {
+            '}' => return &after[consumed..],
+            '\'' | '"' | '`' => {
+                consume_quoted(&mut chars, c, false, |ch| consumed += ch.len_utf8());
+            }
+            _ => {}
+        }
+    }
+    ""
 }
 
 #[cfg(test)]
@@ -325,6 +352,29 @@ mod tests {
         ] {
             assert!(!is_dml(sql), "should not be DML: {sql}");
         }
+    }
+
+    #[test]
+    fn classifies_statements_behind_statement_hints() {
+        // A leading `@{…}` statement hint does not hide the real keyword: hinted DML must route to
+        // the read/write path (a read-only transaction rejects it), hinted DDL to the admin API.
+        for sql in [
+            "@{USE_ADDITIONAL_PARALLELISM=TRUE} UPDATE t SET c = 1 WHERE true",
+            "@{PDML_MAX_PARALLELISM=8} delete from t where true",
+            "/* c */ @{A=1} INSERT INTO t (id) VALUES (1)",
+            "@{A=1} -- c\n UPDATE t SET c = 1 WHERE true",
+            // A `}` inside a string-literal hint value does not close the hint early.
+            "@{A='}'} DELETE FROM t WHERE true",
+        ] {
+            assert!(is_dml(sql), "should classify as DML: {sql}");
+            assert!(!is_ddl(sql), "should not classify as DDL: {sql}");
+        }
+        assert!(is_ddl("@{A=1} CREATE TABLE t (id INT64) PRIMARY KEY (id)"));
+        // A hinted query is neither.
+        let hinted_query = "@{JOIN_METHOD=HASH_JOIN} SELECT * FROM t";
+        assert!(!is_dml(hinted_query) && !is_ddl(hinted_query));
+        // An unterminated hint swallows the rest — no keyword, like an unterminated comment.
+        assert!(!is_dml("@{oops UPDATE t SET c = 1"));
     }
 
     #[test]
