@@ -231,6 +231,26 @@ pub(crate) fn split_statements(sql: &str) -> Vec<String> {
     statements
 }
 
+/// Strip trailing statement terminators — one or more top-level `;`, plus surrounding whitespace —
+/// from a **single** query, so `SELECT current_date;;;` becomes `SELECT current_date`.
+///
+/// Spanner's single-use query API rejects a trailing `;` ("Expected end of input but got `;`"), yet
+/// many clients and conformance suites append one. This reuses the GoogleSQL-aware
+/// [`split_statements`] scanner, so a `;` inside a string literal, quoted identifier or comment is
+/// preserved (`SELECT ';'` is unchanged) rather than being mistaken for a terminator.
+///
+/// Only a single statement is stripped: if the SQL parses to more than one top-level statement it is
+/// returned unchanged, so a genuine multi-statement query keeps reaching Spanner (which rejects it)
+/// rather than being silently reduced to its first statement.
+pub(crate) fn strip_trailing_terminators(sql: &str) -> String {
+    let mut statements = split_statements(sql);
+    if statements.len() == 1 {
+        statements.pop().unwrap()
+    } else {
+        sql.to_string()
+    }
+}
+
 fn copy_line_comment(
     out: &mut String,
     first: char,
@@ -460,6 +480,31 @@ mod tests {
         assert_eq!(
             split_statements("SELECT 1 -- a; b\n; SELECT 2"),
             vec!["SELECT 1 -- a; b", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn strips_trailing_query_terminators() {
+        // A single trailing `;`, a run of them, and trailing whitespace around them are all removed.
+        assert_eq!(strip_trailing_terminators("SELECT 1;"), "SELECT 1");
+        assert_eq!(strip_trailing_terminators("SELECT 1;;;"), "SELECT 1");
+        assert_eq!(strip_trailing_terminators("SELECT 1 ;  "), "SELECT 1");
+        assert_eq!(strip_trailing_terminators("  SELECT 1  "), "SELECT 1");
+        // The conformance case verbatim.
+        assert_eq!(
+            strip_trailing_terminators("SELECT current_date;;;"),
+            "SELECT current_date"
+        );
+        // A bare query is unchanged.
+        assert_eq!(strip_trailing_terminators("SELECT 1"), "SELECT 1");
+        // A `;` inside a string literal is not a terminator and is preserved.
+        assert_eq!(strip_trailing_terminators("SELECT ';'"), "SELECT ';'");
+        assert_eq!(strip_trailing_terminators("SELECT ';';"), "SELECT ';'");
+        // A genuine multi-statement query is returned unchanged (left for Spanner to reject) rather
+        // than reduced to its first statement.
+        assert_eq!(
+            strip_trailing_terminators("SELECT 1; SELECT 2"),
+            "SELECT 1; SELECT 2"
         );
     }
 }

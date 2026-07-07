@@ -54,10 +54,12 @@ Spanner's model self-skip rather than fail.
 - **The `SpannerStatementTest` cases that pass cleanly** — `execute` and
   `execute_schema` for int/string columns and their error paths, `prepare` /
   `get_parameter_schema` / parameter-count / no-query validation, query error
-  handling, query cancellation, concurrent statements, and result
-  independence/invalidation.
+  handling, trailing-semicolon queries (`SELECT current_date;;;` — the driver
+  strips trailing statement terminators on the query path, which Spanner's
+  single-use query API otherwise rejects), query cancellation, concurrent
+  statements, and result independence/invalidation.
 
-**All 41 gated tests pass, 0 self-skip.** `DatabaseTest` and `ConnectionTest` run in
+**All 42 gated tests pass, 0 self-skip.** `DatabaseTest` and `ConnectionTest` run in
 full; the `StatementTest` cases are an explicit allowlist in
 `scripts/run-adbc-validation.sh`. `SpannerQuirks::supports_bulk_ingest` declares
 all four ingest modes (append, create, create_append, replace — the create

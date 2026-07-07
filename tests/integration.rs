@@ -2280,3 +2280,57 @@ fn execute_partitions_round_trip() {
     drop.set_sql_query("DROP TABLE AdbcPartition").unwrap();
     drop.execute_update().expect("drop partition table");
 }
+
+#[test]
+fn query_with_trailing_semicolons_returns_rows() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping query_with_trailing_semicolons_returns_rows");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    // A run of trailing statement terminators on a single query (mirroring the ADBC conformance
+    // case `SqlQueryTrailingSemicolons`, `SELECT current_date;;;`) is stripped by the driver on the
+    // query path — Spanner's single-use query API otherwise rejects the trailing `;` with
+    // "Expected end of input but got ;". The query still runs and returns its row.
+    let mut statement = connection.new_statement().expect("new statement");
+    statement.set_sql_query("SELECT 1 AS n;;;").unwrap();
+    let reader = statement.execute().expect("query with trailing semicolons");
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect batches");
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 1, "expected one row back");
+    let n = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(n.value(0), 1);
+
+    // A `;` inside a string literal is not a terminator: it is preserved, not stripped.
+    let mut str_stmt = connection.new_statement().expect("new statement");
+    str_stmt.set_sql_query("SELECT ';' AS s;").unwrap();
+    let reader = str_stmt
+        .execute()
+        .expect("query with a semicolon string literal");
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect batches");
+    let s = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(s.value(0), ";");
+}
