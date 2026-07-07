@@ -23,12 +23,13 @@ use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use google_cloud_lro::Poller as _;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::model::execute_sql_request::QueryMode;
+use google_cloud_spanner::model::transaction_options::IsolationLevel;
 use google_cloud_spanner::model::PartitionOptions;
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
 use crate::bind;
-use crate::connection::SharedTxn;
+use crate::connection::{apply_isolation, SharedTxn};
 use crate::conversion::{result_set_to_batch, stream_query};
 use crate::error::{
     err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
@@ -61,6 +62,9 @@ pub struct SpannerStatement {
     spanner: Spanner,
     database: String,
     read_only: bool,
+    /// Isolation level for this statement's read/write transactions, inherited from the connection
+    /// at creation time (see the standard `adbc.connection.transaction.isolation_level` option).
+    isolation: IsolationLevel,
     txn: SharedTxn,
     sql: Option<String>,
     /// Parameter / bulk-ingest data bound via [`Statement::bind`] or [`Statement::bind_stream`].
@@ -89,6 +93,7 @@ impl SpannerStatement {
         spanner: Spanner,
         database: String,
         read_only: bool,
+        isolation: IsolationLevel,
         txn: SharedTxn,
     ) -> Self {
         Self {
@@ -97,6 +102,7 @@ impl SpannerStatement {
             spanner,
             database,
             read_only,
+            isolation,
             txn,
             sql: None,
             bound: Vec::new(),
@@ -211,6 +217,7 @@ impl SpannerStatement {
             &self.runtime,
             &self.client,
             &self.cancel,
+            self.isolation.clone(),
             statements,
         )?;
         Ok(Some(count))
@@ -230,9 +237,9 @@ impl SpannerStatement {
         statements: Vec<SpannerSql>,
     ) -> Result<(Vec<RecordBatch>, SchemaRef, i64)> {
         let client = self.client.clone();
+        let isolation = self.isolation.clone();
         let results = block_on_cancellable(&self.runtime, &self.cancel, async move {
-            let runner = client
-                .read_write_transaction()
+            let runner = apply_isolation(client.read_write_transaction(), isolation)
                 .build()
                 .await
                 .map_err(from_spanner)?;

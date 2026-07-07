@@ -60,7 +60,11 @@ Key design points:
   batch atomically in one read/write transaction on `commit` (`rollback` discards it). The client
   exposes no manual begin/commit handle, so buffer-and-replay is what makes manual transactions both
   possible and retry-safe. In manual mode `execute_update` returns `None` (count unknown until
-  commit); queries and DDL still run immediately.
+  commit); queries and DDL still run immediately. The standard
+  `adbc.connection.transaction.isolation_level` option is honoured for read/write transactions:
+  `serializable` and `repeatable_read` map to the client's `IsolationLevel` (applied via
+  `TransactionRunnerBuilder::set_isolation_level`), `default` leaves the database default, and the
+  other spec levels are rejected with `NotImplemented`.
 - **Arrow version.** `arrow-array`/`arrow-schema` are pinned to the range `adbc_core` allows
   (`>=53.1, <59`) so the `RecordBatch`/`Schema`/`RecordBatchReader` types unify across crates.
 
