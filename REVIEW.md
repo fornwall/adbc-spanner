@@ -311,10 +311,19 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   `ADBC_SPANNER_ARROW_VERSION="unknown"` (so `src/info.rs`'s `env!` still compiles and
   `DriverArrowVersion` reports `vunknown`). This makes a source build from the published package —
   which `exclude`s `Cargo.lock` — succeed instead of failing outright.
-- **CLAUDE.md has drifted from ground truth** (also found by the docs review): arrow is now
+- ~~**CLAUDE.md has drifted from ground truth** (also found by the docs review): arrow is now
   `>=58, <60` not `>=53.1, <59`; `adbc_core`/`adbc_ffi` are git-pinned to `fornwall/arrow-adbc`
   (a second publish blocker the "temporary git pin" section doesn't mention); the library matrix
-  is six targets, not four, and macOS x86-64 is cross-compiled.
+  is six targets, not four, and macOS x86-64 is cross-compiled.~~
+  **Fixed.** CLAUDE.md now matches ground truth on all three: the "Arrow version" design point and
+  the arrow line read `>=58, <60` (from `Cargo.toml`, which also pins `arrow-buffer` to the same
+  range); the "Temporary git pin" section is rewritten as *two* pin families, calling out that
+  `adbc_core`/`adbc_ffi`/`adbc_driver_manager` are pinned to a `fornwall/arrow-adbc` fork rev
+  (`786e7f3…`, carrying the idempotent-`release_ffi_error` and `rows_affected = -1` fixes) and that
+  **each** pin independently blocks `cargo publish`; and the "Shared library" section now lists the
+  full six-target matrix (linux x86-64/aarch64, macOS arm64, macOS x86-64 **cross-compiled** on the
+  arm64 runner, windows x86-64, windows aarch64 native). The Releasing / Python / ground-truth-source
+  notes and the aws-lc build-per-arch/NASM sentence were corrected to match while in there.
 - **The two git-pin revs are spread across ~9 dependency lines** plus `deny.toml` plus docs, with
   no single anchor for the scheduled "revert when upstream releases" edit.
 - **`connection.rs` (1050 lines) owns the query half of `get_objects`/`get_statistics`** while

@@ -74,8 +74,9 @@ Key design points:
   partition batch read-only transaction via `staleness::single_use`. Both options exist at connection
   **and** statement level (statement inherits the connection's, then overrides); they are mutually
   exclusive (set one to `""` to unset), and round-trip through `get_option`.
-- **Arrow version.** `arrow-array`/`arrow-schema` are pinned to the range `adbc_core` allows
-  (`>=53.1, <59`) so the `RecordBatch`/`Schema`/`RecordBatchReader` types unify across crates.
+- **Arrow version.** `arrow-array`/`arrow-schema`/`arrow-buffer` are pinned to the range the (git)
+  `adbc_core` allows (`>=58, <60`) so the `RecordBatch`/`Schema`/`RecordBatchReader` types unify
+  across crates.
 
 ## The google-cloud-spanner preview crate
 
@@ -83,21 +84,34 @@ This uses the **googleapis preview** client `google-cloud-spanner` (crate descri
 Client Libraries for Rust - Spanner"). Beware: `docs.rs/.../latest` and web summaries often surface
 an **older, unrelated** yoshidan-style API (`Client::new`, `client.single()`, `add_param`) — do not
 trust those. For ground truth, read the extracted source under
-`~/.cargo/git/checkouts/google-cloud-rust-*/` (the git dependency's checkout), or the crates.io
-source for `adbc_core-0.23.0` and `adbc_ffi-0.23.0`.
+`~/.cargo/git/checkouts/google-cloud-rust-*/` (the git dependency's checkout); `adbc_core` /
+`adbc_ffi` are likewise git-pinned, so their ground truth is the `arrow-adbc-*` checkout under the
+same directory (the fork tracks close to the 0.23.0 release).
 
-**Temporary git pin.** `Cargo.toml` pins the whole `google-cloud-*` family (spanner, auth, lro, both
-admin crates) to a `google-cloud-rust` git revision, because native `STRUCT` mapping needs
-`Type::struct_type()`, which is on `main` but not yet in a crates.io release. Consequences: the crate
-**cannot be published to crates.io** until that ships (revert to versioned deps then); and locally,
-this machine's global git config rewrites `https://github.com` to SSH, so cargo fetches fail unless
-you set `CARGO_NET_GIT_FETCH_WITH_CLI=true` plus a `GIT_CONFIG_*` identity `insteadOf` override for
-the fork URL (see the session notes / the `with-emulator.sh` invocations). CI is unaffected (clean
-git config, public repo over HTTPS).
+**Temporary git pins (two families).** `Cargo.toml` pins two dependency families to git revisions,
+and **each is independently a crates.io publish blocker** — the crate cannot be published until
+*both* are reverted to versioned releases:
+
+1. The whole `google-cloud-*` family (spanner, auth, lro, both admin crates + the test-only `gax`)
+   is pinned to a `google-cloud-rust` git revision, because native `STRUCT` mapping needs
+   `Type::struct_type()`, which is on `main` but not yet in a crates.io release.
+2. `adbc_core` and `adbc_ffi` (and the dev-dependency `adbc_driver_manager`) are pinned to a
+   `fornwall/arrow-adbc` fork git revision — all three must share the *same* rev — carrying two
+   fixes not yet in the 0.23 crates.io release: an idempotent `release_ffi_error` (no double-free on
+   the standard release-twice idiom) and `AdbcStatementExecuteQuery` writing `rows_affected = -1` on
+   the query path (submitted upstream as arrow-adbc PR #4469). Because a git source will not unify
+   with the crates.io `= "0.23"` release, downstream crates must also take `adbc_core` from this
+   same git rev (see `README.md`).
+
+Locally, this machine's global git config rewrites `https://github.com` to SSH, so cargo fetches
+fail unless you set `CARGO_NET_GIT_FETCH_WITH_CLI=true` plus a `GIT_CONFIG_*` identity `insteadOf`
+override for the fork URLs (see the session notes / the `with-emulator.sh` invocations). CI is
+unaffected (clean git config, public repo over HTTPS).
 
 The TLS stack is hardwired to `aws-lc` (via `tonic/tls-aws-lc`, `rustls/aws_lc_rs`, and the auth
-id-token backend) — there is no `ring` option. This is why the release CI builds natively per arch
-and installs NASM on Windows.
+id-token backend) — there is no `ring` option. This is why the release CI builds per arch on its own
+runner (aws-lc-rs cross-compiles poorly — even ARM64 Windows uses a native runner; only macOS x86-64
+is cross-compiled, off the universal Apple toolchain) and installs NASM only on Windows x86-64.
 
 ## Testing against the emulator (or a real instance)
 
@@ -142,9 +156,12 @@ cargo build --release
 nm -D --defined-only target/release/libadbc_spanner.so | grep AdbcSpannerInit
 ```
 
-`.github/workflows/libraries.yml` builds the library natively for linux x86-64, linux aarch64, macOS
-arm64 and windows x86-64 on pushes to main, pull requests and tags; artifacts attach to every run,
-and on `v*` tags they are attached to the GitHub Release.
+`.github/workflows/libraries.yml` builds the library for **six** targets on pushes to main, pull
+requests and tags: linux x86-64 (`ubuntu-22.04`), linux aarch64 (`ubuntu-22.04-arm`), macOS arm64
+(`macos-14`), macOS x86-64 (**cross-compiled** on the same `macos-14` arm64 runner, since the Apple
+toolchain is universal), windows x86-64 (`windows-latest`) and windows aarch64 (`windows-11-arm`,
+native). Every other target is built natively on its own runner. Artifacts attach to every run, and
+on `v*` tags they are attached to the GitHub Release.
 
 ## Releasing
 
@@ -159,8 +176,9 @@ cargo release patch            # dry run (default) — preview only
 cargo release patch --execute  # bump + commit "Release X.Y.Z" + tag vX.Y.Z + push
 ```
 
-**crates.io publishing is off**, via `publish = false` in the release config (the git-pinned
-`google-cloud-*` deps can't be published — see the dependency note above). So `cargo release --execute`
+**crates.io publishing is off**, via `publish = false` in the release config (the git-pinned deps —
+both the `google-cloud-*` family and `adbc_core`/`adbc_ffi` — can't be published; see the two-pin
+dependency note above). So `cargo release --execute`
 does **not** touch crates.io — it only versions, commits, tags and pushes. Note the dry-run still
 prints a `Publishing adbc-spanner` heading; that is just the step label, not an actual `cargo publish`,
 so it is not a reason to avoid cargo-release. Re-enable `publish` once those deps are versioned.
@@ -186,8 +204,9 @@ library `build`:
 - `python-publish` (tags only) uploads to PyPI via **Trusted Publishing (OIDC)** — no token/secret.
   It uses `permissions: id-token: write` and the `pypi` GitHub environment.
 
-Unlike the crate, the wheel ships a compiled binary, so the git-pinned `google-cloud-rust` dependency
-(which blocks `cargo publish`) does **not** block PyPI — the Python package can release independently.
+Unlike the crate, the wheel ships a compiled binary, so the git-pinned dependencies (the
+`google-cloud-rust` and `arrow-adbc` pins, which block `cargo publish`) do **not** block PyPI — the
+Python package can release independently.
 
 **One-time PyPI setup (before the first tag):** register a *pending publisher* at
 <https://pypi.org/manage/account/publishing/> with project `adbc-driver-spanner`, owner `fornwall`,
