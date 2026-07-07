@@ -32,6 +32,12 @@ FULL=0
 # explicit allowlist rather than an exclude list: the remaining cases are genuine
 # Spanner-model / suite-portability gaps (documented in the README), and an
 # allowlist keeps the gate meaningful without tracking every non-applicable case.
+#
+# NOTE: SqlPartitionedInts is intentionally NOT gated even though partitioned
+# execution is implemented: the upstream case hardcodes exactly one partition for
+# `SELECT 42`, but Spanner's partitionQuery may return more (the emulator returns
+# 2). The driver's partition round-trip is covered by execute_partitions_round_trip
+# in tests/integration.rs instead. See adbc-validation/README.md.
 GATED_FILTER='SpannerDatabaseTest.*:SpannerConnectionTest.*'
 GATED_FILTER+=':SpannerStatementTest.NewInit'
 GATED_FILTER+=':SpannerStatementTest.Release'

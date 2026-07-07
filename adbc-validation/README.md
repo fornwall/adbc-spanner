@@ -75,8 +75,8 @@ accepts.)
 
 The rest of `StatementTest` (runnable via `--full`) is gated incrementally as
 each case is understood. Every remaining case now fails **cleanly** (no aborts —
-see the note below); they fall into three buckets, none of them incremental
-driver work:
+see the note below); they fall into the following buckets, none of them
+incremental driver work:
 
 - **Suite-internal non-Spanner DDL** — several cases issue hardcoded
   `CREATE TABLE x (foo INT)` / `TEXT` / `FLOAT` with no primary key and
@@ -94,6 +94,14 @@ driver work:
 - **One upstream `adbc_ffi` gap** — `ErrorCompatibility` checks that the driver
   preserves the caller's `AdbcError.private_data` / `private_driver`; the FFI
   exporter does not. Not fixable from this crate.
+- **Rigid single-partition assumption** — `SqlPartitionedInts` is now *runnable*
+  (the driver implements `execute_partitions`/`read_partition`, and the
+  `supports_partitioned_data` quirk is `true`), but the upstream case hardcodes
+  `ASSERT_EQ(1, num_partitions)` ("Assume only 1 partition") for `SELECT 42`.
+  Spanner's `partitionQuery` is free to return more — the emulator returns 2 — so
+  the case cannot be gated. The driver's own partitioned round-trip
+  (`execute_partitions` → `read_partition`, union of rows) is covered natively by
+  `execute_partitions_round_trip` in `tests/integration.rs`.
 
 The two `adbc_ffi` issues that previously blocked a whole swath of these — a
 non-idempotent error release (which aborted the process) and a missing
