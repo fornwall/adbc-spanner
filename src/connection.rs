@@ -840,8 +840,7 @@ impl Connection for SpannerConnection {
         // Decode the opaque descriptor produced by `Statement::execute_partitions`. It carries the
         // session, transaction id, partition token and Data Boost flag, so it executes on this
         // connection's client (which shares the same multiplexed session) with no further setup.
-        let partition: Partition = serde_json::from_slice(partition.as_ref())
-            .map_err(|e| invalid_argument(format!("invalid partition descriptor: {e}")))?;
+        let partition = decode_partition(partition.as_ref())?;
         let client = self.client.clone();
         let runtime = self.runtime.clone();
         let cancel = self.cancel.clone();
@@ -853,6 +852,15 @@ impl Connection for SpannerConnection {
         })?;
         Ok(Box::new(reader))
     }
+}
+
+/// Decode an opaque partition descriptor produced by `Statement::execute_partitions` — the
+/// serde-JSON of the client's [`Partition`]. Anything that does not decode (empty input, non-JSON
+/// bytes, or valid JSON of the wrong shape) is an [`Status::InvalidArguments`] error, never a
+/// panic. A pure function so the rejection path is unit-testable without a connection.
+fn decode_partition(descriptor: &[u8]) -> Result<Partition> {
+    serde_json::from_slice(descriptor)
+        .map_err(|e| invalid_argument(format!("invalid partition descriptor: {e}")))
 }
 
 fn parse_bool(value: OptionValue) -> Result<bool> {
@@ -940,6 +948,35 @@ mod tests {
         let err = check_lookup_catalog(Some("main")).unwrap_err();
         assert_eq!(err.status, Status::NotFound);
         assert!(err.message.contains("\"main\""), "{}", err.message);
+    }
+
+    /// A garbage partition descriptor — `read_partition`'s input is caller-supplied opaque bytes —
+    /// must be rejected as `InvalidArguments` by the decode step (before anything executes), never
+    /// panic. Covers empty input, non-JSON bytes, truncated JSON, and well-formed JSON that is not
+    /// a partition descriptor.
+    #[test]
+    fn garbage_partition_descriptors_error_cleanly() {
+        let cases: [&[u8]; 6] = [
+            b"",                      // empty
+            b"\xff\xfe\x00 not json", // non-UTF-8, non-JSON bytes
+            b"{",                     // truncated JSON
+            b"{}",                    // valid JSON object missing every descriptor field
+            br#"{"hello": "world"}"#, // valid JSON object of the wrong shape
+            b"[1, 2, 3]",             // valid JSON that is not even an object
+        ];
+        for descriptor in cases {
+            let error = decode_partition(descriptor).unwrap_err();
+            assert_eq!(
+                error.status,
+                Status::InvalidArguments,
+                "descriptor {descriptor:?}"
+            );
+            assert!(
+                error.message.contains("invalid partition descriptor"),
+                "unexpected message for {descriptor:?}: {}",
+                error.message
+            );
+        }
     }
 
     #[test]
