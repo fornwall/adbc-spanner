@@ -20,17 +20,12 @@ on timing, wheels land in `dist/` and get attached to the GitHub Release without
 `adbc-validation.yml`, `fuzz.yml` have no `permissions:` block at all — add `contents: read` like
 the other two workflows already do.
 
-**3. gRPC error fidelity** — `src/error.rs`: `ABORTED` (Spanner's routine "retry me" signal) maps
-to `Status::Internal`, indistinguishable from a driver bug when the r/w runner exhausts retries
-under contention; and `from_spanner` leaves `vendor_code` at zero when it could carry the numeric
-gRPC code for callers' retry logic.
-
-**4. Untested data-loss path** — the "re-enabling autocommit commits buffered DML" branch
+**3. Untested data-loss path** — the "re-enabling autocommit commits buffered DML" branch
 (`src/connection.rs:721`) has zero coverage; the one toggle test deliberately buffers nothing
 (`tests/integration.rs:486`). A regression that *discarded* the buffer instead of committing would
 pass the whole suite.
 
-**5. Emulator scripts fail open** — `scripts/with-emulator.sh:44–64`: both readiness loops fall
+**4. Emulator scripts fail open** — `scripts/with-emulator.sh:44–64`: both readiness loops fall
 through silently on timeout and run the tests against a dead port (the ci.yml copy of this loop
 fails correctly). `run-foundry-validation.sh` also lacks `-e`, so a failed build validates a stale
 `.so`, and its `VALIDATION_REF` pin only applies on first install.

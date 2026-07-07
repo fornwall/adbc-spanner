@@ -32,18 +32,21 @@ pub(crate) fn invalid_argument(message: impl Into<String>) -> Error {
 /// `google_cloud_spanner::Error` (a re-export of `google_cloud_gax::error::Error`). When that error
 /// carries a gRPC status, we map its canonical code onto the closest [`Status`] variant so callers
 /// can distinguish, say, "table not found" from a backend failure instead of collapsing everything
-/// to [`Status::Internal`]. Errors without a status (transport/serialization/etc.) fall back to
-/// [`Status::Internal`].
+/// to [`Status::Internal`] — and preserve the **numeric gRPC code** in the ADBC error's
+/// `vendor_code`, so callers can recover exactly what failed (e.g. a retry loop looking for
+/// `ABORTED` = 10) even where several codes share one ADBC status. Errors without a status
+/// (transport/serialization/etc.) fall back to [`Status::Internal`] with `vendor_code` 0.
 pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
     // `Error::status()` yields the structured gRPC status when present. We match on the code's
     // canonical name (e.g. "NOT_FOUND"), which is derived from the enum by the client itself — this
-    // is not fragile string-parsing of a `Display` message, and it avoids taking a direct
-    // dependency on the transitive `google-cloud-gax` crate just to name its `Code` enum.
-    let status = error
+    // is not fragile string-parsing of a `Display` message.
+    let (status, vendor_code) = error
         .status()
-        .map(|status| status_for_grpc_code(status.code.name()))
-        .unwrap_or(Status::Internal);
-    err(format!("Spanner error: {error}"), status)
+        .map(|status| (status_for_grpc_code(status.code.name()), status.code as i32))
+        .unwrap_or((Status::Internal, 0));
+    let mut adbc = err(format!("Spanner error: {error}"), status);
+    adbc.vendor_code = vendor_code;
+    adbc
 }
 
 /// Translate a Spanner *client/admin builder* construction error into an ADBC error.
@@ -77,7 +80,13 @@ fn status_for_grpc_code(code_name: &str) -> Status {
         "CANCELLED" => Status::Cancelled,
         // ADBC's IO status documents "a remote service may be unavailable".
         "UNAVAILABLE" => Status::IO,
-        // ABORTED, RESOURCE_EXHAUSTED, INTERNAL, UNKNOWN, DATA_LOSS, OK and anything unrecognised.
+        // ABORTED is Spanner's routine "transaction contended, please retry" signal, seen by
+        // callers only after the client's read/write runner has exhausted its retries. It is
+        // transient and environmental, not a driver or database defect, so it maps to IO rather
+        // than Internal (which reads as "driver bug"). ADBC has no closer variant; the exact code
+        // survives in `vendor_code` (ABORTED = 10) for callers with their own retry logic.
+        "ABORTED" => Status::IO,
+        // RESOURCE_EXHAUSTED, INTERNAL, UNKNOWN, DATA_LOSS, OK and anything unrecognised.
         _ => Status::Internal,
     }
 }
@@ -116,12 +125,13 @@ mod tests {
         assert_eq!(status_for_grpc_code("DEADLINE_EXCEEDED"), Status::Timeout);
         assert_eq!(status_for_grpc_code("CANCELLED"), Status::Cancelled);
         assert_eq!(status_for_grpc_code("UNAVAILABLE"), Status::IO);
+        // Transient contention, not a driver/database defect: IO, not Internal.
+        assert_eq!(status_for_grpc_code("ABORTED"), Status::IO);
     }
 
     #[test]
     fn unmapped_and_unknown_codes_fall_back_to_internal() {
         for code in [
-            "ABORTED",
             "RESOURCE_EXHAUSTED",
             "INTERNAL",
             "UNKNOWN",
@@ -146,5 +156,33 @@ mod tests {
         let adbc = from_spanner(gax);
         assert_eq!(adbc.status, Status::NotFound);
         assert!(adbc.message.starts_with("Spanner error:"));
+        // The numeric gRPC code survives in vendor_code (NOT_FOUND = 5).
+        assert_eq!(adbc.vendor_code, Code::NotFound as i32);
+        assert_eq!(adbc.vendor_code, 5);
+    }
+
+    #[test]
+    fn aborted_keeps_its_grpc_code_in_vendor_code() {
+        use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
+        use google_cloud_gax::error::Error as GaxError;
+
+        let gax = GaxError::service(
+            RpcStatus::default()
+                .set_code(Code::Aborted)
+                .set_message("Transaction was aborted"),
+        );
+        let adbc = from_spanner(gax);
+        // Retry loops can detect ABORTED (10) exactly, whatever the ADBC status says.
+        assert_eq!(adbc.status, Status::IO);
+        assert_eq!(adbc.vendor_code, Code::Aborted as i32);
+        assert_eq!(adbc.vendor_code, 10);
+    }
+
+    #[test]
+    fn errors_without_a_grpc_status_have_no_vendor_code() {
+        use google_cloud_gax::error::Error as GaxError;
+        let adbc = from_spanner(GaxError::deser("no structured status here"));
+        assert_eq!(adbc.status, Status::Internal);
+        assert_eq!(adbc.vendor_code, 0);
     }
 }
