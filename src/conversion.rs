@@ -581,13 +581,13 @@ fn build_struct(fields: &Fields, values: &[Option<&Value>]) -> Result<ArrayRef> 
     Ok(Arc::new(array))
 }
 
-/// Parse a Spanner `INT64` value. Integers arrive as strings; we also accept a numeric encoding for
-/// robustness.
+/// Parse a Spanner `INT64` value. Integers always arrive as strings (Spanner encodes `INT64` as a
+/// JSON string precisely so magnitudes above 2^53 survive), so we only accept the string form. We
+/// deliberately do **not** fall back to a JSON number: an `f64` cannot represent every `i64`, and
+/// casting one to `i64` would silently round values above 2^53. A non-string (or non-integer) wire
+/// value is therefore a loud decode error rather than a truncated result.
 fn parse_int64(value: &Value) -> Option<i64> {
-    if let Some(s) = value.try_as_string() {
-        return s.parse::<i64>().ok();
-    }
-    value.try_as_f64().map(|f| f as i64)
+    value.try_as_string()?.parse::<i64>().ok()
 }
 
 /// Parse a Spanner floating-point value. Finite values arrive as numbers; `NaN` and the infinities
@@ -936,5 +936,31 @@ mod tests {
             "{}",
             err.message
         );
+    }
+
+    /// `INT64` arrives as a JSON string, so every `i64` — including magnitudes above 2^53 that an
+    /// `f64` cannot represent — round-trips exactly. A JSON *number* encoding (which the old f64
+    /// fallback would have cast to `i64`, silently rounding) is now a loud decode error rather than
+    /// a truncated result.
+    #[test]
+    fn int64_string_round_trips_exactly_and_number_encoding_is_a_decode_error() {
+        use arrow_array::Int64Array;
+        use google_cloud_spanner::value::ToValue;
+
+        // Ordinary value and a value above 2^53 both round-trip exactly via the string encoding.
+        let above_2_53: i64 = (1i64 << 53) + 1;
+        let small = 42i64.to_value();
+        let big = above_2_53.to_value();
+        let array = build_array(&DataType::Int64, &[Some(&small), Some(&big)]).unwrap();
+        let ints = array.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(ints.value(0), 42);
+        assert_eq!(ints.value(1), above_2_53);
+
+        // A JSON-number encoding of the same magnitude would lose precision if cast through f64,
+        // so it must now error rather than decode to a rounded value.
+        let as_number = (above_2_53 as f64).to_value();
+        let err = build_array(&DataType::Int64, &[Some(&as_number)]).unwrap_err();
+        assert_eq!(err.status, Status::InvalidData);
+        assert!(err.message.contains("INT64"), "{}", err.message);
     }
 }
