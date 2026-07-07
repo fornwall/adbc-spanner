@@ -1,8 +1,9 @@
 name: Fuzz
 
 # Fuzzing is expensive, so it runs on a schedule (and on demand) rather than on every push.
-# Each target seeds from the committed fuzz/seeds/<target> corpus; the generated corpus is not
-# persisted between runs.
+# Each target seeds from the committed fuzz/seeds/<target> corpus, and the generated corpus is
+# cached between runs (actions/cache below) so coverage accumulates instead of restarting from
+# the seeds every night.
 on:
   schedule:
     - cron: "0 3 * * *" # daily at 03:00 UTC
@@ -40,14 +41,28 @@ jobs:
         with:
           workspaces: "fuzz -> target"
 
+      # Persist the generated corpus across runs so coverage accumulates. Cache keys are
+      # immutable, so key on the run id: each run saves a fresh cache and restore-keys picks
+      # the most recent previous one. (The save happens in this action's post step, which is
+      # skipped if the job fails — a crashing input therefore never poisons the cache; it is
+      # uploaded as an artifact below instead.)
+      - name: Restore the accumulated corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
       - name: Fuzz ${{ matrix.target }}
         # cargo-fuzz defaults the fuzz target to its own build triple. The prebuilt
         # binary from install-action is musl-static, and sanitizers are incompatible
         # with a statically linked libc, so pin the target to the host gnu triple.
         #
-        # New units are written to the (ephemeral, gitignored) corpus dir listed first;
-        # the committed seed corpus is passed read-alongside so short runs start with
-        # meaningful coverage. Not every target has seeds (e.g. `options`).
+        # New units are written to the (gitignored, cache-persisted) corpus dir listed
+        # first; the committed seed corpus is passed read-alongside so runs with a cold
+        # cache still start with meaningful coverage. Not every target has seeds (e.g.
+        # `options`).
         run: |
           mkdir -p "fuzz/corpus/${{ matrix.target }}"
           seeds="fuzz/seeds/${{ matrix.target }}"

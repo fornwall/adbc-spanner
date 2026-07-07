@@ -28,8 +28,13 @@ fuzz_target!(|input: (String, String)| {
     }
     re.push_str(r"\z");
 
-    // The escaping above only ever produces a valid regex, so compilation cannot fail.
-    let expected = Regex::new(&re).unwrap().is_match(&value);
+    // The escaping above only ever produces a *syntactically* valid regex, but a large fuzz input
+    // can still exceed the compiler's size limit (`CompiledTooBig`, e.g. if `-max_len` is raised).
+    // The no-panic/termination property was already exercised above, so just skip the oracle then.
+    let expected = match Regex::new(&re) {
+        Ok(regex) => regex.is_match(&value),
+        Err(_) => return,
+    };
     assert_eq!(
         got, expected,
         "like_match disagreed with regex oracle for pattern {pattern:?} value {value:?}"
