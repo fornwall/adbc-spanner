@@ -31,6 +31,10 @@ def option_kwargs(
     emulator: bool = False,
     keyfile: typing.Optional[str] = None,
     keyfile_json: typing.Optional[str] = None,
+    impersonate_target_principal: typing.Optional[str] = None,
+    impersonate_delegates: typing.Optional[typing.Union[str, typing.Sequence[str]]] = None,
+    impersonate_scopes: typing.Optional[typing.Union[str, typing.Sequence[str]]] = None,
+    impersonate_lifetime: typing.Optional[typing.Union[int, str]] = None,
     db_kwargs: typing.Optional[typing.Mapping[str, str]] = None,
 ) -> typing.Dict[str, str]:
     """Translate the friendly connection kwargs into ``spanner.*`` options.
@@ -51,9 +55,27 @@ def option_kwargs(
         options["spanner.keyfile"] = keyfile
     if keyfile_json is not None:
         options["spanner.keyfile_json"] = keyfile_json
+    # Service-account impersonation (layered on top of the base credentials above);
+    # enabled only when a target principal is set. delegates/scopes accept either a
+    # comma-separated string or a sequence of strings.
+    if impersonate_target_principal is not None:
+        options["spanner.impersonate.target_principal"] = impersonate_target_principal
+    if impersonate_delegates is not None:
+        options["spanner.impersonate.delegates"] = _as_csv(impersonate_delegates)
+    if impersonate_scopes is not None:
+        options["spanner.impersonate.scopes"] = _as_csv(impersonate_scopes)
+    if impersonate_lifetime is not None:
+        options["spanner.impersonate.lifetime"] = str(impersonate_lifetime)
     if db_kwargs:
         options.update(db_kwargs)
     return options
+
+
+def _as_csv(value: typing.Union[str, typing.Sequence[str]]) -> str:
+    """Render a delegates/scopes value as the comma-separated string the driver expects."""
+    if isinstance(value, str):
+        return value
+    return ",".join(value)
 
 
 def connect(
@@ -63,6 +85,10 @@ def connect(
     emulator: bool = False,
     keyfile: typing.Optional[str] = None,
     keyfile_json: typing.Optional[str] = None,
+    impersonate_target_principal: typing.Optional[str] = None,
+    impersonate_delegates: typing.Optional[typing.Union[str, typing.Sequence[str]]] = None,
+    impersonate_scopes: typing.Optional[typing.Union[str, typing.Sequence[str]]] = None,
+    impersonate_lifetime: typing.Optional[typing.Union[int, str]] = None,
     db_kwargs: typing.Optional[typing.Mapping[str, str]] = None,
 ) -> adbc_driver_manager.AdbcDatabase:
     """Create a low-level ADBC database handle for Spanner.
@@ -81,6 +107,18 @@ def connect(
     keyfile / keyfile_json:
         Service-account credentials, as a path or inline JSON. Omit both to use
         Application Default Credentials.
+    impersonate_target_principal:
+        Service account to impersonate. Setting it enables service-account
+        impersonation on top of the base credentials above; leave it unset for no
+        impersonation. Mirrors the BigQuery driver's ``impersonate.*`` options.
+    impersonate_delegates:
+        Optional delegation chain (a comma-separated string or a sequence of
+        service-account emails).
+    impersonate_scopes:
+        Optional OAuth scopes (a comma-separated string or a sequence); defaults to
+        the ``cloud-platform`` scope.
+    impersonate_lifetime:
+        Optional impersonated-token lifetime in seconds; defaults to ``3600``.
     db_kwargs:
         Escape hatch for raw ``spanner.*`` option keys, merged last.
 
@@ -92,6 +130,10 @@ def connect(
         emulator=emulator,
         keyfile=keyfile,
         keyfile_json=keyfile_json,
+        impersonate_target_principal=impersonate_target_principal,
+        impersonate_delegates=impersonate_delegates,
+        impersonate_scopes=impersonate_scopes,
+        impersonate_lifetime=impersonate_lifetime,
         db_kwargs=db_kwargs,
     )
     # ** unpacking accepts the dotted, non-identifier option keys; they land in

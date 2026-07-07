@@ -129,6 +129,10 @@ Options are set on the database (via `new_database_with_opts` or `set_option`):
 | `spanner.emulator`                                  | `true` to connect with anonymous credentials (emulator mode).           |
 | `spanner.keyfile`                                   | Path to a service-account JSON key file (dbt's `keyfile`).              |
 | `spanner.keyfile_json`                             | Inline service-account JSON key (dbt's `keyfile_json`); wins over `keyfile`. |
+| `spanner.impersonate.target_principal`             | Service account to impersonate; setting it enables impersonation on top of the base credentials. |
+| `spanner.impersonate.delegates`                    | Optional delegation chain, a comma-separated list of service-account emails.  |
+| `spanner.impersonate.scopes`                       | Optional OAuth scopes for the impersonated token (comma-separated); defaults to `cloud-platform`. |
+| `spanner.impersonate.lifetime`                     | Optional impersonated-token lifetime in seconds; defaults to `3600`.          |
 
 ### Authentication
 
@@ -140,6 +144,23 @@ Credentials are resolved in this order:
    in `spanner.keyfile`.
 3. **[Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)**
    otherwise (e.g. `GOOGLE_APPLICATION_CREDENTIALS`, gcloud login, or the metadata server).
+
+#### Service-account impersonation
+
+Setting `spanner.impersonate.target_principal` layers
+[service-account impersonation](https://cloud.google.com/iam/docs/service-account-impersonation) on
+top of whichever base credentials above are in effect: the base credentials call the IAM Credentials
+`generateAccessToken` API to mint a short-lived token for the target service account, and the driver
+authenticates as that target. The option group mirrors the BigQuery ADBC driver's
+`bigquery.impersonate.*` options:
+
+- `spanner.impersonate.target_principal` — the target service-account email (**required** to enable
+  impersonation; when unset, authentication is unchanged).
+- `spanner.impersonate.delegates` — an optional delegation chain (comma-separated), where each
+  service account has the *Token Creator* role on the next and the last on the target.
+- `spanner.impersonate.scopes` — optional OAuth scopes (comma-separated); defaults to the
+  `cloud-platform` scope.
+- `spanner.impersonate.lifetime` — optional token lifetime in seconds; defaults to `3600` (one hour).
 
 ## Type mapping
 

@@ -48,6 +48,10 @@ Options mirror the driver's `spanner.*` keys:
 | `emulator=`    | `spanner.emulator`     |
 | `keyfile=`     | `spanner.keyfile`      |
 | `keyfile_json=`| `spanner.keyfile_json` |
+| `impersonate_target_principal=` | `spanner.impersonate.target_principal` |
+| `impersonate_delegates=`        | `spanner.impersonate.delegates`        |
+| `impersonate_scopes=`           | `spanner.impersonate.scopes`           |
+| `impersonate_lifetime=`         | `spanner.impersonate.lifetime`         |
 
 Credentials default to Application Default Credentials; pass `keyfile=` /
 `keyfile_json=` for a service account, or point at the emulator:
@@ -56,6 +60,18 @@ Credentials default to Application Default Credentials; pass `keyfile=` /
 # docs-test: skip
 spanner.connect(database="projects/p/instances/i/databases/d",
                 endpoint="localhost:9010", emulator=True)
+```
+
+Set `impersonate_target_principal=` to authenticate as another service account on top
+of the base credentials (mirrors the BigQuery driver's `impersonate.*` options).
+`impersonate_delegates=` / `impersonate_scopes=` accept a comma-separated string or a
+list; `impersonate_lifetime=` is the token lifetime in seconds (default `3600`):
+
+```python
+# docs-test: skip
+spanner.connect(database="projects/p/instances/i/databases/d",
+                impersonate_target_principal="target@p.iam.gserviceaccount.com",
+                impersonate_scopes=["https://www.googleapis.com/auth/cloud-platform"])
 ```
 
 ## Cookbook

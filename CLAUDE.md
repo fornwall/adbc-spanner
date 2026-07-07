@@ -182,7 +182,13 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   ARRAY/STRUCT, parameter binding + bulk ingest, `get_info` (static driver/vendor metadata),
   `get_objects` (incl. foreign-key `constraint_column_usage`), `get_table_types`/`get_table_schema`,
   `get_parameter_schema`, best-effort `Connection`/`Statement::cancel` (a shared `CancelSignal`
-  interrupts an in-flight `block_on` op), and keyfile/keyfile_json auth.
+  interrupts an in-flight `block_on` op), keyfile/keyfile_json auth (credential-type auto-detected
+  from the JSON `"type"`), and service-account impersonation
+  (`spanner.impersonate.target_principal` enables it; optional `spanner.impersonate.delegates`
+  [comma-separated chain], `spanner.impersonate.scopes` [comma-separated, defaults to
+  cloud-platform], `spanner.impersonate.lifetime` [seconds, default 3600] — layered on top of the
+  base credentials via `google-cloud-auth`'s `impersonated::Builder::from_source_credentials`,
+  aligned with the BigQuery ADBC driver's `impersonate.*` group).
   (`get_statistics` computes exact `ROW_COUNT`/`NULL_COUNT`/`DISTINCT_COUNT` via one aggregate scan
   per table — see `src/statistics.rs`; `approximate=true` returns nothing since Spanner has no cheap
   stats. `get_statistic_names` returns an empty, correctly-typed result set.)

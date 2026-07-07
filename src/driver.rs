@@ -8,6 +8,7 @@ use google_cloud_auth::credentials::external_account::Builder as ExternalAccount
 use google_cloud_auth::credentials::impersonated::Builder as ImpersonatedCredentials;
 use google_cloud_auth::credentials::service_account::Builder as ServiceAccountCredentials;
 use google_cloud_auth::credentials::user_account::Builder as UserAccountCredentials;
+use google_cloud_auth::credentials::Builder as AdcCredentials;
 use google_cloud_auth::credentials::Credentials;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 
@@ -15,8 +16,16 @@ use crate::connection::SpannerConnection;
 use crate::error::{err, from_builder, from_spanner, invalid_argument, invalid_state};
 use crate::runtime::{new_runtime, SharedRuntime};
 use crate::{
-    OPTION_DATABASE, OPTION_EMULATOR, OPTION_ENDPOINT, OPTION_KEYFILE, OPTION_KEYFILE_JSON,
+    OPTION_DATABASE, OPTION_EMULATOR, OPTION_ENDPOINT, OPTION_IMPERSONATE_DELEGATES,
+    OPTION_IMPERSONATE_LIFETIME, OPTION_IMPERSONATE_SCOPES, OPTION_IMPERSONATE_TARGET_PRINCIPAL,
+    OPTION_KEYFILE, OPTION_KEYFILE_JSON,
 };
+use std::time::Duration;
+
+/// The default lifetime, in seconds, of an impersonated access token when
+/// [`OPTION_IMPERSONATE_LIFETIME`] is left unset — one hour, matching both the BigQuery ADBC driver
+/// and the `google-cloud-auth` `impersonated` builder's own default.
+const DEFAULT_IMPERSONATION_LIFETIME_SECS: u64 = 3600;
 
 /// The Spanner ADBC driver — the entry point for creating [`SpannerDatabase`] instances.
 ///
@@ -76,6 +85,15 @@ pub struct SpannerDatabase {
     emulator: bool,
     keyfile: Option<String>,
     keyfile_json: Option<String>,
+    /// The service account to impersonate. When `Some`, impersonation is layered on top of the base
+    /// credentials (keyfile or ADC); when `None`, authentication is unchanged.
+    impersonate_target_principal: Option<String>,
+    /// Optional delegation chain for impersonation (empty = none).
+    impersonate_delegates: Vec<String>,
+    /// Optional OAuth scopes for the impersonated token (empty = the auth crate's cloud-platform default).
+    impersonate_scopes: Vec<String>,
+    /// Optional impersonated-token lifetime in seconds (`None` = [`DEFAULT_IMPERSONATION_LIFETIME_SECS`]).
+    impersonate_lifetime_secs: Option<u64>,
 }
 
 impl SpannerDatabase {
@@ -87,6 +105,10 @@ impl SpannerDatabase {
             emulator: false,
             keyfile: None,
             keyfile_json: None,
+            impersonate_target_principal: None,
+            impersonate_delegates: Vec::new(),
+            impersonate_scopes: Vec::new(),
+            impersonate_lifetime_secs: None,
         }
     }
 
@@ -140,6 +162,20 @@ impl SpannerDatabase {
             self.credentials_json()?
         };
 
+        // Impersonation config, applied on top of the base credentials below when a target is set.
+        // Ignored in emulator mode (which uses anonymous credentials and does no real auth).
+        let impersonate_target = if emulator {
+            None
+        } else {
+            self.impersonate_target_principal.clone()
+        };
+        let impersonate_delegates = self.impersonate_delegates.clone();
+        let impersonate_scopes = self.impersonate_scopes.clone();
+        let impersonate_lifetime = Duration::from_secs(
+            self.impersonate_lifetime_secs
+                .unwrap_or(DEFAULT_IMPERSONATION_LIFETIME_SECS),
+        );
+
         self.runtime.block_on(async move {
             let mut builder = Spanner::builder();
             if let Some(endpoint) = endpoint {
@@ -147,6 +183,30 @@ impl SpannerDatabase {
             }
             if emulator {
                 builder = builder.with_credentials(AnonymousCredentials::new().build());
+            } else if let Some(target) = impersonate_target {
+                // Build the base credential exactly as the non-impersonated path does — an explicit
+                // keyfile, or ADC when none is given — then wrap it so it is only used to mint a
+                // short-lived token for `target` (optionally through a delegation chain).
+                let source = match credentials_json {
+                    Some(json) => build_credentials_from_json(&json)?,
+                    None => AdcCredentials::default().build().map_err(|e| {
+                        err(
+                            format!(
+                                "failed to build Application Default Credentials to impersonate \
+                                 {target:?}: {e}"
+                            ),
+                            Status::InvalidArguments,
+                        )
+                    })?,
+                };
+                let credentials = build_impersonated_credentials(
+                    source,
+                    &target,
+                    &impersonate_delegates,
+                    &impersonate_scopes,
+                    impersonate_lifetime,
+                )?;
+                builder = builder.with_credentials(credentials);
             } else if let Some(json) = credentials_json {
                 builder = builder.with_credentials(build_credentials_from_json(&json)?);
             }
@@ -196,6 +256,18 @@ impl Optionable for SpannerDatabase {
             OptionDatabase::Other(name) if name == OPTION_KEYFILE_JSON => {
                 self.keyfile_json = Some(string_value(&key, value)?)
             }
+            OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_TARGET_PRINCIPAL => {
+                self.impersonate_target_principal = Some(string_value(&key, value)?)
+            }
+            OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_DELEGATES => {
+                self.impersonate_delegates = comma_separated(&string_value(&key, value)?)
+            }
+            OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_SCOPES => {
+                self.impersonate_scopes = comma_separated(&string_value(&key, value)?)
+            }
+            OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_LIFETIME => {
+                self.impersonate_lifetime_secs = Some(u64_seconds_value(&key, value)?)
+            }
             other => {
                 return Err(invalid_argument(format!(
                     "unsupported Spanner database option: {}",
@@ -216,6 +288,19 @@ impl Optionable for SpannerDatabase {
             }
             OptionDatabase::Other(name) if name == OPTION_KEYFILE => self.keyfile.clone(),
             OptionDatabase::Other(name) if name == OPTION_KEYFILE_JSON => self.keyfile_json.clone(),
+            OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_TARGET_PRINCIPAL => {
+                self.impersonate_target_principal.clone()
+            }
+            OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_DELEGATES => {
+                (!self.impersonate_delegates.is_empty())
+                    .then(|| self.impersonate_delegates.join(","))
+            }
+            OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_SCOPES => {
+                (!self.impersonate_scopes.is_empty()).then(|| self.impersonate_scopes.join(","))
+            }
+            OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_LIFETIME => {
+                self.impersonate_lifetime_secs.map(|secs| secs.to_string())
+            }
             _ => None,
         };
         value.ok_or_else(|| {
@@ -311,7 +396,7 @@ const SUPPORTED_CREDENTIAL_TYPES: &str =
 /// The underlying `google-cloud-auth` top-level `Builder` already dispatches on this field, but only
 /// for credentials it loads itself from the environment (the `GOOGLE_APPLICATION_CREDENTIALS` var or
 /// the well-known ADC file). It offers no entry point that takes inline JSON, so the dispatch has to
-/// happen here for the JSON supplied through the `adbc.spanner.keyfile` / `adbc.spanner.keyfile_json`
+/// happen here for the JSON supplied through the `spanner.keyfile` / `spanner.keyfile_json`
 /// options. Previously every keyfile was forced through the `service_account` builder, which failed
 /// (or misbehaved) for any other credential type.
 fn build_credentials_from_json(json: &str) -> Result<Credentials> {
@@ -352,6 +437,68 @@ fn build_credentials_from_json(json: &str) -> Result<Credentials> {
             Status::InvalidArguments,
         )
     })
+}
+
+/// Wrap a base credential with service-account impersonation using the `google-cloud-auth`
+/// `impersonated` builder.
+///
+/// The base credentials (built as usual from a keyfile or ADC) become the *source*: they are used to
+/// call the IAM Credentials `generateAccessToken` API and mint a short-lived token for
+/// `target_principal`. `delegates` is an optional delegation chain; `scopes` overrides the default
+/// `cloud-platform` scope when non-empty; `lifetime` bounds the minted token. This mirrors the
+/// BigQuery ADBC driver's `impersonate.*` option group.
+fn build_impersonated_credentials(
+    source: Credentials,
+    target_principal: &str,
+    delegates: &[String],
+    scopes: &[String],
+    lifetime: Duration,
+) -> Result<Credentials> {
+    let mut builder = ImpersonatedCredentials::from_source_credentials(source)
+        .with_target_principal(target_principal)
+        .with_lifetime(lifetime);
+    if !delegates.is_empty() {
+        builder = builder.with_delegates(delegates.iter().cloned());
+    }
+    if !scopes.is_empty() {
+        builder = builder.with_scopes(scopes.iter().cloned());
+    }
+    builder.build().map_err(|e| {
+        err(
+            format!("failed to build impersonated credentials for {target_principal:?}: {e}"),
+            Status::InvalidArguments,
+        )
+    })
+}
+
+/// Split a comma-separated option value (delegates, scopes) into a list, trimming surrounding
+/// whitespace and dropping empty entries so a trailing comma or spaces are harmless.
+fn comma_separated(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Parse an option carrying a non-negative integer number of seconds (the impersonation lifetime).
+/// Accepts an integer option value directly or a numeric string; anything else is rejected with a
+/// clear `InvalidArguments` error.
+fn u64_seconds_value(key: &OptionDatabase, value: OptionValue) -> Result<u64> {
+    match value {
+        OptionValue::Int(seconds) if seconds >= 0 => Ok(seconds as u64),
+        OptionValue::String(seconds) => seconds.trim().parse::<u64>().map_err(|_| {
+            invalid_argument(format!(
+                "option {} expects a non-negative integer number of seconds, got {seconds:?}",
+                option_name(key)
+            ))
+        }),
+        _ => Err(invalid_argument(format!(
+            "option {} expects a non-negative integer number of seconds",
+            option_name(key)
+        ))),
+    }
 }
 
 fn bool_value(key: &OptionDatabase, value: OptionValue) -> Result<bool> {
@@ -554,5 +701,159 @@ mod tests {
         assert!(error
             .message
             .contains("failed to build service_account credentials"));
+    }
+
+    #[test]
+    fn impersonation_options_round_trip_and_split() {
+        let mut db = new_database();
+        db.set_option(
+            OptionDatabase::Other(OPTION_IMPERSONATE_TARGET_PRINCIPAL.into()),
+            OptionValue::String("target@project.iam.gserviceaccount.com".into()),
+        )
+        .unwrap();
+        // Delegates and scopes are comma-separated; surrounding whitespace and a trailing comma are
+        // tolerated.
+        db.set_option(
+            OptionDatabase::Other(OPTION_IMPERSONATE_DELEGATES.into()),
+            OptionValue::String("a@p.iam.gserviceaccount.com, b@p.iam.gserviceaccount.com,".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other(OPTION_IMPERSONATE_SCOPES.into()),
+            OptionValue::String(
+                "https://www.googleapis.com/auth/spanner.data,https://www.googleapis.com/auth/cloud-platform".into(),
+            ),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other(OPTION_IMPERSONATE_LIFETIME.into()),
+            OptionValue::String("1800".into()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.impersonate_target_principal.as_deref(),
+            Some("target@project.iam.gserviceaccount.com")
+        );
+        assert_eq!(
+            db.impersonate_delegates,
+            vec![
+                "a@p.iam.gserviceaccount.com".to_string(),
+                "b@p.iam.gserviceaccount.com".to_string()
+            ]
+        );
+        assert_eq!(
+            db.impersonate_scopes,
+            vec![
+                "https://www.googleapis.com/auth/spanner.data".to_string(),
+                "https://www.googleapis.com/auth/cloud-platform".to_string()
+            ]
+        );
+        assert_eq!(db.impersonate_lifetime_secs, Some(1800));
+
+        // Round-trips back out through get_option_string (delegates/scopes re-joined with commas).
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(
+                OPTION_IMPERSONATE_TARGET_PRINCIPAL.into()
+            ))
+            .unwrap(),
+            "target@project.iam.gserviceaccount.com"
+        );
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(OPTION_IMPERSONATE_DELEGATES.into()))
+                .unwrap(),
+            "a@p.iam.gserviceaccount.com,b@p.iam.gserviceaccount.com"
+        );
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(OPTION_IMPERSONATE_LIFETIME.into()))
+                .unwrap(),
+            "1800"
+        );
+    }
+
+    #[test]
+    fn impersonation_lifetime_defaults_to_one_hour_when_unset() {
+        let mut db = new_database();
+        db.set_option(
+            OptionDatabase::Other(OPTION_IMPERSONATE_TARGET_PRINCIPAL.into()),
+            OptionValue::String("target@project.iam.gserviceaccount.com".into()),
+        )
+        .unwrap();
+        // With a target set but no explicit lifetime, the effective lifetime is the 3600s default —
+        // resolved exactly as `connect()` does.
+        assert_eq!(db.impersonate_lifetime_secs, None);
+        let effective = Duration::from_secs(
+            db.impersonate_lifetime_secs
+                .unwrap_or(DEFAULT_IMPERSONATION_LIFETIME_SECS),
+        );
+        assert_eq!(effective, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn impersonation_target_is_disabled_by_default() {
+        let db = new_database();
+        assert!(db.impersonate_target_principal.is_none());
+        assert!(db.impersonate_delegates.is_empty());
+        assert!(db.impersonate_scopes.is_empty());
+        // Unset options report "not set".
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(
+                OPTION_IMPERSONATE_TARGET_PRINCIPAL.into()
+            ))
+            .unwrap_err()
+            .status,
+            Status::NotFound
+        );
+    }
+
+    #[test]
+    fn a_non_numeric_impersonation_lifetime_is_rejected() {
+        let mut db = new_database();
+        let error = db
+            .set_option(
+                OptionDatabase::Other(OPTION_IMPERSONATE_LIFETIME.into()),
+                OptionValue::String("not-a-number".into()),
+            )
+            .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("non-negative integer"));
+    }
+
+    #[test]
+    fn an_integer_impersonation_lifetime_is_accepted() {
+        let mut db = new_database();
+        db.set_option(
+            OptionDatabase::Other(OPTION_IMPERSONATE_LIFETIME.into()),
+            OptionValue::Int(900),
+        )
+        .unwrap();
+        assert_eq!(db.impersonate_lifetime_secs, Some(900));
+    }
+
+    // Building impersonated credentials on top of a valid base credential succeeds without any
+    // network I/O: the `impersonated` builder clones the source credential and constructs a lazy
+    // token provider — the IAM `generateAccessToken` call only happens on first token use. We use an
+    // `authorized_user` base (which itself builds offline, like #23's test) and must run inside a
+    // Tokio runtime because the builders spawn token-cache tasks, exactly as `connect()` does.
+    #[test]
+    fn impersonated_credentials_build_without_network() {
+        let source_json = r#"{
+            "type": "authorized_user",
+            "client_id": "test-client-id.apps.googleusercontent.com",
+            "client_secret": "test-client-secret",
+            "refresh_token": "test-refresh-token"
+        }"#;
+        let runtime = new_runtime().unwrap();
+        runtime.block_on(async {
+            let source = build_credentials_from_json(source_json).unwrap();
+            let result = build_impersonated_credentials(
+                source,
+                "target@project.iam.gserviceaccount.com",
+                &["delegate@project.iam.gserviceaccount.com".to_string()],
+                &["https://www.googleapis.com/auth/cloud-platform".to_string()],
+                Duration::from_secs(1200),
+            );
+            assert!(result.is_ok());
+        });
     }
 }

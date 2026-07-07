@@ -182,6 +182,31 @@ pub const OPTION_KEYFILE: &str = "spanner.keyfile";
 /// falls back to Application Default Credentials.
 pub const OPTION_KEYFILE_JSON: &str = "spanner.keyfile_json";
 
+/// Driver-specific database option: the service-account email to impersonate. Setting this **enables
+/// service-account impersonation** — the base credentials (ADC, keyfile, …) are used to mint a
+/// short-lived access token for this target principal via the IAM Credentials
+/// `generateAccessToken` API, and the driver authenticates as the target. When unset, no
+/// impersonation happens and authentication is unchanged.
+///
+/// Mirrors the BigQuery ADBC driver's `bigquery.impersonate.target_principal` option.
+pub const OPTION_IMPERSONATE_TARGET_PRINCIPAL: &str = "spanner.impersonate.target_principal";
+
+/// Driver-specific database option: an optional delegation chain for impersonation — a
+/// comma-separated list of service-account emails, each of which must have the *Token Creator* role
+/// on the next, with the last granting it on [`OPTION_IMPERSONATE_TARGET_PRINCIPAL`]. Only used when
+/// a target principal is set. Mirrors BigQuery's `bigquery.impersonate.delegates`.
+pub const OPTION_IMPERSONATE_DELEGATES: &str = "spanner.impersonate.delegates";
+
+/// Driver-specific database option: optional OAuth 2.0 scopes for the impersonated token, as a
+/// comma-separated list. Defaults to the `cloud-platform` scope when unset. Only used when a target
+/// principal is set. Mirrors BigQuery's `bigquery.impersonate.scopes`.
+pub const OPTION_IMPERSONATE_SCOPES: &str = "spanner.impersonate.scopes";
+
+/// Driver-specific database option: the lifetime (in seconds) of the impersonated access token.
+/// Defaults to 3600 (one hour) when unset. Only used when a target principal is set. Mirrors
+/// BigQuery's `bigquery.impersonate.lifetime`.
+pub const OPTION_IMPERSONATE_LIFETIME: &str = "spanner.impersonate.lifetime";
+
 /// Driver-specific statement option: the number of rows converted into each Arrow
 /// [`RecordBatch`](arrow_array::RecordBatch) streamed by
 /// [`Statement::execute`](adbc_core::Statement::execute). Larger batches trade memory for fewer
