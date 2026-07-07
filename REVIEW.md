@@ -440,9 +440,11 @@ is snapshotted into statements at creation, so flipping the connection option le
 statements writable (`src/connection.rs:792-801` — flagged independently by correctness,
 conformance and maintainability; share via `SharedTxn`/`AtomicBool`); the autocommit-enable path
 reads/takes/flips in separate lock acquisitions, so a concurrently-buffering statement can strand
-DML (`connection.rs:734-742`); `get_statistics` breaks for the whole database if any table has a
+DML (`connection.rs:734-742`); ~~`get_statistics` breaks for the whole database if any table has a
 `TOKENLIST`/`PROTO` column (`is_groupable` only excludes ARRAY/STRUCT/JSON,
-`connection.rs:439-442`); ~~`str_col`'s `RecordBatch::column(i)` can panic instead of erroring on a
+`connection.rs:439-442`)~~ **Fixed.** `is_groupable` (now in `src/statistics.rs`) also excludes
+`TOKENLIST` and `PROTO<...>`, so distinct counts are skipped (not errored) for them, matching the
+existing ARRAY/STRUCT/JSON handling; ~~`str_col`'s `RecordBatch::column(i)` can panic instead of erroring on a
 zero-column metadata batch (`connection.rs:494-505`)~~ (**Fixed.** `str_col` now bounds-checks the
 column index against `batch.num_columns()` and returns a `Status::Internal` error for an
 out-of-range/zero-column batch instead of letting `RecordBatch::column` panic; covered by a new
