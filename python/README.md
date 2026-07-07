@@ -67,6 +67,10 @@ with spanner.connect(database="projects/p/instances/i/databases/d",
     # any INSERT/UPDATE/DELETE, DDL or adbc_ingest raises
 ```
 
+The flag is live: it is checked when a statement executes, so toggling
+`adbc.connection.readonly` on an open connection immediately applies to already-open cursors
+as well as new ones.
+
 Credentials default to Application Default Credentials; pass `keyfile=` /
 `keyfile_json=` for a service account, or point at the emulator:
 

@@ -3207,9 +3207,10 @@ fn query_with_trailing_semicolons_returns_rows() {
 /// The spec `adbc.connection.readonly` option. Covers the four dimensions the review asks for:
 /// **round-trip** (defaults to `false`, and set values read back through `get_option`), **allow**
 /// (a SELECT still runs), **deny** (DML, DDL and bulk ingest each fail with `InvalidState`), and
-/// **toggle/snapshot** (the flag is captured into each statement at creation, so flipping the
-/// connection back to writable only frees statements created afterwards). Regression guard for the
-/// four read-only enforcement branches in `src/statement.rs`, which previously had no coverage.
+/// **toggle/live** (the flag is shared live with every statement — not snapshotted at creation —
+/// so flipping the connection option immediately affects existing statements in both directions).
+/// Regression guard for the four read-only enforcement branches in `src/statement.rs`, which
+/// previously had no coverage.
 #[test]
 fn readonly_connection_rejects_writes() {
     let Some(target) = test_target() else {
@@ -3320,11 +3321,11 @@ fn readonly_connection_rejects_writes() {
         "ingest on a read-only connection must be InvalidState, got: {ingest_err:?}"
     );
 
-    // --- toggle / snapshot: the flag is captured at statement creation ---
+    // --- toggle / live: the flag is read at execution time, not snapshotted at creation ---
     // Create a statement while the connection is still read-only, then flip the connection back to
-    // writable. The snapshotted statement must stay read-only; a statement created afterwards is
-    // writable again.
-    let mut snapshot_ro = connection.new_statement().expect("new statement");
+    // writable. The existing statement must become writable immediately — the flag is shared live
+    // with every statement, so a toggle applies to statements created before it.
+    let mut live = connection.new_statement().expect("new statement");
     connection
         .set_option(
             OptionConnection::ReadOnly,
@@ -3338,29 +3339,41 @@ fn readonly_connection_rejects_writes() {
         "false",
         "setting adbc.connection.readonly=false round-trips through get_option"
     );
-    snapshot_ro
-        .set_sql_query("DELETE FROM Singers WHERE true")
+    live.set_sql_query("DELETE FROM Singers WHERE false")
         .unwrap();
-    let snapshot_err = snapshot_ro
-        .execute_update()
-        .expect_err("a statement created while read-only stays read-only");
     assert_eq!(
-        snapshot_err.status,
-        Status::InvalidState,
-        "a statement snapshots read-only at creation; clearing the connection flag must not free \
-         an already-created statement, got: {snapshot_err:?}"
+        live.execute_update()
+            .expect("a pre-existing statement can write once readonly is cleared"),
+        Some(0),
+        "the read-only flag is live: clearing it on the connection immediately frees a statement \
+         created while it was set"
     );
 
-    // A statement created after the flip is writable again: a no-op DELETE reports its zero count.
-    let mut now_writable = connection.new_statement().expect("new statement");
-    now_writable
-        .set_sql_query("DELETE FROM Singers WHERE false")
+    // ... and the other direction: re-enabling read-only immediately locks the same pre-existing
+    // statement out of writes again (nothing is touched — the WHERE never runs).
+    connection
+        .set_option(
+            OptionConnection::ReadOnly,
+            OptionValue::String("true".into()),
+        )
+        .expect("re-enable readonly");
+    live.set_sql_query("DELETE FROM Singers WHERE true")
         .unwrap();
+    let relock_err = live
+        .execute_update()
+        .expect_err("re-enabling readonly must immediately affect an existing statement");
     assert_eq!(
-        now_writable
-            .execute_update()
-            .expect("write after readonly cleared"),
-        Some(0),
-        "a statement created after readonly is cleared can write"
+        relock_err.status,
+        Status::InvalidState,
+        "the read-only flag is live: re-enabling it on the connection immediately locks a \
+         pre-existing statement, got: {relock_err:?}"
     );
+
+    // Leave the connection writable for any later use of the shared database.
+    connection
+        .set_option(
+            OptionConnection::ReadOnly,
+            OptionValue::String("false".into()),
+        )
+        .expect("disable readonly again");
 }

@@ -49,8 +49,8 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
 - Read-only connections: set the standard `adbc.connection.readonly` connection option to `true` to
   reject all writes on that connection — DML, DDL and bulk ingest fail with an `InvalidState` error,
   while queries still run. Accepts `true`/`false` (default `false`) and round-trips through
-  `get_option`. The flag is captured when a statement is created, so toggling it applies to
-  statements created afterwards.
+  `get_option`. The flag is live: statements check it at execution time, so toggling it on the
+  connection immediately applies to existing statements as well as new ones.
 - [Stale reads](https://cloud.google.com/spanner/docs/timestamp-bounds): queries read at a **strong**
   bound by default, but the `spanner.read.staleness` and `spanner.read.timestamp` options (settable on
   a connection — where they become the default for its statements — or per statement) request a

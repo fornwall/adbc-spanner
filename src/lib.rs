@@ -32,8 +32,8 @@
 //! option opens a **read-only** connection: when set to `true` the connection rejects all writes —
 //! DML, DDL and bulk ingest fail with [`Status::InvalidState`](adbc_core::error::Status::InvalidState),
 //! while read-only queries still run. It defaults to `false`, accepts `true`/`false`, and
-//! round-trips through `get_option`. The flag is captured when a statement is created, so toggling
-//! it takes effect for statements created afterwards.
+//! round-trips through `get_option`. The flag is live: statements check it at execution time, so
+//! toggling it takes effect immediately for existing statements as well as new ones.
 //!
 //! ## Transactions
 //!
