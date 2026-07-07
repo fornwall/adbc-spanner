@@ -144,6 +144,18 @@ jobs:
       - name: End-to-end tests
         run: python -m pytest python/tests -v
 
+  # Lint the workflow files themselves. The pinned Docker image bundles
+  # actionlint plus its shellcheck/pyflakes integrations, so `run:` scripts are
+  # checked too.
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Lint GitHub Actions workflows
+        run: docker run --rm -v "${PWD}:/repo" --workdir /repo rhysd/actionlint:1.7.12 -color
+
   # Supply-chain + hygiene checks (no build / emulator needed):
   # cargo-deny — security advisories (RUSTSEC), license compliance, banned/duplicate
   #   crates and allowed sources (see deny.toml).
