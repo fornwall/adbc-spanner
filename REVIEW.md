@@ -456,9 +456,16 @@ after a CASE expression is still detected. Unit-tested for nested CASE, mixed ca
 `THEN RETURN`/`CASE` inside literals and quoted identifiers, and unbalanced `END`); `read_only`
 is snapshotted into statements at creation, so flipping the connection option leaves existing
 statements writable (`src/connection.rs:792-801` — flagged independently by correctness,
-conformance and maintainability; share via `SharedTxn`/`AtomicBool`); the autocommit-enable path
+conformance and maintainability; share via `SharedTxn`/`AtomicBool`); ~~the autocommit-enable path
 reads/takes/flips in separate lock acquisitions, so a concurrently-buffering statement can strand
-DML (`connection.rs:734-742`); ~~`get_statistics` breaks for the whole database if any table has a
+DML (`connection.rs:734-742`)~~ (**Fixed.** the enable path now flips the mode and takes the buffer
+in *one* lock acquisition (`TxnState::enter_autocommit`) — `run_or_buffer` checks-and-buffers under
+the same mutex, so once the mode reads autocommit no statement can buffer DML behind the flip — then
+applies the taken batch outside the lock (from a clone; locks are never held across `block_on`), and
+a failed apply restores manual mode with the batch re-buffered (`restore_manual`), preserving the
+P1 #1 guarantee that a failed implicit commit stays retryable/rollbackable; covered by new offline
+unit tests of the two helpers plus the existing enable-autocommit success/failure sections of the
+manual-transaction integration test); ~~`get_statistics` breaks for the whole database if any table has a
 `TOKENLIST`/`PROTO` column (`is_groupable` only excludes ARRAY/STRUCT/JSON,
 `connection.rs:439-442`)~~ **Fixed.** `is_groupable` (now in `src/statistics.rs`) also excludes
 `TOKENLIST` and `PROTO<...>`, so distinct counts are skipped (not errored) for them, matching the

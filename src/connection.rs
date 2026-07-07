@@ -85,6 +85,77 @@ impl TxnState {
     pub(crate) fn buffer(&mut self, statement: SpannerSql) {
         self.pending.push(statement);
     }
+
+    /// Atomically flip into autocommit mode and take the buffered DML that must be committed
+    /// first.
+    ///
+    /// Doing both in one step — under the caller's single lock acquisition — is what closes the
+    /// enable-autocommit race: `run_or_buffer` checks the mode and buffers under this same mutex,
+    /// so once the mode reads autocommit no statement can add to the buffer, and the batch taken
+    /// here is the complete transaction. Flipping only *after* the apply (in a later acquisition)
+    /// would strand any DML buffered while the commit RPC was in flight.
+    fn enter_autocommit(&mut self) -> Vec<SpannerSql> {
+        self.autocommit = true;
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Re-enter manual mode with `pending` re-buffered — the failure path of
+    /// [`Self::enter_autocommit`], so a failed apply keeps the transaction open and replayable
+    /// (retry the toggle or `commit`, or `rollback` to discard). Nothing can have buffered while
+    /// autocommit was on (see `enter_autocommit`), but splice at the front anyway so replay order
+    /// would survive even if that invariant ever changed.
+    fn restore_manual(&mut self, pending: Vec<SpannerSql>) {
+        self.autocommit = false;
+        self.pending.splice(0..0, pending);
+    }
+}
+
+#[cfg(test)]
+mod txn_state_tests {
+    use super::{SpannerSql, TxnState};
+
+    fn sql(s: &str) -> SpannerSql {
+        SpannerSql::builder(s).build()
+    }
+
+    fn pending_sqls(st: &TxnState) -> Vec<&str> {
+        st.pending.iter().map(|s| s.sql()).collect()
+    }
+
+    /// The mode flip and the buffer take must be one atomic step: after `enter_autocommit` the
+    /// state already reads as autocommit (so `run_or_buffer`, which checks under the same mutex,
+    /// routes new DML to immediate execution) and the taken batch is the complete buffer.
+    #[test]
+    fn enter_autocommit_flips_and_takes_in_one_step() {
+        let mut st = TxnState::new();
+        st.autocommit = false;
+        st.buffer(sql("UPDATE a"));
+        st.buffer(sql("UPDATE b"));
+        let taken = st.enter_autocommit();
+        assert!(st.autocommit());
+        assert!(st.pending.is_empty());
+        assert_eq!(
+            taken.iter().map(|s| s.sql()).collect::<Vec<_>>(),
+            ["UPDATE a", "UPDATE b"]
+        );
+    }
+
+    /// The failure path must re-enter manual mode with the batch re-buffered — replaying the
+    /// toggle (or `commit`) then applies exactly the original transaction, and any DML that
+    /// somehow got buffered in between stays *behind* the restored batch.
+    #[test]
+    fn restore_manual_rebuffers_in_front() {
+        let mut st = TxnState::new();
+        st.autocommit = false;
+        st.buffer(sql("UPDATE a"));
+        let taken = st.enter_autocommit();
+        // Defensively simulate a buffer written during the window (run_or_buffer cannot actually
+        // do this while autocommit is on): restore must keep it, ordered after the original batch.
+        st.buffer(sql("UPDATE late"));
+        st.restore_manual(taken);
+        assert!(!st.autocommit());
+        assert_eq!(pending_sqls(&st), ["UPDATE a", "UPDATE late"]);
+    }
 }
 
 /// A handle to a connection's transaction state, shared with its statements.
@@ -407,25 +478,30 @@ impl Optionable for SpannerConnection {
         match &key {
             OptionConnection::AutoCommit => {
                 let enable = parse_bool(value)?;
-                // Enabling autocommit commits any active manual transaction. Like `commit`, apply
-                // from a clone and drain only on success: a failed apply must leave the buffer
-                // (and manual mode — note the early return keeps `autocommit` false) intact so
-                // the caller can retry or roll back, not silently lose the writes and flip mode.
+                // Enabling autocommit commits any active manual transaction. The mode flip and the
+                // buffer take happen in ONE lock acquisition (`enter_autocommit`): once the mode is
+                // autocommit, `run_or_buffer` — which checks-and-buffers under this same mutex —
+                // can no longer add DML, so nothing a concurrent statement buffers can be stranded
+                // behind the flip (the old read/apply/flip-in-separate-acquisitions shape had
+                // exactly that race). Like `commit`, a failed apply must not lose the writes:
+                // `restore_manual` re-enters manual mode with the batch re-buffered so the caller
+                // can retry the toggle (a genuine replay) or roll back. Apply from a clone so the
+                // taken batch is still around to restore.
                 let pending = {
-                    let st = self.txn.lock().unwrap();
-                    (enable && !st.autocommit).then(|| st.pending.clone())
-                };
-                let applied = match pending {
-                    Some(pending) => {
-                        let applied = pending.len();
-                        self.apply_transaction(pending)?;
-                        applied
+                    let mut st = self.txn.lock().unwrap();
+                    if enable && !st.autocommit {
+                        Some(st.enter_autocommit())
+                    } else {
+                        st.autocommit = enable;
+                        None
                     }
-                    None => 0,
                 };
-                let mut st = self.txn.lock().unwrap();
-                st.pending.drain(..applied);
-                st.autocommit = enable;
+                if let Some(pending) = pending {
+                    if let Err(e) = self.apply_transaction(pending.clone()) {
+                        self.txn.lock().unwrap().restore_manual(pending);
+                        return Err(e);
+                    }
+                }
             }
             OptionConnection::ReadOnly => self.read_only = parse_bool(value)?,
             OptionConnection::IsolationLevel => self.isolation = parse_isolation_level(value)?,
