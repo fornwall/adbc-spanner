@@ -24,7 +24,7 @@ cargo build
 scripts/with-toxiproxy.sh cargo test --test resilience -- --nocapture --test-threads=1
 ```
 
-Run the two tests **serially** (`--test-threads=1`): they share one global proxy, so their toxics
+Run the tests **serially** (`--test-threads=1`): they share one global proxy, so their toxics
 must not overlap.
 
 Without `TOXIPROXY_URL` + `SPANNER_EMULATOR_HOST` set, the tests **self-skip**, so a plain
@@ -38,6 +38,7 @@ CI runs it non-gating via `.github/workflows/resilience.yml` (manual dispatch + 
 | --- | --- | --- |
 | `bandwidth` (downstream throttle) | `cancel_interrupts_in_flight_query` | Throttling a ~48 MB result to 2000 KB/s keeps the streaming reader blocked in a real network read; `Statement::cancel` from another thread interrupts it in **milliseconds** with `Status::Cancelled`, instead of blocking ~18s for the rest of the stream. Drives the real `CancelSignal` → `block_on_cancellable` path. |
 | `reset_peer` (immediate TCP RST) | `reset_peer_surfaces_error_then_recovers` | A query under the reset surfaces a **clean ADBC error** (no panic; no unbounded hang — a watchdog thread bounds it), and once the toxic is removed a subsequent query **recovers** as the gRPC channel re-establishes through the proxy. |
+| `reset_peer` (immediate TCP RST) | `commit_under_transport_fault_never_loses_the_write` | A manual-transaction `commit()` started under the reset must **never lose the buffered DML**: the write has to land once the toxic is removed. With the pinned client the commit *blocks and heals* — it retries internally and succeeds on its own once the transport recovers (see the limitation below). If a future client surfaces the error instead, the test's other branch asserts the driver kept the buffer so a retried `commit()` replays it (guarding the take-before-apply regression, where a retried commit vacuously succeeded on an emptied buffer — a silent lost write). The buffered DML is an idempotent UPDATE, so the assertion holds regardless of whether the faulted commit reached the emulator. |
 
 ## Honest limitations (read this)
 
@@ -46,6 +47,15 @@ CI runs it non-gating via `.github/workflows/resilience.yml` (manual dispatch + 
   logical gRPC status. In particular it **cannot produce `ABORTED`**, so this harness does **not**
   test Spanner's ABORTED-driven read/write transaction replay (the driver's buffer-and-retry commit
   path). That would need either a real Spanner instance under contention or a gRPC-aware fault proxy.
+
+- **A transport fault cannot make `commit()` fail — it makes it block.** Verified empirically while
+  building the commit-fault test: the pinned client's `apply_request_defaults` marks *every* Spanner
+  data-plane RPC idempotent (safe for DML because `seqno` provides replay protection), and its
+  `SpannerRetryPolicy` has no attempt cap, so under a persistent transport fault a commit retries
+  inside the client indefinitely — the driver call neither succeeds nor errors until the network
+  heals (then it succeeds) or something cancels it. Two consequences: a *failed* commit can only be
+  produced at the SQL level (covered in `tests/integration.rs`), and an unreachable network can
+  block a commit unboundedly — the missing request-timeout knob is tracked in `REVIEW.md`.
 
 - **Cancel is tested on the streaming read path, and needs the server to chunk.** The only in-flight
   network operation the safe (`&mut self`) Rust API lets a second thread cancel is a **streamed chunk

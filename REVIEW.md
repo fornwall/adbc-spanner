@@ -18,17 +18,14 @@ case.
 
 ## P1 — fix first
 
-### 1. A failed `commit()` discards the buffered DML; a retried `commit()` falsely reports success (correctness)
+### ~~1. A failed `commit()` discards the buffered DML; a retried `commit()` falsely reports success~~ (fixed)
 
-`src/connection.rs:955-966` (also the autocommit-enable path at `connection.rs:737-742`). The
-manual-transaction buffer is `std::mem::take`n **before** `apply_transaction` runs, so on error
-(e.g. `ABORTED` after the runner's retries are exhausted — exactly the code `error.rs` preserves in
-`vendor_code` for callers to retry on — or `UNAVAILABLE`, or a latched cancel) the DML is gone. The
-caller retries `commit()`; `run_batch_dml` short-circuits `Ok(0)` for an empty statement list, and
-**commit reports success with nothing written**. This is a silent lost write in the retry pattern
-the driver's own error mapping encourages. Fix: clear the buffer only after a successful apply (or
-restore it on `Err`), and consider poisoning the transaction state after a failed commit so a
-retry surfaces `InvalidState` rather than fake success.
+**Fixed.** `commit()` and the autocommit-enable path now apply from a clone of the buffer and
+drain it only after a successful apply, so a failed commit keeps the transaction open for a
+genuine retry (or `rollback`). Covered by the failed-commit section of the manual-transaction
+integration test (SQL-level failure: fail → retry fails again, not vacuous success → rollback →
+clean commit) and by `commit_under_transport_fault_never_loses_the_write` in
+`tests/resilience.rs`.
 
 ### 2. `get_table_types` and `get_objects` disagree on table-type vocabulary; the spec round-trip returns zero tables (conformance + correctness, found independently by both)
 
@@ -181,10 +178,13 @@ into the three `single_use()` call sites plus the partition path. Low–medium e
 - **`create_append` ingest mode is never executed end-to-end**, nor are ingest error paths
   (`create` on existing table, `append` on missing table, schema mismatch)
   (`tests/integration.rs:770-775`).
-- **Resilience suite covers 2 fault classes; missing the likeliest production failures**
-  (`tests/resilience.rs`): mid-stream disconnect after batches were consumed, latency/timeout
-  toxics (does anything bound the wait?), faults during a manual-transaction commit (directly
-  exercises P1 #1), and truncated streams.
+- **Resilience suite misses some likely production failures** (`tests/resilience.rs`):
+  mid-stream disconnect after batches were consumed, latency/timeout toxics (nothing bounds the
+  wait — building the commit-fault test confirmed the client marks all data-plane RPCs idempotent
+  and retries transport faults with no attempt cap, so a commit under a persistent fault blocks
+  unboundedly; see the P3 timeout/retry-tuning feature), and truncated streams. (Faults during a
+  manual-transaction commit are now covered by
+  `commit_under_transport_fault_never_loses_the_write`.)
 - **`statement.rs` has zero unit tests**; the option-coercion error paths (`rows_per_batch=0`,
   bad bools, negative `max_partitions`, unknown-option statuses) are pure functions guarding the
   C-ABI boundary and are unit-testable offline.
