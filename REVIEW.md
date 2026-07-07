@@ -421,8 +421,11 @@ batch read-only transaction so every partition executes at that bound. Parsing l
 
 **Correctness.** List/Struct columns map present-but-undecodable wire values to NULL,
 contradicting the strict-decode policy of the scalar arms (`src/conversion.rs:466-474`,
-`:493-513`); `parse_int64`'s f64 fallback loses precision above 2^53 (`conversion.rs:527-532` —
-better removed); `is_dml_returning`'s documented false positive (`CASE WHEN c THEN return …`)
+`:493-513`); ~~`parse_int64`'s f64 fallback loses precision above 2^53 (`conversion.rs:527-532` —
+better removed)~~ (**Fixed.** the f64 fallback is gone — `parse_int64` now only accepts the JSON
+string encoding Spanner actually uses for `INT64`, so every `i64` round-trips exactly and a JSON
+number is a loud decode error instead of a silently-rounded value); `is_dml_returning`'s documented
+false positive (`CASE WHEN c THEN return …`)
 hard-errors valid DML in manual mode (`src/ddl.rs:49` + `src/statement.rs:289-295`); `read_only`
 is snapshotted into statements at creation, so flipping the connection option leaves existing
 statements writable (`src/connection.rs:792-801` — flagged independently by correctness,
