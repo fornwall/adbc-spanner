@@ -101,12 +101,18 @@ into the three `single_use()` call sites plus the partition path. Low–medium e
 
 ### Correctness
 
-- **`split_statements` emits comment-only segments as statements** (`src/ddl.rs:268-274`).
+- ~~**`split_statements` emits comment-only segments as statements** (`src/ddl.rs:268-274`).
   `execute_update("DELETE FROM t1; DELETE FROM t2; -- cleanup")` sends `"-- cleanup"` as a third
   DML statement → the whole batch fails with `INVALID_ARGUMENT` (in manual mode it is buffered
   silently and only fails at commit). Same for DDL batches, and `"SELECT 1; -- done"` fails where
   `"SELECT 1;"` works because the trailing-terminator strip sees two statements. Fix: drop
-  segments that are only whitespace/comments (lex-aware `push_statement`).
+  segments that are only whitespace/comments (lex-aware `push_statement`).~~ (fixed)
+  **Fixed.** `push_statement` now runs each segment through a shared
+  `skip_leading_whitespace_and_comments` lexer helper (extracted from `first_keyword`) and drops it
+  when nothing but whitespace and `--`/`#`/`/* … */` comments remains, so a trailing/interleaved
+  comment-only segment produces no statement while `SELECT 1 -- done` (real SQL then a comment) is
+  kept. `strip_trailing_terminators("SELECT 1; -- done")` now yields `"SELECT 1"` like
+  `"SELECT 1;"`. Covered by the `split_drops_comment_only_segments` unit test in `src/ddl.rs`.
 - **Manual transactions have no read-your-writes, and DML/DDL reorder** (`src/connection.rs:8-23`,
   `src/statement.rs:200-217`; also flagged by the conformance review). DML is buffered while
   queries run immediately in a fresh read-only snapshot, so `INSERT` → `SELECT COUNT(*)` inside one
@@ -144,15 +150,18 @@ into the three `single_use()` call sites plus the partition path. Low–medium e
 
 ### Performance
 
-- **`bind_params` re-lexes the entire SQL text once per bound row** (`src/statement.rs:113-122` →
+- ~~**`bind_params` re-lexes the entire SQL text once per bound row** (`src/statement.rs:113-122` →
   `src/bind.rs:73-109`). A 50k-row bound DML lexes the same SQL 50k times — O(rows × |sql|) CPU
   before the first RPC. Resolve the parameter-name mapping once per (sql, schema) and pass it into
-  a per-row loop.
-- **String columns pay an extra allocation + copy per value in the read hot path**
-  (`src/conversion.rs:450-456`). The `Utf8` arm builds an owned `String` per value, then
-  `StringArray::from_iter` copies again — one avoidable malloc+memcpy per non-null string (~8k per
-  column per default batch), on Spanner's most common type. Use a `StringBuilder` and
-  `append_value(&str)`, mirroring the `BinaryBuilder` arm above it.
+  a per-row loop.~~ **Fixed.** `resolve_parameter_names` is now `pub(crate)` and called once per
+  batch by `build_bound_statements`; `bind_params` takes the precomputed `names: &[String]` and only
+  binds values per row, so the SQL is lexed once per (sql, batch) rather than once per row.
+- ~~**String columns pay an extra allocation + copy per value in the read hot path**~~
+  (`src/conversion.rs:450-456`). **Fixed.** The `Utf8`/fallback arm now builds with a `StringBuilder`
+  and `append_value(&str)` (mirroring the `BinaryBuilder` arm), appending the wire string slice
+  directly — no per-value owned `String` and no second copy from `StringArray::from_iter`. Only the
+  non-string JSON-render fallback still allocates. Behavior is unchanged (null/empty handling
+  preserved); covered by `string_array_round_trips_values_and_nulls`.
 - **`rows_per_batch` bounds rows, not bytes** (`src/conversion.rs:98-108`). 8192 rows of
   `STRING(MAX)`/`BYTES(MAX)` (up to 10MB each) can be tens of GB per chunk, held roughly twice
   during conversion. Track approximate cumulative bytes in `pull_chunk` and cut the chunk early at

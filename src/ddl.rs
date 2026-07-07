@@ -267,18 +267,22 @@ fn copy_line_comment(
 
 fn push_statement(statements: &mut Vec<String>, current: &mut String) {
     let trimmed = current.trim();
-    if !trimmed.is_empty() {
+    // Drop segments that carry no statement — pure whitespace, or only comments (e.g. a trailing
+    // `-- cleanup` after the last `;`). Emitting those as statements makes Spanner reject the whole
+    // batch with `INVALID_ARGUMENT` (silently buffered until commit in manual mode), and would make
+    // `strip_trailing_terminators` see two statements for `SELECT 1; -- done`. A segment with real
+    // SQL followed by a comment (`SELECT 1 -- done`) still has a leading keyword, so it is kept.
+    if !skip_leading_whitespace_and_comments(trimmed).is_empty() {
         statements.push(trimmed.to_string());
     }
     current.clear();
 }
 
-/// The first SQL keyword, uppercased, skipping leading whitespace, `--`/`#`/`/* */` comments, and
-/// [statement hints](https://cloud.google.com/spanner/docs/reference/standard-sql/query-syntax#statement_hints)
-/// (`@{HINT=value, …}`), which GoogleSQL allows before the statement proper — so hinted DML/DDL is
-/// classified by its real leading keyword, not misread as "no keyword" and routed to the wrong
-/// execution path.
-fn first_keyword(sql: &str) -> Option<String> {
+/// Return `sql` with any leading whitespace and `--`/`#`/`/* … */` comments removed, repeatedly,
+/// until the first character is neither whitespace nor the start of a comment (or the input is
+/// exhausted). Shared by [`first_keyword`] and [`push_statement`]; an unterminated comment consumes
+/// the rest of the input, mirroring the lexer in [`split_statements`].
+fn skip_leading_whitespace_and_comments(sql: &str) -> &str {
     let mut rest = sql.trim_start();
     loop {
         if let Some(after) = rest.strip_prefix("--").or_else(|| rest.strip_prefix('#')) {
@@ -291,11 +295,22 @@ fn first_keyword(sql: &str) -> Option<String> {
                 .find("*/")
                 .map_or("", |i| &after[i + 2..])
                 .trim_start();
-        } else if let Some(after) = rest.strip_prefix("@{") {
-            rest = skip_hint_body(after).trim_start();
         } else {
             break;
         }
+    }
+    rest
+}
+
+/// The first SQL keyword, uppercased, skipping leading whitespace, `--`/`#`/`/* */` comments, and
+/// [statement hints](https://cloud.google.com/spanner/docs/reference/standard-sql/query-syntax#statement_hints)
+/// (`@{HINT=value, …}`), which GoogleSQL allows before the statement proper — so hinted DML/DDL is
+/// classified by its real leading keyword, not misread as "no keyword" and routed to the wrong
+/// execution path.
+fn first_keyword(sql: &str) -> Option<String> {
+    let mut rest = skip_leading_whitespace_and_comments(sql);
+    while let Some(after) = rest.strip_prefix("@{") {
+        rest = skip_leading_whitespace_and_comments(skip_hint_body(after));
     }
     let word: String = rest.chars().take_while(char::is_ascii_alphabetic).collect();
     (!word.is_empty()).then(|| word.to_ascii_uppercase())
@@ -447,6 +462,60 @@ mod tests {
             ]
         );
         assert_eq!(split_statements("   ;  ; "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn split_drops_comment_only_segments() {
+        // A trailing comment-only segment must not be emitted as a statement — otherwise Spanner
+        // rejects the whole batch with INVALID_ARGUMENT (silently buffered until commit in manual
+        // mode). Both DML and DDL batches go through here.
+        assert_eq!(
+            split_statements("DELETE FROM t1; DELETE FROM t2; -- cleanup"),
+            vec!["DELETE FROM t1", "DELETE FROM t2"]
+        );
+        // A whitespace-only segment is dropped and a trailing block-comment-only segment is dropped;
+        // a leading comment on a real statement is kept (Spanner accepts it, and `first_keyword`
+        // skips it for classification), so those segments survive verbatim.
+        assert_eq!(
+            split_statements("SELECT 1;\n  \n-- a\nSELECT 2; # b\nSELECT 3; /* c */"),
+            vec!["SELECT 1", "-- a\nSELECT 2", "# b\nSELECT 3"]
+        );
+        // A statement followed by an inline comment keeps its leading keyword, so it survives.
+        assert_eq!(
+            split_statements("SELECT 1 -- done\n; SELECT 2 /* tail */"),
+            vec!["SELECT 1 -- done", "SELECT 2 /* tail */"]
+        );
+        // Purely comments/whitespace splits to nothing at all.
+        assert_eq!(
+            split_statements("-- just a comment\n/* and a block */  ; # trailing"),
+            Vec::<String>::new()
+        );
+        // The single-query terminator strip must treat "SELECT 1; -- done" as one statement, so the
+        // trailing `;` is removed just as it is for "SELECT 1;".
+        assert_eq!(strip_trailing_terminators("SELECT 1; -- done"), "SELECT 1");
+    }
+
+    #[test]
+    fn split_drops_interleaved_comment_only_segment_in_ddl_batch() {
+        // The dbt "swap" DDL batch is submitted as one `UpdateDatabaseDdl` call, so a stray
+        // comment-only segment *between* two real DDL statements (not just trailing) must also be
+        // dropped — otherwise the empty `/* swap */` segment is sent as a DDL statement and Spanner
+        // rejects the whole schema change with INVALID_ARGUMENT. Here the block-comment-only segment
+        // sits between DROP and RENAME, and a trailing `# done` segment closes the batch; both
+        // vanish while the three real statements survive verbatim.
+        let batch = "CREATE TABLE tmp (id INT64) PRIMARY KEY (id);\n\
+                     DROP TABLE target;\n\
+                     /* swap in the rebuilt table */;\n\
+                     RENAME TABLE tmp TO target;\n\
+                     # done";
+        assert_eq!(
+            split_statements(batch),
+            vec![
+                "CREATE TABLE tmp (id INT64) PRIMARY KEY (id)",
+                "DROP TABLE target",
+                "RENAME TABLE tmp TO target",
+            ]
+        );
     }
 
     #[test]
