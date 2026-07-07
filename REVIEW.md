@@ -242,9 +242,20 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   `manylinux_2_28` container and lower the tag + verify step together. **(wontfix — we don't care
   about those old distributions.)**
 - **No musl (Alpine) build/wheel** — `pip install` fails on Alpine-based data-service images.
-- **Wheels are published without ever being installed or inspected** — no `twine check`, no
+- ~~**Wheels are published without ever being installed or inspected** — no `twine check`, no
   unzip-and-assert-the-lib-is-inside, no `pip install` + import smoke test; the CI python job
-  installs from the source tree, a different packaging path. All cheap on the same runner.
+  installs from the source tree, a different packaging path. All cheap on the same runner.~~
+  **Fixed.** The `python-wheels` job now inspects the freshly built wheels before the irreversible
+  `python-publish` step (which already `needs: python-wheels`, so a failed inspection blocks the
+  release). Two steps were added after "Build wheels": (1) `twine check wheelhouse/*.whl` plus a
+  per-wheel assertion that the platform shared library (`libadbc_spanner.so`/`.dylib` /
+  `adbc_spanner.dll`, selected from the wheel's platform tag) is actually inside the archive
+  (`python -m zipfile -l | grep -qF`), failing loudly if a data-only wheel ships empty; and (2) a
+  `pip install` of the actual built `manylinux_2_35_x86_64` wheel (the only tag installable on the
+  x86_64 Linux runner) followed by an import smoke test from `$RUNNER_TEMP`
+  (`import adbc_driver_spanner; print(adbc_driver_spanner._driver_path()); import
+  adbc_driver_spanner.dbapi`) — exercising the *installed* package, not the source tree, and
+  `_driver_path()` raises unless the bundled library resolves.
 - **The tag-vs-version gate lives only in `python-wheels`**; the `release` job (GitHub assets)
   has no gate, and `release` / `python-publish` are unordered siblings — a partial failure yields
   a PyPI version with no GitHub assets or vice versa. Hoist the check into a `version-gate` job
