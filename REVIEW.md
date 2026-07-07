@@ -366,8 +366,17 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   full six-target matrix (linux x86-64/aarch64, macOS arm64, macOS x86-64 **cross-compiled** on the
   arm64 runner, windows x86-64, windows aarch64 native). The Releasing / Python / ground-truth-source
   notes and the aws-lc build-per-arch/NASM sentence were corrected to match while in there.
-- **The two git-pin revs are spread across ~9 dependency lines** plus `deny.toml` plus docs, with
-  no single anchor for the scheduled "revert when upstream releases" edit.
+- ~~**The two git-pin revs are spread across ~9 dependency lines** plus `deny.toml` plus docs, with
+  no single anchor for the scheduled "revert when upstream releases" edit.~~ **Fixed.** CLAUDE.md's
+  "Temporary git pins" section now carries a *Revert checklist — the single anchor* subsection: the
+  one place that lists both current rev SHAs (`google-cloud-rust` `3872d28…`, `fornwall/arrow-adbc`
+  `786e7f3…`), enumerates every location to edit in lockstep when reverting a family to a versioned
+  crates.io release (each `Cargo.toml` `[dependencies]`/`[dev-dependencies]` line grouped by family,
+  `deny.toml`'s `allow-git`, the `README.md` quickstart + notes, and the `publish = false` release
+  gate), and states the invariant that the three arrow-adbc crates (`adbc_core`/`adbc_ffi`/
+  `adbc_driver_manager`) must share ONE rev (as the six `google-cloud-*` crates do). A one-line
+  pointer comment at the top of `Cargo.toml`'s `[dependencies]`, next to the first pinned dependency,
+  directs the maintainer to that checklist, keeping a single source of truth.
 - ~~**`connection.rs` (1050 lines) owns the query half of `get_objects`/`get_statistics`** while
   `objects.rs`/`statistics.rs` hold only the Arrow-assembly half — split along the wrong axis.
   Move the INFORMATION_SCHEMA collectors into their feature modules. (`bind.rs` at 1359 lines is
@@ -421,8 +430,11 @@ batch read-only transaction so every partition executes at that bound. Parsing l
 
 **Correctness.** List/Struct columns map present-but-undecodable wire values to NULL,
 contradicting the strict-decode policy of the scalar arms (`src/conversion.rs:466-474`,
-`:493-513`); `parse_int64`'s f64 fallback loses precision above 2^53 (`conversion.rs:527-532` —
-better removed); `is_dml_returning`'s documented false positive (`CASE WHEN c THEN return …`)
+`:493-513`); ~~`parse_int64`'s f64 fallback loses precision above 2^53 (`conversion.rs:527-532` —
+better removed)~~ (**Fixed.** the f64 fallback is gone — `parse_int64` now only accepts the JSON
+string encoding Spanner actually uses for `INT64`, so every `i64` round-trips exactly and a JSON
+number is a loud decode error instead of a silently-rounded value); `is_dml_returning`'s documented
+false positive (`CASE WHEN c THEN return …`)
 hard-errors valid DML in manual mode (`src/ddl.rs:49` + `src/statement.rs:289-295`); `read_only`
 is snapshotted into statements at creation, so flipping the connection option leaves existing
 statements writable (`src/connection.rs:792-801` — flagged independently by correctness,
@@ -432,16 +444,26 @@ DML (`connection.rs:734-742`); ~~`get_statistics` breaks for the whole database 
 `TOKENLIST`/`PROTO` column (`is_groupable` only excludes ARRAY/STRUCT/JSON,
 `connection.rs:439-442`)~~ **Fixed.** `is_groupable` (now in `src/statistics.rs`) also excludes
 `TOKENLIST` and `PROTO<...>`, so distinct counts are skipped (not errored) for them, matching the
-existing ARRAY/STRUCT/JSON handling; `str_col`'s `RecordBatch::column(i)` can panic instead of erroring on a
-zero-column metadata batch (`connection.rs:494-505`); `execute_bound_query` runs each bound row in
+existing ARRAY/STRUCT/JSON handling; ~~`str_col`'s `RecordBatch::column(i)` can panic instead of erroring on a
+zero-column metadata batch (`connection.rs:494-505`)~~ (**Fixed.** `str_col` now bounds-checks the
+column index against `batch.num_columns()` and returns a `Status::Internal` error for an
+out-of-range/zero-column batch instead of letting `RecordBatch::column` panic; covered by a new
+offline unit test); `execute_bound_query` runs each bound row in
 its own snapshot (mutually inconsistent results) and materialises everything ignoring
 `rows_per_batch` (`src/statement.rs:319-345`).
 
-**Performance.** `get_statistics` per-table scans run strictly sequentially — a small
-`buffer_unordered(4..8)` would cut wall-clock near-linearly (`connection.rs:337-359`);
-`execute_partitions` pays an extra PLAN round trip for the schema (unavoidable until the client
-surfaces partition metadata); binary parameters take a forced `to_vec()` copy (upstream `ToValue`
-limitation).
+**Performance.** ~~`get_statistics` per-table scans run strictly sequentially — a small
+`buffer_unordered(4..8)` would cut wall-clock near-linearly (`connection.rs:337-359`)~~ **Fixed.**
+The per-table aggregate scans now run with bounded concurrency (`buffer_unordered(8)`,
+`STATISTICS_SCAN_CONCURRENCY` in `src/statistics.rs`) inside the one shared runtime's single
+`block_on_cancellable`, cutting `get_statistics` wall-clock near-linearly on a many-table database.
+Output is unchanged: each table's query is prepared in deterministic `table_batch` order, and since
+`buffer_unordered` yields out of order the results are index-tagged and slotted back into that order
+before parsing, so the tables, schemas and statistics — and their ordering — match the old
+sequential loop. Cancellation (the shared `CancelSignal` interrupts the in-flight batch) and error
+propagation (any scan error surfaces as an overall `Err`) are preserved. `execute_partitions` pays
+an extra PLAN round trip for the schema (unavoidable until the client surfaces partition metadata);
+binary parameters take a forced `to_vec()` copy (upstream `ToValue` limitation).
 
 **Security.** Emulator mode (`SPANNER_EMULATOR_HOST`) silently forces anonymous credentials +
 plaintext `http://`, overriding configured keyfiles — an env-controlled downgrade footgun;
