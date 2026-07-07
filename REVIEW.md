@@ -142,11 +142,12 @@ into the three `single_use()` call sites plus the partition path. Low–medium e
   `src/bind.rs:73-109`). A 50k-row bound DML lexes the same SQL 50k times — O(rows × |sql|) CPU
   before the first RPC. Resolve the parameter-name mapping once per (sql, schema) and pass it into
   a per-row loop.
-- **String columns pay an extra allocation + copy per value in the read hot path**
-  (`src/conversion.rs:450-456`). The `Utf8` arm builds an owned `String` per value, then
-  `StringArray::from_iter` copies again — one avoidable malloc+memcpy per non-null string (~8k per
-  column per default batch), on Spanner's most common type. Use a `StringBuilder` and
-  `append_value(&str)`, mirroring the `BinaryBuilder` arm above it.
+- ~~**String columns pay an extra allocation + copy per value in the read hot path**~~
+  (`src/conversion.rs:450-456`). **Fixed.** The `Utf8`/fallback arm now builds with a `StringBuilder`
+  and `append_value(&str)` (mirroring the `BinaryBuilder` arm), appending the wire string slice
+  directly — no per-value owned `String` and no second copy from `StringArray::from_iter`. Only the
+  non-string JSON-render fallback still allocates. Behavior is unchanged (null/empty handling
+  preserved); covered by `string_array_round_trips_values_and_nulls`.
 - **`rows_per_batch` bounds rows, not bytes** (`src/conversion.rs:98-108`). 8192 rows of
   `STRING(MAX)`/`BYTES(MAX)` (up to 10MB each) can be tens of GB per chunk, held roughly twice
   during conversion. Track approximate cumulative bytes in `pull_chunk` and cut the chunk early at

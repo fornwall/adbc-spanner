@@ -37,12 +37,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use adbc_core::error::{Result, Status};
-use arrow_array::builder::{BinaryBuilder, BooleanBuilder, PrimitiveBuilder};
+use arrow_array::builder::{BinaryBuilder, BooleanBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_array::types::{
     ArrowPrimitiveType, Date32Type, Decimal128Type, Float32Type, Float64Type, Int64Type,
 };
 use arrow_array::{
-    ArrayRef, ListArray, PrimitiveArray, RecordBatch, RecordBatchReader, StringArray, StructArray,
+    ArrayRef, ListArray, PrimitiveArray, RecordBatch, RecordBatchReader, StructArray,
     TimestampNanosecondArray,
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -447,13 +447,21 @@ fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Result<ArrayR
         DataType::Struct(fields) => build_struct(fields, values)?,
         // Utf8 and every fallback (JSON, …): keep strings verbatim, render anything else (numbers,
         // bools, nested values) as JSON text.
-        _ => Arc::new(StringArray::from_iter(values.iter().map(|&v| {
-            present(v).map(|x| {
-                x.try_as_string()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| value_to_json(x).to_string())
-            })
-        }))),
+        _ => {
+            let mut builder = StringBuilder::new();
+            for &value in values {
+                match present(value) {
+                    None => builder.append_null(),
+                    // Append the string slice directly (no per-value owned String); only the
+                    // JSON-render fallback allocates, and only for non-string values.
+                    Some(x) => match x.try_as_string() {
+                        Some(s) => builder.append_value(s),
+                        None => builder.append_value(value_to_json(x).to_string()),
+                    },
+                }
+            }
+            Arc::new(builder.finish())
+        }
     })
 }
 
@@ -619,7 +627,7 @@ fn value_to_json(value: &Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::Array;
+    use arrow_array::{Array, StringArray};
     use google_cloud_spanner::value::ToValue;
 
     /// The `arrow.json` extension name attached to a Field's metadata, if any.
@@ -677,6 +685,36 @@ mod tests {
         let strings = array.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(strings.len(), 1);
         assert_eq!(strings.value(0), text);
+    }
+
+    #[test]
+    fn string_array_round_trips_values_and_nulls() {
+        // Built via StringBuilder (no per-value owned String on the string path). Both a SQL NULL
+        // value and a missing slot become null; present strings are kept verbatim, incl. empty.
+        let hello = "hello".to_value();
+        let empty = "".to_value();
+        let unicode = "naïve café — 日本語".to_value();
+        let sql_null = None::<&str>.to_value();
+
+        let array = build_array(
+            &DataType::Utf8,
+            &[
+                Some(&hello),
+                Some(&empty),
+                Some(&unicode),
+                Some(&sql_null),
+                None,
+            ],
+        )
+        .unwrap();
+        let strings = array.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(strings.len(), 5);
+        assert_eq!(strings.value(0), "hello");
+        assert_eq!(strings.value(1), "");
+        assert!(!strings.is_null(1)); // present empty string, not a null slot
+        assert_eq!(strings.value(2), "naïve café — 日本語");
+        assert!(strings.is_null(3)); // SQL NULL value
+        assert!(strings.is_null(4)); // missing slot
     }
 
     #[test]
