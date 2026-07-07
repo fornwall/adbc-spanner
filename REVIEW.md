@@ -4,13 +4,8 @@
 
 Overall: the driver is in very good shape — the type mapping, dense-union metadata assembly,
 transaction model, streaming reader, and test suite (property-based round-trips, FFI conformance,
-C++ validation, Python cookbook tests) are all solid. The issues below are ranked by how likely
-they are to bite a real user. (All P1 and P2 findings from the original review have been fixed.)
-
-## P3 — improvements worth queuing
-
-- **macOS deployment target**: the `macosx_10_12` tag is asserted, not enforced — export
-  `MACOSX_DEPLOYMENT_TARGET` in the build (aws-lc's cmake defaults from the host).
+C++ validation, Python cookbook tests) are all solid. **All findings from the review (P1, P2 and
+P3) have been fixed** — nothing is currently queued.
 
 ## Verified non-issues
 
