@@ -45,6 +45,7 @@ use google_cloud_spanner::model::transaction_options::IsolationLevel;
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
+use crate::bind::qualified_table;
 use crate::conversion::{result_set_to_batch, stream_query};
 use crate::driver::Connected;
 use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
@@ -1150,35 +1151,9 @@ fn connection_option_name(key: &OptionConnection) -> String {
     key.as_ref().to_string()
 }
 
-/// Backtick-quote a table name, optionally qualified by a (named) schema, with proper GoogleSQL
-/// identifier escaping (see [`crate::bind::quote_ident`]) so a hostile or mistyped name cannot
-/// leak into the surrounding SQL.
-fn qualified_table(db_schema: Option<&str>, table_name: &str) -> String {
-    match db_schema.filter(|s| !s.is_empty()) {
-        Some(schema) => format!(
-            "{}.{}",
-            crate::bind::quote_ident(schema),
-            crate::bind::quote_ident(table_name)
-        ),
-        None => crate::bind::quote_ident(table_name),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn qualifies_table_names() {
-        assert_eq!(qualified_table(None, "Users"), "`Users`");
-        assert_eq!(qualified_table(Some(""), "Users"), "`Users`");
-        assert_eq!(qualified_table(Some("app"), "Users"), "`app`.`Users`");
-        // Caller-supplied names are escaped, so a backtick cannot leak into the surrounding SQL
-        // (previously it was interpolated verbatim, breaking the query and mislabelling the
-        // resulting analyzer error as NotFound).
-        assert_eq!(qualified_table(None, "a`b"), r"`a\`b`");
-        assert_eq!(qualified_table(Some("s`x"), r"t\y"), r"`s\`x`.`t\\y`");
-    }
 
     #[test]
     fn parses_supported_isolation_levels() {

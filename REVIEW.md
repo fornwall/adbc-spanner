@@ -137,9 +137,15 @@ into the three `single_use()` call sites plus the partition path. Low–medium e
   (`src/statement.rs:513-516`). An FFI caller doing ingest with a non-null stream out-pointer gets
   `InvalidState` ("no SQL query set") instead of an ingest + empty stream. Mirror the
   `execute_update` ingest branch in `execute()` and return `Self::empty_reader()`.
-- **`adbc.ingest.target_db_schema` is rejected although the driver supports named schemas
+- ~~**`adbc.ingest.target_db_schema` is rejected although the driver supports named schemas
   everywhere else** (`src/statement.rs:405-437`). Accept it and qualify the ingest/CREATE TABLE
-  statements via `qualified_table`; accept `target_catalog` when it names the `""` catalog.
+  statements via `qualified_table`; accept `target_catalog` when it names the `""` catalog.~~
+  **Fixed.** `adbc.ingest.target_db_schema` is now stored and threaded into the ingest INSERT,
+  CREATE TABLE and DROP TABLE via the shared `qualified_table` helper (moved to `src/bind.rs`
+  alongside `quote_ident`), so the target/created table is `schema.table`. The append-error probe
+  now checks the table in its target schema too. `adbc.ingest.target_catalog` is accepted when it
+  names Spanner's only (empty `""`) catalog and rejected with `NotImplemented` otherwise. Both
+  options round-trip through `get_option`/`set_option` like the other ingest options.
 - ~~**Standard isolation-level option rejected despite client support**
   (`adbc.connection.transaction.isolation.*` falls into the unknown-key arm,
   `src/connection.rs:745-750`). Spanner supports `REPEATABLE_READ` GA alongside `SERIALIZABLE`,

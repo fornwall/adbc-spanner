@@ -661,6 +661,16 @@ pub(crate) fn quote_ident(ident: &str) -> String {
     out
 }
 
+/// Backtick-quote a table name, optionally qualified by a (named) schema, with proper GoogleSQL
+/// identifier escaping (see [`quote_ident`]) so a hostile or mistyped name cannot leak into the
+/// surrounding SQL. An empty schema (Spanner's default, unnamed schema) qualifies to the bare table.
+pub(crate) fn qualified_table(db_schema: Option<&str>, table_name: &str) -> String {
+    match db_schema.filter(|s| !s.is_empty()) {
+        Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(table_name)),
+        None => quote_ident(table_name),
+    }
+}
+
 /// Synthetic primary-key column added to tables created by bulk ingest (see [`create_table_sql`]).
 /// Spanner requires a primary key, but Arrow ingest data carries none, so we add a hidden
 /// UUID-defaulted key. Spanner forbids leading-underscore identifiers, hence the `adbc_`-prefixed
@@ -698,9 +708,11 @@ pub(crate) fn spanner_column_type(data_type: &DataType) -> Result<String> {
 ///
 /// Every data column maps to its Spanner type via [`spanner_column_type`], and a hidden
 /// [`INGEST_KEY_COLUMN`] UUID key is appended as the primary key (Spanner requires one). Pass
-/// `if_not_exists` for `create_append` mode.
+/// `if_not_exists` for `create_append` mode. `db_schema` (the `adbc.ingest.target_db_schema` option)
+/// optionally qualifies the created table with a named schema.
 pub(crate) fn create_table_sql(
     table: &str,
+    db_schema: Option<&str>,
     schema: &arrow_schema::Schema,
     if_not_exists: bool,
 ) -> Result<String> {
@@ -719,7 +731,7 @@ pub(crate) fn create_table_sql(
     let guard = if if_not_exists { "IF NOT EXISTS " } else { "" };
     Ok(format!(
         "CREATE TABLE {guard}{} ({}) PRIMARY KEY ({})",
-        quote_ident(table),
+        qualified_table(db_schema, table),
         columns.join(", "),
         quote_ident(INGEST_KEY_COLUMN),
     ))
@@ -729,8 +741,9 @@ pub(crate) fn create_table_sql(
 ///
 /// Identifiers are quoted; the parameter references are synthetic positional names (`@p0`, …)
 /// bound by [`bind_row`], since a column name that is not a valid identifier can appear in the
-/// quoted column list but not as a `@name` parameter reference.
-pub(crate) fn insert_sql(table: &str, columns: &[String]) -> String {
+/// quoted column list but not as a `@name` parameter reference. `db_schema` (the
+/// `adbc.ingest.target_db_schema` option) optionally qualifies the target table with a named schema.
+pub(crate) fn insert_sql(table: &str, db_schema: Option<&str>, columns: &[String]) -> String {
     let names = columns
         .iter()
         .map(|c| quote_ident(c))
@@ -742,7 +755,7 @@ pub(crate) fn insert_sql(table: &str, columns: &[String]) -> String {
         .join(", ");
     format!(
         "INSERT INTO {} ({names}) VALUES ({params})",
-        quote_ident(table)
+        qualified_table(db_schema, table)
     )
 }
 
@@ -804,14 +817,18 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
         ]);
         assert_eq!(
-            create_table_sql("my_table", &schema, false).unwrap(),
+            create_table_sql("my_table", None, &schema, false).unwrap(),
             "CREATE TABLE `my_table` (`idx` INT64, `name` STRING(MAX), \
              `adbc_ingest_key` STRING(36) DEFAULT (GENERATE_UUID())) \
              PRIMARY KEY (`adbc_ingest_key`)"
         );
-        assert!(create_table_sql("t", &schema, true)
+        assert!(create_table_sql("t", None, &schema, true)
             .unwrap()
             .starts_with("CREATE TABLE IF NOT EXISTS `t`"));
+        // A named target schema (`adbc.ingest.target_db_schema`) qualifies the created table.
+        assert!(create_table_sql("t", Some("app"), &schema, false)
+            .unwrap()
+            .starts_with("CREATE TABLE `app`.`t`"));
     }
 
     #[test]
@@ -819,25 +836,40 @@ mod tests {
         // Parameter references are synthetic positional names, decoupled from the column names —
         // a column name that is not a valid identifier can never produce invalid `@name` SQL.
         assert_eq!(
-            insert_sql("Users", &["Id".to_string(), "Name".to_string()]),
+            insert_sql("Users", None, &["Id".to_string(), "Name".to_string()]),
             "INSERT INTO `Users` (`Id`, `Name`) VALUES (@p0, @p1)"
         );
         assert_eq!(
-            insert_sql("T", &["a".to_string()]),
+            insert_sql("T", None, &["a".to_string()]),
             "INSERT INTO `T` (`a`) VALUES (@p0)"
+        );
+        // A named target schema (`adbc.ingest.target_db_schema`) qualifies the target table.
+        assert_eq!(
+            insert_sql("Users", Some("app"), &["Id".to_string()]),
+            "INSERT INTO `app`.`Users` (`Id`) VALUES (@p0)"
         );
         // Reserved words are quoted so the DDL-shaped names the ADBC ingest-escaping tests use
         // (table `create`, column `index`) are valid identifiers.
         assert_eq!(
-            insert_sql("create", &["index".to_string()]),
+            insert_sql("create", None, &["index".to_string()]),
             "INSERT INTO `create` (`index`) VALUES (@p0)"
         );
         // Embedded backticks/backslashes use GoogleSQL backslash escapes (formerly the invalid
         // MySQL-style backtick doubling, plus a broken `@c`d` parameter reference).
         assert_eq!(
-            insert_sql("a`b", &["c`d".to_string()]),
+            insert_sql("a`b", None, &["c`d".to_string()]),
             r"INSERT INTO `a\`b` (`c\`d`) VALUES (@p0)"
         );
+    }
+
+    #[test]
+    fn qualifies_table_names() {
+        assert_eq!(qualified_table(None, "Users"), "`Users`");
+        assert_eq!(qualified_table(Some(""), "Users"), "`Users`");
+        assert_eq!(qualified_table(Some("app"), "Users"), "`app`.`Users`");
+        // Caller-supplied names are escaped, so a backtick cannot leak into the surrounding SQL.
+        assert_eq!(qualified_table(None, "a`b"), r"`a\`b`");
+        assert_eq!(qualified_table(Some("s`x"), r"t\y"), r"`s\`x`.`t\\y`");
     }
 
     #[test]

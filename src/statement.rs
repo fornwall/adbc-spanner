@@ -71,6 +71,13 @@ pub struct SpannerStatement {
     bound: Vec<RecordBatch>,
     /// Target table for bulk ingest (`adbc.ingest.target_table`), if set.
     target_table: Option<String>,
+    /// Named schema qualifying the ingest target table (`adbc.ingest.target_db_schema`), if set.
+    /// `None` (or empty) targets Spanner's default, unnamed schema.
+    target_db_schema: Option<String>,
+    /// Ingest target catalog (`adbc.ingest.target_catalog`), if set. Spanner has a single, unnamed
+    /// (`""`) catalog, so only the empty catalog is accepted; stored solely so the option
+    /// round-trips through `get_option`.
+    target_catalog: Option<String>,
     /// Ingest mode (`adbc.ingest.mode`), stored in canonical form once set so it round-trips
     /// through `get_option`. `append` (default), `create`, `create_append`, and `replace` are
     /// accepted; the create/replace modes build the table from the ingest data's Arrow schema.
@@ -107,6 +114,8 @@ impl SpannerStatement {
             sql: None,
             bound: Vec::new(),
             target_table: None,
+            target_db_schema: None,
+            target_catalog: None,
             ingest_mode: None,
             rows_per_batch: DEFAULT_ROWS_PER_BATCH,
             data_boost: false,
@@ -155,11 +164,20 @@ impl SpannerStatement {
             .first()
             .ok_or_else(|| invalid_state("cannot create the ingest table: no data is bound"))?
             .schema();
+        let db_schema = self.target_db_schema.as_deref();
         let mut statements = Vec::new();
         if drop_first {
-            statements.push(format!("DROP TABLE IF EXISTS {}", bind::quote_ident(table)));
+            statements.push(format!(
+                "DROP TABLE IF EXISTS {}",
+                bind::qualified_table(db_schema, table)
+            ));
         }
-        statements.push(bind::create_table_sql(table, &schema, if_not_exists)?);
+        statements.push(bind::create_table_sql(
+            table,
+            db_schema,
+            &schema,
+            if_not_exists,
+        )?);
         Ok(Some(statements))
     }
 
@@ -173,7 +191,7 @@ impl SpannerStatement {
                 .iter()
                 .map(|f| f.name().clone())
                 .collect();
-            let sql = bind::insert_sql(table, &columns);
+            let sql = bind::insert_sql(table, self.target_db_schema.as_deref(), &columns);
             for row in 0..batch.num_rows() {
                 statements.push(bind::bind_row(SpannerSql::builder(&sql), batch, row)?.build());
             }
@@ -200,10 +218,16 @@ impl SpannerStatement {
             Ok(count) => return Ok(count),
             Err(error) => error,
         };
-        // The ingest target is a bare table name (quoted whole when the DDL/DML is built), so it
-        // lives in Spanner's default (unnamed, empty-string) schema.
-        let exists =
-            crate::connection::table_exists(&self.runtime, &self.client, &self.cancel, "", table)?;
+        // Probe the target table in its schema (`adbc.ingest.target_db_schema`, empty = Spanner's
+        // default, unnamed schema).
+        let db_schema = self.target_db_schema.as_deref().unwrap_or("");
+        let exists = crate::connection::table_exists(
+            &self.runtime,
+            &self.client,
+            &self.cancel,
+            db_schema,
+            table,
+        )?;
         if exists {
             Err(err(
                 format!(
@@ -462,6 +486,15 @@ impl Optionable for SpannerStatement {
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
         match &key {
             OptionStatement::TargetTable => self.target_table = Some(string_option(value)?),
+            OptionStatement::TargetDbSchema => {
+                // Named schema for the ingest target table; qualifies the INSERT / CREATE TABLE via
+                // `qualified_table` (empty selects Spanner's default, unnamed schema).
+                self.target_db_schema = Some(string_option(value)?);
+            }
+            OptionStatement::TargetCatalog => {
+                // Spanner exposes a single, unnamed catalog, so only the empty catalog is accepted.
+                self.target_catalog = Some(check_target_catalog(string_option(value)?)?);
+            }
             OptionStatement::IngestMode => {
                 // Append into an existing table, or create it (from the ingest data's Arrow schema,
                 // with a synthetic UUID primary key) in the create/replace modes.
@@ -498,6 +531,8 @@ impl Optionable for SpannerStatement {
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
         let value = match &key {
             OptionStatement::TargetTable => self.target_table.clone(),
+            OptionStatement::TargetDbSchema => self.target_db_schema.clone(),
+            OptionStatement::TargetCatalog => self.target_catalog.clone(),
             OptionStatement::IngestMode => self.ingest_mode.clone(),
             OptionStatement::Other(k) if k == crate::OPTION_ROWS_PER_BATCH => {
                 Some(self.rows_per_batch.to_string())
@@ -852,6 +887,18 @@ fn string_option(value: OptionValue) -> Result<String> {
     }
 }
 
+/// Validate the `adbc.ingest.target_catalog` option. Spanner has a single, unnamed (`""`) catalog,
+/// so only the empty catalog is accepted; any other name is rejected as unsupported.
+fn check_target_catalog(catalog: String) -> Result<String> {
+    if catalog.is_empty() {
+        Ok(catalog)
+    } else {
+        Err(not_implemented(&format!(
+            "ingest target catalog {catalog:?}: Spanner has only the default (empty) catalog"
+        )))
+    }
+}
+
 /// Parse a boolean statement option, accepted as a bool-ish string (`true`/`false`/`1`/`0`/…) or an
 /// integer (`0` = false, non-zero = true).
 fn bool_option(value: OptionValue) -> Result<bool> {
@@ -907,4 +954,19 @@ fn rows_per_batch_option(value: OptionValue) -> Result<usize> {
         .ok()
         .filter(|&n| n > 0)
         .ok_or_else(|| invalid_argument("rows_per_batch must be a positive integer"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adbc_core::error::Status;
+
+    #[test]
+    fn accepts_only_the_empty_ingest_catalog() {
+        // Spanner's single, unnamed catalog is accepted and preserved for round-tripping.
+        assert_eq!(check_target_catalog(String::new()).unwrap(), "");
+        // Any named catalog is rejected as unsupported.
+        let error = check_target_catalog("main".to_string()).unwrap_err();
+        assert_eq!(error.status, Status::NotImplemented);
+    }
 }
