@@ -551,8 +551,18 @@ while any other catalog name fails with `NotFound` (nothing can exist in a catal
 have, matching the missing-table status). Covered by an offline unit test
 (`lookup_catalog_accepts_only_the_default_empty_catalog`) plus new `Some("")`-still-works /
 bogus-catalog-is-NotFound assertions in the `get_table_schema` section of
-`tests/integration.rs`); `get_objects` at
-`Catalogs` depth still runs the SCHEMATA query; ~~`execute_schema` lets DML through to a PLAN probe
+`tests/integration.rs`); ~~`get_objects` at
+`Catalogs` depth still runs the SCHEMATA query~~ (**Fixed.** `collect_objects` in `src/objects.rs`
+now short-circuits at `Catalogs` depth before any RPC — the result at that depth is just the single
+unnamed catalog with a NULL `catalog_db_schemas` list, which `build` produces without looking at the
+collected schemas, so no INFORMATION_SCHEMA query is needed at all; the catalog `LIKE` filter was
+already applied RPC-free in `get_objects`. The other depths already fetched only what they populate
+(DBSchemas → SCHEMATA only; Tables adds TABLES; All/Columns add COLUMNS + the constraint tables).
+Byte-identity of the short-circuit is unit-tested offline
+(`build_catalogs_depth_ignores_collected_schemas` in `src/objects.rs`), and the emulator conformance
+test grew Catalogs-depth (NULL schemas list, excluding-catalog-filter → zero rows) and
+DBSchemas-depth (schemas populated, NULL table lists) shape assertions in `tests/integration.rs`);
+~~`execute_schema` lets DML through to a PLAN probe
 whose read-only-transaction error is surfaced raw~~ (**Fixed.** `execute_schema` now classifies the
 SQL up front via the shared `ddl::is_dml` lexer (`check_schema_query` in `src/statement.rs`) and
 rejects DML — including hinted and `THEN RETURN` forms — with a clear `InvalidArguments`

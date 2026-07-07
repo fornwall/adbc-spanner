@@ -76,6 +76,14 @@ pub(crate) fn collect_objects(
     table_type: &Option<Vec<&str>>,
     column_name: Option<&str>,
 ) -> Result<Vec<DbSchema>> {
+    // At catalog depth the result is just the single unnamed catalog with a null db_schemas
+    // list — `build` ignores the collected schemas entirely — so skip INFORMATION_SCHEMA
+    // (and any RPC) altogether. The remaining depths each fetch only what they populate:
+    // Schemas queries SCHEMATA only; Tables adds TABLES; All/Columns add COLUMNS and the
+    // constraint tables.
+    if depth == ObjectDepth::Catalogs {
+        return Ok(Vec::new());
+    }
     let populate_tables = matches!(
         depth,
         ObjectDepth::All | ObjectDepth::Tables | ObjectDepth::Columns
@@ -783,6 +791,23 @@ mod tests {
             .downcast_ref::<ListArray>()
             .unwrap();
         assert!(schemas.is_null(0));
+    }
+
+    #[test]
+    fn build_catalogs_depth_ignores_collected_schemas() {
+        // `collect_objects` short-circuits at catalog depth and hands `build` an empty Vec
+        // without ever querying INFORMATION_SCHEMA. That is only sound if the output is
+        // identical to what building from real collected schemas would produce.
+        let from_empty = build(ObjectDepth::Catalogs, Vec::new()).unwrap();
+        let from_sample = build(ObjectDepth::Catalogs, sample()).unwrap();
+        assert_eq!(from_empty, from_sample);
+        assert_eq!(from_empty.num_rows(), 1, "single unnamed catalog");
+        let name = from_empty
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(name.value(0), "");
     }
 
     #[test]
