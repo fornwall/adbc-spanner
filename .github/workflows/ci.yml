@@ -78,8 +78,17 @@ jobs:
   # it, and exercise the whole DBAPI/Arrow surface (DDL, DML, ingest, manual
   # transactions) the way a real user would.
   python:
-    name: Python package (emulator)
+    name: Python package (emulator, py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+
+    # Run against the minimum supported Python (pyproject `requires-python`) and
+    # the latest stable release, so both ends of the supported range stay green.
+    # "3.x" is resolved by setup-python to the newest Python 3 available, so this
+    # tracks new releases automatically without hardcoding the current version.
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.x"]
 
     services:
       spanner:
@@ -101,7 +110,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Build the driver shared library
         run: cargo build
