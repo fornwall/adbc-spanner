@@ -101,12 +101,18 @@ into the three `single_use()` call sites plus the partition path. Low–medium e
 
 ### Correctness
 
-- **`split_statements` emits comment-only segments as statements** (`src/ddl.rs:268-274`).
+- ~~**`split_statements` emits comment-only segments as statements** (`src/ddl.rs:268-274`).
   `execute_update("DELETE FROM t1; DELETE FROM t2; -- cleanup")` sends `"-- cleanup"` as a third
   DML statement → the whole batch fails with `INVALID_ARGUMENT` (in manual mode it is buffered
   silently and only fails at commit). Same for DDL batches, and `"SELECT 1; -- done"` fails where
   `"SELECT 1;"` works because the trailing-terminator strip sees two statements. Fix: drop
-  segments that are only whitespace/comments (lex-aware `push_statement`).
+  segments that are only whitespace/comments (lex-aware `push_statement`).~~ (fixed)
+  **Fixed.** `push_statement` now runs each segment through a shared
+  `skip_leading_whitespace_and_comments` lexer helper (extracted from `first_keyword`) and drops it
+  when nothing but whitespace and `--`/`#`/`/* … */` comments remains, so a trailing/interleaved
+  comment-only segment produces no statement while `SELECT 1 -- done` (real SQL then a comment) is
+  kept. `strip_trailing_terminators("SELECT 1; -- done")` now yields `"SELECT 1"` like
+  `"SELECT 1;"`. Covered by the `split_drops_comment_only_segments` unit test in `src/ddl.rs`.
 - **Manual transactions have no read-your-writes, and DML/DDL reorder** (`src/connection.rs:8-23`,
   `src/statement.rs:200-217`; also flagged by the conformance review). DML is buffered while
   queries run immediately in a fresh read-only snapshot, so `INSERT` → `SELECT COUNT(*)` inside one
