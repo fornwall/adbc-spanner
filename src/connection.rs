@@ -340,6 +340,19 @@ pub(crate) fn run_batch_dml(
     })
 }
 
+/// Validate a lookup's `catalog` argument. Spanner has a single, unnamed (`""`) catalog, so `None`
+/// and `Some("")` are accepted; any other catalog does not exist — nothing can be found in it — so
+/// the lookup fails with [`Status::NotFound`] (matching how a missing table is reported).
+fn check_lookup_catalog(catalog: Option<&str>) -> Result<()> {
+    match catalog {
+        None | Some("") => Ok(()),
+        Some(other) => Err(err(
+            format!("catalog {other:?} not found: Spanner has only the default (empty) catalog"),
+            Status::NotFound,
+        )),
+    }
+}
+
 /// Whether a table exists, via a parameterized `INFORMATION_SCHEMA.TABLES` lookup. The default
 /// (unnamed) schema is the empty string in Spanner.
 ///
@@ -659,16 +672,18 @@ impl Connection for SpannerConnection {
     /// Return the Arrow schema of a table.
     ///
     /// Implemented by running a zero-row `SELECT * FROM <table> LIMIT 0` and mapping the result-set
-    /// column metadata to Arrow (the same mapping used for query results). Spanner has no catalog
-    /// concept, so `catalog` is ignored.
+    /// column metadata to Arrow (the same mapping used for query results). Spanner has a single,
+    /// unnamed (`""`) catalog, so `catalog` must be `None` or `Some("")`; any other catalog fails
+    /// with [`Status::NotFound`].
     fn get_table_schema(
         &self,
-        _catalog: Option<&str>,
+        catalog: Option<&str>,
         db_schema: Option<&str>,
         table_name: &str,
     ) -> Result<Schema> {
         // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
         self.cancel.reset();
+        check_lookup_catalog(catalog)?;
         let table = qualified_table(db_schema, table_name);
         let sql = format!("SELECT * FROM {table} LIMIT 0");
         let client = self.client.clone();
@@ -914,6 +929,17 @@ mod tests {
             isolation_to_adbc_string(&IsolationLevel::Unspecified),
             ADBC_OPTION_ISOLATION_LEVEL_DEFAULT
         );
+    }
+
+    #[test]
+    fn lookup_catalog_accepts_only_the_default_empty_catalog() {
+        // Spanner's single catalog is the empty string; `None` means "don't filter".
+        assert!(check_lookup_catalog(None).is_ok());
+        assert!(check_lookup_catalog(Some("")).is_ok());
+        // Any named catalog does not exist, so a lookup in it is NotFound.
+        let err = check_lookup_catalog(Some("main")).unwrap_err();
+        assert_eq!(err.status, Status::NotFound);
+        assert!(err.message.contains("\"main\""), "{}", err.message);
     }
 
     #[test]

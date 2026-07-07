@@ -395,6 +395,17 @@ fn query_and_dml_round_trip() {
         .expect_err("hostile table name must not resolve");
     assert_eq!(hostile.status, adbc_core::error::Status::NotFound);
 
+    // The catalog argument is honoured: Spanner's single catalog is the empty string, so `Some("")`
+    // behaves like `None`, while any other catalog is NotFound (nothing can exist in it).
+    let empty_catalog = connection
+        .get_table_schema(Some(""), None, "Singers")
+        .expect("get_table_schema with the default empty catalog");
+    assert_eq!(empty_catalog, singers_schema);
+    let bogus_catalog = connection
+        .get_table_schema(Some("nosuchcatalog"), None, "Singers")
+        .expect_err("a named catalog does not exist in Spanner");
+    assert_eq!(bogus_catalog.status, adbc_core::error::Status::NotFound);
+
     // --- DDL through the driver (routed to the admin UpdateDatabaseDdl API) ---
 
     // A batch of two DDL statements submitted as one near-atomic schema change; idempotent so the
