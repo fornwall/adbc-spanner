@@ -544,6 +544,12 @@ impl Statement for SpannerStatement {
                 DmlOutcome::Plain(_) => Ok(Self::empty_reader()),
             };
         }
+        // Query path (SELECT / WITH / …). Strip any trailing statement terminator(s): Spanner's
+        // single-use query API rejects a trailing `;` ("Expected end of input but got `;`"), yet
+        // clients and conformance suites routinely append one (e.g. `SELECT current_date;;;`). The
+        // DDL and DML paths above go through `split_statements`, which already drops empty trailing
+        // segments, so this stripping is scoped to the query path and never splits a `;`-batch.
+        let sql = crate::ddl::strip_trailing_terminators(&sql);
         // Parameterized query: run once per bound row.
         if !self.bound.is_empty() {
             let reader = self.execute_bound_query(&sql)?;
