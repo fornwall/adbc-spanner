@@ -33,6 +33,7 @@
 //!   the batch twice unless the DML is idempotent.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use adbc_core::error::{Error, Result, Status};
@@ -182,7 +183,10 @@ pub struct SpannerConnection {
     client: DatabaseClient,
     spanner: Spanner,
     database: String,
-    read_only: bool,
+    /// The standard `adbc.connection.readonly` flag. Shared (`Arc`) with every statement the
+    /// connection creates, and read by statements at *execution* time, so toggling the option
+    /// immediately affects existing statements in both directions.
+    read_only: Arc<AtomicBool>,
     /// Isolation level applied to read/write transactions (autocommit DML and manual-mode commit),
     /// set via the standard ADBC `adbc.connection.transaction.isolation_level` option.
     /// [`IsolationLevel::Unspecified`] (the default) leaves the client/database default in place.
@@ -204,7 +208,7 @@ impl SpannerConnection {
             client: connected.client,
             spanner: connected.spanner,
             database: connected.database,
-            read_only: false,
+            read_only: Arc::new(AtomicBool::new(false)),
             isolation: IsolationLevel::Unspecified,
             read_staleness: ReadStaleness::default(),
             txn: Arc::new(Mutex::new(TxnState::new())),
@@ -518,7 +522,9 @@ impl Optionable for SpannerConnection {
                     }
                 }
             }
-            OptionConnection::ReadOnly => self.read_only = parse_bool(value)?,
+            OptionConnection::ReadOnly => {
+                self.read_only.store(parse_bool(value)?, Ordering::Release)
+            }
             OptionConnection::IsolationLevel => self.isolation = parse_isolation_level(value)?,
             OptionConnection::Other(k) if k == crate::OPTION_READ_STALENESS => {
                 self.read_staleness.set_staleness(value)?;
@@ -539,7 +545,7 @@ impl Optionable for SpannerConnection {
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
         match &key {
             OptionConnection::AutoCommit => Ok(self.txn.lock().unwrap().autocommit.to_string()),
-            OptionConnection::ReadOnly => Ok(self.read_only.to_string()),
+            OptionConnection::ReadOnly => Ok(self.read_only.load(Ordering::Acquire).to_string()),
             OptionConnection::IsolationLevel => {
                 Ok(isolation_to_adbc_string(&self.isolation).to_string())
             }
@@ -602,7 +608,7 @@ impl Connection for SpannerConnection {
             self.client.clone(),
             self.spanner.clone(),
             self.database.clone(),
-            self.read_only,
+            self.read_only.clone(),
             self.isolation.clone(),
             self.read_staleness.clone(),
             self.txn.clone(),
@@ -840,8 +846,7 @@ impl Connection for SpannerConnection {
         // Decode the opaque descriptor produced by `Statement::execute_partitions`. It carries the
         // session, transaction id, partition token and Data Boost flag, so it executes on this
         // connection's client (which shares the same multiplexed session) with no further setup.
-        let partition: Partition = serde_json::from_slice(partition.as_ref())
-            .map_err(|e| invalid_argument(format!("invalid partition descriptor: {e}")))?;
+        let partition = decode_partition(partition.as_ref())?;
         let client = self.client.clone();
         let runtime = self.runtime.clone();
         let cancel = self.cancel.clone();
@@ -853,6 +858,15 @@ impl Connection for SpannerConnection {
         })?;
         Ok(Box::new(reader))
     }
+}
+
+/// Decode an opaque partition descriptor produced by `Statement::execute_partitions` — the
+/// serde-JSON of the client's [`Partition`]. Anything that does not decode (empty input, non-JSON
+/// bytes, or valid JSON of the wrong shape) is an [`Status::InvalidArguments`] error, never a
+/// panic. A pure function so the rejection path is unit-testable without a connection.
+fn decode_partition(descriptor: &[u8]) -> Result<Partition> {
+    serde_json::from_slice(descriptor)
+        .map_err(|e| invalid_argument(format!("invalid partition descriptor: {e}")))
 }
 
 fn parse_bool(value: OptionValue) -> Result<bool> {
@@ -940,6 +954,35 @@ mod tests {
         let err = check_lookup_catalog(Some("main")).unwrap_err();
         assert_eq!(err.status, Status::NotFound);
         assert!(err.message.contains("\"main\""), "{}", err.message);
+    }
+
+    /// A garbage partition descriptor — `read_partition`'s input is caller-supplied opaque bytes —
+    /// must be rejected as `InvalidArguments` by the decode step (before anything executes), never
+    /// panic. Covers empty input, non-JSON bytes, truncated JSON, and well-formed JSON that is not
+    /// a partition descriptor.
+    #[test]
+    fn garbage_partition_descriptors_error_cleanly() {
+        let cases: [&[u8]; 6] = [
+            b"",                      // empty
+            b"\xff\xfe\x00 not json", // non-UTF-8, non-JSON bytes
+            b"{",                     // truncated JSON
+            b"{}",                    // valid JSON object missing every descriptor field
+            br#"{"hello": "world"}"#, // valid JSON object of the wrong shape
+            b"[1, 2, 3]",             // valid JSON that is not even an object
+        ];
+        for descriptor in cases {
+            let error = decode_partition(descriptor).unwrap_err();
+            assert_eq!(
+                error.status,
+                Status::InvalidArguments,
+                "descriptor {descriptor:?}"
+            );
+            assert!(
+                error.message.contains("invalid partition descriptor"),
+                "unexpected message for {descriptor:?}: {}",
+                error.message
+            );
+        }
     }
 
     #[test]

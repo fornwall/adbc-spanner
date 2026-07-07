@@ -15,11 +15,10 @@ use std::sync::Arc;
 
 use adbc_core::error::{Error, Result, Status};
 use arrow_array::{
-    new_empty_array, new_null_array, Array, ArrayRef, BooleanArray, Int16Array, Int64Array,
-    RecordBatch, StringArray, StructArray, UnionArray,
+    new_null_array, Array, ArrayRef, BooleanArray, Int16Array, Int64Array, RecordBatch,
+    StringArray, StructArray,
 };
-use arrow_buffer::ScalarBuffer;
-use arrow_schema::{DataType, Fields, SchemaRef, UnionFields};
+use arrow_schema::{DataType, Fields, SchemaRef};
 use futures_util::stream::{self, StreamExt};
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::Statement as SpannerSql;
@@ -28,7 +27,7 @@ use crate::bind::{qualified_table, quote_ident};
 use crate::connection::{like_match, query_batch, str_col};
 use crate::conversion::result_set_to_batch;
 use crate::error::{err, from_spanner};
-use crate::nested::{arrow_err, field, list_item, list_of, struct_fields};
+use crate::nested::{arrow_err, dense_union, field, list_item, list_of, struct_fields};
 use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
 use crate::staleness::ReadStaleness;
 
@@ -327,7 +326,16 @@ fn build_statistic_struct(stat_fields: &Fields, stats: &[&Statistic]) -> Result<
     };
     let int64_values: ArrayRef =
         Arc::new(Int64Array::from_iter(stats.iter().map(|s| Some(s.value))));
-    let statistic_value = build_value_union(&union_fields, int64_values, n)?;
+    // Every statistic value lives in the `int64` branch; `dense_union` fills the other branches with
+    // empty children so the union type still matches the schema.
+    let type_ids = vec![INT64_BRANCH; n];
+    let offsets: Vec<i32> = (0..n as i32).collect();
+    let statistic_value = dense_union(
+        &union_fields,
+        &[(INT64_BRANCH, int64_values)],
+        type_ids,
+        offsets,
+    )?;
 
     let arrays: Vec<ArrayRef> = stat_fields
         .iter()
@@ -352,29 +360,6 @@ fn build_statistic_struct(stat_fields: &Fields, stats: &[&Statistic]) -> Result<
     Ok(Arc::new(
         StructArray::try_new(stat_fields.clone(), arrays, None).map_err(arrow_err)?,
     ))
-}
-
-/// Build the `statistic_value` dense union with all `n` values in the `int64` branch.
-fn build_value_union(
-    union_fields: &UnionFields,
-    int64_values: ArrayRef,
-    n: usize,
-) -> Result<ArrayRef> {
-    let type_ids = ScalarBuffer::from(vec![INT64_BRANCH; n]);
-    let offsets = ScalarBuffer::from((0..n as i32).collect::<Vec<_>>());
-    let children: Vec<ArrayRef> = union_fields
-        .iter()
-        .map(|(id, f)| {
-            if id == INT64_BRANCH {
-                int64_values.clone()
-            } else {
-                new_empty_array(f.data_type())
-            }
-        })
-        .collect();
-    let union = UnionArray::try_new(union_fields.clone(), type_ids, Some(offsets), children)
-        .map_err(arrow_err)?;
-    Ok(Arc::new(union))
 }
 
 #[cfg(test)]

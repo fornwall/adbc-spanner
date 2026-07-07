@@ -473,10 +473,18 @@ only recognises `THEN` followed by `RETURN` at depth zero, since GoogleSQL's `TH
 only appears at the top level at the end of a DML statement; a CASE branch expression that is a
 column literally named `return` no longer trips the check, while a genuine top-level `THEN RETURN`
 after a CASE expression is still detected. Unit-tested for nested CASE, mixed case, comments,
-`THEN RETURN`/`CASE` inside literals and quoted identifiers, and unbalanced `END`); `read_only`
+`THEN RETURN`/`CASE` inside literals and quoted identifiers, and unbalanced `END`); ~~`read_only`
 is snapshotted into statements at creation, so flipping the connection option leaves existing
 statements writable (`src/connection.rs:792-801` — flagged independently by correctness,
-conformance and maintainability; share via `SharedTxn`/`AtomicBool`); ~~the autocommit-enable path
+conformance and maintainability; share via `SharedTxn`/`AtomicBool`)~~ (**Fixed.** the connection's
+flag is now an `Arc<AtomicBool>` shared into every statement, and all four enforcement branches in
+`src/statement.rs` (DML via `execute`, DML via `execute_update`, DDL, bulk ingest) load it at
+execution time through one `is_read_only()` helper instead of a creation-time snapshot — so
+toggling `adbc.connection.readonly` immediately locks or frees existing statements in both
+directions. The `readonly_connection_rejects_writes` integration test's toggle section now asserts
+the live semantics both ways (clearing the flag lets a pre-existing statement write; re-enabling it
+immediately rejects the same statement with `InvalidState`), and the README.md / python/README.md /
+lib.rs / CLAUDE.md docs describe the live-toggle behavior); ~~the autocommit-enable path
 reads/takes/flips in separate lock acquisitions, so a concurrently-buffering statement can strand
 DML (`connection.rs:734-742`)~~ (**Fixed.** the enable path now flips the mode and takes the buffer
 in *one* lock acquisition (`TxnState::enter_autocommit`) — `run_or_buffer` checks-and-buffers under
@@ -543,8 +551,18 @@ while any other catalog name fails with `NotFound` (nothing can exist in a catal
 have, matching the missing-table status). Covered by an offline unit test
 (`lookup_catalog_accepts_only_the_default_empty_catalog`) plus new `Some("")`-still-works /
 bogus-catalog-is-NotFound assertions in the `get_table_schema` section of
-`tests/integration.rs`); `get_objects` at
-`Catalogs` depth still runs the SCHEMATA query; ~~`execute_schema` lets DML through to a PLAN probe
+`tests/integration.rs`); ~~`get_objects` at
+`Catalogs` depth still runs the SCHEMATA query~~ (**Fixed.** `collect_objects` in `src/objects.rs`
+now short-circuits at `Catalogs` depth before any RPC — the result at that depth is just the single
+unnamed catalog with a NULL `catalog_db_schemas` list, which `build` produces without looking at the
+collected schemas, so no INFORMATION_SCHEMA query is needed at all; the catalog `LIKE` filter was
+already applied RPC-free in `get_objects`. The other depths already fetched only what they populate
+(DBSchemas → SCHEMATA only; Tables adds TABLES; All/Columns add COLUMNS + the constraint tables).
+Byte-identity of the short-circuit is unit-tested offline
+(`build_catalogs_depth_ignores_collected_schemas` in `src/objects.rs`), and the emulator conformance
+test grew Catalogs-depth (NULL schemas list, excluding-catalog-filter → zero rows) and
+DBSchemas-depth (schemas populated, NULL table lists) shape assertions in `tests/integration.rs`);
+~~`execute_schema` lets DML through to a PLAN probe
 whose read-only-transaction error is surfaced raw~~ (**Fixed.** `execute_schema` now classifies the
 SQL up front via the shared `ddl::is_dml` lexer (`check_schema_query` in `src/statement.rs`) and
 rejects DML — including hinted and `THEN RETURN` forms — with a clear `InvalidArguments`
@@ -559,8 +577,22 @@ docs.rs)~~ (**Fixed.** `ci.yml` now has a dedicated `cargo test --doc --all-feat
 the unit tests, and the docs step runs `cargo doc --no-deps --all-features` to match docs.rs);
 keyfile/impersonation auth is offline-unit-tested only, never exercised end-to-end;
 weak assertions (`AdbcDdl` note value unchecked, `replace`-ingest values unchecked, only row
-counts); untested small surfaces: `rollback()` without a transaction, `get_statistic_names`,
-`read_partition` with a garbage descriptor (also a natural fuzz target), `Connection::cancel`;
+counts); ~~untested small surfaces: `rollback()` without a transaction, `get_statistic_names`,
+`read_partition` with a garbage descriptor (also a natural fuzz target), `Connection::cancel`~~
+(**Fixed.** All four are covered. `rollback()` in autocommit mode asserts `InvalidState`, and in
+manual mode with nothing buffered it is a no-op that keeps the connection in manual mode
+(`rollback_without_a_transaction_is_invalid_state`). `get_statistic_names` asserts the canonical
+`GET_STATISTIC_NAMES_SCHEMA` — with the field names/types also spelled out — and zero batches
+(`get_statistic_names_is_empty_and_correctly_typed`). The partition-descriptor decode was factored
+into a pure `decode_partition` helper in `src/connection.rs` (behavior unchanged) so the rejection
+path is unit-tested offline against empty / non-JSON / truncated / wrong-shape-JSON inputs
+(`garbage_partition_descriptors_error_cleanly`), and the same inputs go through
+`Connection::read_partition` end-to-end (`read_partition_rejects_garbage_descriptors`) — all
+`InvalidArguments`, no panic, no RPC. `Connection::cancel` is covered deterministically by
+`connection_cancel_is_sticky_until_the_next_operation`, mirroring the statement-level test: a
+cancel latched *between* `read_partition` chunk fetches cancels the next fetch, statements on the
+same connection are unaffected (own signal), and the connection's next operation resets the latch.
+All but the offline decode test live in `tests/integration.rs`.);
 fuzz gaps: statement-hint parsing (`first_keyword` — this exact code had a real bug),
 `strip_trailing_terminators`, parameter-name extraction, `quote_ident`, partition-descriptor
 deserialization; `tests/resilience.rs` mutates process env in setup — safe only under

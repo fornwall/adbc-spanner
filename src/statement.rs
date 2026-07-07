@@ -13,6 +13,7 @@
 //! does not support `THEN RETURN`); through [`Statement::execute_update`] the rows are discarded
 //! and the affected-row count is reported from the result-set stats.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use adbc_core::error::{Error, Result, Status};
@@ -62,7 +63,10 @@ pub struct SpannerStatement {
     client: DatabaseClient,
     spanner: Spanner,
     database: String,
-    read_only: bool,
+    /// The connection's `adbc.connection.readonly` flag, shared live (`Arc`) rather than
+    /// snapshotted: each write path loads it at execution time, so toggling the option on the
+    /// connection immediately affects this statement in both directions.
+    read_only: Arc<AtomicBool>,
     /// Isolation level for this statement's read/write transactions, inherited from the connection
     /// at creation time (see the standard `adbc.connection.transaction.isolation_level` option).
     isolation: IsolationLevel,
@@ -105,7 +109,7 @@ impl SpannerStatement {
         client: DatabaseClient,
         spanner: Spanner,
         database: String,
-        read_only: bool,
+        read_only: Arc<AtomicBool>,
         isolation: IsolationLevel,
         read_staleness: ReadStaleness,
         txn: SharedTxn,
@@ -130,6 +134,12 @@ impl SpannerStatement {
             read_staleness,
             cancel: CancelSignal::new(),
         }
+    }
+
+    /// The *live* value of the connection's `adbc.connection.readonly` flag. Loaded at each write
+    /// attempt (never cached), so a toggle on the connection applies to this statement immediately.
+    fn is_read_only(&self) -> bool {
+        self.read_only.load(Ordering::Acquire)
     }
 
     /// Build one Spanner statement per bound row, binding its columns as named parameters.
@@ -294,7 +304,7 @@ impl SpannerStatement {
     /// to need several chunks does **not** — each chunk commits in its own transaction, so a
     /// mid-ingest failure leaves the earlier chunks' rows committed.
     fn run_ingest(&mut self, table: &str) -> Result<Option<i64>> {
-        if self.read_only {
+        if self.is_read_only() {
             return Err(invalid_state("cannot ingest: the connection is read-only"));
         }
         if self.bound.is_empty() {
@@ -552,7 +562,7 @@ impl SpannerStatement {
     /// Batching all statements into one call makes a multi-step change (for example dbt's
     /// intermediate-table build followed by a rename swap) near-atomic.
     fn run_ddl(&self, statements: Vec<String>) -> Result<()> {
-        if self.read_only {
+        if self.is_read_only() {
             return Err(invalid_state(
                 "cannot execute DDL: the connection is read-only",
             ));
@@ -781,7 +791,7 @@ impl Statement for SpannerStatement {
         // DML with a `THEN RETURN` clause returns its rows; plain DML yields an empty result (the
         // query interface has nowhere to report the affected-row count, so it is discarded).
         if crate::ddl::is_dml(&sql) {
-            if self.read_only {
+            if self.is_read_only() {
                 return Err(invalid_state(
                     "cannot execute DML: the connection is read-only",
                 ));
@@ -850,7 +860,7 @@ impl Statement for SpannerStatement {
             // it always runs immediately rather than buffering).
             return Ok(None);
         }
-        if self.read_only {
+        if self.is_read_only() {
             return Err(invalid_state(
                 "cannot execute DML: the connection is read-only",
             ));
