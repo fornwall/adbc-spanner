@@ -47,11 +47,14 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   `get_statistic_names` is empty (Spanner has no custom named statistics).
 - `execute_schema()`: a query's result schema without running it (via `QueryMode::Plan`), so tools
   can introspect output columns — including a top-level `WITH` — with no data scan.
+- Partitioned execution: `execute_partitions()` splits a query into independently executable
+  partitions via Spanner's `PartitionQuery` API, each serialized as a self-contained opaque ADBC
+  descriptor, and `Connection::read_partition()` streams one partition's rows back as Arrow.
+  `spanner.data_boost_enabled` bakes [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview)
+  into the descriptors; `spanner.max_partitions` hints the partition count.
 
-Not supported (return `NotImplemented`, by nature of Spanner): **Substrait** — Spanner has no
-Substrait support; and **partitioned execution** (`execute_partitions`/`read_partition`) — Spanner's
-Partition APIs are session-bound (they don't map onto ADBC's opaque-token model) and the emulator
-doesn't implement them.
+Not supported (returns `NotImplemented`, by nature of Spanner): **Substrait** — Spanner executes
+GoogleSQL/PostgreSQL text and has no Substrait support.
 
 ## Shared library (loadable driver)
 
@@ -76,11 +79,13 @@ db = adbc_driver_manager.AdbcDatabase(
 
 ## Usage
 
-Add the dependency (this crate plus the Arrow crates you consume results with):
+Add the dependency (this crate plus the Arrow crates you consume results with). The crate is not
+yet on crates.io — it pins `google-cloud-*` to a git revision (see the note under *Type mapping*) —
+so depend on it via git until that pin is lifted:
 
 ```toml
 [dependencies]
-adbc-spanner = "0.1"
+adbc-spanner = { git = "https://github.com/fornwall/adbc-spanner", tag = "v0.5.0" }
 adbc_core = "0.23"
 arrow-array = "58"
 ```
@@ -253,8 +258,7 @@ Fuzzing runs weekly (and on demand) in CI ([`.github/workflows/fuzz.yml`](.githu
 Releases are cut with [`cargo-release`](https://github.com/crate-ci/cargo-release), configured under
 `[package.metadata.release]` in `Cargo.toml`.
 
-Prerequisites: `cargo install cargo-release`, a crates.io token (`cargo login`), and push access to
-`main`.
+Prerequisites: `cargo install cargo-release` and push access to `main`.
 
 Preview a release (dry run — this is the default, nothing is changed):
 
@@ -271,14 +275,18 @@ cargo release patch --execute
 That single command:
 
 1. bumps the version in `Cargo.toml` and commits it (`Release X.Y.Z`),
-2. publishes the crate to [crates.io](https://crates.io/crates/adbc-spanner),
-3. creates the annotated tag `vX.Y.Z` and pushes the commit and tag to `origin`.
+2. creates the annotated tag `vX.Y.Z` and pushes the commit and tag to `origin`.
+
+Publishing to crates.io is **disabled** (`publish = false` in the release config) while the
+`google-cloud-*` dependencies are pinned to a git revision, since crates.io does not accept git
+dependencies; re-enable it once those ship in a versioned release.
 
 Pushing the `vX.Y.Z` tag triggers the [`Shared libraries`](.github/workflows/libraries.yml) workflow,
-which builds the Linux (x86-64, aarch64), macOS (Apple Silicon) and Windows (x86-64) shared libraries
-and attaches them to the [GitHub Release](https://github.com/fornwall/adbc-spanner/releases) for that
-tag. So the flow is: `cargo release … --execute` → crates.io publish + tag → CI attaches the prebuilt
-libraries to the release.
+which builds the shared libraries for Linux (x86-64, aarch64), macOS (arm64, x86-64) and Windows
+(x86-64, arm64), attaches them to the [GitHub Release](https://github.com/fornwall/adbc-spanner/releases)
+for that tag, and builds and publishes the Python wheels to PyPI. So the flow is:
+`cargo release … --execute` → version bump + tag → CI attaches the prebuilt libraries and publishes
+the wheels.
 
 ## License
 
