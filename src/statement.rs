@@ -35,6 +35,7 @@ use crate::error::{
     err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
 };
 use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
+use crate::staleness::ReadStaleness;
 
 /// Default number of rows converted into each streamed Arrow batch (see
 /// [`OPTION_ROWS_PER_BATCH`](crate::OPTION_ROWS_PER_BATCH)). Also used by
@@ -89,11 +90,16 @@ pub struct SpannerStatement {
     /// Maximum number of partitions to request from `execute_partitions`
     /// (`spanner.max_partitions`); `None` lets Spanner choose.
     max_partitions: Option<i64>,
+    /// Read staleness / timestamp bound for this statement's read-only queries
+    /// (`spanner.read.staleness` / `spanner.read.timestamp`), inherited from the connection at
+    /// creation time and overridable per statement. Default is a strong read.
+    read_staleness: ReadStaleness,
     /// Cancellation signal for this statement's in-flight execution (see [`Statement::cancel`]).
     cancel: CancelSignal,
 }
 
 impl SpannerStatement {
+    #[allow(clippy::too_many_arguments)] // constructor threads the connection's config verbatim
     pub(crate) fn new(
         runtime: SharedRuntime,
         client: DatabaseClient,
@@ -101,6 +107,7 @@ impl SpannerStatement {
         database: String,
         read_only: bool,
         isolation: IsolationLevel,
+        read_staleness: ReadStaleness,
         txn: SharedTxn,
     ) -> Self {
         Self {
@@ -120,6 +127,7 @@ impl SpannerStatement {
             rows_per_batch: DEFAULT_ROWS_PER_BATCH,
             data_boost: false,
             max_partitions: None,
+            read_staleness,
             cancel: CancelSignal::new(),
         }
     }
@@ -402,12 +410,13 @@ impl SpannerStatement {
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let statements = self.build_bound_statements(sql)?;
         let client = self.client.clone();
+        let bound = self.read_staleness.timestamp_bound()?;
         let (schema, batches): (Option<SchemaRef>, Vec<RecordBatch>) =
             block_on_cancellable(&self.runtime, &self.cancel, async move {
                 let mut schema = None;
                 let mut batches = Vec::new();
                 for statement in statements {
-                    let transaction = client.single_use().build();
+                    let transaction = crate::staleness::single_use(&client, bound.clone());
                     let result_set = transaction
                         .execute_query(statement)
                         .await
@@ -518,6 +527,12 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) if k == crate::OPTION_MAX_PARTITIONS => {
                 self.max_partitions = Some(max_partitions_option(value)?);
             }
+            OptionStatement::Other(k) if k == crate::OPTION_READ_STALENESS => {
+                self.read_staleness.set_staleness(value)?;
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_READ_TIMESTAMP => {
+                self.read_staleness.set_timestamp(value)?;
+            }
             other => {
                 return Err(not_implemented(&format!(
                     "statement option {}",
@@ -542,6 +557,12 @@ impl Optionable for SpannerStatement {
             }
             OptionStatement::Other(k) if k == crate::OPTION_MAX_PARTITIONS => {
                 self.max_partitions.map(|n| n.to_string())
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_READ_STALENESS => {
+                self.read_staleness.staleness_string().map(str::to_string)
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_READ_TIMESTAMP => {
+                self.read_staleness.timestamp_string().map(str::to_string)
             }
             _ => None,
         };
@@ -652,10 +673,11 @@ impl Statement for SpannerStatement {
         let runtime = self.runtime.clone();
         let cancel = self.cancel.clone();
         let batch_size = self.rows_per_batch;
+        let bound = self.read_staleness.timestamp_bound()?;
         // Stream the result: `stream_query` fetches the first chunk (settling the schema) and the
         // returned reader converts the rest to Arrow one bounded chunk at a time as it is iterated.
         let reader = block_on_cancellable(&self.runtime, &self.cancel, async move {
-            let transaction = client.single_use().build();
+            let transaction = crate::staleness::single_use(&client, bound);
             let statement = SpannerSql::builder(sql).build();
             let result_set = transaction
                 .execute_query(statement)
@@ -773,23 +795,24 @@ impl Statement for SpannerStatement {
         let client = self.client.clone();
         let data_boost = self.data_boost;
         let max_partitions = self.max_partitions;
+        // The partitioned read honours the statement's read staleness: it is baked into the batch
+        // read-only transaction, so every partition executes at that bound wherever it is read back.
+        let bound = self.read_staleness.timestamp_bound()?;
 
         let (schema, partitions) = block_on_cancellable(&self.runtime, &self.cancel, async move {
             // Schema via a PLAN of the query: column metadata without scanning any data.
-            let plan_rs = client
-                .single_use()
-                .build()
+            let plan_rs = crate::staleness::single_use(&client, bound.clone())
                 .execute_query(plan_stmt)
                 .await
                 .map_err(from_spanner)?;
             let (schema, _batch) = result_set_to_batch(plan_rs).await?;
 
             // Partition the query across a batch read-only transaction.
-            let transaction = client
-                .batch_read_only_transaction()
-                .build()
-                .await
-                .map_err(from_spanner)?;
+            let mut txn_builder = client.batch_read_only_transaction();
+            if let Some(b) = bound {
+                txn_builder = txn_builder.set_timestamp_bound(b);
+            }
+            let transaction = txn_builder.build().await.map_err(from_spanner)?;
             let mut options = PartitionOptions::default();
             if let Some(n) = max_partitions {
                 options = options.set_max_partitions(n);

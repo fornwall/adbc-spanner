@@ -82,16 +82,22 @@ is supported": it documents all four modes (`append`/`create`/`create_append`/`r
 synthetic `adbc_ingest_key` UUID primary key the create modes add (and that it appears in
 `SELECT *`).
 
-### 7. Stale reads / timestamp bounds are unexposed (features)
+### ~~7. Stale reads / timestamp bounds are unexposed~~ (fixed)
 
-Every query uses `client.single_use()` with strong reads (`src/statement.rs:330`, `:677`,
-`src/connection.rs:485`); no staleness option exists. Stale reads are one of Spanner's signature
-features — cheap, lock-free reads for exactly the analytics audience an Arrow driver serves — and
-they pair naturally with the already-shipped Data Boost partitioned reads. The pinned client fully
-exposes `TimestampBound::{strong, exact_staleness, max_staleness, read_timestamp,
-min_read_timestamp}` on single-use, multi-use and batch read-only builders. Fix: add
-`spanner.read.staleness` / `spanner.read.timestamp` connection+statement options and plumb them
-into the three `single_use()` call sites plus the partition path. Low–medium effort, high value.
+**Fixed.** Two options — `spanner.read.staleness` and `spanner.read.timestamp` — are now honoured at
+both connection and statement level (a statement inherits the connection's bound and may override
+it). `spanner.read.staleness` is `exact:<duration>` / `max:<duration>` (duration with an optional
+`s`/`ms`/`us`/`ns`/`m`/`h` suffix) → `TimestampBound::{exact,max}_staleness`; `spanner.read.timestamp`
+is an RFC 3339 timestamp, optionally prefixed `read:` (default) or `min:` →
+`TimestampBound::{read,min_read}_timestamp`. The two are mutually exclusive — setting one while the
+other is active is rejected with `InvalidArgument` (unset the other with an empty value first) — and
+both round-trip through `get_option` (NotFound when unset). The bound is applied at the read-only
+query `single_use()` sites (`execute`, bound queries, the `execute_partitions` PLAN probe, and the
+connection's `get_table_schema` / statistics table scans) and, for partitioned reads, baked into the
+batch read-only transaction so every partition executes at that bound. Parsing lives in
+`src/staleness.rs` (`ReadBound` / `ReadStaleness`) with offline unit tests
+(`parses_exact_and_max_staleness_with_units`, `parses_read_and_min_timestamp`,
+`rejects_bad_staleness`, `rejects_bad_timestamp`, `mutually_exclusive_options_conflict_and_can_be_switched`).
 
 ---
 

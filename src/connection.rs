@@ -50,6 +50,7 @@ use crate::conversion::{result_set_to_batch, stream_query};
 use crate::driver::Connected;
 use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
 use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
+use crate::staleness::ReadStaleness;
 use crate::statement::{SpannerStatement, DEFAULT_ROWS_PER_BATCH};
 
 /// Transaction state shared between a connection and the statements it creates.
@@ -96,6 +97,10 @@ pub struct SpannerConnection {
     /// set via the standard ADBC `adbc.connection.transaction.isolation_level` option.
     /// [`IsolationLevel::Unspecified`] (the default) leaves the client/database default in place.
     isolation: IsolationLevel,
+    /// Read staleness / timestamp bound for read-only queries (`spanner.read.staleness` /
+    /// `spanner.read.timestamp`). The default is a strong read; this becomes the default for
+    /// statements created on the connection, which may override it.
+    read_staleness: ReadStaleness,
     txn: SharedTxn,
     /// Cancellation signal for this connection's in-flight metadata/commit operations
     /// (see [`Connection::cancel`]).
@@ -111,6 +116,7 @@ impl SpannerConnection {
             database: connected.database,
             read_only: false,
             isolation: IsolationLevel::Unspecified,
+            read_staleness: ReadStaleness::default(),
             txn: Arc::new(Mutex::new(TxnState::new())),
             cancel: CancelSignal::new(),
         }
@@ -424,8 +430,10 @@ impl SpannerConnection {
             qualified_table(Some(schema), table)
         );
         let client = self.client.clone();
+        // The aggregate scans the user table, so honour the connection's read staleness.
+        let bound = self.read_staleness.timestamp_bound()?;
         let batch = block_on_cancellable(&self.runtime, &self.cancel, async move {
-            let transaction = client.single_use().build();
+            let transaction = crate::staleness::single_use(&client, bound);
             let result_set = transaction
                 .execute_query(SpannerSql::builder(sql).build())
                 .await
@@ -979,6 +987,12 @@ impl Optionable for SpannerConnection {
             }
             OptionConnection::ReadOnly => self.read_only = parse_bool(value)?,
             OptionConnection::IsolationLevel => self.isolation = parse_isolation_level(value)?,
+            OptionConnection::Other(k) if k == crate::OPTION_READ_STALENESS => {
+                self.read_staleness.set_staleness(value)?;
+            }
+            OptionConnection::Other(k) if k == crate::OPTION_READ_TIMESTAMP => {
+                self.read_staleness.set_timestamp(value)?;
+            }
             other => {
                 return Err(not_implemented(&format!(
                     "unsupported Spanner connection option: {}",
@@ -996,6 +1010,26 @@ impl Optionable for SpannerConnection {
             OptionConnection::IsolationLevel => {
                 Ok(isolation_to_adbc_string(&self.isolation).to_string())
             }
+            OptionConnection::Other(k) if k == crate::OPTION_READ_STALENESS => self
+                .read_staleness
+                .staleness_string()
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    err(
+                        format!("option {} is not set", crate::OPTION_READ_STALENESS),
+                        Status::NotFound,
+                    )
+                }),
+            OptionConnection::Other(k) if k == crate::OPTION_READ_TIMESTAMP => self
+                .read_staleness
+                .timestamp_string()
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    err(
+                        format!("option {} is not set", crate::OPTION_READ_TIMESTAMP),
+                        Status::NotFound,
+                    )
+                }),
             // A Spanner database has a single, unnamed catalog and (default) schema — both the empty
             // string in INFORMATION_SCHEMA, which is what `get_objects` reports — so the "current"
             // catalog/schema are reported as "". (They can't be switched; setting them is unsupported.)
@@ -1037,6 +1071,7 @@ impl Connection for SpannerConnection {
             self.database.clone(),
             self.read_only,
             self.isolation.clone(),
+            self.read_staleness.clone(),
             self.txn.clone(),
         ))
     }
@@ -1109,8 +1144,9 @@ impl Connection for SpannerConnection {
         let table = qualified_table(db_schema, table_name);
         let sql = format!("SELECT * FROM {table} LIMIT 0");
         let client = self.client.clone();
+        let bound = self.read_staleness.timestamp_bound()?;
         let result = block_on_cancellable(&self.runtime, &self.cancel, async move {
-            let transaction = client.single_use().build();
+            let transaction = crate::staleness::single_use(&client, bound);
             let result_set = transaction
                 .execute_query(SpannerSql::builder(sql).build())
                 .await
