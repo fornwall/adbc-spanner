@@ -1004,11 +1004,13 @@ fn query_and_dml_round_trip() {
         )
         .unwrap()
     };
-    let ingest_create = |connection: &mut SpannerConnection, mode: &str| {
+    // Bind `create_rows()` into `table` with the given ingest mode, returning the raw result so
+    // callers can assert either the affected count or an error status.
+    let ingest_into = |connection: &mut SpannerConnection, table: &str, mode: &str| {
         let mut s = connection.new_statement().expect("new statement");
         s.set_option(
             OptionStatement::TargetTable,
-            OptionValue::String("AdbcCreate".into()),
+            OptionValue::String(table.into()),
         )
         .unwrap();
         s.set_option(
@@ -1017,13 +1019,25 @@ fn query_and_dml_round_trip() {
         )
         .unwrap();
         s.bind(create_rows()).expect("bind ingest rows");
-        s.execute_update().expect("ingest")
+        s.execute_update()
     };
-    assert_eq!(ingest_create(&mut connection, "create"), Some(2)); // creates table + 2 rows
+    let ingest_create = |connection: &mut SpannerConnection, mode: &str| {
+        ingest_into(connection, "AdbcCreate", mode)
+    };
+    assert_eq!(
+        ingest_create(&mut connection, "create").expect("create"),
+        Some(2)
+    ); // creates table + 2 rows
     assert_eq!(count_rows(&mut connection, "AdbcCreate"), 2);
-    assert_eq!(ingest_create(&mut connection, "append"), Some(2)); // appends
+    assert_eq!(
+        ingest_create(&mut connection, "append").expect("append"),
+        Some(2)
+    ); // appends
     assert_eq!(count_rows(&mut connection, "AdbcCreate"), 4);
-    assert_eq!(ingest_create(&mut connection, "replace"), Some(2)); // drops + recreates
+    assert_eq!(
+        ingest_create(&mut connection, "replace").expect("replace"),
+        Some(2)
+    ); // drops + recreates
     assert_eq!(count_rows(&mut connection, "AdbcCreate"), 2);
     // The data columns read back even though the table also has the synthetic key column.
     let mut read_create = connection.new_statement().expect("new statement");
@@ -1036,9 +1050,65 @@ fn query_and_dml_round_trip() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(created.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    // `create` mode on an already-existing table is the error path: the driver emits a
+    // `CREATE TABLE` (no `IF NOT EXISTS`), which Spanner rejects because `AdbcCreate` still exists.
+    // Unlike append-mode ingest, create-mode failures are not remapped, so the underlying DDL error
+    // surfaces directly — we only assert that it fails and that nothing was inserted.
+    let create_on_existing = ingest_into(&mut connection, "AdbcCreate", "create")
+        .expect_err("create-mode ingest onto an existing table must fail");
+    assert_eq!(
+        count_rows(&mut connection, "AdbcCreate"),
+        2,
+        "a failed create-mode ingest must leave the table unchanged (got error: {create_on_existing:?})"
+    );
     let mut drop_created = connection.new_statement().expect("new statement");
     drop_created.set_sql_query("DROP TABLE AdbcCreate").unwrap();
     drop_created.execute_update().expect("drop create table");
+
+    // `create_append` mode end-to-end: it creates the table from the bound Arrow schema when absent
+    // (like `create`), but — unlike `create` — is a no-op-on-conflict for the table itself, so a
+    // second ingest into the now-existing table simply appends. Exercises both halves.
+    let mut drop_create_append = connection.new_statement().expect("new statement");
+    drop_create_append
+        .set_sql_query("DROP TABLE IF EXISTS AdbcCreateAppend")
+        .unwrap();
+    drop_create_append
+        .execute_update()
+        .expect("pre-drop create_append table");
+    // First ingest: table absent → created + 2 rows.
+    assert_eq!(
+        ingest_into(&mut connection, "AdbcCreateAppend", "create_append").expect("create_append"),
+        Some(2)
+    );
+    assert_eq!(count_rows(&mut connection, "AdbcCreateAppend"), 2);
+    // Second ingest: table now present → append (no error, unlike `create`).
+    assert_eq!(
+        ingest_into(&mut connection, "AdbcCreateAppend", "create_append")
+            .expect("create_append onto an existing table appends"),
+        Some(2)
+    );
+    assert_eq!(count_rows(&mut connection, "AdbcCreateAppend"), 4);
+    // The data columns read back even though the table also carries the synthetic key column.
+    let mut read_create_append = connection.new_statement().expect("new statement");
+    read_create_append
+        .set_sql_query("SELECT Id, Label FROM AdbcCreateAppend ORDER BY Id")
+        .unwrap();
+    let create_appended = read_create_append
+        .execute()
+        .expect("read create_append")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        create_appended.iter().map(|b| b.num_rows()).sum::<usize>(),
+        4
+    );
+    let mut drop_create_appended = connection.new_statement().expect("new statement");
+    drop_create_appended
+        .set_sql_query("DROP TABLE AdbcCreateAppend")
+        .unwrap();
+    drop_create_appended
+        .execute_update()
+        .expect("drop create_append table");
 
     // Parameterized query: bind @Id and read the matching row back.
     let param = RecordBatch::try_new(
