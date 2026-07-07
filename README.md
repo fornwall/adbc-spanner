@@ -83,13 +83,18 @@ db = adbc_driver_manager.AdbcDatabase(
 ## Usage
 
 Add the dependency (this crate plus the Arrow crates you consume results with). The crate is not
-yet on crates.io — it pins `google-cloud-*` to a git revision (see the note under *Type mapping*) —
-so depend on it via git until that pin is lifted:
+yet on crates.io — it pins both `google-cloud-*` and `adbc_core`/`adbc_ffi` (to a
+[`fornwall/arrow-adbc`](https://github.com/fornwall/arrow-adbc) fork) to git revisions (see the note
+under *Type mapping*) — so depend on it via git until those pins are lifted:
 
 ```toml
 [dependencies]
 adbc-spanner = { git = "https://github.com/fornwall/adbc-spanner", tag = "v0.5.0" }
-adbc_core = "0.23"
+# `adbc_core` must come from the SAME git source as `adbc-spanner`'s own dependency:
+# Cargo does not unify a git source with the crates.io registry, so a plain
+# `adbc_core = "0.23"` here would resolve to a *different*, incompatible `adbc_core`
+# than the traits `SpannerDriver` implements, and the quickstart would not compile.
+adbc_core = { git = "https://github.com/fornwall/arrow-adbc", rev = "786e7f3488eb71b200ece775b027a647cf42db9e" }
 arrow-array = "58"
 ```
 
@@ -209,8 +214,11 @@ the offending value rather than silently truncating or wrapping it.
 
 > **Note:** native `STRUCT` mapping needs `Type::struct_type()`, which is on `google-cloud-rust`
 > `main` but not yet in a crates.io release. Until it ships, `Cargo.toml` pins the `google-cloud-*`
-> crates to a git revision — so `adbc-spanner` cannot itself be published to crates.io in the
-> meantime (see the note in `Cargo.toml`).
+> crates to a git revision. `adbc_core`/`adbc_ffi` are likewise pinned to a
+> [`fornwall/arrow-adbc`](https://github.com/fornwall/arrow-adbc) fork carrying fixes not yet in the
+> `0.23` release. Either git pin means `adbc-spanner` cannot itself be published to crates.io in the
+> meantime, and downstream crates must take `adbc_core` from the same `arrow-adbc` git revision (see
+> the notes in `Cargo.toml`).
 
 ## Testing
 
