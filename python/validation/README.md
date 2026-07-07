@@ -28,28 +28,25 @@ instance/database, and runs pytest. It is **not wired into gating CI** (see stat
   and test classes and points `driver_path` at `target/debug/libadbc_spanner.*`.
 - `queries/spanner/` — Spanner-dialect **overrides** overlaid on the suite's base corpus (see below).
 
-## Status — dialect porting needed
+## Status
 
-The suite runs and the plumbing is solid (connection/metadata and many query cases pass), but its
-**base query corpus assumes a portable SQL dialect that Spanner diverges from**, so a chunk of the
-`type/*` cases currently error or fail. Three gaps, all addressable under `queries/spanner/`:
+The plumbing is solid (connection/metadata and many query cases pass). The suite's **base query
+corpus assumes a portable SQL dialect that Spanner diverges from**, so per-category
+`queries/spanner/` overrides are added incrementally.
 
-1. **Mandatory `PRIMARY KEY`.** Base setups like `CREATE TABLE t (idx INTEGER, res BIGINT)` are
-   rejected by Spanner (*"Must specify either table or column PRIMARY KEY"*). Each type case needs a
-   Spanner `setup_query` override.
-2. **Type names.** `INTEGER`/`BIGINT`/`VARCHAR` → Spanner `INT64`/`STRING(MAX)`/etc.
-3. **Named parameters.** The suite emits positional `$1`; Spanner is named-only. `bind_parameter`
-   already maps `$N` → `@pN`, but the driver binds a batch **column** to `@<column-name>`, so the
-   `type/bind/*` cases need the bind column renamed to `pN` (per-case override) or a driver-side
-   positional-binding enhancement.
+**`type/bind/*` is done** (all pass or `skip`): the driver binds parameters positionally when the
+bound column names don't match the query's `@names`, so no per-case column renaming is needed — each
+override just supplies a Spanner `setup_query` (mandatory `PRIMARY KEY`, native type names) and an
+explicit `INSERT` column list. Cases Spanner cannot round-trip are `skip`ped with a reason: narrower
+integers (read back as `INT64`), `DECIMAL(p,s)` (Spanner `NUMERIC` is fixed 38,9), `FLOAT` (cannot be
+a primary key), `TIME`-of-day / `float16` / `fixed_size_binary` / Arrow view types (no Spanner type),
+and timestamps outside Arrow's nanosecond range.
 
-Bulk **ingest** cases largely work as-is, because the driver builds the `INSERT` from the bound
-Arrow data's own column names.
+Still to port (the two remaining `type/*` families), each the same shape — a Spanner `setup_query`
+override (`PRIMARY KEY` + native type names) plus `skip`s for unsupported types:
 
-### Roadmap (incremental follow-up)
+- `queries/spanner/type/select/*`
+- `queries/spanner/type/ingest/*` (bulk-ingest cases largely work already — the driver builds the
+  `INSERT` from the bound data's column names — but their table DDL still needs the dialect override)
 
-- Add `queries/spanner/type/select/*` and `queries/spanner/type/ingest/*` `setup_query` overrides
-  (PRIMARY KEY + Spanner type names). Mark genuinely-unsupported Arrow types (`uint*`, `float16`,
-  time-of-day, `fixed_size_binary`, views) `skip`/`hide` in `query.toml`.
-- Decide on named-parameter binding: per-case bind overrides vs. a driver enhancement.
-- Once a category is green, flip it on and consider a gating CI job for that subset.
+Once a category is green, consider a gating CI job for that subset.

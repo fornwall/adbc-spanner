@@ -1,0 +1,3 @@
+// part: metadata
+
+skip = "Spanner has one 64-bit integer type; a bound INT32 reads back as INT64, not the case's narrower type"

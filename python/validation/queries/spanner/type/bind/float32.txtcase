@@ -1,0 +1,3 @@
+// part: metadata
+
+skip = "Spanner FLOAT32 columns cannot be primary keys, and the case's single-column bind table has no other key"

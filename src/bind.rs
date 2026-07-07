@@ -4,7 +4,8 @@
 //! column is one parameter, and each row is one set of bindings. Spanner uses **named** query
 //! parameters (`@name`), so a bind column named `id` binds to `@id` in the SQL.
 //!
-//! Supported Arrow parameter types are `Int64`, `Float64`, `Float32`, `Boolean`, `Utf8`/`LargeUtf8`,
+//! Supported Arrow parameter types are `Int16`/`Int32`/`Int64` (all → Spanner `INT64`), `Float64`,
+//! `Float32`, `Boolean`, `Utf8`/`LargeUtf8`,
 //! `Binary`/`LargeBinary`, `Date32` (→ `DATE`), `Timestamp` at any `TimeUnit`
 //! (Second/Millisecond/Microsecond/Nanosecond, → `TIMESTAMP`), `Decimal128` (→ `NUMERIC`), and
 //! their nulls. Other Arrow types are rejected with an `InvalidArguments` error.
@@ -27,8 +28,9 @@
 use adbc_core::error::Result;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    Date32Type, Decimal128Type, Float32Type, Float64Type, Int64Type, TimestampMicrosecondType,
-    TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType,
+    Date32Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+    TimestampSecondType,
 };
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, TimeUnit};
@@ -37,133 +39,202 @@ use google_cloud_spanner::statement::StatementBuilder;
 
 use crate::error::invalid_argument;
 
-/// Bind every column of `batch` at `row` as a named parameter on `builder`.
+/// Bind every column of `batch` at `row` as a parameter named after that column (`@<column-name>`).
+///
+/// Used where the parameter names are the column names by construction — bulk ingest builds
+/// `INSERT ... (@col, ...)` from the data's own columns. For binding a user query's parameters, use
+/// [`bind_params`], which also handles positional binding.
 pub(crate) fn bind_row(
     mut builder: StatementBuilder,
     batch: &RecordBatch,
     row: usize,
 ) -> Result<StatementBuilder> {
     for (i, field) in batch.schema().fields().iter().enumerate() {
-        let name = field.name().as_str();
-        let column = batch.column(i);
-        let is_null = column.is_null(row);
-        builder = match field.data_type() {
-            DataType::Int64 => {
-                let a = column.as_primitive::<Int64Type>();
-                bind_scalar(builder, name, is_null, || a.value(row))
-            }
-            DataType::Float64 => {
-                let a = column.as_primitive::<Float64Type>();
-                bind_scalar(builder, name, is_null, || a.value(row))
-            }
-            DataType::Float32 => {
-                let a = column.as_primitive::<Float32Type>();
-                bind_scalar(builder, name, is_null, || a.value(row))
-            }
-            DataType::Boolean => {
-                let a = column.as_boolean();
-                bind_scalar(builder, name, is_null, || a.value(row))
-            }
-            // `Utf8`/`LargeUtf8` differ only in offset width; both map to Spanner STRING. LargeUtf8
-            // is what Arrow-native producers commonly emit (e.g. `pyarrow.Table.from_pandas`).
-            DataType::Utf8 => {
-                let a = column.as_string::<i32>();
-                if is_null {
-                    builder.add_param(name, &None::<String>)
-                } else {
-                    builder.add_param(name, &a.value(row))
-                }
-            }
-            DataType::LargeUtf8 => {
-                let a = column.as_string::<i64>();
-                if is_null {
-                    builder.add_param(name, &None::<String>)
-                } else {
-                    builder.add_param(name, &a.value(row))
-                }
-            }
-            DataType::Binary => {
-                let a = column.as_binary::<i32>();
-                if is_null {
-                    builder.add_param(name, &None::<Vec<u8>>)
-                } else {
-                    builder.add_param(name, &a.value(row).to_vec())
-                }
-            }
-            DataType::LargeBinary => {
-                let a = column.as_binary::<i64>();
-                if is_null {
-                    builder.add_param(name, &None::<Vec<u8>>)
-                } else {
-                    builder.add_param(name, &a.value(row).to_vec())
-                }
-            }
-            DataType::Date32 => {
-                let a = column.as_primitive::<Date32Type>();
-                if is_null {
-                    builder.add_param(name, &None::<String>)
-                } else {
-                    // Arrow `Date32` is days since the Unix epoch; Spanner wants `YYYY-MM-DD`.
-                    let days = a.value(row);
-                    let date = NaiveDate::from_ymd_opt(1970, 1, 1)
-                        .unwrap()
-                        .checked_add_signed(Duration::days(i64::from(days)))
-                        .ok_or_else(|| {
-                            invalid_argument(format!(
-                                "cannot bind DATE parameter {name:?}: {days} is out of range"
-                            ))
-                        })?;
-                    builder.add_param(name, &date.format("%Y-%m-%d").to_string())
-                }
-            }
-            // Spanner `TIMESTAMP` is UTC with nanosecond precision, so every Arrow timestamp unit
-            // is accepted; the four arms differ only in the typed array they read the raw i64 from,
-            // and `timestamp_string` formats the Spanner value at the unit's full precision.
-            DataType::Timestamp(unit, _) => {
-                if is_null {
-                    builder.add_param(name, &None::<String>)
-                } else {
-                    let value = match unit {
-                        TimeUnit::Second => column.as_primitive::<TimestampSecondType>().value(row),
-                        TimeUnit::Millisecond => {
-                            column.as_primitive::<TimestampMillisecondType>().value(row)
-                        }
-                        TimeUnit::Microsecond => {
-                            column.as_primitive::<TimestampMicrosecondType>().value(row)
-                        }
-                        TimeUnit::Nanosecond => {
-                            column.as_primitive::<TimestampNanosecondType>().value(row)
-                        }
-                    };
-                    builder.add_param(name, &timestamp_string(name, unit, value)?)
-                }
-            }
-            DataType::Decimal128(_precision, scale) => {
-                let a = column.as_primitive::<Decimal128Type>();
-                if is_null {
-                    builder.add_param(name, &None::<String>)
-                } else {
-                    let scale =
-                        u32::try_from(*scale)
-                            .ok()
-                            .filter(|s| *s <= 38)
-                            .ok_or_else(|| {
-                                invalid_argument(format!(
-                            "cannot bind NUMERIC parameter {name:?}: unsupported scale {scale}"
-                        ))
-                            })?;
-                    // Format the full i128 directly; no narrower decimal type in the way.
-                    builder.add_param(name, &numeric_string(a.value(row), scale))
-                }
-            }
-            other => {
-                return Err(invalid_argument(format!(
-                    "cannot bind parameter {name:?}: unsupported Arrow type {other:?}"
-                )))
-            }
-        };
+        builder = bind_one(builder, field.name(), batch.column(i).as_ref(), row)?;
     }
     Ok(builder)
+}
+
+/// Bind the columns of `batch` at `row` to the parameters of `sql`.
+///
+/// ADBC's parameter model is a batch of columns matched to the query's parameters. This driver
+/// resolves the pairing two ways:
+///
+/// - **By name** (the historical behaviour): when every bound column's name is one of the query's
+///   `@name` parameters, each column binds to `@<its own name>`.
+/// - **Positionally** (the ADBC ordinal contract): otherwise the *i*-th column binds to the *i*-th
+///   distinct `@name` parameter in query order. This is what positional clients expect — most ADBC
+///   drivers (PostgreSQL, Snowflake, …) bind by position, and the Python DBAPI / validation suites
+///   pass parameters as `$1`/`?` with columns not named after the parameters.
+pub(crate) fn bind_params(
+    builder: StatementBuilder,
+    sql: &str,
+    batch: &RecordBatch,
+    row: usize,
+) -> Result<StatementBuilder> {
+    let names = resolve_parameter_names(sql, batch)?;
+    let mut builder = builder;
+    for (i, name) in names.iter().enumerate() {
+        builder = bind_one(builder, name, batch.column(i).as_ref(), row)?;
+    }
+    Ok(builder)
+}
+
+/// Work out which parameter name each column of `batch` binds to for `sql` (see [`bind_params`]).
+fn resolve_parameter_names(sql: &str, batch: &RecordBatch) -> Result<Vec<String>> {
+    let schema = batch.schema();
+    let column_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    let params = named_parameters(sql);
+    let param_set: std::collections::HashSet<&str> = params.iter().map(String::as_str).collect();
+
+    // Name mode: every bound column corresponds to a query parameter of the same name.
+    if !column_names.is_empty() && column_names.iter().all(|c| param_set.contains(c)) {
+        return Ok(column_names.iter().map(|c| (*c).to_string()).collect());
+    }
+
+    // Positional mode: i-th column -> i-th parameter. Counts must line up.
+    if params.len() != column_names.len() {
+        return Err(invalid_argument(format!(
+            "parameter count mismatch: query references {} parameter(s) {:?} but {} column(s) were bound",
+            params.len(),
+            params,
+            column_names.len(),
+        )));
+    }
+    Ok(params)
+}
+
+/// Bind a single `column` value at `row` as parameter `name`.
+fn bind_one(
+    builder: StatementBuilder,
+    name: &str,
+    column: &dyn Array,
+    row: usize,
+) -> Result<StatementBuilder> {
+    let is_null = column.is_null(row);
+    Ok(match column.data_type() {
+        DataType::Int64 => {
+            let a = column.as_primitive::<Int64Type>();
+            bind_scalar(builder, name, is_null, || a.value(row))
+        }
+        // Spanner's only integer type is INT64, so narrower Arrow ints widen to it.
+        DataType::Int32 => {
+            let a = column.as_primitive::<Int32Type>();
+            bind_scalar(builder, name, is_null, || i64::from(a.value(row)))
+        }
+        DataType::Int16 => {
+            let a = column.as_primitive::<Int16Type>();
+            bind_scalar(builder, name, is_null, || i64::from(a.value(row)))
+        }
+        DataType::Float64 => {
+            let a = column.as_primitive::<Float64Type>();
+            bind_scalar(builder, name, is_null, || a.value(row))
+        }
+        DataType::Float32 => {
+            let a = column.as_primitive::<Float32Type>();
+            bind_scalar(builder, name, is_null, || a.value(row))
+        }
+        DataType::Boolean => {
+            let a = column.as_boolean();
+            bind_scalar(builder, name, is_null, || a.value(row))
+        }
+        // `Utf8`/`LargeUtf8` differ only in offset width; both map to Spanner STRING. LargeUtf8
+        // is what Arrow-native producers commonly emit (e.g. `pyarrow.Table.from_pandas`).
+        DataType::Utf8 => {
+            let a = column.as_string::<i32>();
+            if is_null {
+                builder.add_param(name, &None::<String>)
+            } else {
+                builder.add_param(name, &a.value(row))
+            }
+        }
+        DataType::LargeUtf8 => {
+            let a = column.as_string::<i64>();
+            if is_null {
+                builder.add_param(name, &None::<String>)
+            } else {
+                builder.add_param(name, &a.value(row))
+            }
+        }
+        DataType::Binary => {
+            let a = column.as_binary::<i32>();
+            if is_null {
+                builder.add_param(name, &None::<Vec<u8>>)
+            } else {
+                builder.add_param(name, &a.value(row).to_vec())
+            }
+        }
+        DataType::LargeBinary => {
+            let a = column.as_binary::<i64>();
+            if is_null {
+                builder.add_param(name, &None::<Vec<u8>>)
+            } else {
+                builder.add_param(name, &a.value(row).to_vec())
+            }
+        }
+        DataType::Date32 => {
+            let a = column.as_primitive::<Date32Type>();
+            if is_null {
+                builder.add_param(name, &None::<String>)
+            } else {
+                // Arrow `Date32` is days since the Unix epoch; Spanner wants `YYYY-MM-DD`.
+                let days = a.value(row);
+                let date = NaiveDate::from_ymd_opt(1970, 1, 1)
+                    .unwrap()
+                    .checked_add_signed(Duration::days(i64::from(days)))
+                    .ok_or_else(|| {
+                        invalid_argument(format!(
+                            "cannot bind DATE parameter {name:?}: {days} is out of range"
+                        ))
+                    })?;
+                builder.add_param(name, &date.format("%Y-%m-%d").to_string())
+            }
+        }
+        // Spanner `TIMESTAMP` is UTC with nanosecond precision, so every Arrow timestamp unit
+        // is accepted; the four arms differ only in the typed array they read the raw i64 from,
+        // and `timestamp_string` formats the Spanner value at the unit's full precision.
+        DataType::Timestamp(unit, _) => {
+            if is_null {
+                builder.add_param(name, &None::<String>)
+            } else {
+                let value = match unit {
+                    TimeUnit::Second => column.as_primitive::<TimestampSecondType>().value(row),
+                    TimeUnit::Millisecond => {
+                        column.as_primitive::<TimestampMillisecondType>().value(row)
+                    }
+                    TimeUnit::Microsecond => {
+                        column.as_primitive::<TimestampMicrosecondType>().value(row)
+                    }
+                    TimeUnit::Nanosecond => {
+                        column.as_primitive::<TimestampNanosecondType>().value(row)
+                    }
+                };
+                builder.add_param(name, &timestamp_string(name, unit, value)?)
+            }
+        }
+        DataType::Decimal128(_precision, scale) => {
+            let a = column.as_primitive::<Decimal128Type>();
+            if is_null {
+                builder.add_param(name, &None::<String>)
+            } else {
+                let scale = u32::try_from(*scale)
+                    .ok()
+                    .filter(|s| *s <= 38)
+                    .ok_or_else(|| {
+                        invalid_argument(format!(
+                            "cannot bind NUMERIC parameter {name:?}: unsupported scale {scale}"
+                        ))
+                    })?;
+                // Format the full i128 directly; no narrower decimal type in the way.
+                builder.add_param(name, &numeric_string(a.value(row), scale))
+            }
+        }
+        other => {
+            return Err(invalid_argument(format!(
+                "cannot bind parameter {name:?}: unsupported Arrow type {other:?}"
+            )))
+        }
+    })
 }
 
 /// Bind a `Copy` scalar (or a typed null) as parameter `name`.
@@ -344,7 +415,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        Date32Array, Decimal128Array, Int32Array, LargeBinaryArray, LargeStringArray,
+        Date32Array, Decimal128Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
         TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
         TimestampSecondArray,
     };
@@ -352,6 +423,23 @@ mod tests {
     use google_cloud_spanner::statement::Statement;
 
     use super::*;
+
+    #[test]
+    fn binds_narrow_integers_as_int64() {
+        // Int16 / Int32 widen to Spanner INT64 (its only integer type).
+        let b = batch(
+            vec![
+                Field::new("a", DataType::Int16, true),
+                Field::new("b", DataType::Int32, true),
+            ],
+            vec![
+                Arc::new(arrow_array::Int16Array::from(vec![Some(7i16), None])),
+                Arc::new(Int32Array::from(vec![Some(9i32), None])),
+            ],
+        );
+        assert!(bind_row(Statement::builder("SELECT @a, @b"), &b, 0).is_ok());
+        assert!(bind_row(Statement::builder("SELECT @a, @b"), &b, 1).is_ok());
+    }
 
     #[test]
     fn builds_insert_sql() {
@@ -377,6 +465,57 @@ mod tests {
 
     fn batch(fields: Vec<Field>, columns: Vec<arrow_array::ArrayRef>) -> RecordBatch {
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+    }
+
+    fn int_batch(names: &[&str]) -> RecordBatch {
+        batch(
+            names
+                .iter()
+                .map(|n| Field::new(*n, DataType::Int64, false))
+                .collect(),
+            names
+                .iter()
+                .map(|_| Arc::new(Int64Array::from(vec![1])) as arrow_array::ArrayRef)
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn resolves_parameters_by_name_when_columns_match() {
+        // Every bound column names a query parameter -> bind by name, order-independent.
+        let b = int_batch(&["b", "a"]);
+        assert_eq!(
+            resolve_parameter_names("SELECT @a, @b", &b).unwrap(),
+            vec!["b", "a"],
+        );
+    }
+
+    #[test]
+    fn resolves_parameters_positionally_when_names_differ() {
+        // Columns not named after the parameters (as positional clients / the validation suite
+        // produce) -> i-th column binds to the i-th parameter in query order.
+        let b = int_batch(&["res", "other"]);
+        assert_eq!(
+            resolve_parameter_names("INSERT INTO t VALUES (@p1, @p2)", &b).unwrap(),
+            vec!["p1", "p2"],
+        );
+        // A single unmatched column still binds to the single parameter.
+        let one = int_batch(&["res"]);
+        assert_eq!(
+            resolve_parameter_names("INSERT INTO t VALUES (@p1)", &one).unwrap(),
+            vec!["p1"],
+        );
+    }
+
+    #[test]
+    fn positional_binding_rejects_count_mismatch() {
+        let b = int_batch(&["x", "y"]);
+        let err = resolve_parameter_names("SELECT @p1", &b).unwrap_err();
+        assert!(
+            err.message.contains("parameter count mismatch"),
+            "unexpected error: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -562,10 +701,10 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_arrow_type() {
-        // A type with no mapping (Int32 here) is still rejected, unchanged by the new arms.
+        // A type with no Spanner mapping (UInt64 — Spanner has no unsigned integer) is rejected.
         let b = batch(
-            vec![Field::new("x", DataType::Int32, false)],
-            vec![Arc::new(Int32Array::from(vec![1]))],
+            vec![Field::new("x", DataType::UInt64, false)],
+            vec![Arc::new(arrow_array::UInt64Array::from(vec![1u64]))],
         );
         assert!(bind_row(Statement::builder("SELECT @x"), &b, 0).is_err());
     }
