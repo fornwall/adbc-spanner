@@ -118,12 +118,17 @@ into the three `single_use()` call sites plus the partition path. Low–medium e
 
 ### ADBC conformance
 
-- **Ingest append doesn't use the spec-mandated error statuses** (`src/statement.rs:155-170`).
-  Missing table should be `Status::NotFound`, schema mismatch `Status::AlreadyExists`; today both
-  surface as generic mapped Spanner errors. The C++ validation quirks file already admits this
-  (`supports_error_on_incompatible_schema() { return false; }`), and `get_table_schema` already
-  implements the needed probe-and-remap pattern (`src/connection.rs:879-894`) — reuse it with
-  `table_exists` on the ingest error path.
+- ~~**Ingest append doesn't use the spec-mandated error statuses**~~ (`src/statement.rs`).
+  **Fixed.** On an `append`-mode ingest failure the driver now probes the target table (via the
+  shared `connection::table_exists` helper, extracted from the `get_table_schema` probe-and-remap so
+  the query is not duplicated) and remaps: a missing table → `Status::NotFound`, an existing table
+  (so the insert failed on an incompatible schema) → `Status::AlreadyExists`. A probe that itself
+  errors is surfaced rather than masked, and only the `append` path is remapped
+  (`create`/`create_append`/`replace` are untouched). The C++ validation quirks
+  `supports_error_on_incompatible_schema()` is flipped to `true`, and the upstream
+  `SpannerStatementTest.SqlIngestErrors` case now passes end-to-end against the emulator;
+  `tests/integration.rs` also covers append-on-missing-table (NotFound) and append-with-mismatched-
+  schema (AlreadyExists).
 - **Bulk ingest only triggers through `execute_update()`, not `execute()`**
   (`src/statement.rs:513-516`). An FFI caller doing ingest with a non-null stream out-pointer gets
   `InvalidState` ("no SQL query set") instead of an ingest + empty stream. Mirror the
@@ -172,9 +177,9 @@ into the three `single_use()` call sites plus the partition path. Low–medium e
 - **`adbc.connection.readonly` has zero tests** anywhere (four enforcement branches at
   `src/statement.rs:352, 529, 582, 606`). A regression silently allowing writes on a read-only
   connection would ship. Add an integration case covering allow/deny/toggle/round-trip.
-- **`create_append` ingest mode is never executed end-to-end**, nor are ingest error paths
-  (`create` on existing table, `append` on missing table, schema mismatch)
-  (`tests/integration.rs:770-775`).
+- **`create_append` ingest mode is never executed end-to-end**, nor is the `create`-on-existing-table
+  error path (`tests/integration.rs`). (The `append`-on-missing-table and schema-mismatch error paths
+  are now covered — see the ADBC-conformance fix above.)
 - **Resilience suite misses some likely production failures** (`tests/resilience.rs`):
   mid-stream disconnect after batches were consumed, latency/timeout toxics (nothing bounds the
   wait — building the commit-fault test confirmed the client marks all data-plane RPCs idempotent

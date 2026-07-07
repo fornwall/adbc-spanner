@@ -169,6 +169,49 @@ impl SpannerStatement {
         Ok(statements)
     }
 
+    /// Remap a failed `append`-mode bulk ingest onto the statuses the ADBC bulk-ingest contract
+    /// mandates.
+    ///
+    /// A successful (or, in manual-transaction mode, merely buffered) outcome is returned unchanged.
+    /// On failure the target table is probed via the shared [`table_exists`](crate::connection::table_exists)
+    /// query: a missing table becomes [`Status::NotFound`], and an existing table — so the insert
+    /// must have failed because the bound data's schema is incompatible with the table's — becomes
+    /// [`Status::AlreadyExists`]. Only these two cases are remapped; the original Spanner error's
+    /// detail is folded into the message. If the probe itself fails (e.g. a transport error) that
+    /// probe error is surfaced instead, so a genuine outage is not masked as a schema mismatch.
+    fn remap_ingest_append_error(
+        &self,
+        table: &str,
+        result: Result<Option<i64>>,
+    ) -> Result<Option<i64>> {
+        let error = match result {
+            Ok(count) => return Ok(count),
+            Err(error) => error,
+        };
+        // The ingest target is a bare table name (quoted whole when the DDL/DML is built), so it
+        // lives in Spanner's default (unnamed, empty-string) schema.
+        let exists =
+            crate::connection::table_exists(&self.runtime, &self.client, &self.cancel, "", table)?;
+        if exists {
+            Err(err(
+                format!(
+                    "bulk ingest append into table {table:?} failed: the bound data is \
+                     incompatible with the existing table's schema ({})",
+                    error.message
+                ),
+                Status::AlreadyExists,
+            ))
+        } else {
+            Err(err(
+                format!(
+                    "bulk ingest append target table {table:?} not found ({})",
+                    error.message
+                ),
+                Status::NotFound,
+            ))
+        }
+    }
+
     /// Build the DML statements to apply for `sql`: one per bound row for parameterized DML,
     /// otherwise a `;`-separated batch (e.g. dbt's `DELETE; INSERT`) split into individual
     /// statements so the whole batch is applied atomically. Shared by `execute` and `execute_update`.
@@ -588,12 +631,22 @@ impl Statement for SpannerStatement {
             // In the create/replace modes, first build the table from the ingest data's Arrow schema
             // (with a synthetic UUID primary key) — Spanner DDL runs immediately, before the inserts.
             let mode = self.ingest_mode.as_deref();
-            if let Some(ddl) = self.build_ingest_table_ddl(&table, mode)? {
+            let ingest_ddl = self.build_ingest_table_ddl(&table, mode)?;
+            // `append` (the default) is the only mode that inserts into a pre-existing table, so it
+            // is the only one whose failure the ADBC spec wants remapped to NotFound / AlreadyExists.
+            // `build_ingest_table_ddl` returns `None` for exactly that mode.
+            let is_append = ingest_ddl.is_none();
+            if let Some(ddl) = ingest_ddl {
                 self.run_ddl(ddl)?;
             }
             let statements = self.build_ingest_statements(&table)?;
             self.bound.clear();
-            return self.run_or_buffer(statements);
+            let result = self.run_or_buffer(statements);
+            return if is_append {
+                self.remap_ingest_append_error(&table, result)
+            } else {
+                result
+            };
         }
 
         let sql = self.sql()?;

@@ -144,7 +144,10 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   bool supports_statistics() const override { return true; }
   bool supports_cancel() const override { return true; }
   bool supports_dynamic_parameter_binding() const override { return true; }
-  bool supports_error_on_incompatible_schema() const override { return false; }
+  // The driver's bulk-ingest append path probes INFORMATION_SCHEMA on failure and remaps to the
+  // spec statuses (missing table -> NotFound, incompatible schema -> AlreadyExists), so the
+  // `SqlIngestErrors` case's incompatible-append assertion now holds.
+  bool supports_error_on_incompatible_schema() const override { return true; }
   bool supports_concurrent_statements() const override { return true; }
   bool supports_transactions() const override { return true; }
   // Spanner has a single, unnamed catalog and default schema (both "", which base
