@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: nothing in this workflow needs to write to the repository.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
