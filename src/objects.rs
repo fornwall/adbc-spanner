@@ -13,7 +13,7 @@ use adbc_core::schemas::GET_OBJECTS_SCHEMA;
 use arrow_array::{
     new_null_array, ArrayRef, Int32Array, ListArray, RecordBatch, StringArray, StructArray,
 };
-use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, FieldRef, Fields};
 
 use crate::error::err;
@@ -87,6 +87,18 @@ fn field(fields: &Fields, name: &str) -> FieldRef {
 /// Wrap `child` (one entry per element) into a `ListArray` grouping elements by `lengths`, one list
 /// per parent. All lists are non-null.
 fn list_of(item: FieldRef, lengths: &[usize], child: ArrayRef) -> Result<ArrayRef> {
+    list_of_nullable(item, lengths, child, None)
+}
+
+/// Like [`list_of`], but marks selected list entries null via `nulls` (a validity mask, one bool
+/// per entry — `false` = SQL NULL). A null entry still has a zero-length slice, so its `lengths`
+/// value must be 0.
+fn list_of_nullable(
+    item: FieldRef,
+    lengths: &[usize],
+    child: ArrayRef,
+    nulls: Option<NullBuffer>,
+) -> Result<ArrayRef> {
     let mut offsets = Vec::with_capacity(lengths.len() + 1);
     offsets.push(0i32);
     let mut acc = 0i32;
@@ -98,7 +110,7 @@ fn list_of(item: FieldRef, lengths: &[usize], child: ArrayRef) -> Result<ArrayRe
         item,
         OffsetBuffer::new(ScalarBuffer::from(offsets)),
         child,
-        None,
+        nulls,
     )
     .map_err(arrow_err)?;
     Ok(Arc::new(list))
@@ -270,8 +282,9 @@ fn build_constraint_struct(
     let column_lengths: Vec<usize> = constraints.iter().map(|c| c.columns.len()).collect();
     let constraint_column_names = list_of(name_item, &column_lengths, column_child)?;
 
-    // constraint_column_usage: one non-null list<struct> per constraint — the referenced (parent)
-    // columns for a foreign key, empty for everything else.
+    // constraint_column_usage: a list<struct> of the referenced (parent) columns for a FOREIGN KEY,
+    // and SQL NULL (not an empty list) for every other constraint type — matching the ADBC spec and
+    // what the driver validation suite expects for PRIMARY KEY / CHECK / UNIQUE constraints.
     let usage_field = field(constraint_fields, "constraint_column_usage");
     let usage_item = match usage_field.data_type() {
         DataType::List(item) => item.clone(),
@@ -284,7 +297,17 @@ fn build_constraint_struct(
     let flat_usages: Vec<&Usage> = constraints.iter().flat_map(|c| c.usages.iter()).collect();
     let usage_struct = build_usage_struct(&usage_fields, &flat_usages);
     let usage_lengths: Vec<usize> = constraints.iter().map(|c| c.usages.len()).collect();
-    let constraint_column_usage = list_of(usage_item, &usage_lengths, usage_struct)?;
+    // Only FOREIGN KEY constraints carry a usage list; the rest are NULL.
+    let usage_valid: Vec<bool> = constraints
+        .iter()
+        .map(|c| c.constraint_type == "FOREIGN KEY")
+        .collect();
+    let constraint_column_usage = list_of_nullable(
+        usage_item,
+        &usage_lengths,
+        usage_struct,
+        Some(NullBuffer::from(usage_valid)),
+    )?;
 
     let arrays: Vec<ArrayRef> = constraint_fields
         .iter()
@@ -400,5 +423,44 @@ mod tests {
             .downcast_ref::<ListArray>()
             .unwrap();
         assert!(schemas.is_null(0));
+    }
+
+    #[test]
+    fn constraint_column_usage_is_null_for_non_foreign_keys() {
+        // The sample has one PRIMARY KEY (no usages) and one FOREIGN KEY (one usage). The usage
+        // list must be NULL for the primary key and a non-null single-element list for the FK.
+        let batch = build(ObjectDepth::All, sample()).unwrap();
+        let list = |a: &dyn Array| a.as_any().downcast_ref::<ListArray>().unwrap().value(0);
+        let strukt = |a: ArrayRef| a.as_any().downcast_ref::<StructArray>().unwrap().clone();
+        let child = |s: &StructArray, name: &str| s.column_by_name(name).unwrap().clone();
+
+        let schemas = strukt(list(batch.column(1).as_ref()));
+        let tables = strukt(list(child(&schemas, "db_schema_tables").as_ref()));
+        let constraints_list = child(&tables, "table_constraints");
+        let constraints = constraints_list
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .value(0);
+        let constraints = constraints.as_any().downcast_ref::<StructArray>().unwrap();
+
+        let ctype = constraints
+            .column_by_name("constraint_type")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let usage = constraints
+            .column_by_name("constraint_column_usage")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+
+        assert_eq!(ctype.value(0), "PRIMARY KEY");
+        assert!(usage.is_null(0), "PRIMARY KEY usage must be NULL, not []");
+        assert_eq!(ctype.value(1), "FOREIGN KEY");
+        assert!(usage.is_valid(1));
+        assert_eq!(usage.value(1).len(), 1);
     }
 }

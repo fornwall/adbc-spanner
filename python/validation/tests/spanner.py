@@ -25,22 +25,20 @@ class SpannerQuirks(model.DriverQuirks):
         connection_transactions=True,
         get_objects=True,
         # The constraint-setup DDL hook (sample_ddl_constraints below) is implemented
-        # and the driver reports the constraints faithfully, but the two constraint
-        # tests themselves cannot pass yet, so they stay gated off:
+        # and the driver reports the constraints faithfully. _primary now passes (the
+        # driver reports constraint_column_usage as NULL for non-FK constraints); only
+        # _foreign stays gated off:
         # - _foreign: Spanner mandates a primary key on every table (even
         #   `PRIMARY KEY ()` still yields a PK_<table> row in
         #   INFORMATION_SCHEMA.TABLE_CONSTRAINTS), so the FK tables report the PK
         #   constraint alongside the FK where the suite asserts exactly one
         #   constraint per table.
-        # - _primary: the driver reports constraint_column_usage as an empty list
-        #   for non-FK constraints; the suite expects null there (a small driver
-        #   change would fix this).
         # Everything else the tests assert matches what the driver reports: the FK
         # shapes are exact, and declared key order is preserved (PRIMARY KEY (b, a)
         # reports ["b", "a"], FOREIGN KEY (c, b) reports ["c", "b"]), so the
         # quirk_get_objects_constraints_*_normalized defaults (False) are correct.
         get_objects_constraints_foreign=False,
-        get_objects_constraints_primary=False,
+        get_objects_constraints_primary=True,
         statement_bind=True,
         statement_bulk_ingest=True,
         statement_execute_schema=True,
