@@ -11,7 +11,7 @@ A Python [ADBC](https://arrow.apache.org/adbc/) driver for **Google Cloud Spanne
 It bundles the prebuilt native driver (a Rust cdylib) and exposes it through
 [`adbc_driver_manager`](https://pypi.org/project/adbc-driver-manager/), so you
 get a standard DBAPI 2.0 connection whose results come back as Apache Arrow —
-ready for pandas, polars, DuckDB, or PyArrow with no per-row conversion.
+ready for pandas, polars, DuckDB, or PyArrow without a per-row Python conversion step.
 
 ## Install
 
@@ -85,7 +85,7 @@ Two things to know:
   `conn.commit()`** (or pass `autocommit=True`). Reads need neither.
 - The DataFrame / Arrow paths need the `[dbapi]` extra (pyarrow).
 
-**pyarrow — zero-copy Arrow:**
+**pyarrow — results as a native Arrow table:**
 
 ```python
 import adbc_driver_spanner.dbapi as spanner
