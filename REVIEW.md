@@ -368,10 +368,25 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   notes and the aws-lc build-per-arch/NASM sentence were corrected to match while in there.
 - **The two git-pin revs are spread across ~9 dependency lines** plus `deny.toml` plus docs, with
   no single anchor for the scheduled "revert when upstream releases" edit.
-- **`connection.rs` (1050 lines) owns the query half of `get_objects`/`get_statistics`** while
+- ~~**`connection.rs` (1050 lines) owns the query half of `get_objects`/`get_statistics`** while
   `objects.rs`/`statistics.rs` hold only the Arrow-assembly half — split along the wrong axis.
   Move the INFORMATION_SCHEMA collectors into their feature modules. (`bind.rs` at 1359 lines is
-  fine — ~600 lines are tests and the rest is one cohesive concern.)
+  fine — ~600 lines are tests and the rest is one cohesive concern.)~~ **Fixed.** The
+  INFORMATION_SCHEMA collectors now live in the feature modules alongside their Arrow-assembly half,
+  so each module owns both halves. `collect_objects` and all its grouping/assembly helpers
+  (`group_tables`/`group_columns`/`group_constraints`/`group_key_columns`/`group_referential`,
+  `collect_columns`/`collect_constraints`/`foreign_key_usages`, plus the `TableRow`/`ColumnRow`/
+  `ConstraintRow`/`KeyColumnRow`/`ReferentialMap` row types) moved to `src/objects.rs`;
+  `collect_statistics`, `table_statistics` and `is_groupable` moved to `src/statistics.rs`. Both
+  were converted from `SpannerConnection` methods to `pub(crate)` free functions taking the inputs
+  they used (`runtime`/`client`/`cancel`, plus `read_staleness` for statistics), and `get_objects`/
+  `get_statistics` now call `crate::objects::collect_objects` / `crate::statistics::collect_statistics`.
+  The two low-level INFORMATION_SCHEMA primitives shared by both features — `query_batch` and
+  `str_col` — stay in `connection.rs` (now `pub(crate)`), as does `like_match` (also used by the
+  catalog-filter fast paths). Identical SQL, identical grouping/ordering (`ORDER BY`-preserving
+  per-group `Vec`s) and identical output — a pure no-behavior structural move, verified by the full
+  unit + emulator integration suites (including `get_statistics_reports_real_counts` and the
+  `get_objects` conformance test).
 
 ### Docs
 

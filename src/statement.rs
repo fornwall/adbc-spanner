@@ -807,6 +807,17 @@ impl Statement for SpannerStatement {
         Ok((*schema).clone())
     }
 
+    /// Partition this query and return one opaque descriptor per partition, to be executed later by
+    /// `Connection::read_partition`.
+    ///
+    /// # Security
+    ///
+    /// Each returned descriptor is **opaque but executable**: it is serde-JSON of the client's
+    /// `Partition`, carrying the SQL text (inside its `ExecuteSqlRequest`) plus the session and
+    /// transaction identity. Anyone who can hand a descriptor to `Connection::read_partition` can
+    /// run arbitrary SQL with that connection's credentials — the blob is not authenticated. Treat
+    /// descriptors as executable request blobs, not opaque data:
+    /// transport them only over trusted channels and never accept one from an untrusted source.
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
         // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
         self.cancel.reset();

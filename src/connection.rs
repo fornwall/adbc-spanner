@@ -28,14 +28,14 @@
 //!   failure the usual Spanner caveat applies — the commit may have landed, so a replay can apply
 //!   the batch twice unless the DML is idempotent.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection, OptionValue};
 use adbc_core::{Connection, Optionable};
 use arrow_array::{
-    Array, ArrayRef, Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
+    Array, ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema};
 use google_cloud_spanner::batch::Partition;
@@ -137,184 +137,6 @@ impl SpannerConnection {
         Ok(())
     }
 
-    /// Query `INFORMATION_SCHEMA` and assemble the schema→table→column hierarchy for `get_objects`,
-    /// applying the ADBC `LIKE`/type filters and the requested depth.
-    fn collect_objects(
-        &self,
-        depth: ObjectDepth,
-        db_schema: Option<&str>,
-        table_name: Option<&str>,
-        table_type: &Option<Vec<&str>>,
-        column_name: Option<&str>,
-    ) -> Result<Vec<crate::objects::DbSchema>> {
-        let populate_tables = matches!(
-            depth,
-            ObjectDepth::All | ObjectDepth::Tables | ObjectDepth::Columns
-        );
-        let populate_columns = matches!(depth, ObjectDepth::All | ObjectDepth::Columns);
-        let client = self.client.clone();
-
-        let (
-            schema_batch,
-            table_batch,
-            column_batch,
-            constraint_batch,
-            key_column_batch,
-            referential_batch,
-        ) = block_on_cancellable(&self.runtime, &self.cancel, async move {
-            let schemas = query_batch(
-                &client,
-                "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA",
-            )
-            .await?;
-            let tables = if populate_tables {
-                Some(
-                    query_batch(
-                        &client,
-                        "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES",
-                    )
-                    .await?,
-                )
-            } else {
-                None
-            };
-            let columns = if populate_columns {
-                Some(
-                    query_batch(
-                        &client,
-                        "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, IS_NULLABLE \
-                         FROM INFORMATION_SCHEMA.COLUMNS \
-                         ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION",
-                    )
-                    .await?,
-                )
-            } else {
-                None
-            };
-            // Constraints (primary/foreign/unique/check) and their key columns, populated at the
-            // same depth as columns. KEY_COLUMN_USAGE covers the key-based constraints; its rows are
-            // ordered so each constraint's columns come out in key order. For foreign keys,
-            // REFERENTIAL_CONSTRAINTS maps the FK to the referenced unique/primary-key constraint,
-            // whose own KEY_COLUMN_USAGE rows give the referenced (parent) columns in order — the
-            // ordering CONSTRAINT_COLUMN_USAGE does not preserve.
-            let (constraints, key_columns, referential) = if populate_columns {
-                (
-                    Some(
-                        query_batch(
-                            &client,
-                            "SELECT TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE \
-                             FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS",
-                        )
-                        .await?,
-                    ),
-                    Some(
-                        query_batch(
-                            &client,
-                            "SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, TABLE_SCHEMA, TABLE_NAME, \
-                             COLUMN_NAME, CAST(ORDINAL_POSITION AS STRING), \
-                             CAST(POSITION_IN_UNIQUE_CONSTRAINT AS STRING) \
-                             FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE \
-                             ORDER BY CONSTRAINT_SCHEMA, CONSTRAINT_NAME, ORDINAL_POSITION",
-                        )
-                        .await?,
-                    ),
-                    Some(
-                        query_batch(
-                            &client,
-                            "SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, UNIQUE_CONSTRAINT_SCHEMA, \
-                             UNIQUE_CONSTRAINT_NAME \
-                             FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS",
-                        )
-                        .await?,
-                    ),
-                )
-            } else {
-                (None, None, None)
-            };
-            Ok::<_, Error>((
-                schemas,
-                tables,
-                columns,
-                constraints,
-                key_columns,
-                referential,
-            ))
-        })?;
-
-        let schema_names = str_col(&schema_batch, 0)?;
-
-        // Group each INFORMATION_SCHEMA batch ONCE into lookup maps keyed by (schema, table) — and
-        // the key/referential batches by (constraint_schema, constraint_name) — so the assembly
-        // below is a series of hash lookups rather than a full rescan of each batch per table (which
-        // was quadratic for large schemas). This mirrors `collect_statistics`. The per-group `Vec`s
-        // keep batch (i.e. `ORDER BY`) order, so column and key-column ordering is preserved exactly.
-        let tables_by_schema = match &table_batch {
-            Some(batch) => group_tables(batch)?,
-            None => HashMap::new(),
-        };
-        let columns_by_table = match &column_batch {
-            Some(batch) => group_columns(batch)?,
-            None => HashMap::new(),
-        };
-        let constraints_by_table = match &constraint_batch {
-            Some(batch) => group_constraints(batch)?,
-            None => HashMap::new(),
-        };
-        let key_columns_by_constraint = match &key_column_batch {
-            Some(batch) => group_key_columns(batch)?,
-            None => HashMap::new(),
-        };
-        let referential_by_constraint = match &referential_batch {
-            Some(batch) => group_referential(batch)?,
-            None => HashMap::new(),
-        };
-
-        let mut result = Vec::new();
-        for i in 0..schema_batch.num_rows() {
-            let schema_name = schema_names.value(i);
-            if db_schema.is_some_and(|p| !like_match(p, schema_name)) {
-                continue;
-            }
-            let mut tables = Vec::new();
-            // `tables_by_schema` is empty unless tables were populated, so this yields no tables at
-            // schema-only depth — matching the previous `if let Some(&table_batch)` guard.
-            for table in tables_by_schema.get(schema_name).into_iter().flatten() {
-                let name = table.name;
-                if table_name.is_some_and(|p| !like_match(p, name)) {
-                    continue;
-                }
-                let ttype = table.table_type.to_string();
-                if table_type
-                    .as_ref()
-                    .is_some_and(|types| !types.iter().any(|t| *t == ttype))
-                {
-                    continue;
-                }
-                // Empty maps (columns/constraints not populated at this depth) yield empty lists,
-                // matching the previous depth-gated `match` arms.
-                let columns = collect_columns(&columns_by_table, schema_name, name, column_name);
-                let constraints = collect_constraints(
-                    &constraints_by_table,
-                    &key_columns_by_constraint,
-                    &referential_by_constraint,
-                    schema_name,
-                    name,
-                );
-                tables.push(crate::objects::Table {
-                    name: name.to_string(),
-                    table_type: ttype,
-                    columns,
-                    constraints,
-                });
-            }
-            result.push(crate::objects::DbSchema {
-                name: schema_name.to_string(),
-                tables,
-            });
-        }
-        Ok(result)
-    }
-
     /// Whether a table exists, via a parameterized `INFORMATION_SCHEMA.TABLES` lookup. The default
     /// (unnamed) schema is the empty string in Spanner. Delegates to the shared [`table_exists`]
     /// probe so the same query serves the connection's introspection and the statement's ingest
@@ -328,158 +150,6 @@ impl SpannerConnection {
             table_name,
         )
     }
-
-    /// Compute exact statistics for the base tables matching the `LIKE` filters: `ROW_COUNT` per
-    /// table, and `NULL_COUNT` (+ `DISTINCT_COUNT` for groupable types) per column.
-    fn collect_statistics(
-        &self,
-        db_schema: Option<&str>,
-        table_name: Option<&str>,
-    ) -> Result<Vec<crate::statistics::SchemaStatistics>> {
-        let client = self.client.clone();
-        let (table_batch, column_batch) =
-            block_on_cancellable(&self.runtime, &self.cancel, async move {
-                let tables = query_batch(
-                    &client,
-                    "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
-                     WHERE TABLE_TYPE = 'BASE TABLE'",
-                )
-                .await?;
-                let columns = query_batch(
-                    &client,
-                    "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, SPANNER_TYPE \
-                     FROM INFORMATION_SCHEMA.COLUMNS \
-                     ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION",
-                )
-                .await?;
-                Ok::<_, Error>((tables, columns))
-            })?;
-
-        let (ts, tn) = (str_col(&table_batch, 0)?, str_col(&table_batch, 1)?);
-        let (cts, ctn, ccn, ctype) = (
-            str_col(&column_batch, 0)?,
-            str_col(&column_batch, 1)?,
-            str_col(&column_batch, 2)?,
-            str_col(&column_batch, 3)?,
-        );
-
-        // Group the COLUMNS rows by (schema, table) in one pass: (column name, whether its type is
-        // groupable → distinct-countable). The ORDER BY keeps each group in ordinal order.
-        let mut columns_by_table: HashMap<(&str, &str), Vec<(String, bool)>> = HashMap::new();
-        for c in 0..column_batch.num_rows() {
-            columns_by_table
-                .entry((cts.value(c), ctn.value(c)))
-                .or_default()
-                .push((ccn.value(c).to_string(), is_groupable(ctype.value(c))));
-        }
-
-        let mut schemas: Vec<crate::statistics::SchemaStatistics> = Vec::new();
-        for r in 0..table_batch.num_rows() {
-            let schema = ts.value(r);
-            let table = tn.value(r);
-            if db_schema.is_some_and(|p| !like_match(p, schema)) {
-                continue;
-            }
-            if table_name.is_some_and(|p| !like_match(p, table)) {
-                continue;
-            }
-            let columns = columns_by_table
-                .remove(&(schema, table))
-                .unwrap_or_default();
-            let stats = self.table_statistics(schema, table, &columns)?;
-            match schemas.iter_mut().find(|s| s.db_schema == schema) {
-                Some(s) => s.statistics.extend(stats),
-                None => schemas.push(crate::statistics::SchemaStatistics {
-                    db_schema: schema.to_string(),
-                    statistics: stats,
-                }),
-            }
-        }
-        Ok(schemas)
-    }
-
-    /// Run one aggregate scan over `table`, returning its `ROW_COUNT` and per-column `NULL_COUNT`
-    /// (and `DISTINCT_COUNT` for groupable columns).
-    fn table_statistics(
-        &self,
-        schema: &str,
-        table: &str,
-        columns: &[(String, bool)],
-    ) -> Result<Vec<crate::statistics::Statistic>> {
-        use adbc_core::constants::{
-            ADBC_STATISTIC_DISTINCT_COUNT_KEY, ADBC_STATISTIC_NULL_COUNT_KEY,
-            ADBC_STATISTIC_ROW_COUNT_KEY,
-        };
-
-        // Build one SELECT computing every count in a single scan; `plan` maps each result column
-        // after the row count to its (column, statistic key).
-        let mut exprs = vec!["COUNT(*)".to_string()];
-        let mut plan: Vec<(String, i16)> = Vec::new();
-        for (name, groupable) in columns {
-            let quoted = crate::bind::quote_ident(name);
-            exprs.push(format!("COUNTIF({quoted} IS NULL)"));
-            plan.push((name.clone(), ADBC_STATISTIC_NULL_COUNT_KEY));
-            if *groupable {
-                exprs.push(format!("COUNT(DISTINCT {quoted})"));
-                plan.push((name.clone(), ADBC_STATISTIC_DISTINCT_COUNT_KEY));
-            }
-        }
-        let sql = format!(
-            "SELECT {} FROM {}",
-            exprs.join(", "),
-            qualified_table(Some(schema), table)
-        );
-        let client = self.client.clone();
-        // The aggregate scans the user table, so honour the connection's read staleness.
-        let bound = self.read_staleness.timestamp_bound()?;
-        let batch = block_on_cancellable(&self.runtime, &self.cancel, async move {
-            let transaction = crate::staleness::single_use(&client, bound);
-            let result_set = transaction
-                .execute_query(SpannerSql::builder(sql).build())
-                .await
-                .map_err(from_spanner)?;
-            let (_schema, batch) = result_set_to_batch(result_set).await?;
-            Ok::<_, Error>(batch)
-        })?;
-
-        // The aggregate query always yields exactly one row of `Int64` counts.
-        let value = |index: usize| -> Result<i64> {
-            batch
-                .column(index)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .filter(|a| a.len() == 1)
-                .map(|a| a.value(0))
-                .ok_or_else(|| {
-                    err(
-                        "statistic aggregate is not a single integer",
-                        Status::Internal,
-                    )
-                })
-        };
-        let mut out = vec![crate::statistics::Statistic {
-            table: table.to_string(),
-            column: None,
-            key: ADBC_STATISTIC_ROW_COUNT_KEY,
-            value: value(0)?,
-        }];
-        for (index, (column, key)) in plan.into_iter().enumerate() {
-            out.push(crate::statistics::Statistic {
-                table: table.to_string(),
-                column: Some(column),
-                key,
-                value: value(index + 1)?,
-            });
-        }
-        Ok(out)
-    }
-}
-
-/// Whether a Spanner column type supports `COUNT(DISTINCT)`. `ARRAY`, `STRUCT` and `JSON` are not
-/// groupable, so distinct counts are skipped for them.
-fn is_groupable(spanner_type: &str) -> bool {
-    let t = spanner_type.trim_start();
-    !(t.starts_with("ARRAY") || t.starts_with("STRUCT") || t == "JSON")
 }
 
 /// Apply the connection's isolation level to a read/write transaction runner builder.
@@ -611,8 +281,9 @@ pub(crate) fn table_exists(
     })
 }
 
-/// Run a query and return its single materialised record batch.
-async fn query_batch(client: &DatabaseClient, sql: &str) -> Result<RecordBatch> {
+/// Run a query and return its single materialised record batch. Shared with the `INFORMATION_SCHEMA`
+/// collectors in [`crate::objects`] and [`crate::statistics`].
+pub(crate) async fn query_batch(client: &DatabaseClient, sql: &str) -> Result<RecordBatch> {
     let transaction = client.single_use().build();
     let result_set = transaction
         .execute_query(SpannerSql::builder(sql).build())
@@ -622,7 +293,9 @@ async fn query_batch(client: &DatabaseClient, sql: &str) -> Result<RecordBatch> 
     Ok(batch)
 }
 
-fn str_col(batch: &RecordBatch, index: usize) -> Result<&StringArray> {
+/// Extract column `index` of an `INFORMATION_SCHEMA` batch as a [`StringArray`]. Shared with the
+/// collectors in [`crate::objects`] and [`crate::statistics`].
+pub(crate) fn str_col(batch: &RecordBatch, index: usize) -> Result<&StringArray> {
     batch
         .column(index)
         .as_any()
@@ -633,267 +306,6 @@ fn str_col(batch: &RecordBatch, index: usize) -> Result<&StringArray> {
                 Status::Internal,
             )
         })
-}
-
-/// One grouped `INFORMATION_SCHEMA.TABLES` row (per schema group).
-struct TableRow<'a> {
-    name: &'a str,
-    table_type: &'a str,
-}
-
-/// Maps each foreign key's (constraint_schema, constraint_name) to the referenced constraint's
-/// (unique_schema, unique_name), grouped once from `REFERENTIAL_CONSTRAINTS`.
-type ReferentialMap<'a> = HashMap<(&'a str, &'a str), (&'a str, &'a str)>;
-
-/// One grouped `INFORMATION_SCHEMA.COLUMNS` row (per (schema, table) group, in ordinal order).
-struct ColumnRow<'a> {
-    name: &'a str,
-    ordinal: i32,
-    nullable: bool,
-}
-
-/// One grouped `INFORMATION_SCHEMA.TABLE_CONSTRAINTS` row (per (schema, table) group).
-struct ConstraintRow<'a> {
-    name: &'a str,
-    constraint_type: &'a str,
-}
-
-/// One grouped `INFORMATION_SCHEMA.KEY_COLUMN_USAGE` row (per (constraint_schema, constraint_name)
-/// group, in `ORDINAL_POSITION` order). `position` is `POSITION_IN_UNIQUE_CONSTRAINT`, null except
-/// for foreign-key columns.
-struct KeyColumnRow<'a> {
-    column: &'a str,
-    table_schema: &'a str,
-    table: &'a str,
-    ordinal: &'a str,
-    position: Option<&'a str>,
-}
-
-/// Group `INFORMATION_SCHEMA.TABLES` rows by `TABLE_SCHEMA`, preserving batch order within a schema.
-fn group_tables(batch: &RecordBatch) -> Result<HashMap<&str, Vec<TableRow<'_>>>> {
-    let (ts, tn, tt) = (str_col(batch, 0)?, str_col(batch, 1)?, str_col(batch, 2)?);
-    let mut map: HashMap<&str, Vec<TableRow>> = HashMap::new();
-    for r in 0..batch.num_rows() {
-        map.entry(ts.value(r)).or_default().push(TableRow {
-            name: tn.value(r),
-            table_type: tt.value(r),
-        });
-    }
-    Ok(map)
-}
-
-/// Group `INFORMATION_SCHEMA.COLUMNS` rows by (schema, table); each group keeps ordinal order (the
-/// query's `ORDER BY`).
-fn group_columns(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<ColumnRow<'_>>>> {
-    let (ts, tn, cn, nul) = (
-        str_col(batch, 0)?,
-        str_col(batch, 1)?,
-        str_col(batch, 2)?,
-        str_col(batch, 4)?,
-    );
-    let ordinal = batch
-        .column(3)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| err("ORDINAL_POSITION is not an integer", Status::Internal))?;
-    let mut map: HashMap<(&str, &str), Vec<ColumnRow>> = HashMap::new();
-    for r in 0..batch.num_rows() {
-        map.entry((ts.value(r), tn.value(r)))
-            .or_default()
-            .push(ColumnRow {
-                name: cn.value(r),
-                ordinal: ordinal.value(r) as i32,
-                nullable: nul.value(r).eq_ignore_ascii_case("YES"),
-            });
-    }
-    Ok(map)
-}
-
-/// Group `INFORMATION_SCHEMA.TABLE_CONSTRAINTS` rows by (schema, table).
-fn group_constraints(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<ConstraintRow<'_>>>> {
-    let (ts, tn, cn, ct) = (
-        str_col(batch, 0)?,
-        str_col(batch, 1)?,
-        str_col(batch, 2)?,
-        str_col(batch, 3)?,
-    );
-    let mut map: HashMap<(&str, &str), Vec<ConstraintRow>> = HashMap::new();
-    for r in 0..batch.num_rows() {
-        map.entry((ts.value(r), tn.value(r)))
-            .or_default()
-            .push(ConstraintRow {
-                name: cn.value(r),
-                constraint_type: ct.value(r),
-            });
-    }
-    Ok(map)
-}
-
-/// Group `INFORMATION_SCHEMA.KEY_COLUMN_USAGE` rows by (constraint_schema, constraint_name); each
-/// group keeps `ORDINAL_POSITION` order (the query's `ORDER BY`).
-fn group_key_columns(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<KeyColumnRow<'_>>>> {
-    // 0 CONSTRAINT_SCHEMA, 1 CONSTRAINT_NAME, 2 TABLE_SCHEMA, 3 TABLE_NAME, 4 COLUMN_NAME,
-    // 5 ORDINAL_POSITION, 6 POSITION_IN_UNIQUE_CONSTRAINT.
-    let (kcs, kcn, kts, ktn, kcol, kord, kpos) = (
-        str_col(batch, 0)?,
-        str_col(batch, 1)?,
-        str_col(batch, 2)?,
-        str_col(batch, 3)?,
-        str_col(batch, 4)?,
-        str_col(batch, 5)?,
-        str_col(batch, 6)?,
-    );
-    let mut map: HashMap<(&str, &str), Vec<KeyColumnRow>> = HashMap::new();
-    for r in 0..batch.num_rows() {
-        map.entry((kcs.value(r), kcn.value(r)))
-            .or_default()
-            .push(KeyColumnRow {
-                column: kcol.value(r),
-                table_schema: kts.value(r),
-                table: ktn.value(r),
-                ordinal: kord.value(r),
-                position: if kpos.is_null(r) {
-                    None
-                } else {
-                    Some(kpos.value(r))
-                },
-            });
-    }
-    Ok(map)
-}
-
-/// Group `INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS` by (constraint_schema, constraint_name),
-/// mapping each foreign key to its referenced (unique_schema, unique_name). Keeps the first row per
-/// key, matching the previous `find`.
-fn group_referential(batch: &RecordBatch) -> Result<ReferentialMap<'_>> {
-    // 0 CONSTRAINT_SCHEMA, 1 CONSTRAINT_NAME, 2 UNIQUE_CONSTRAINT_SCHEMA, 3 UNIQUE_CONSTRAINT_NAME.
-    let (rcs, rcn, rus, run) = (
-        str_col(batch, 0)?,
-        str_col(batch, 1)?,
-        str_col(batch, 2)?,
-        str_col(batch, 3)?,
-    );
-    let mut map: ReferentialMap = HashMap::new();
-    for r in 0..batch.num_rows() {
-        map.entry((rcs.value(r), rcn.value(r)))
-            .or_insert_with(|| (rus.value(r), run.value(r)));
-    }
-    Ok(map)
-}
-
-/// Collect the columns of one table from the pre-grouped `COLUMNS` map, applying the `LIKE` filter.
-fn collect_columns<'a>(
-    columns_by_table: &HashMap<(&'a str, &'a str), Vec<ColumnRow<'a>>>,
-    schema: &'a str,
-    table: &'a str,
-    filter: Option<&str>,
-) -> Vec<crate::objects::Column> {
-    let mut columns = Vec::new();
-    for column in columns_by_table.get(&(schema, table)).into_iter().flatten() {
-        if filter.is_some_and(|p| !like_match(p, column.name)) {
-            continue;
-        }
-        columns.push(crate::objects::Column {
-            name: column.name.to_string(),
-            ordinal: column.ordinal,
-            nullable: column.nullable,
-        });
-    }
-    columns
-}
-
-/// Assemble the constraints for one table from the pre-grouped `TABLE_CONSTRAINTS`,
-/// `KEY_COLUMN_USAGE` and `REFERENTIAL_CONSTRAINTS` maps. Each constraint's key columns come out in
-/// key order (the `KEY_COLUMN_USAGE` group keeps `ORDINAL_POSITION` order); check/... constraints
-/// have no key columns and get an empty list.
-fn collect_constraints<'a>(
-    constraints_by_table: &HashMap<(&'a str, &'a str), Vec<ConstraintRow<'a>>>,
-    key_columns_by_constraint: &HashMap<(&'a str, &'a str), Vec<KeyColumnRow<'a>>>,
-    referential_by_constraint: &ReferentialMap<'a>,
-    schema: &'a str,
-    table: &'a str,
-) -> Vec<crate::objects::Constraint> {
-    let mut out = Vec::new();
-    for constraint in constraints_by_table
-        .get(&(schema, table))
-        .into_iter()
-        .flatten()
-    {
-        let name = constraint.name;
-        // Columns for this constraint, in key order (the group keeps ORDINAL_POSITION order);
-        // check/... constraints have no key columns and get an empty list.
-        let columns = key_columns_by_constraint
-            .get(&(schema, name))
-            .into_iter()
-            .flatten()
-            .map(|k| k.column.to_string())
-            .collect();
-        let constraint_type = constraint.constraint_type.to_string();
-        let usages = if constraint_type == "FOREIGN KEY" {
-            foreign_key_usages(
-                key_columns_by_constraint,
-                referential_by_constraint,
-                schema,
-                name,
-            )
-        } else {
-            Vec::new()
-        };
-        out.push(crate::objects::Constraint {
-            name: Some(name.to_string()),
-            constraint_type,
-            columns,
-            usages,
-        });
-    }
-    out
-}
-
-/// The referenced (parent) columns of one foreign key, in the same order as its own key columns.
-///
-/// `CONSTRAINT_COLUMN_USAGE` lists the referenced columns but does not preserve order, so instead:
-/// find the referenced unique constraint via `REFERENTIAL_CONSTRAINTS`, index its key columns by
-/// ordinal, then walk the FK's own columns (ordered) mapping each through
-/// `POSITION_IN_UNIQUE_CONSTRAINT` to the referenced column at that ordinal.
-fn foreign_key_usages<'a>(
-    key_columns_by_constraint: &HashMap<(&'a str, &'a str), Vec<KeyColumnRow<'a>>>,
-    referential_by_constraint: &ReferentialMap<'a>,
-    schema: &'a str,
-    fk_name: &'a str,
-) -> Vec<crate::objects::Usage> {
-    // The referenced unique/primary-key constraint.
-    let Some(&(unique_schema, unique_name)) = referential_by_constraint.get(&(schema, fk_name))
-    else {
-        return Vec::new();
-    };
-
-    // Index the referenced constraint's key columns by ordinal position.
-    let referenced: HashMap<i64, &KeyColumnRow> = key_columns_by_constraint
-        .get(&(unique_schema, unique_name))
-        .into_iter()
-        .flatten()
-        .filter_map(|k| Some((k.ordinal.parse::<i64>().ok()?, k)))
-        .collect();
-
-    // Walk the FK's own columns in key order, mapping each to its referenced column.
-    let mut fk_columns: Vec<(i64, i64)> = key_columns_by_constraint
-        .get(&(schema, fk_name))
-        .into_iter()
-        .flatten()
-        .filter_map(|k| Some((k.ordinal.parse().ok()?, k.position?.parse().ok()?)))
-        .collect();
-    fk_columns.sort_by_key(|&(ordinal, _)| ordinal);
-
-    fk_columns
-        .into_iter()
-        .filter_map(|(_, position)| {
-            referenced.get(&position).map(|k| crate::objects::Usage {
-                db_schema: k.table_schema.to_string(),
-                table: k.table.to_string(),
-                column: k.column.to_string(),
-            })
-        })
-        .collect()
 }
 
 /// Match an ADBC `LIKE` pattern (`%` = any run, `_` = one char) against a value, case-sensitively.
@@ -1119,8 +531,16 @@ impl Connection for SpannerConnection {
         if catalog.is_some_and(|c| !like_match(c, "")) {
             return Ok(Box::new(RecordBatchIterator::new(Vec::new(), out_schema)));
         }
-        let schemas =
-            self.collect_objects(depth, db_schema, table_name, &table_type, column_name)?;
+        let schemas = crate::objects::collect_objects(
+            &self.runtime,
+            &self.client,
+            &self.cancel,
+            depth,
+            db_schema,
+            table_name,
+            &table_type,
+            column_name,
+        )?;
         let batch = crate::objects::build(depth, schemas)?;
         Ok(Box::new(RecordBatchIterator::new(
             vec![Ok(batch)],
@@ -1223,7 +643,14 @@ impl Connection for SpannerConnection {
         let schemas = if approximate {
             Vec::new()
         } else {
-            self.collect_statistics(db_schema, table_name)?
+            crate::statistics::collect_statistics(
+                &self.runtime,
+                &self.client,
+                &self.cancel,
+                &self.read_staleness,
+                db_schema,
+                table_name,
+            )?
         };
         let batch = crate::statistics::build(schemas, out_schema.clone())?;
         Ok(Box::new(RecordBatchIterator::new(
@@ -1268,6 +695,19 @@ impl Connection for SpannerConnection {
         Ok(())
     }
 
+    /// Execute a partition descriptor produced by `Statement::execute_partitions` and stream its
+    /// rows as Arrow.
+    ///
+    /// # Security
+    ///
+    /// A partition descriptor is **opaque but executable**: it is serde-JSON of the client's
+    /// `Partition`, whose inner `ExecuteSqlRequest` carries the SQL text itself along with the
+    /// session and transaction identity. `read_partition` runs whatever that blob contains against
+    /// this connection's `DatabaseClient`, with **this connection's credentials** — so a crafted
+    /// descriptor executes arbitrary SQL as the connection's principal. This is inherent to ADBC's
+    /// portable-descriptor design and the upstream serde format, and there is no in-band
+    /// authentication of the blob. Treat a descriptor as an executable request, not as opaque data:
+    /// transport it only over trusted channels and **never accept one from an untrusted source**.
     fn read_partition(
         &self,
         partition: impl AsRef<[u8]>,
