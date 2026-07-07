@@ -445,9 +445,15 @@ contradicting the strict-decode policy of the scalar arms (`src/conversion.rs:46
 `:493-513`); ~~`parse_int64`'s f64 fallback loses precision above 2^53 (`conversion.rs:527-532` —
 better removed)~~ (**Fixed.** the f64 fallback is gone — `parse_int64` now only accepts the JSON
 string encoding Spanner actually uses for `INT64`, so every `i64` round-trips exactly and a JSON
-number is a loud decode error instead of a silently-rounded value); `is_dml_returning`'s documented
+number is a loud decode error instead of a silently-rounded value); ~~`is_dml_returning`'s documented
 false positive (`CASE WHEN c THEN return …`)
-hard-errors valid DML in manual mode (`src/ddl.rs:49` + `src/statement.rs:289-295`); `read_only`
+hard-errors valid DML in manual mode (`src/ddl.rs:49` + `src/statement.rs:289-295`)~~ (**Fixed.**
+the scan now tracks `CASE`/`END` nesting depth — using the same quote/comment-aware lexer — and
+only recognises `THEN` followed by `RETURN` at depth zero, since GoogleSQL's `THEN RETURN` clause
+only appears at the top level at the end of a DML statement; a CASE branch expression that is a
+column literally named `return` no longer trips the check, while a genuine top-level `THEN RETURN`
+after a CASE expression is still detected. Unit-tested for nested CASE, mixed case, comments,
+`THEN RETURN`/`CASE` inside literals and quoted identifiers, and unbalanced `END`); `read_only`
 is snapshotted into statements at creation, so flipping the connection option leaves existing
 statements writable (`src/connection.rs:792-801` — flagged independently by correctness,
 conformance and maintainability; share via `SharedTxn`/`AtomicBool`); the autocommit-enable path

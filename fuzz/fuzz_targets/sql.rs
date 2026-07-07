@@ -22,9 +22,12 @@ fuzz_target!(|sql: String| {
         }
     }
 
-    // DDL detection must not panic on the whole batch or any individual statement.
+    // DDL / `THEN RETURN` detection must not panic on the whole batch or any individual
+    // statement (`is_dml_returning` walks the same lexer with `CASE`/`END` depth tracking).
     let _ = adbc_spanner::fuzzing::is_ddl(&sql);
+    let _ = adbc_spanner::fuzzing::is_dml_returning(&sql);
     for statement in &statements {
         let _ = adbc_spanner::fuzzing::is_ddl(statement);
+        let _ = adbc_spanner::fuzzing::is_dml_returning(statement);
     }
 });

@@ -41,30 +41,41 @@ pub(crate) fn is_dml(sql: &str) -> bool {
 /// (`INSERT`/`UPDATE`/`DELETE ... THEN RETURN <columns>`).
 ///
 /// Scans word tokens outside string/identifier literals and comments (the same lexical rules as
-/// [`split_statements`]) for the keyword `THEN` immediately followed by `RETURN`, case-insensitively.
-/// A `CASE WHEN … THEN …` whose branch expression happens to be a column named `return` is a
-/// (harmless) false positive: the caller then routes the DML through the read/write
-/// `execute_query` path, which executes plain DML just as correctly — it merely returns zero rows
-/// and reports the affected-row count from the result-set stats.
+/// [`split_statements`]) for the keyword `THEN` immediately followed by `RETURN`,
+/// case-insensitively — but only at `CASE` expression nesting depth zero. GoogleSQL's `THEN
+/// RETURN` clause appears only at the top level, at the end of a DML statement; a `THEN` inside a
+/// `CASE WHEN … THEN … END` expression belongs to the CASE, so a branch expression that is a
+/// column literally named `return` (`RETURN` is not a reserved keyword) must not match. `CASE` and
+/// `END` are tracked as a nesting depth (`END` only closes `CASE` in GoogleSQL expressions);
+/// quoted identifiers and literals never affect the depth, and an unbalanced `END` (invalid SQL)
+/// saturates at zero rather than underflowing.
 pub(crate) fn is_dml_returning(sql: &str) -> bool {
     let mut previous_was_then = false;
+    let mut case_depth = 0usize;
     let mut word = String::new();
     let mut chars = sql.chars().peekable();
-    let check_word = |word: &mut String, previous_was_then: &mut bool| -> bool {
-        if word.is_empty() {
-            return false;
-        }
-        let matched = *previous_was_then && word.eq_ignore_ascii_case("RETURN");
-        *previous_was_then = word.eq_ignore_ascii_case("THEN");
-        word.clear();
-        matched
-    };
+    let check_word =
+        |word: &mut String, previous_was_then: &mut bool, case_depth: &mut usize| -> bool {
+            if word.is_empty() {
+                return false;
+            }
+            let matched =
+                *previous_was_then && *case_depth == 0 && word.eq_ignore_ascii_case("RETURN");
+            *previous_was_then = word.eq_ignore_ascii_case("THEN");
+            if word.eq_ignore_ascii_case("CASE") {
+                *case_depth += 1;
+            } else if word.eq_ignore_ascii_case("END") {
+                *case_depth = case_depth.saturating_sub(1);
+            }
+            word.clear();
+            matched
+        };
     while let Some(c) = chars.next() {
         match c {
             '\'' | '"' | '`' => {
                 // The raw-prefix check must read `word` before `check_word` clears it.
                 let raw = c != '`' && is_raw_prefix(&word);
-                if check_word(&mut word, &mut previous_was_then) {
+                if check_word(&mut word, &mut previous_was_then, &mut case_depth) {
                     return true;
                 }
                 // A quoted literal/identifier resets the keyword window.
@@ -72,7 +83,7 @@ pub(crate) fn is_dml_returning(sql: &str) -> bool {
                 consume_quoted(&mut chars, c, raw, |_| {});
             }
             '-' if chars.peek() == Some(&'-') => {
-                if check_word(&mut word, &mut previous_was_then) {
+                if check_word(&mut word, &mut previous_was_then, &mut case_depth) {
                     return true;
                 }
                 for ch in chars.by_ref() {
@@ -82,7 +93,7 @@ pub(crate) fn is_dml_returning(sql: &str) -> bool {
                 }
             }
             '#' => {
-                if check_word(&mut word, &mut previous_was_then) {
+                if check_word(&mut word, &mut previous_was_then, &mut case_depth) {
                     return true;
                 }
                 for ch in chars.by_ref() {
@@ -92,7 +103,7 @@ pub(crate) fn is_dml_returning(sql: &str) -> bool {
                 }
             }
             '/' if chars.peek() == Some(&'*') => {
-                if check_word(&mut word, &mut previous_was_then) {
+                if check_word(&mut word, &mut previous_was_then, &mut case_depth) {
                     return true;
                 }
                 chars.next(); // '*'
@@ -106,13 +117,13 @@ pub(crate) fn is_dml_returning(sql: &str) -> bool {
             }
             _ if c == '_' || c.is_ascii_alphanumeric() => word.push(c),
             _ => {
-                if check_word(&mut word, &mut previous_was_then) {
+                if check_word(&mut word, &mut previous_was_then, &mut case_depth) {
                     return true;
                 }
             }
         }
     }
-    check_word(&mut word, &mut previous_was_then)
+    check_word(&mut word, &mut previous_was_then, &mut case_depth)
 }
 
 /// Whether `word` — the identifier run immediately (adjacently) before a quote — is a GoogleSQL
@@ -437,6 +448,10 @@ mod tests {
             "INSERT INTO t (s) VALUES ('''THEN RETURN''')",
             r"INSERT INTO t (s) VALUES (r'THEN RETURN\')",
             "UPDATE t SET `then return` = 1 WHERE true",
+            // `THEN RETURN` inside a comment is not a clause.
+            "UPDATE t SET a = 1 /* THEN RETURN */ WHERE true",
+            "UPDATE t SET a = 1 WHERE true -- THEN RETURN",
+            "UPDATE t SET a = 1 WHERE true # THEN RETURN",
             // Adjacent words, not the two keywords.
             "UPDATE t SET a = thenreturn WHERE true",
             "UPDATE t SET a = x_then WHERE return_value = 1",
@@ -446,6 +461,46 @@ mod tests {
         ] {
             assert!(!is_dml_returning(sql), "should not detect: {sql}");
         }
+    }
+
+    #[test]
+    fn then_return_ignores_case_expression_branches() {
+        // `RETURN` is not a reserved GoogleSQL keyword, so a CASE branch expression can be a
+        // column literally named `return`. The `THEN` there belongs to the CASE, not a top-level
+        // `THEN RETURN` clause — misdetecting it hard-errors valid DML in manual transaction mode.
+        for sql in [
+            "UPDATE t SET x = CASE WHEN c THEN return ELSE 0 END WHERE true",
+            "update t set x = case when c then RETURN else 0 end where true",
+            // Searched and multi-branch forms.
+            "UPDATE t SET x = CASE y WHEN 1 THEN return END WHERE true",
+            "UPDATE t SET x = CASE WHEN a THEN return WHEN b THEN return ELSE return END \
+             WHERE true",
+            // Nested CASE: the inner branch is still inside the outer CASE.
+            "UPDATE t SET x = CASE WHEN a THEN CASE WHEN b THEN return END END WHERE true",
+            // A comment between the CASE's THEN and the branch expression changes nothing.
+            "UPDATE t SET x = CASE WHEN c THEN /* pick */ return ELSE 0 END WHERE true",
+        ] {
+            assert!(!is_dml_returning(sql), "CASE branch, not a clause: {sql}");
+        }
+        // A genuine top-level `THEN RETURN` *after* a CASE expression in the same statement must
+        // still be detected — the depth is back to zero once the CASE closes.
+        for sql in [
+            "UPDATE t SET x = CASE WHEN c THEN 1 ELSE 0 END WHERE true THEN RETURN x",
+            "UPDATE t SET x = CASE WHEN c THEN return ELSE 0 END WHERE true THEN RETURN x",
+            "UPDATE t SET x = CASE WHEN a THEN CASE WHEN b THEN 2 END ELSE 0 END WHERE true \
+             then return *",
+            // `CASE` inside a literal or quoted identifier must not open a depth level (which
+            // would suppress the real clause); `END`/`case` likewise must not close/open one.
+            "UPDATE t SET s = 'CASE' WHERE true THEN RETURN s",
+            "UPDATE t SET `case` = 1 WHERE true THEN RETURN `case`",
+        ] {
+            assert!(is_dml_returning(sql), "top-level clause after CASE: {sql}");
+        }
+        // An unbalanced `END` (invalid SQL) saturates at depth zero instead of underflowing, so a
+        // following top-level clause is still seen.
+        assert!(is_dml_returning(
+            "UPDATE t SET a = b END WHERE true THEN RETURN a"
+        ));
     }
 
     #[test]

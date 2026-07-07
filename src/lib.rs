@@ -108,6 +108,10 @@ pub mod fuzzing {
     pub fn is_ddl(sql: &str) -> bool {
         crate::ddl::is_ddl(sql)
     }
+    /// Whether the SQL contains a top-level `THEN RETURN` clause.
+    pub fn is_dml_returning(sql: &str) -> bool {
+        crate::ddl::is_dml_returning(sql)
+    }
     /// Parse a Spanner `DATE` string into Arrow `Date32` days.
     pub fn parse_date_days(s: &str) -> Option<i32> {
         crate::conversion::parse_date_days(s)
