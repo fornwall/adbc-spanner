@@ -520,7 +520,14 @@ set-false/round-trip/set-true-fails assertions in the ingest section of `tests/i
 `get_info` could report a vendor version instead of null; the upstream `adbc_ffi` shim
 rejects 1.0.0 driver managers and errors on unknown `get_info` codes (both stricter than the C
 spec — upstream issues, worth tracking); no `sqlstate` on errors (a coarse mapping would help
-ODBC bridges); `get_table_schema` ignores the catalog argument entirely; `get_objects` at
+ODBC bridges); ~~`get_table_schema` ignores the catalog argument entirely~~ (**Fixed.**
+`get_table_schema` now validates its catalog argument via a pure `check_lookup_catalog` helper in
+`src/connection.rs`: `None` and `Some("")` — Spanner's single, unnamed catalog — behave as before,
+while any other catalog name fails with `NotFound` (nothing can exist in a catalog Spanner doesn't
+have, matching the missing-table status). Covered by an offline unit test
+(`lookup_catalog_accepts_only_the_default_empty_catalog`) plus new `Some("")`-still-works /
+bogus-catalog-is-NotFound assertions in the `get_table_schema` section of
+`tests/integration.rs`); `get_objects` at
 `Catalogs` depth still runs the SCHEMATA query; `execute_schema` lets DML through to a PLAN probe
 whose read-only-transaction error is surfaced raw.
 
