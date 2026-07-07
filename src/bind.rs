@@ -5,9 +5,13 @@
 //! parameters (`@name`), so a bind column named `id` binds to `@id` in the SQL.
 //!
 //! Supported Arrow parameter types are `Int64`, `Float64`, `Float32`, `Boolean`, `Utf8`/`LargeUtf8`,
-//! `Binary`/`LargeBinary`, `Date32` (→ `DATE`), `Timestamp(Microsecond)` (→ `TIMESTAMP`),
-//! `Decimal128` (→ `NUMERIC`), and their nulls. Other Arrow types are rejected with an
-//! `InvalidArguments` error.
+//! `Binary`/`LargeBinary`, `Date32` (→ `DATE`), `Timestamp` at any `TimeUnit`
+//! (Second/Millisecond/Microsecond/Nanosecond, → `TIMESTAMP`), `Decimal128` (→ `NUMERIC`), and
+//! their nulls. Other Arrow types are rejected with an `InvalidArguments` error.
+//!
+//! Spanner `TIMESTAMP` has microsecond precision, so a `Timestamp` parameter of any unit is
+//! normalised to microseconds since the epoch before binding; sub-microsecond digits (from a
+//! `Nanosecond` input) are truncated toward zero, matching the read path.
 //!
 //! Spanner encodes `DATE` / `TIMESTAMP` / `NUMERIC` values on the wire as strings, and query
 //! parameters are sent untyped (Spanner infers the type from the SQL). So these three are formatted
@@ -18,6 +22,7 @@ use adbc_core::error::Result;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     Date32Type, Decimal128Type, Float32Type, Float64Type, Int64Type, TimestampMicrosecondType,
+    TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType,
 };
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, TimeUnit};
@@ -105,18 +110,26 @@ pub(crate) fn bind_row(
                     builder.add_param(name, &date.format("%Y-%m-%d").to_string())
                 }
             }
-            DataType::Timestamp(TimeUnit::Microsecond, _) => {
-                let a = column.as_primitive::<TimestampMicrosecondType>();
+            // Spanner `TIMESTAMP` is UTC with microsecond precision, so every Arrow timestamp unit
+            // is accepted; the four arms differ only in the typed array they read the raw i64 from,
+            // and `timestamp_string` scales it to microseconds and formats the Spanner value.
+            DataType::Timestamp(unit, _) => {
                 if is_null {
                     builder.add_param(name, &None::<String>)
                 } else {
-                    let micros = a.value(row);
-                    let ts = DateTime::<Utc>::from_timestamp_micros(micros).ok_or_else(|| {
-                        invalid_argument(format!(
-                            "cannot bind TIMESTAMP parameter {name:?}: {micros} is out of range"
-                        ))
-                    })?;
-                    builder.add_param(name, &ts.to_rfc3339_opts(SecondsFormat::Micros, true))
+                    let value = match unit {
+                        TimeUnit::Second => column.as_primitive::<TimestampSecondType>().value(row),
+                        TimeUnit::Millisecond => {
+                            column.as_primitive::<TimestampMillisecondType>().value(row)
+                        }
+                        TimeUnit::Microsecond => {
+                            column.as_primitive::<TimestampMicrosecondType>().value(row)
+                        }
+                        TimeUnit::Nanosecond => {
+                            column.as_primitive::<TimestampNanosecondType>().value(row)
+                        }
+                    };
+                    builder.add_param(name, &timestamp_string(name, unit, value)?)
                 }
             }
             DataType::Decimal128(_precision, scale) => {
@@ -163,6 +176,28 @@ where
     } else {
         builder.add_param(name, &value())
     }
+}
+
+/// Convert an Arrow timestamp `value` in `unit` to the Spanner `TIMESTAMP` wire form — an RFC 3339
+/// string in UTC with microsecond precision, the same shape the read path parses back
+/// (`conversion::parse_timestamp_micros`).
+///
+/// Spanner stores microseconds, so the value is first normalised to microseconds since the Unix
+/// epoch: a `Nanosecond` input is divided by 1000, truncating any sub-microsecond digits toward
+/// zero (Spanner cannot represent them). `name` is used only for the out-of-range error message.
+fn timestamp_string(name: &str, unit: &TimeUnit, value: i64) -> Result<String> {
+    let micros = match unit {
+        TimeUnit::Second => value * 1_000_000,
+        TimeUnit::Millisecond => value * 1_000,
+        TimeUnit::Microsecond => value,
+        TimeUnit::Nanosecond => value / 1_000,
+    };
+    let ts = DateTime::<Utc>::from_timestamp_micros(micros).ok_or_else(|| {
+        invalid_argument(format!(
+            "cannot bind TIMESTAMP parameter {name:?}: {micros} is out of range"
+        ))
+    })?;
+    Ok(ts.to_rfc3339_opts(SecondsFormat::Micros, true))
 }
 
 /// Format an unscaled `Decimal128` value at the given scale as a plain decimal string, exact across
@@ -289,7 +324,8 @@ mod tests {
 
     use arrow_array::{
         Date32Array, Decimal128Array, Int32Array, LargeBinaryArray, LargeStringArray,
-        TimestampMicrosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
     };
     use arrow_schema::{Field, Schema};
     use google_cloud_spanner::statement::Statement;
@@ -342,6 +378,75 @@ mod tests {
             ],
         );
         assert!(bind_row(Statement::builder("SELECT @d, @t, @n"), &b, 0).is_ok());
+    }
+
+    #[test]
+    fn timestamp_string_truncates_all_units_to_micros() {
+        // Microsecond is the baseline: 2024-01-15T12:34:56.789012Z.
+        let micros = 1_705_322_096_789_012i64;
+        let expected = "2024-01-15T12:34:56.789012Z";
+        assert_eq!(
+            timestamp_string("t", &TimeUnit::Microsecond, micros).unwrap(),
+            expected
+        );
+        // Nanosecond: the extra sub-microsecond digits (…012_999 ns) are truncated toward zero, so
+        // the bound value equals the microsecond-truncated instant, not a rounded one.
+        assert_eq!(
+            timestamp_string("t", &TimeUnit::Nanosecond, micros * 1_000 + 999).unwrap(),
+            expected
+        );
+        // Millisecond and Second scale up to the same instant (at their coarser precision).
+        assert_eq!(
+            timestamp_string("t", &TimeUnit::Millisecond, 1_705_322_096_789).unwrap(),
+            "2024-01-15T12:34:56.789000Z"
+        );
+        assert_eq!(
+            timestamp_string("t", &TimeUnit::Second, 1_705_322_096).unwrap(),
+            "2024-01-15T12:34:56.000000Z"
+        );
+        // A negative nanosecond value truncates toward zero as well (integer division).
+        assert_eq!(
+            timestamp_string("t", &TimeUnit::Nanosecond, -1).unwrap(),
+            "1970-01-01T00:00:00.000000Z"
+        );
+    }
+
+    #[test]
+    fn binds_timestamp_at_every_unit() {
+        // Every Arrow TimestampArray unit binds without error (nanosecond, millisecond, second all
+        // previously fell through to the unsupported-type rejection).
+        let ns = 1_705_322_096_789_012_999i64;
+        let b = batch(
+            vec![
+                Field::new("s", DataType::Timestamp(TimeUnit::Second, None), false),
+                Field::new("m", DataType::Timestamp(TimeUnit::Millisecond, None), false),
+                Field::new(
+                    "n",
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                    false,
+                ),
+            ],
+            vec![
+                Arc::new(TimestampSecondArray::from(vec![1_705_322_096])),
+                Arc::new(TimestampMillisecondArray::from(vec![1_705_322_096_789])),
+                Arc::new(TimestampNanosecondArray::from(vec![ns]).with_timezone("UTC")),
+            ],
+        );
+        assert!(bind_row(Statement::builder("SELECT @s, @m, @n"), &b, 0).is_ok());
+    }
+
+    #[test]
+    fn binds_null_nanosecond_timestamp() {
+        // A null nanosecond timestamp binds as a typed NULL, like the other temporal types.
+        let b = batch(
+            vec![Field::new(
+                "n",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            )],
+            vec![Arc::new(TimestampNanosecondArray::from(vec![None::<i64>]))],
+        );
+        assert!(bind_row(Statement::builder("SELECT @n"), &b, 0).is_ok());
     }
 
     #[test]
