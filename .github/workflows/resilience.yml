@@ -26,6 +26,12 @@ jobs:
     name: Resilience harness (emulator + Toxiproxy, non-gating)
     runs-on: ubuntu-latest
 
+    # `with-toxiproxy.sh` exports TOXIPROXY_URL / SPANNER_EMULATOR_HOST for the test; this makes the
+    # `toxi()` gate panic instead of self-skipping if that wiring ever breaks, so the resilience
+    # suite can't pass vacuously. Inherited by the cargo-test subprocess the script spawns.
+    env:
+      ADBC_TEST_REQUIRE_TARGET: "1"
+
     steps:
       - uses: actions/checkout@v7
 
