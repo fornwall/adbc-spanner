@@ -1,0 +1,5 @@
+// Spanner override: native FLOAT64 cast (Spanner has no DOUBLE PRECISION keyword).
+
+// part: query
+
+SELECT CAST(3.14159265358979 AS FLOAT64) AS res
