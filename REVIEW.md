@@ -366,8 +366,17 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   full six-target matrix (linux x86-64/aarch64, macOS arm64, macOS x86-64 **cross-compiled** on the
   arm64 runner, windows x86-64, windows aarch64 native). The Releasing / Python / ground-truth-source
   notes and the aws-lc build-per-arch/NASM sentence were corrected to match while in there.
-- **The two git-pin revs are spread across ~9 dependency lines** plus `deny.toml` plus docs, with
-  no single anchor for the scheduled "revert when upstream releases" edit.
+- ~~**The two git-pin revs are spread across ~9 dependency lines** plus `deny.toml` plus docs, with
+  no single anchor for the scheduled "revert when upstream releases" edit.~~ **Fixed.** CLAUDE.md's
+  "Temporary git pins" section now carries a *Revert checklist — the single anchor* subsection: the
+  one place that lists both current rev SHAs (`google-cloud-rust` `3872d28…`, `fornwall/arrow-adbc`
+  `786e7f3…`), enumerates every location to edit in lockstep when reverting a family to a versioned
+  crates.io release (each `Cargo.toml` `[dependencies]`/`[dev-dependencies]` line grouped by family,
+  `deny.toml`'s `allow-git`, the `README.md` quickstart + notes, and the `publish = false` release
+  gate), and states the invariant that the three arrow-adbc crates (`adbc_core`/`adbc_ffi`/
+  `adbc_driver_manager`) must share ONE rev (as the six `google-cloud-*` crates do). A one-line
+  pointer comment at the top of `Cargo.toml`'s `[dependencies]`, next to the first pinned dependency,
+  directs the maintainer to that checklist, keeping a single source of truth.
 - ~~**`connection.rs` (1050 lines) owns the query half of `get_objects`/`get_statistics`** while
   `objects.rs`/`statistics.rs` hold only the Arrow-assembly half — split along the wrong axis.
   Move the INFORMATION_SCHEMA collectors into their feature modules. (`bind.rs` at 1359 lines is
