@@ -577,8 +577,22 @@ docs.rs)~~ (**Fixed.** `ci.yml` now has a dedicated `cargo test --doc --all-feat
 the unit tests, and the docs step runs `cargo doc --no-deps --all-features` to match docs.rs);
 keyfile/impersonation auth is offline-unit-tested only, never exercised end-to-end;
 weak assertions (`AdbcDdl` note value unchecked, `replace`-ingest values unchecked, only row
-counts); untested small surfaces: `rollback()` without a transaction, `get_statistic_names`,
-`read_partition` with a garbage descriptor (also a natural fuzz target), `Connection::cancel`;
+counts); ~~untested small surfaces: `rollback()` without a transaction, `get_statistic_names`,
+`read_partition` with a garbage descriptor (also a natural fuzz target), `Connection::cancel`~~
+(**Fixed.** All four are covered. `rollback()` in autocommit mode asserts `InvalidState`, and in
+manual mode with nothing buffered it is a no-op that keeps the connection in manual mode
+(`rollback_without_a_transaction_is_invalid_state`). `get_statistic_names` asserts the canonical
+`GET_STATISTIC_NAMES_SCHEMA` — with the field names/types also spelled out — and zero batches
+(`get_statistic_names_is_empty_and_correctly_typed`). The partition-descriptor decode was factored
+into a pure `decode_partition` helper in `src/connection.rs` (behavior unchanged) so the rejection
+path is unit-tested offline against empty / non-JSON / truncated / wrong-shape-JSON inputs
+(`garbage_partition_descriptors_error_cleanly`), and the same inputs go through
+`Connection::read_partition` end-to-end (`read_partition_rejects_garbage_descriptors`) — all
+`InvalidArguments`, no panic, no RPC. `Connection::cancel` is covered deterministically by
+`connection_cancel_is_sticky_until_the_next_operation`, mirroring the statement-level test: a
+cancel latched *between* `read_partition` chunk fetches cancels the next fetch, statements on the
+same connection are unaffected (own signal), and the connection's next operation resets the latch.
+All but the offline decode test live in `tests/integration.rs`.);
 fuzz gaps: statement-hint parsing (`first_keyword` — this exact code had a real bug),
 `strip_trailing_terminators`, parameter-name extraction, `quote_ident`, partition-descriptor
 deserialization; `tests/resilience.rs` mutates process env in setup — safe only under

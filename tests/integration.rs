@@ -3445,3 +3445,267 @@ fn readonly_connection_rejects_writes() {
         )
         .expect("disable readonly again");
 }
+
+/// `rollback()` without an active manual transaction — i.e. in autocommit mode, the default — is
+/// an `InvalidState` error, while `rollback()` inside a manual transaction with nothing buffered
+/// is a harmless no-op that discards nothing and keeps the connection in manual mode.
+#[test]
+fn rollback_without_a_transaction_is_invalid_state() {
+    use adbc_core::error::Status;
+
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping rollback_without_a_transaction");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    // Autocommit (the default): there is no transaction to roll back.
+    let error = connection
+        .rollback()
+        .expect_err("rollback in autocommit mode must fail");
+    assert_eq!(error.status, Status::InvalidState, "got: {error:?}");
+    assert!(
+        error.message.contains("autocommit"),
+        "the error should say why there is no transaction, got: {}",
+        error.message
+    );
+
+    // Manual mode with an empty buffer: rollback succeeds as a no-op — there is an (empty)
+    // transaction to discard — and it must not flip the connection back to autocommit.
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("disable autocommit");
+    connection
+        .rollback()
+        .expect("rollback with nothing buffered is a no-op");
+    connection
+        .rollback()
+        .expect("a repeated empty rollback is still a no-op");
+    assert_eq!(
+        connection
+            .get_option_string(OptionConnection::AutoCommit)
+            .expect("get autocommit"),
+        "false",
+        "rollback discards buffered work, not the transaction mode"
+    );
+
+    // Back in autocommit mode the error returns.
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("true".into()),
+        )
+        .expect("re-enable autocommit");
+    assert_eq!(
+        connection
+            .rollback()
+            .expect_err("rollback must fail again in autocommit mode")
+            .status,
+        Status::InvalidState
+    );
+}
+
+/// `get_statistic_names` returns an *empty* result set with exactly the canonical ADBC schema —
+/// Spanner exposes no portable named statistics (`get_statistics` computes its standard ones on
+/// demand instead).
+#[test]
+fn get_statistic_names_is_empty_and_correctly_typed() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping get_statistic_names");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let connection = connect_with_retry(&database);
+
+    let mut reader = connection
+        .get_statistic_names()
+        .expect("get_statistic_names");
+    let schema = reader.schema();
+    assert_eq!(
+        schema,
+        adbc_core::schemas::GET_STATISTIC_NAMES_SCHEMA.clone(),
+        "the reader must carry the canonical GET_STATISTIC_NAMES_SCHEMA"
+    );
+    // Spell out the shape too, so a drift in the upstream constant cannot silently pass.
+    assert_eq!(schema.field(0).name(), "statistic_name");
+    assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+    assert!(!schema.field(0).is_nullable());
+    assert_eq!(schema.field(1).name(), "statistic_key");
+    assert_eq!(schema.field(1).data_type(), &DataType::Int16);
+    assert!(!schema.field(1).is_nullable());
+    assert!(
+        reader.next().is_none(),
+        "expected an empty result set (no batches at all)"
+    );
+}
+
+/// `read_partition` with a descriptor that is not one of ours must fail cleanly with
+/// `InvalidArguments` — no panic, and no RPC: the decode step rejects it before anything executes.
+/// (The decode itself is unit-tested offline in `src/connection.rs`; this exercises the same
+/// inputs through the public connection method.)
+#[test]
+fn read_partition_rejects_garbage_descriptors() {
+    use adbc_core::error::Status;
+
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping read_partition_rejects_garbage_descriptors");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let connection = connect_with_retry(&database);
+
+    let cases: [&[u8]; 4] = [
+        b"",                      // empty descriptor
+        b"\xffnot json",          // non-JSON garbage
+        br#"{"hello": "world"}"#, // valid JSON that is not a partition descriptor
+        b"[1, 2, 3]",             // valid JSON that is not even an object
+    ];
+    for descriptor in cases {
+        let error = match connection.read_partition(descriptor) {
+            Ok(_) => panic!("descriptor {descriptor:?} must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.status,
+            Status::InvalidArguments,
+            "descriptor {descriptor:?} → {error:?}"
+        );
+        assert!(
+            error.message.contains("invalid partition descriptor"),
+            "unexpected message for {descriptor:?}: {}",
+            error.message
+        );
+    }
+}
+
+/// `Connection::cancel` mirrors the statement-level semantics on the connection's own signal: the
+/// latch is sticky, so a cancel that lands *between* two chunk fetches of a `read_partition`
+/// stream (nothing parked on the signal) still cancels the next fetch; it does not touch
+/// statements, which carry their own signal; and the connection's next operation clears it.
+/// Deterministic — the cancel is always latched *before* the operation it must affect.
+#[test]
+fn connection_cancel_is_sticky_until_the_next_operation() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping connection_cancel_is_sticky");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    run(
+        &mut connection,
+        "DROP TABLE IF EXISTS AdbcConnCancel; \
+         CREATE TABLE AdbcConnCancel (Id INT64) PRIMARY KEY (Id)",
+    );
+    run(
+        &mut connection,
+        "INSERT INTO AdbcConnCancel (Id) \
+         SELECT n FROM UNNEST(GENERATE_ARRAY(1, 200)) AS n",
+    );
+
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_sql_query("SELECT Id FROM AdbcConnCancel")
+        .unwrap();
+    let partitioned = statement.execute_partitions().expect("execute_partitions");
+    let descriptor = partitioned
+        .partitions
+        .first()
+        .expect("at least one partition");
+
+    // Stream one partition and consume the prefetched first chunk, leaving the stream idle
+    // between fetches — then cancel with nothing parked on the signal, exactly the window where
+    // a non-sticky signal would be lost.
+    let mut reader = connection
+        .read_partition(descriptor)
+        .expect("read_partition");
+    let first = reader
+        .next()
+        .expect("first batch")
+        .expect("first batch is ok");
+    assert!(first.num_rows() <= 200);
+    connection.cancel().expect("cancel");
+
+    // The next chunk fetch must observe the latched cancel instead of running to completion.
+    let error = reader
+        .next()
+        .expect("the cancelled fetch yields an item")
+        .expect_err("the fetch after cancel must fail");
+    assert!(
+        error.to_string().to_lowercase().contains("cancel"),
+        "expected a cancellation error, got: {error}"
+    );
+
+    // The connection-level latch must not leak into statements: they have their own signal, so a
+    // statement query on this connection still runs while the connection latch is set.
+    assert_eq!(count_rows(&mut connection, "AdbcConnCancel"), 200);
+
+    // Starting the connection's next operation clears the latch: reading every partition back now
+    // succeeds and reproduces the full result set (including the partition whose earlier read was
+    // cancelled mid-stream).
+    let mut total = 0usize;
+    for token in &partitioned.partitions {
+        let reader = connection
+            .read_partition(token)
+            .expect("read_partition after cancel");
+        for batch in reader {
+            total += batch.expect("partition batch").num_rows();
+        }
+    }
+    assert_eq!(
+        total, 200,
+        "after the reset the connection must stream every partition normally"
+    );
+
+    // A cancel latched with nothing at all in flight must not pre-empt an unrelated metadata
+    // operation either — every connection entry point resets the signal first.
+    connection.cancel().expect("cancel with nothing in flight");
+    let schema = connection
+        .get_table_schema(None, None, "AdbcConnCancel")
+        .expect("get_table_schema after a stale cancel");
+    assert_eq!(schema.fields().len(), 1);
+
+    let mut drop = connection.new_statement().expect("new statement");
+    drop.set_sql_query("DROP TABLE AdbcConnCancel").unwrap();
+    drop.execute_update().expect("drop conn-cancel table");
+}
