@@ -13,6 +13,7 @@ dependencies = [
  "arrow-schema",
  "base64",
  "chrono",
+ "futures-util",
  "google-cloud-auth",
  "google-cloud-lro",
  "google-cloud-spanner",
