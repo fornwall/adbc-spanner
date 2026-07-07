@@ -108,6 +108,16 @@ and installs NASM on Windows.
   starting the test that early made `create_instance` fail silently → "Instance not found". It also
   works around a broken gcr.io Docker credential helper with a clean empty `DOCKER_CONFIG` (the
   emulator image is public).
+- **The emulator gRPC endpoint must sit on port `9010`.** The pinned `google-cloud-rust` client
+  derives the admin/REST endpoint by literal-substring-replacing `9010`→`9020` in the gRPC endpoint
+  (see `.../google-cloud-rust-*/tests/spanner/src/client.rs`), so on any *other* gRPC port the admin
+  request is sent to the gRPC port and every DDL / `create_database` fails with `error sending
+  request ... /ddl`. So `SPANNER_EMULATOR_HOST` may use any *host* but the *port* must be `9010`
+  (admin REST on `9020`); the driver has no override. To run several emulators concurrently (e.g.
+  parallel test worktrees) without host-port clashes, start each container with **no** `-p` publish
+  and connect via its docker-network IP on the internal `9010`/`9020` — distinct IP per container,
+  ports stay `9010`/`9020` so the remap works. `SPANNER_EMULATOR_REST_PORT` (read by the Python
+  `conftest.py`, not the driver) can still move the REST admin port.
 
 ## Shared library (loadable driver)
 
