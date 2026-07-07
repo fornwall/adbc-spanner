@@ -1417,4 +1417,161 @@ mod tests {
             "ARRAY<DATE>"
         );
     }
+
+    // ------------------------------------------------------------------------------------------
+    // Sliced batches / arrays (non-zero Arrow offsets).
+    //
+    // A caller can legitimately bind a sliced `RecordBatch` (e.g. `pyarrow.Table.slice`, or a
+    // consumer splitting bound data into chunks), whose arrays are views at a non-zero offset
+    // into shared buffers. Row `i` must then be read from the *sliced view*, not from position
+    // `i` of the underlying buffers — the upstream PostgreSQL ADBC driver had exactly that bug
+    // for sliced list arrays (apache/arrow-adbc#4320). These tests pin the behaviour down by
+    // asserting the actual bound values, via the built statement's `Debug` rendering — the only
+    // view of its parameters outside the client crate (`Statement.params` is `pub(crate)`
+    // there). The needles are exact wire encodings: `INT64` binds as `StringValue("<digits>")`,
+    // strings as `StringValue(..)`, and SQL nulls as `NullValue`.
+    // ------------------------------------------------------------------------------------------
+
+    /// Bind row `row` of `batch` as `@p0…@pN` (via [`bind_row`]) and render the built statement,
+    /// parameters included, for substring assertions on the bound values.
+    fn bound_params_debug(batch: &RecordBatch, row: usize) -> String {
+        let params = (0..batch.num_columns())
+            .map(|i| format!("@p{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let stmt = bind_row(Statement::builder(format!("SELECT {params}")), batch, row)
+            .unwrap()
+            .build();
+        format!("{stmt:?}")
+    }
+
+    #[test]
+    fn binds_rows_of_a_sliced_batch_at_their_offset() {
+        // Three-row parent; the bound batch is `slice(1, 2)`, so slice row 0 is parent row 1 and
+        // slice row 1 is parent row 2 (all null). Reading from position 0 of the underlying
+        // buffers instead would bind 10 / "alpha".
+        let parent = batch(
+            vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("name", DataType::Utf8, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![Some(10), Some(20), None])),
+                Arc::new(arrow_array::StringArray::from(vec![
+                    Some("alpha"),
+                    Some("beta"),
+                    None,
+                ])),
+            ],
+        );
+        let sliced = parent.slice(1, 2);
+        assert_eq!(sliced.num_rows(), 2);
+
+        let row0 = bound_params_debug(&sliced, 0);
+        assert!(row0.contains(r#"StringValue("20")"#), "row 0: {row0}");
+        assert!(row0.contains(r#"StringValue("beta")"#), "row 0: {row0}");
+        assert!(
+            !row0.contains("alpha") && !row0.contains(r#"StringValue("10")"#),
+            "row 0 was read from the unsliced buffer: {row0}"
+        );
+
+        // Slice row 1 (parent row 2) is null in both columns; nothing from earlier rows leaks in.
+        let row1 = bound_params_debug(&sliced, 1);
+        assert!(row1.contains("NullValue"), "row 1: {row1}");
+        assert!(
+            !row1.contains("beta") && !row1.contains(r#"StringValue("20")"#),
+            "row 1 was read from the unsliced buffer: {row1}"
+        );
+    }
+
+    #[test]
+    fn binds_list_cells_of_a_sliced_batch_at_their_offset() {
+        // The apache/arrow-adbc#4320 shape: a list column in a sliced batch. Slice row 0 must
+        // bind parent row 1's cell [3, NULL, 5] — not the buffer-start cell [1, 2].
+        let arr = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(1i64), Some(2)]),
+            Some(vec![Some(3), None, Some(5)]),
+            Some(vec![Some(6)]),
+        ]);
+        let b = batch(
+            vec![Field::new("tags", arr.data_type().clone(), true)],
+            vec![Arc::new(arr)],
+        );
+        let sliced = b.slice(1, 2);
+
+        let row0 = bound_params_debug(&sliced, 0);
+        for needle in [r#"StringValue("3")"#, "NullValue", r#"StringValue("5")"#] {
+            assert!(row0.contains(needle), "row 0 missing {needle}: {row0}");
+        }
+        assert!(
+            !row0.contains(r#"StringValue("1")"#) && !row0.contains(r#"StringValue("2")"#),
+            "row 0 was read from the unsliced buffer: {row0}"
+        );
+
+        let row1 = bound_params_debug(&sliced, 1);
+        assert!(row1.contains(r#"StringValue("6")"#), "row 1: {row1}");
+        assert!(
+            !row1.contains(r#"StringValue("3")"#),
+            "row 1 was read from the unsliced buffer: {row1}"
+        );
+    }
+
+    #[test]
+    fn binds_string_list_cells_of_a_sliced_batch_at_their_offset() {
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+
+        // Same shape with variable-width elements: both the list offsets and the child string
+        // offsets are shared with the sliced-away row.
+        let mut sb = ListBuilder::new(StringBuilder::new());
+        sb.values().append_value("skip");
+        sb.append(true);
+        sb.values().append_value("keep");
+        sb.values().append_null();
+        sb.append(true);
+        let strings = sb.finish();
+        let b = batch(
+            vec![Field::new("names", strings.data_type().clone(), true)],
+            vec![Arc::new(strings)],
+        );
+        let sliced = b.slice(1, 1);
+
+        let row0 = bound_params_debug(&sliced, 0);
+        assert!(row0.contains(r#"StringValue("keep")"#), "row 0: {row0}");
+        assert!(row0.contains("NullValue"), "row 0: {row0}");
+        assert!(
+            !row0.contains("skip"),
+            "row 0 was read from the unsliced buffer: {row0}"
+        );
+    }
+
+    #[test]
+    fn list_helpers_read_sliced_list_arrays_at_their_offset() {
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+
+        // Slicing the ListArray itself (not just a containing batch) and collecting the cell the
+        // way `bind_one` does (`.value(row)` on the sliced view) yields the sliced row's
+        // elements, asserted structurally rather than via `Debug`.
+        let ints = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(1i64)]),
+            Some(vec![Some(2), None]),
+        ]);
+        let sliced = ints.slice(1, 1);
+        assert_eq!(
+            list_primitive::<Int64Type, _>(Some(sliced.value(0)), |v| v),
+            Some(vec![Some(2i64), None])
+        );
+
+        let mut sb = ListBuilder::new(StringBuilder::new());
+        sb.values().append_value("skip");
+        sb.append(true);
+        sb.values().append_value("keep");
+        sb.values().append_null();
+        sb.append(true);
+        let strings = sb.finish();
+        let sliced = strings.slice(1, 1);
+        assert_eq!(
+            list_string::<i32>(Some(sliced.value(0))),
+            Some(vec![Some("keep".to_string()), None])
+        );
+    }
 }
