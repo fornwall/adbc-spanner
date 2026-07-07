@@ -68,8 +68,6 @@ them consistent.
 
 Known remaining gaps (documented, not yet addressed):
 
-- `test_get_info_arrow_version` — the driver does not report the ADBC `driver_arrow_version` info
-  code.
 - `test_get_objects_column_filter_table` / `_table_name` — tables created by `mode="create"` ingest
   carry the synthetic `adbc_ingest_key` column, which `get_objects` faithfully lists; the cases
   expect only the data columns.
