@@ -13,9 +13,10 @@ from adbc_drivers_validation import model, quirks
 class SpannerQuirks(model.DriverQuirks):
     name = "spanner"
     driver = "adbc_spanner"
-    driver_name = "ADBC Spanner Driver"
+    # These must match what the driver reports via get_info (see src/lib.rs, src/info.rs).
+    driver_name = "adbc-spanner"
     vendor_name = "Google Cloud Spanner"
-    vendor_version = "emulator"
+    vendor_version = ""  # the driver reports no Spanner server version
     short_version = "emulator"
 
     features = model.DriverFeatures(
@@ -32,6 +33,10 @@ class SpannerQuirks(model.DriverQuirks):
         statement_prepare=True,
         statement_rows_affected=True,
         supported_xdbc_fields=[],
+        # Spanner's default catalog and schema are both the empty string (GoogleSQL
+        # INFORMATION_SCHEMA), which is what get_objects reports.
+        current_catalog="",
+        current_schema="",
     )
 
     # database options are filled in by get_quirks() (emulator vs real target).
@@ -48,6 +53,13 @@ class SpannerQuirks(model.DriverQuirks):
         # to the @<column-name> of the same name. The suite substitutes $N via
         # this hook, so we emit @pN and pair it with a pN-named bind column.
         return f"@p{index}"
+
+    def query_override(self, context: str, default: str) -> str:
+        # The suite's sample table uses portable DDL (INT/VARCHAR, no key); Spanner needs a
+        # primary key and native type names.
+        if context == "TestStatement.sample_table":
+            return "CREATE TABLE `sample_table` (id INT64, value STRING(MAX)) PRIMARY KEY (id)"
+        return super().query_override(context, default)
 
     def quote_one_identifier(self, identifier: str) -> str:
         return "`" + identifier.replace("`", "``") + "`"

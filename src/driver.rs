@@ -13,7 +13,9 @@ use google_cloud_auth::credentials::Credentials;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 
 use crate::connection::SpannerConnection;
-use crate::error::{err, from_builder, from_spanner, invalid_argument, invalid_state};
+use crate::error::{
+    err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
+};
 use crate::runtime::{new_runtime, SharedRuntime};
 use crate::{
     OPTION_DATABASE, OPTION_EMULATOR, OPTION_ENDPOINT, OPTION_IMPERSONATE_DELEGATES,
@@ -269,7 +271,7 @@ impl Optionable for SpannerDatabase {
                 self.impersonate_lifetime_secs = Some(u64_seconds_value(&key, value)?)
             }
             other => {
-                return Err(invalid_argument(format!(
+                return Err(not_implemented(&format!(
                     "unsupported Spanner database option: {}",
                     option_name(other)
                 )))
@@ -619,6 +621,20 @@ mod tests {
                 .unwrap(),
             "{\"type\":\"service_account\"}"
         );
+    }
+
+    #[test]
+    fn unknown_database_option_is_not_implemented() {
+        // ADBC: setting an unrecognised option reports NotImplemented (not InvalidArguments), so a
+        // driver manager can tell "I don't support this option" from "this value is wrong".
+        let mut db = new_database();
+        let error = db
+            .set_option(
+                OptionDatabase::Other("this_option_does_not_exist".into()),
+                OptionValue::String("x".into()),
+            )
+            .unwrap_err();
+        assert_eq!(error.status, Status::NotImplemented);
     }
 
     #[test]

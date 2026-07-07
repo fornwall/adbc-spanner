@@ -57,8 +57,27 @@ schema, adding a synthetic `adbc_ingest_key` UUID primary key (Spanner requires 
 38,9), `TIME`/view/fixed-size-binary (no type), tz-naive `timestamp` (Spanner `TIMESTAMP` is
 UTC-aware), and `timestamptz` at non-nanosecond units (Spanner returns nanosecond).
 
-Still to port — the last remaining group:
+**`connection`/`statement` metadata is mostly done.** Fixed via quirks config (real `get_info`
+values, `current_catalog`/`current_schema` = `""`, a Spanner `sample_table` `query_override`) and two
+small driver changes: an unrecognised option now reports `NotImplemented` (not `InvalidArguments`),
+and the connection reports the current catalog/schema as `""` (Spanner's single unnamed catalog and
+default schema). Both conformance suites model current catalog/schema the same way — report the value
+when the driver declares support, else `NOT_FOUND` — so declaring support in both harnesses (the
+Foundry `current_catalog`/`current_schema` and the C++ `supports_metadata_current_catalog()`) keeps
+them consistent.
 
-- A handful of `connection`/`statement` metadata cases.
+Known remaining gaps (documented, not yet addressed):
+
+- `test_get_info_arrow_version` — the driver does not report the ADBC `driver_arrow_version` info
+  code.
+- `test_get_objects_column_filter_table` / `_table_name` — tables created by `mode="create"` ingest
+  carry the synthetic `adbc_ingest_key` column, which `get_objects` faithfully lists; the cases
+  expect only the data columns.
+- `test_get_statistics` — the driver's `get_statistics` result schema does not exactly match the
+  ADBC-spec schema.
+- `test_get_objects_constraints_foreign` / `_primary` — the suite's constraint-setup DDL does not
+  apply on Spanner.
+- `test_rows_affected` — the suite hardcodes portable `CREATE TABLE (id INT)` with no override hook;
+  Spanner needs a `PRIMARY KEY` and `INT64` (an upstream suite limitation).
 
 Once a category is green, consider a gating CI job for that subset.

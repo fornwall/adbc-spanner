@@ -36,7 +36,7 @@ use google_cloud_spanner::transaction::ReadWriteTransaction;
 
 use crate::conversion::{result_set_to_batch, stream_query};
 use crate::driver::Connected;
-use crate::error::{err, from_spanner, invalid_argument, invalid_state};
+use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
 use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
 use crate::statement::{SpannerStatement, DEFAULT_ROWS_PER_BATCH};
 
@@ -732,7 +732,7 @@ impl Optionable for SpannerConnection {
             }
             OptionConnection::ReadOnly => self.read_only = parse_bool(value)?,
             other => {
-                return Err(invalid_argument(format!(
+                return Err(not_implemented(&format!(
                     "unsupported Spanner connection option: {}",
                     connection_option_name(other)
                 )))
@@ -745,6 +745,10 @@ impl Optionable for SpannerConnection {
         match &key {
             OptionConnection::AutoCommit => Ok(self.txn.lock().unwrap().autocommit.to_string()),
             OptionConnection::ReadOnly => Ok(self.read_only.to_string()),
+            // A Spanner database has a single, unnamed catalog and (default) schema — both the empty
+            // string in INFORMATION_SCHEMA, which is what `get_objects` reports — so the "current"
+            // catalog/schema are reported as "". (They can't be switched; setting them is unsupported.)
+            OptionConnection::CurrentCatalog | OptionConnection::CurrentSchema => Ok(String::new()),
             other => Err(err(
                 format!("option {} is not set", connection_option_name(other)),
                 Status::NotFound,

@@ -142,8 +142,10 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   bool supports_error_on_incompatible_schema() const override { return false; }
   bool supports_concurrent_statements() const override { return true; }
   bool supports_transactions() const override { return true; }
-  bool supports_metadata_current_catalog() const override { return false; }
-  bool supports_metadata_current_db_schema() const override { return false; }
+  // Spanner has a single, unnamed catalog and default schema (both "", which base
+  // catalog()/db_schema() return), so the connection reports them rather than NOT_FOUND.
+  bool supports_metadata_current_catalog() const override { return true; }
+  bool supports_metadata_current_db_schema() const override { return true; }
   bool supports_ingest_view_types() const override { return false; }
   bool supports_ingest_float16() const override { return false; }
 
