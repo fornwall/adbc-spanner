@@ -5,16 +5,23 @@
 //! `INFORMATION_SCHEMA` (a Spanner database is a single, unnamed catalog). Levels below the
 //! requested [`ObjectDepth`] are left null via [`new_null_array`].
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use adbc_core::error::Result;
+use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::ObjectDepth;
 use adbc_core::schemas::GET_OBJECTS_SCHEMA;
-use arrow_array::{new_null_array, ArrayRef, Int32Array, RecordBatch, StringArray, StructArray};
+use arrow_array::{
+    new_null_array, Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+};
 use arrow_buffer::NullBuffer;
 use arrow_schema::Fields;
+use google_cloud_spanner::client::DatabaseClient;
 
+use crate::connection::{like_match, query_batch, str_col};
+use crate::error::err;
 use crate::nested::{arrow_err, field, list_item, list_of, list_of_nullable, struct_fields};
+use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
 
 /// A column of a table, as returned by `get_objects`.
 pub(crate) struct Column {
@@ -54,6 +61,448 @@ pub(crate) struct Table {
 pub(crate) struct DbSchema {
     pub name: String,
     pub tables: Vec<Table>,
+}
+
+/// Query `INFORMATION_SCHEMA` and assemble the schema→table→column hierarchy for `get_objects`,
+/// applying the ADBC `LIKE`/type filters and the requested depth.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn collect_objects(
+    runtime: &SharedRuntime,
+    client: &DatabaseClient,
+    cancel: &CancelSignal,
+    depth: ObjectDepth,
+    db_schema: Option<&str>,
+    table_name: Option<&str>,
+    table_type: &Option<Vec<&str>>,
+    column_name: Option<&str>,
+) -> Result<Vec<DbSchema>> {
+    let populate_tables = matches!(
+        depth,
+        ObjectDepth::All | ObjectDepth::Tables | ObjectDepth::Columns
+    );
+    let populate_columns = matches!(depth, ObjectDepth::All | ObjectDepth::Columns);
+    let client = client.clone();
+
+    let (
+        schema_batch,
+        table_batch,
+        column_batch,
+        constraint_batch,
+        key_column_batch,
+        referential_batch,
+    ) = block_on_cancellable(runtime, cancel, async move {
+        let schemas = query_batch(
+            &client,
+            "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA",
+        )
+        .await?;
+        let tables = if populate_tables {
+            Some(
+                query_batch(
+                    &client,
+                    "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES",
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let columns = if populate_columns {
+            Some(
+                query_batch(
+                    &client,
+                    "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, IS_NULLABLE \
+                     FROM INFORMATION_SCHEMA.COLUMNS \
+                     ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION",
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        // Constraints (primary/foreign/unique/check) and their key columns, populated at the
+        // same depth as columns. KEY_COLUMN_USAGE covers the key-based constraints; its rows are
+        // ordered so each constraint's columns come out in key order. For foreign keys,
+        // REFERENTIAL_CONSTRAINTS maps the FK to the referenced unique/primary-key constraint,
+        // whose own KEY_COLUMN_USAGE rows give the referenced (parent) columns in order — the
+        // ordering CONSTRAINT_COLUMN_USAGE does not preserve.
+        let (constraints, key_columns, referential) = if populate_columns {
+            (
+                Some(
+                    query_batch(
+                        &client,
+                        "SELECT TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE \
+                         FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS",
+                    )
+                    .await?,
+                ),
+                Some(
+                    query_batch(
+                        &client,
+                        "SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, TABLE_SCHEMA, TABLE_NAME, \
+                         COLUMN_NAME, CAST(ORDINAL_POSITION AS STRING), \
+                         CAST(POSITION_IN_UNIQUE_CONSTRAINT AS STRING) \
+                         FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE \
+                         ORDER BY CONSTRAINT_SCHEMA, CONSTRAINT_NAME, ORDINAL_POSITION",
+                    )
+                    .await?,
+                ),
+                Some(
+                    query_batch(
+                        &client,
+                        "SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, UNIQUE_CONSTRAINT_SCHEMA, \
+                         UNIQUE_CONSTRAINT_NAME \
+                         FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS",
+                    )
+                    .await?,
+                ),
+            )
+        } else {
+            (None, None, None)
+        };
+        Ok::<_, Error>((
+            schemas,
+            tables,
+            columns,
+            constraints,
+            key_columns,
+            referential,
+        ))
+    })?;
+
+    let schema_names = str_col(&schema_batch, 0)?;
+
+    // Group each INFORMATION_SCHEMA batch ONCE into lookup maps keyed by (schema, table) — and
+    // the key/referential batches by (constraint_schema, constraint_name) — so the assembly
+    // below is a series of hash lookups rather than a full rescan of each batch per table (which
+    // was quadratic for large schemas). This mirrors `collect_statistics`. The per-group `Vec`s
+    // keep batch (i.e. `ORDER BY`) order, so column and key-column ordering is preserved exactly.
+    let tables_by_schema = match &table_batch {
+        Some(batch) => group_tables(batch)?,
+        None => HashMap::new(),
+    };
+    let columns_by_table = match &column_batch {
+        Some(batch) => group_columns(batch)?,
+        None => HashMap::new(),
+    };
+    let constraints_by_table = match &constraint_batch {
+        Some(batch) => group_constraints(batch)?,
+        None => HashMap::new(),
+    };
+    let key_columns_by_constraint = match &key_column_batch {
+        Some(batch) => group_key_columns(batch)?,
+        None => HashMap::new(),
+    };
+    let referential_by_constraint = match &referential_batch {
+        Some(batch) => group_referential(batch)?,
+        None => HashMap::new(),
+    };
+
+    let mut result = Vec::new();
+    for i in 0..schema_batch.num_rows() {
+        let schema_name = schema_names.value(i);
+        if db_schema.is_some_and(|p| !like_match(p, schema_name)) {
+            continue;
+        }
+        let mut tables = Vec::new();
+        // `tables_by_schema` is empty unless tables were populated, so this yields no tables at
+        // schema-only depth — matching the previous `if let Some(&table_batch)` guard.
+        for table in tables_by_schema.get(schema_name).into_iter().flatten() {
+            let name = table.name;
+            if table_name.is_some_and(|p| !like_match(p, name)) {
+                continue;
+            }
+            let ttype = table.table_type.to_string();
+            if table_type
+                .as_ref()
+                .is_some_and(|types| !types.iter().any(|t| *t == ttype))
+            {
+                continue;
+            }
+            // Empty maps (columns/constraints not populated at this depth) yield empty lists,
+            // matching the previous depth-gated `match` arms.
+            let columns = collect_columns(&columns_by_table, schema_name, name, column_name);
+            let constraints = collect_constraints(
+                &constraints_by_table,
+                &key_columns_by_constraint,
+                &referential_by_constraint,
+                schema_name,
+                name,
+            );
+            tables.push(Table {
+                name: name.to_string(),
+                table_type: ttype,
+                columns,
+                constraints,
+            });
+        }
+        result.push(DbSchema {
+            name: schema_name.to_string(),
+            tables,
+        });
+    }
+    Ok(result)
+}
+
+/// One grouped `INFORMATION_SCHEMA.TABLES` row (per schema group).
+struct TableRow<'a> {
+    name: &'a str,
+    table_type: &'a str,
+}
+
+/// Maps each foreign key's (constraint_schema, constraint_name) to the referenced constraint's
+/// (unique_schema, unique_name), grouped once from `REFERENTIAL_CONSTRAINTS`.
+type ReferentialMap<'a> = HashMap<(&'a str, &'a str), (&'a str, &'a str)>;
+
+/// One grouped `INFORMATION_SCHEMA.COLUMNS` row (per (schema, table) group, in ordinal order).
+struct ColumnRow<'a> {
+    name: &'a str,
+    ordinal: i32,
+    nullable: bool,
+}
+
+/// One grouped `INFORMATION_SCHEMA.TABLE_CONSTRAINTS` row (per (schema, table) group).
+struct ConstraintRow<'a> {
+    name: &'a str,
+    constraint_type: &'a str,
+}
+
+/// One grouped `INFORMATION_SCHEMA.KEY_COLUMN_USAGE` row (per (constraint_schema, constraint_name)
+/// group, in `ORDINAL_POSITION` order). `position` is `POSITION_IN_UNIQUE_CONSTRAINT`, null except
+/// for foreign-key columns.
+struct KeyColumnRow<'a> {
+    column: &'a str,
+    table_schema: &'a str,
+    table: &'a str,
+    ordinal: &'a str,
+    position: Option<&'a str>,
+}
+
+/// Group `INFORMATION_SCHEMA.TABLES` rows by `TABLE_SCHEMA`, preserving batch order within a schema.
+fn group_tables(batch: &RecordBatch) -> Result<HashMap<&str, Vec<TableRow<'_>>>> {
+    let (ts, tn, tt) = (str_col(batch, 0)?, str_col(batch, 1)?, str_col(batch, 2)?);
+    let mut map: HashMap<&str, Vec<TableRow>> = HashMap::new();
+    for r in 0..batch.num_rows() {
+        map.entry(ts.value(r)).or_default().push(TableRow {
+            name: tn.value(r),
+            table_type: tt.value(r),
+        });
+    }
+    Ok(map)
+}
+
+/// Group `INFORMATION_SCHEMA.COLUMNS` rows by (schema, table); each group keeps ordinal order (the
+/// query's `ORDER BY`).
+fn group_columns(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<ColumnRow<'_>>>> {
+    let (ts, tn, cn, nul) = (
+        str_col(batch, 0)?,
+        str_col(batch, 1)?,
+        str_col(batch, 2)?,
+        str_col(batch, 4)?,
+    );
+    let ordinal = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| err("ORDINAL_POSITION is not an integer", Status::Internal))?;
+    let mut map: HashMap<(&str, &str), Vec<ColumnRow>> = HashMap::new();
+    for r in 0..batch.num_rows() {
+        map.entry((ts.value(r), tn.value(r)))
+            .or_default()
+            .push(ColumnRow {
+                name: cn.value(r),
+                ordinal: ordinal.value(r) as i32,
+                nullable: nul.value(r).eq_ignore_ascii_case("YES"),
+            });
+    }
+    Ok(map)
+}
+
+/// Group `INFORMATION_SCHEMA.TABLE_CONSTRAINTS` rows by (schema, table).
+fn group_constraints(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<ConstraintRow<'_>>>> {
+    let (ts, tn, cn, ct) = (
+        str_col(batch, 0)?,
+        str_col(batch, 1)?,
+        str_col(batch, 2)?,
+        str_col(batch, 3)?,
+    );
+    let mut map: HashMap<(&str, &str), Vec<ConstraintRow>> = HashMap::new();
+    for r in 0..batch.num_rows() {
+        map.entry((ts.value(r), tn.value(r)))
+            .or_default()
+            .push(ConstraintRow {
+                name: cn.value(r),
+                constraint_type: ct.value(r),
+            });
+    }
+    Ok(map)
+}
+
+/// Group `INFORMATION_SCHEMA.KEY_COLUMN_USAGE` rows by (constraint_schema, constraint_name); each
+/// group keeps `ORDINAL_POSITION` order (the query's `ORDER BY`).
+fn group_key_columns(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<KeyColumnRow<'_>>>> {
+    // 0 CONSTRAINT_SCHEMA, 1 CONSTRAINT_NAME, 2 TABLE_SCHEMA, 3 TABLE_NAME, 4 COLUMN_NAME,
+    // 5 ORDINAL_POSITION, 6 POSITION_IN_UNIQUE_CONSTRAINT.
+    let (kcs, kcn, kts, ktn, kcol, kord, kpos) = (
+        str_col(batch, 0)?,
+        str_col(batch, 1)?,
+        str_col(batch, 2)?,
+        str_col(batch, 3)?,
+        str_col(batch, 4)?,
+        str_col(batch, 5)?,
+        str_col(batch, 6)?,
+    );
+    let mut map: HashMap<(&str, &str), Vec<KeyColumnRow>> = HashMap::new();
+    for r in 0..batch.num_rows() {
+        map.entry((kcs.value(r), kcn.value(r)))
+            .or_default()
+            .push(KeyColumnRow {
+                column: kcol.value(r),
+                table_schema: kts.value(r),
+                table: ktn.value(r),
+                ordinal: kord.value(r),
+                position: if kpos.is_null(r) {
+                    None
+                } else {
+                    Some(kpos.value(r))
+                },
+            });
+    }
+    Ok(map)
+}
+
+/// Group `INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS` by (constraint_schema, constraint_name),
+/// mapping each foreign key to its referenced (unique_schema, unique_name). Keeps the first row per
+/// key, matching the previous `find`.
+fn group_referential(batch: &RecordBatch) -> Result<ReferentialMap<'_>> {
+    // 0 CONSTRAINT_SCHEMA, 1 CONSTRAINT_NAME, 2 UNIQUE_CONSTRAINT_SCHEMA, 3 UNIQUE_CONSTRAINT_NAME.
+    let (rcs, rcn, rus, run) = (
+        str_col(batch, 0)?,
+        str_col(batch, 1)?,
+        str_col(batch, 2)?,
+        str_col(batch, 3)?,
+    );
+    let mut map: ReferentialMap = HashMap::new();
+    for r in 0..batch.num_rows() {
+        map.entry((rcs.value(r), rcn.value(r)))
+            .or_insert_with(|| (rus.value(r), run.value(r)));
+    }
+    Ok(map)
+}
+
+/// Collect the columns of one table from the pre-grouped `COLUMNS` map, applying the `LIKE` filter.
+fn collect_columns<'a>(
+    columns_by_table: &HashMap<(&'a str, &'a str), Vec<ColumnRow<'a>>>,
+    schema: &'a str,
+    table: &'a str,
+    filter: Option<&str>,
+) -> Vec<Column> {
+    let mut columns = Vec::new();
+    for column in columns_by_table.get(&(schema, table)).into_iter().flatten() {
+        if filter.is_some_and(|p| !like_match(p, column.name)) {
+            continue;
+        }
+        columns.push(Column {
+            name: column.name.to_string(),
+            ordinal: column.ordinal,
+            nullable: column.nullable,
+        });
+    }
+    columns
+}
+
+/// Assemble the constraints for one table from the pre-grouped `TABLE_CONSTRAINTS`,
+/// `KEY_COLUMN_USAGE` and `REFERENTIAL_CONSTRAINTS` maps. Each constraint's key columns come out in
+/// key order (the `KEY_COLUMN_USAGE` group keeps `ORDINAL_POSITION` order); check/... constraints
+/// have no key columns and get an empty list.
+fn collect_constraints<'a>(
+    constraints_by_table: &HashMap<(&'a str, &'a str), Vec<ConstraintRow<'a>>>,
+    key_columns_by_constraint: &HashMap<(&'a str, &'a str), Vec<KeyColumnRow<'a>>>,
+    referential_by_constraint: &ReferentialMap<'a>,
+    schema: &'a str,
+    table: &'a str,
+) -> Vec<Constraint> {
+    let mut out = Vec::new();
+    for constraint in constraints_by_table
+        .get(&(schema, table))
+        .into_iter()
+        .flatten()
+    {
+        let name = constraint.name;
+        // Columns for this constraint, in key order (the group keeps ORDINAL_POSITION order);
+        // check/... constraints have no key columns and get an empty list.
+        let columns = key_columns_by_constraint
+            .get(&(schema, name))
+            .into_iter()
+            .flatten()
+            .map(|k| k.column.to_string())
+            .collect();
+        let constraint_type = constraint.constraint_type.to_string();
+        let usages = if constraint_type == "FOREIGN KEY" {
+            foreign_key_usages(
+                key_columns_by_constraint,
+                referential_by_constraint,
+                schema,
+                name,
+            )
+        } else {
+            Vec::new()
+        };
+        out.push(Constraint {
+            name: Some(name.to_string()),
+            constraint_type,
+            columns,
+            usages,
+        });
+    }
+    out
+}
+
+/// The referenced (parent) columns of one foreign key, in the same order as its own key columns.
+///
+/// `CONSTRAINT_COLUMN_USAGE` lists the referenced columns but does not preserve order, so instead:
+/// find the referenced unique constraint via `REFERENTIAL_CONSTRAINTS`, index its key columns by
+/// ordinal, then walk the FK's own columns (ordered) mapping each through
+/// `POSITION_IN_UNIQUE_CONSTRAINT` to the referenced column at that ordinal.
+fn foreign_key_usages<'a>(
+    key_columns_by_constraint: &HashMap<(&'a str, &'a str), Vec<KeyColumnRow<'a>>>,
+    referential_by_constraint: &ReferentialMap<'a>,
+    schema: &'a str,
+    fk_name: &'a str,
+) -> Vec<Usage> {
+    // The referenced unique/primary-key constraint.
+    let Some(&(unique_schema, unique_name)) = referential_by_constraint.get(&(schema, fk_name))
+    else {
+        return Vec::new();
+    };
+
+    // Index the referenced constraint's key columns by ordinal position.
+    let referenced: HashMap<i64, &KeyColumnRow> = key_columns_by_constraint
+        .get(&(unique_schema, unique_name))
+        .into_iter()
+        .flatten()
+        .filter_map(|k| Some((k.ordinal.parse::<i64>().ok()?, k)))
+        .collect();
+
+    // Walk the FK's own columns in key order, mapping each to its referenced column.
+    let mut fk_columns: Vec<(i64, i64)> = key_columns_by_constraint
+        .get(&(schema, fk_name))
+        .into_iter()
+        .flatten()
+        .filter_map(|k| Some((k.ordinal.parse().ok()?, k.position?.parse().ok()?)))
+        .collect();
+    fk_columns.sort_by_key(|&(ordinal, _)| ordinal);
+
+    fk_columns
+        .into_iter()
+        .filter_map(|(_, position)| {
+            referenced.get(&position).map(|k| Usage {
+                db_schema: k.table_schema.to_string(),
+                table: k.table.to_string(),
+                column: k.column.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Build the single-catalog `get_objects` record batch.
