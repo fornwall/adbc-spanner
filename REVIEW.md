@@ -453,9 +453,16 @@ batch read-only transaction so every partition executes at that bound. Parsing l
 
 ## P3 — nice to have
 
-**Correctness.** List/Struct columns map present-but-undecodable wire values to NULL,
+**Correctness.** ~~List/Struct columns map present-but-undecodable wire values to NULL,
 contradicting the strict-decode policy of the scalar arms (`src/conversion.rs:466-474`,
-`:493-513`); ~~`parse_int64`'s f64 fallback loses precision above 2^53 (`conversion.rs:527-532` —
+`:493-513`)~~ (**Fixed.** `build_list` and `build_struct` now apply the scalar arms' strict-decode
+policy: a *present* column value that is not a wire list (for `ARRAY`) or neither a wire list nor a
+keyed struct (for `STRUCT`) is a loud `InvalidData` decode error via the same `decode_error` helper,
+never a silent NULL; genuine SQL NULLs (and absent slots) still map to null slots, and
+elements/fields recurse through `build_array` so undecodable nested values error at any depth.
+Unit-tested by `list_with_undecodable_element_errors`, `struct_with_undecodable_field_errors`
+(incl. an undecodable struct nested inside a list) and `list_and_struct_nulls_round_trip_as_nulls`);
+~~`parse_int64`'s f64 fallback loses precision above 2^53 (`conversion.rs:527-532` —
 better removed)~~ (**Fixed.** the f64 fallback is gone — `parse_int64` now only accepts the JSON
 string encoding Spanner actually uses for `INT64`, so every `i64` round-trips exactly and a JSON
 number is a loud decode error instead of a silently-rounded value); ~~`is_dml_returning`'s documented
