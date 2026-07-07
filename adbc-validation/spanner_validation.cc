@@ -127,7 +127,10 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
     return "@p" + std::to_string(index);
   }
 
-  // Only append-into-existing-table ingest is supported (no create/replace).
+  // The driver also supports create/create_append/replace ingest (it synthesizes
+  // an `adbc_ingest_key` primary key), but this still declares append-only until
+  // the CREATE-gated cases (MetadataGetTableSchema{,Escaping}) are vetted and
+  // re-gated — see the README.
   bool supports_bulk_ingest(const char* mode) const override {
     return std::strcmp(mode, "adbc.ingest.mode.append") == 0;
   }

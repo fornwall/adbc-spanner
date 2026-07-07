@@ -58,14 +58,19 @@ Spanner's model self-skip rather than fail.
 
 **40 tests pass, 2 self-skip.** The `StatementTest` cases are an explicit
 allowlist in `scripts/run-adbc-validation.sh`. The 2 remaining `ConnectionTest`
-skips both hinge on **create-mode ingest**, which Spanner cannot support: every
-table needs a `PRIMARY KEY`, so there is no way to create a table from an
-arbitrary Arrow schema.
+skips are gated on `supports_bulk_ingest(CREATE)`, which `SpannerQuirks` still
+declares unsupported. That declaration is stale: the driver *does* support
+create-mode ingest (it builds the table from the ingest data's Arrow schema,
+with a synthetic `adbc_ingest_key` UUID primary key satisfying Spanner's
+mandatory-key rule). Neither case actually ingests — their fixture is the
+quirks' DDL `CreateSampleTable` — so flipping the quirk should un-skip them and
+let them pass (`MetadataGetTableSchemaDbSchema` runs the same fixture and
+schema comparison against a named schema and is already gated green).
 
 | Skipped test | Why |
 |---|---|
-| `MetadataGetTableSchema` | gated on `supports_bulk_ingest(CREATE)` (uses create-mode ingest to build its fixture) |
-| `MetadataGetTableSchemaEscaping` | same — create-mode ingest of a reserved-word table |
+| `MetadataGetTableSchema` | skip gated on `supports_bulk_ingest(CREATE)`, though its fixture is plain DDL |
+| `MetadataGetTableSchemaEscaping` | same gate; the case itself only checks `NOT_FOUND` for a query-shaped table name |
 
 (`MetadataGetStatisticNames` is now gated: `get_statistic_names` returns a valid
 empty catalog — Spanner has no per-column statistics to name, which the suite
@@ -84,13 +89,16 @@ incremental driver work:
   valid Spanner DDL (which needs `INT64`/`FLOAT64`, a `PRIMARY KEY`, backtick
   quoting). Covers e.g. `SqlBind`, `SqlQueryEmpty`, `SqlQueryFloats`,
   `SqlSchemaFloats`, `SqlQueryRowsAffectedDelete`, `Transactions`.
-- **Create-mode ingest** — Spanner requires a primary key, so the driver has no
-  create-mode ingest; the suite's ingest tests create the target table
-  (`SqlIngest*`). Where the value is separable from create-mode — the ingest
-  **identifier-escaping** tests (reserved-word table/column names) — it is
-  captured natively instead: the driver quotes ingest identifiers
-  (`bind::insert_sql`) and `tests/integration.rs` exercises an append-mode ingest
-  into a table `create` with a column `index`.
+- **Ingest readback** — the driver supports create-mode ingest (with a
+  synthetic `adbc_ingest_key` UUID primary key, since Spanner mandates one),
+  but the suite's `SqlIngest*` cases remain blocked: they read the data back
+  via a hardcoded double-quoted `SELECT * FROM "bulk_ingest" ORDER BY "col" …`
+  (not valid GoogleSQL, no quirks hook), and `SELECT *` would also surface the
+  synthetic key column, breaking the single-column result assertions. Where the
+  value is separable — the ingest **identifier-escaping** tests (reserved-word
+  table/column names) — it is captured natively instead: the driver quotes
+  ingest identifiers (`bind::insert_sql`) and `tests/integration.rs` exercises
+  an append-mode ingest into a table `create` with a column `index`.
 - **One upstream `adbc_ffi` gap** — `ErrorCompatibility` checks that the driver
   preserves the caller's `AdbcError.private_data` / `private_driver`; the FFI
   exporter does not. Not fixable from this crate.

@@ -73,10 +73,15 @@ Known remaining gaps (documented, not yet addressed):
 - `test_get_objects_column_filter_table` / `_table_name` — tables created by `mode="create"` ingest
   carry the synthetic `adbc_ingest_key` column, which `get_objects` faithfully lists; the cases
   expect only the data columns.
-- `test_get_statistics` — the driver's `get_statistics` result schema does not exactly match the
-  ADBC-spec schema.
-- `test_get_objects_constraints_foreign` / `_primary` — the suite's constraint-setup DDL does not
-  apply on Spanner.
+- `test_get_statistics` — the suite calls `get_statistics` with `approximate=True`, which the
+  driver deliberately answers with an empty result (Spanner keeps no cheap pre-computed statistics;
+  the exact aggregate scans only run for `approximate=false`), so the test's table lookup fails.
+  The result schema itself matches the ADBC spec.
+- `test_get_objects_constraints_foreign` / `_primary` — the constraint-setup DDL is quirks-supplied
+  via the suite's `sample_ddl_constraints` hook, which `SpannerQuirks` does not implement yet, so
+  the fixture errors with `NotImplementedError`. Supplying Spanner DDL there (mandatory `PRIMARY
+  KEY`, `INT64`, table-level `FOREIGN KEY` — cf. the C++ harness's constraint DDL) should enable
+  these.
 - `test_rows_affected` — the suite hardcodes portable `CREATE TABLE (id INT)` with no override hook;
   Spanner needs a `PRIMARY KEY` and `INT64` (an upstream suite limitation).
 
