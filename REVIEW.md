@@ -9,10 +9,6 @@ they are to bite a real user. (All P1 and P2 findings from the original review h
 
 ## P3 — improvements worth queuing
 
-- **Python packaging polish**: wheel ships no LICENSE text despite embedding aws-lc etc.
-  (Apache-2.0 §4 gap); `setuptools>=64` floor is too low for the PEP 639 string license (needs
-  ≥77); `adbc-driver-manager` dependency has no version floor; dev `_version.py` has drifted
-  (0.3.9 vs 0.5.0) — wire it into cargo-release's `pre-release-replacements`.
 - **macOS deployment target**: the `macosx_10_12` tag is asserted, not enforced — export
   `MACOSX_DEPLOYMENT_TARGET` in the build (aws-lc's cmake defaults from the host).
 - **Test/fuzz upkeep**: `AdbcDdl` scratch table is never dropped (leaks into a real
