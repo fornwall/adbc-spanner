@@ -2920,3 +2920,164 @@ fn query_with_trailing_semicolons_returns_rows() {
         .unwrap();
     assert_eq!(s.value(0), ";");
 }
+
+/// The spec `adbc.connection.readonly` option. Covers the four dimensions the review asks for:
+/// **round-trip** (defaults to `false`, and set values read back through `get_option`), **allow**
+/// (a SELECT still runs), **deny** (DML, DDL and bulk ingest each fail with `InvalidState`), and
+/// **toggle/snapshot** (the flag is captured into each statement at creation, so flipping the
+/// connection back to writable only frees statements created afterwards). Regression guard for the
+/// four read-only enforcement branches in `src/statement.rs`, which previously had no coverage.
+#[test]
+fn readonly_connection_rejects_writes() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping readonly_connection_rejects_writes");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    use adbc_core::error::Status;
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    // --- round-trip: the option defaults to false, and set values read back ---
+    assert_eq!(
+        connection
+            .get_option_string(OptionConnection::ReadOnly)
+            .expect("read default readonly"),
+        "false",
+        "adbc.connection.readonly defaults to false"
+    );
+    connection
+        .set_option(
+            OptionConnection::ReadOnly,
+            OptionValue::String("true".into()),
+        )
+        .expect("enable readonly");
+    assert_eq!(
+        connection
+            .get_option_string(OptionConnection::ReadOnly)
+            .expect("read readonly back"),
+        "true",
+        "setting adbc.connection.readonly=true round-trips through get_option"
+    );
+
+    // --- allow: a SELECT still runs on a read-only connection ---
+    let mut query = connection.new_statement().expect("new statement");
+    query.set_sql_query("SELECT 1 AS n").unwrap();
+    let rows: usize = query
+        .execute()
+        .expect("SELECT on a read-only connection must run")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    assert_eq!(
+        rows, 1,
+        "a query on a read-only connection returns its rows"
+    );
+
+    // --- deny: DML is rejected with InvalidState (nothing is touched — the WHERE never runs) ---
+    let mut dml = connection.new_statement().expect("new statement");
+    dml.set_sql_query("DELETE FROM Singers WHERE true").unwrap();
+    let dml_err = dml
+        .execute_update()
+        .expect_err("DML on a read-only connection must fail");
+    assert_eq!(
+        dml_err.status,
+        Status::InvalidState,
+        "DML on a read-only connection must be InvalidState, got: {dml_err:?}"
+    );
+
+    // --- deny: DDL is rejected with InvalidState (the table is never created) ---
+    let mut ddl = connection.new_statement().expect("new statement");
+    ddl.set_sql_query("CREATE TABLE AdbcReadOnlyDenied (Id INT64) PRIMARY KEY (Id)")
+        .unwrap();
+    let ddl_err = ddl
+        .execute_update()
+        .expect_err("DDL on a read-only connection must fail");
+    assert_eq!(
+        ddl_err.status,
+        Status::InvalidState,
+        "DDL on a read-only connection must be InvalidState, got: {ddl_err:?}"
+    );
+
+    // --- deny: bulk ingest is rejected with InvalidState ---
+    let ingest_rows = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "SingerId",
+            DataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(Int64Array::from(vec![1]))],
+    )
+    .unwrap();
+    let mut ingest = connection.new_statement().expect("new statement");
+    ingest
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("Singers".into()),
+        )
+        .unwrap();
+    ingest.bind(ingest_rows).expect("bind ingest rows");
+    let ingest_err = ingest
+        .execute_update()
+        .expect_err("ingest on a read-only connection must fail");
+    assert_eq!(
+        ingest_err.status,
+        Status::InvalidState,
+        "ingest on a read-only connection must be InvalidState, got: {ingest_err:?}"
+    );
+
+    // --- toggle / snapshot: the flag is captured at statement creation ---
+    // Create a statement while the connection is still read-only, then flip the connection back to
+    // writable. The snapshotted statement must stay read-only; a statement created afterwards is
+    // writable again.
+    let mut snapshot_ro = connection.new_statement().expect("new statement");
+    connection
+        .set_option(
+            OptionConnection::ReadOnly,
+            OptionValue::String("false".into()),
+        )
+        .expect("disable readonly");
+    assert_eq!(
+        connection
+            .get_option_string(OptionConnection::ReadOnly)
+            .expect("read readonly back"),
+        "false",
+        "setting adbc.connection.readonly=false round-trips through get_option"
+    );
+    snapshot_ro
+        .set_sql_query("DELETE FROM Singers WHERE true")
+        .unwrap();
+    let snapshot_err = snapshot_ro
+        .execute_update()
+        .expect_err("a statement created while read-only stays read-only");
+    assert_eq!(
+        snapshot_err.status,
+        Status::InvalidState,
+        "a statement snapshots read-only at creation; clearing the connection flag must not free \
+         an already-created statement, got: {snapshot_err:?}"
+    );
+
+    // A statement created after the flip is writable again: a no-op DELETE reports its zero count.
+    let mut now_writable = connection.new_statement().expect("new statement");
+    now_writable
+        .set_sql_query("DELETE FROM Singers WHERE false")
+        .unwrap();
+    assert_eq!(
+        now_writable
+            .execute_update()
+            .expect("write after readonly cleared"),
+        Some(0),
+        "a statement created after readonly is cleared can write"
+    );
+}
