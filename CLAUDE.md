@@ -137,6 +137,32 @@ Pushing the `vX.Y.Z` tag triggers `libraries.yml` to attach the platform shared 
 GitHub Release. So: `cargo release --execute` owns versioning + crates.io publish + tagging; CI owns
 building and attaching the binaries. They do not overlap.
 
+### Python package (`python/`)
+
+`python/` is a separate PyPI distribution, `adbc-driver-spanner` — a data-only wheel that bundles the
+prebuilt cdylib and drives it through `adbc_driver_manager` (DBAPI 2.0 + Arrow). It links nothing
+against Python, so there is no PyO3/maturin build; `python/setup.py` just forces a
+`py3-none-<platform>` tag and CI copies the right `.so`/`.dylib`/`.dll` in before packaging.
+
+The same `vX.Y.Z` tag drives it — no separate command. `libraries.yml` has two extra jobs after the
+library `build`:
+
+- `python-wheels` reuses the per-platform artifacts `build` already produced, repackaging each into a
+  wheel on one Linux runner (no compilation). It derives the version from `Cargo.toml` and **fails the
+  release if the tag disagrees with the crate version**, so crate/tag/wheel can't drift.
+  `adbc_driver_spanner/_version.py` (checked in) is only a dev fallback; CI overwrites it.
+- `python-publish` (tags only) uploads to PyPI via **Trusted Publishing (OIDC)** — no token/secret.
+  It uses `permissions: id-token: write` and the `pypi` GitHub environment.
+
+Unlike the crate, the wheel ships a compiled binary, so the git-pinned `google-cloud-rust` dependency
+(which blocks `cargo publish`) does **not** block PyPI — the Python package can release independently.
+
+**One-time PyPI setup (before the first tag):** register a *pending publisher* at
+<https://pypi.org/manage/account/publishing/> with project `adbc-driver-spanner`, owner `fornwall`,
+repo `adbc-spanner`, workflow `libraries.yml`, environment `pypi` (all must match exactly), then
+create the `pypi` GitHub environment (Settings → Environments), ideally restricted to `v*` tags. See
+`python/README.md` for usage.
+
 ## Conventions / gotchas
 
 - Match surrounding style; keep `fmt`/`clippy` clean (CI fails otherwise).

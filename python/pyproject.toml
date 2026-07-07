@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adbc-driver-spanner"
+dynamic = ["version"]
+description = "ADBC (Arrow Database Connectivity) driver for Google Cloud Spanner"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+authors = [{ name = "Fredrik Fornwall", email = "fredrik@fornwall.net" }]
+keywords = ["adbc", "arrow", "spanner", "database", "gcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+]
+dependencies = ["adbc-driver-manager"]
+
+[project.optional-dependencies]
+# Arrow result helpers used by the DBAPI layer (fetch_arrow_table/fetch_df).
+dbapi = ["pyarrow>=8"]
+
+[project.urls]
+Homepage = "https://github.com/fornwall/adbc-spanner"
+Repository = "https://github.com/fornwall/adbc-spanner"
+
+[tool.setuptools]
+packages = ["adbc_driver_spanner"]
+
+[tool.setuptools.dynamic]
+version = { attr = "adbc_driver_spanner._version.__version__" }
+
+[tool.setuptools.package-data]
+# The prebuilt shared library is dropped in by CI per platform before the wheel
+# is built. py.typed ships the type-hint marker.
+adbc_driver_spanner = ["*.so", "*.dylib", "*.dll", "py.typed"]

@@ -1,0 +1,9 @@
+/build/
+/dist/
+/wheelhouse/
+*.egg-info/
+__pycache__/
+# Bundled per-platform libraries are copied in by CI, never committed.
+adbc_driver_spanner/*.so
+adbc_driver_spanner/*.dylib
+adbc_driver_spanner/*.dll

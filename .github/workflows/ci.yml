@@ -73,6 +73,62 @@ jobs:
       - name: Integration tests (Spanner emulator)
         run: cargo test --test integration
 
+  # End-to-end test of the Python package (python/) against the emulator: build
+  # the driver, drop it into the package exactly as the wheel job does, install
+  # it, and exercise the whole DBAPI/Arrow surface (DDL, DML, ingest, manual
+  # transactions) the way a real user would.
+  python:
+    name: Python package (emulator)
+    runs-on: ubuntu-latest
+
+    services:
+      spanner:
+        image: gcr.io/cloud-spanner-emulator/emulator
+        ports:
+          - 9010:9010
+          - 9020:9020
+
+    env:
+      SPANNER_EMULATOR_HOST: localhost:9010
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build the driver shared library
+        run: cargo build
+
+      - name: Install the Python package with the freshly built driver
+        run: |
+          set -euo pipefail
+          cp target/debug/libadbc_spanner.so python/adbc_driver_spanner/
+          python -m pip install --upgrade pip
+          # adbc_driver_manager + pyarrow/pandas exercise the Arrow + DataFrame paths.
+          python -m pip install ./python pyarrow pandas pytest
+
+      - name: Wait for the Spanner emulator
+        run: |
+          for _ in $(seq 1 60); do
+            if [ "$(curl -s -o /dev/null -w '%{http_code}' \
+                http://127.0.0.1:9020/v1/projects/emulator/instanceConfigs)" = "200" ]; then
+              echo "emulator admin API is up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "emulator did not become ready" >&2
+          exit 1
+
+      - name: End-to-end tests
+        run: python -m pytest python/tests -v
+
   # Supply-chain + hygiene checks (no build / emulator needed):
   # cargo-deny — security advisories (RUSTSEC), license compliance, banned/duplicate
   #   crates and allowed sources (see deny.toml).
