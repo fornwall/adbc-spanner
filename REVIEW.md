@@ -234,9 +234,16 @@ batch read-only transaction so every partition executes at that bound. Parsing l
 
 ### Testing
 
-- **`adbc.connection.readonly` has zero tests** anywhere (four enforcement branches at
+- ~~**`adbc.connection.readonly` has zero tests** anywhere (four enforcement branches at
   `src/statement.rs:352, 529, 582, 606`). A regression silently allowing writes on a read-only
-  connection would ship. Add an integration case covering allow/deny/toggle/round-trip.
+  connection would ship. Add an integration case covering allow/deny/toggle/round-trip.~~
+  **Fixed.** The `readonly_connection_rejects_writes` integration test (in `tests/integration.rs`,
+  self-skipping like the others) covers all four dimensions: **round-trip** (the option defaults to
+  `false` and set `true`/`false` values read back through `get_option`), **allow** (a `SELECT` still
+  runs on a read-only connection), **deny** (a DML `execute_update`, a DDL, and a bulk ingest each
+  fail with `InvalidState`), and **toggle/snapshot** (the flag is captured into each statement at
+  creation — a statement made while read-only stays read-only after the connection flips back to
+  writable, while one created afterwards can write).
 - **`create_append` ingest mode is never executed end-to-end**, nor is the `create`-on-existing-table
   error path (`tests/integration.rs`). (The `append`-on-missing-table and schema-mismatch error paths
   are now covered — see the ADBC-conformance fix above.)
