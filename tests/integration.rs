@@ -2580,13 +2580,18 @@ fn get_statistics_reports_real_counts() {
         "Id distinct 3: {stats:?}"
     );
 
-    // approximate=true yields nothing (Spanner has no cheap statistics).
+    // approximate=true serves the same exact statistics: approximate merely *allows* inexact
+    // values, and Spanner has no cheaper source, so both modes run the same aggregate scans.
     let approx = connection
         .get_statistics(None, None, Some("AdbcStats"), true)
         .expect("get_statistics approx")
         .collect::<Result<Vec<_>, _>>()
         .expect("collect approx");
-    assert!(extract_statistics(&approx[0]).is_empty());
+    assert_eq!(
+        extract_statistics(&approx[0]),
+        stats,
+        "approximate=true must serve the same exact statistics"
+    );
 
     let mut drop = connection.new_statement().expect("new statement");
     drop.set_sql_query("DROP TABLE AdbcStats").unwrap();

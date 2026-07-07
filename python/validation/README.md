@@ -76,15 +76,17 @@ when the driver declares support, else `NOT_FOUND` — so declaring support in b
 Foundry `current_catalog`/`current_schema` and the C++ `supports_metadata_current_catalog()`) keeps
 them consistent.
 
+**`test_get_statistics` passes.** The suite calls `get_statistics` with `approximate=True`, and the
+driver serves the same exact aggregate-scan statistics as for `approximate=false`. That is
+spec-conformant — `approximate=True` merely *allows* approximate/out-of-date values, and exact
+values always satisfy it (Spanner keeps no cheap pre-computed statistics, so there is nothing
+cheaper to serve); each row reports `statistic_is_approximate=false`.
+
 Known remaining gaps (documented, not yet addressed):
 
 - `test_get_objects_column_filter_table` / `_table_name` — tables created by `mode="create"` ingest
   carry the synthetic `adbc_ingest_key` column, which `get_objects` faithfully lists; the cases
   expect only the data columns.
-- `test_get_statistics` — the suite calls `get_statistics` with `approximate=True`, which the
-  driver deliberately answers with an empty result (Spanner keeps no cheap pre-computed statistics;
-  the exact aggregate scans only run for `approximate=false`), so the test's table lookup fails.
-  The result schema itself matches the ADBC spec.
 - `test_get_objects_constraints_foreign` — `SpannerQuirks` implements the suite's
   `sample_ddl_constraints` hook (Spanner DDL: `INT64`, trailing `PRIMARY KEY`, table-level
   `FOREIGN KEY`), so the fixture no longer errors, and the driver reports the constraints
