@@ -96,6 +96,27 @@ impl SpannerStatement {
         Ok(statements)
     }
 
+    /// Build the DML statements to apply for `sql`: one per bound row for parameterized DML,
+    /// otherwise a `;`-separated batch (e.g. dbt's `DELETE; INSERT`) split into individual
+    /// statements so the whole batch is applied atomically. Shared by `execute` and `execute_update`.
+    fn build_dml_statements(&self, sql: &str) -> Result<Vec<SpannerSql>> {
+        if !self.bound.is_empty() {
+            self.build_bound_statements(sql)
+        } else {
+            Ok(crate::ddl::split_statements(sql)
+                .into_iter()
+                .map(|s| SpannerSql::builder(s).build())
+                .collect())
+        }
+    }
+
+    /// An empty result reader (empty schema, no rows), for statements that yield no result set.
+    fn empty_reader() -> Box<dyn RecordBatchReader + Send + 'static> {
+        let schema = Arc::new(Schema::empty());
+        let empty: Vec<std::result::Result<RecordBatch, ArrowError>> = Vec::new();
+        Box::new(RecordBatchIterator::new(empty, schema))
+    }
+
     /// Apply DML `statements` honouring the connection's transaction mode.
     ///
     /// In autocommit mode they run immediately in one atomic read/write transaction and the
@@ -269,13 +290,29 @@ impl Statement for SpannerStatement {
         if crate::ddl::is_ddl(&sql) {
             self.run_ddl(crate::ddl::split_statements(&sql))?;
             // DDL has no result set — return an empty reader with an empty schema.
-            let schema = Arc::new(Schema::empty());
-            let empty: Vec<std::result::Result<RecordBatch, ArrowError>> = Vec::new();
-            return Ok(Box::new(RecordBatchIterator::new(empty, schema)));
+            return Ok(Self::empty_reader());
+        }
+        // DML arriving through the query entry point. Standard ADBC clients (the Python DBAPI, R,
+        // etc.) issue every statement — including INSERT/UPDATE/DELETE — through `ExecuteQuery`, so
+        // route DML onto the read/write path (or buffer it in manual mode) rather than the read-only
+        // single-use transaction below, which Spanner rejects for DML. This mirrors `execute_update`;
+        // the query interface just has nowhere to report the affected-row count, so it is discarded.
+        if crate::ddl::is_dml(&sql) {
+            if self.read_only {
+                return Err(invalid_state(
+                    "cannot execute DML: the connection is read-only",
+                ));
+            }
+            let statements = self.build_dml_statements(&sql)?;
+            self.bound.clear();
+            self.run_or_buffer(statements)?;
+            return Ok(Self::empty_reader());
         }
         // Parameterized query: run once per bound row.
         if !self.bound.is_empty() {
-            return self.execute_bound_query(&sql);
+            let reader = self.execute_bound_query(&sql)?;
+            self.bound.clear();
+            return Ok(reader);
         }
         let client = self.client.clone();
         let (schema, batch) = block_on_cancellable(&self.runtime, &self.cancel, async move {
@@ -297,6 +334,7 @@ impl Statement for SpannerStatement {
                 return Err(invalid_state("cannot ingest: the connection is read-only"));
             }
             let statements = self.build_ingest_statements(&table)?;
+            self.bound.clear();
             return self.run_or_buffer(statements);
         }
 
@@ -312,18 +350,8 @@ impl Statement for SpannerStatement {
                 "cannot execute DML: the connection is read-only",
             ));
         }
-        // Build the statements to apply: one per bound row for parameterized DML, otherwise a
-        // `;`-separated batch (e.g. dbt's DELETE; INSERT) split into individual statements so the
-        // whole batch is applied atomically. `run_or_buffer` then either runs them (autocommit) or
-        // buffers them for commit (manual mode).
-        let statements = if !self.bound.is_empty() {
-            self.build_bound_statements(&sql)?
-        } else {
-            crate::ddl::split_statements(&sql)
-                .into_iter()
-                .map(|s| SpannerSql::builder(s).build())
-                .collect()
-        };
+        let statements = self.build_dml_statements(&sql)?;
+        self.bound.clear();
         self.run_or_buffer(statements)
     }
 

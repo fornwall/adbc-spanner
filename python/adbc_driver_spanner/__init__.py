@@ -18,10 +18,42 @@ import adbc_driver_manager
 
 from ._version import __version__
 
-__all__ = ["connect", "ENTRYPOINT", "__version__"]
+__all__ = ["connect", "option_kwargs", "ENTRYPOINT", "__version__"]
 
 #: C entrypoint exported by the shared library (see src/ffi.rs).
 ENTRYPOINT = "AdbcSpannerInit"
+
+
+def option_kwargs(
+    database: typing.Optional[str] = None,
+    *,
+    endpoint: typing.Optional[str] = None,
+    emulator: bool = False,
+    keyfile: typing.Optional[str] = None,
+    keyfile_json: typing.Optional[str] = None,
+    db_kwargs: typing.Optional[typing.Mapping[str, str]] = None,
+) -> typing.Dict[str, str]:
+    """Translate the friendly connection kwargs into ``adbc.spanner.*`` options.
+
+    Shared by :func:`connect` and :func:`adbc_driver_spanner.dbapi.connect` so the
+    two entry points map parameters identically. ``db_kwargs`` is an escape hatch
+    for raw option keys and is merged last.
+    """
+    options: typing.Dict[str, str] = {}
+    # Friendly kwargs -> the driver's option keys (see src/lib.rs).
+    if database is not None:
+        options["adbc.spanner.database"] = database
+    if endpoint is not None:
+        options["adbc.spanner.endpoint"] = endpoint
+    if emulator:
+        options["adbc.spanner.emulator"] = "true"
+    if keyfile is not None:
+        options["adbc.spanner.keyfile"] = keyfile
+    if keyfile_json is not None:
+        options["adbc.spanner.keyfile_json"] = keyfile_json
+    if db_kwargs:
+        options.update(db_kwargs)
+    return options
 
 
 def connect(
@@ -31,7 +63,7 @@ def connect(
     emulator: bool = False,
     keyfile: typing.Optional[str] = None,
     keyfile_json: typing.Optional[str] = None,
-    db_kwargs: typing.Optional[typing.Dict[str, str]] = None,
+    db_kwargs: typing.Optional[typing.Mapping[str, str]] = None,
 ) -> adbc_driver_manager.AdbcDatabase:
     """Create a low-level ADBC database handle for Spanner.
 
@@ -51,28 +83,22 @@ def connect(
         Application Default Credentials.
     db_kwargs:
         Escape hatch for raw ``adbc.spanner.*`` option keys, merged last.
-    """
-    kwargs: typing.Dict[str, str] = {
-        "driver": _driver_path(),
-        "entrypoint": ENTRYPOINT,
-    }
-    # Friendly kwargs -> the driver's option keys (see src/lib.rs).
-    if database is not None:
-        kwargs["adbc.spanner.database"] = database
-    if endpoint is not None:
-        kwargs["adbc.spanner.endpoint"] = endpoint
-    if emulator:
-        kwargs["adbc.spanner.emulator"] = "true"
-    if keyfile is not None:
-        kwargs["adbc.spanner.keyfile"] = keyfile
-    if keyfile_json is not None:
-        kwargs["adbc.spanner.keyfile_json"] = keyfile_json
-    if db_kwargs:
-        kwargs.update(db_kwargs)
 
+    For a DBAPI 2.0 connection, prefer :func:`adbc_driver_spanner.dbapi.connect`.
+    """
+    options = option_kwargs(
+        database,
+        endpoint=endpoint,
+        emulator=emulator,
+        keyfile=keyfile,
+        keyfile_json=keyfile_json,
+        db_kwargs=db_kwargs,
+    )
     # ** unpacking accepts the dotted, non-identifier option keys; they land in
     # AdbcDatabase's **kwargs and are forwarded as ADBC options.
-    return adbc_driver_manager.AdbcDatabase(**kwargs)
+    return adbc_driver_manager.AdbcDatabase(
+        driver=_driver_path(), entrypoint=ENTRYPOINT, **options
+    )
 
 
 @functools.cache

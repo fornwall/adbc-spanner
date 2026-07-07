@@ -606,6 +606,76 @@ fn query_and_dml_round_trip() {
     assert_eq!(ingest.execute_update().expect("ingest"), Some(2));
     assert_eq!(count_rows(&mut connection, "AdbcBind"), 2);
 
+    // DML issued through the query entry point (`execute`, not the Rust-only `execute_update`) must
+    // run on the read/write path and succeed. Every ADBC client — the Python DBAPI, R, etc. — issues
+    // DML this way, since the C ABI exposes only `ExecuteQuery`. Regression test for routing it to a
+    // read-only single-use transaction, which Spanner rejects ("DML statements may not be performed
+    // in single-use transactions").
+    let mut dml_via_execute = connection.new_statement().expect("new statement");
+    dml_via_execute
+        .set_sql_query("INSERT INTO AdbcBind (Id, Name) VALUES (3, 'Carol')")
+        .unwrap();
+    let dml_rows = dml_via_execute
+        .execute()
+        .expect("DML via execute()")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        dml_rows.iter().all(|b| b.num_rows() == 0),
+        "DML via execute() must yield an empty result set"
+    );
+    assert_eq!(count_rows(&mut connection, "AdbcBind"), 3);
+
+    // Bound data is consumed by the execute that uses it. A client that reuses one statement handle
+    // (as the Python DBAPI does: adbc_ingest binds a stream, then the next cursor.execute is a query)
+    // must not replay the stale bound rows — which previously ran the follow-up query once per bound
+    // row, tripling its result.
+    let mut reuse_ddl = connection.new_statement().expect("new statement");
+    reuse_ddl
+        .set_sql_query(
+            "DROP TABLE IF EXISTS AdbcReuse; \
+             CREATE TABLE AdbcReuse (Id INT64) PRIMARY KEY (Id)",
+        )
+        .unwrap();
+    reuse_ddl.execute_update().expect("create reuse table");
+    let reuse_rows = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(vec![10, 20, 30]))],
+    )
+    .unwrap();
+    let mut reuse = connection.new_statement().expect("new statement");
+    reuse
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcReuse".into()),
+        )
+        .unwrap();
+    reuse
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .unwrap();
+    reuse.bind(reuse_rows).expect("bind reuse rows");
+    assert_eq!(reuse.execute_update().expect("ingest reuse"), Some(3));
+    // Same handle, now a query: the ingest consumed the bound rows, so it runs exactly once.
+    reuse
+        .set_sql_query("SELECT Id FROM AdbcReuse ORDER BY Id")
+        .unwrap();
+    let reuse_out = reuse
+        .execute()
+        .expect("reuse query")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        reuse_out.iter().map(|b| b.num_rows()).sum::<usize>(),
+        3,
+        "stale bound rows must not replay the follow-up query"
+    );
+    let mut drop_reuse = connection.new_statement().expect("new statement");
+    drop_reuse.set_sql_query("DROP TABLE AdbcReuse").unwrap();
+    drop_reuse.execute_update().expect("drop reuse table");
+
     // Parameterized query: bind @Id and read the matching row back.
     let param = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, false)])),

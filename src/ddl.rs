@@ -20,9 +20,21 @@ const DDL_KEYWORDS: &[&str] = &[
     "CREATE", "DROP", "ALTER", "RENAME", "GRANT", "REVOKE", "ANALYZE",
 ];
 
+/// Leading keywords that identify a Spanner DML statement (data modification).
+const DML_KEYWORDS: &[&str] = &["INSERT", "UPDATE", "DELETE"];
+
 /// Return `true` if `sql` begins with a DDL statement (ignoring leading whitespace and comments).
 pub(crate) fn is_ddl(sql: &str) -> bool {
     first_keyword(sql).is_some_and(|kw| DDL_KEYWORDS.contains(&kw.as_str()))
+}
+
+/// Return `true` if `sql` begins with a DML statement (`INSERT`/`UPDATE`/`DELETE`).
+///
+/// Used to route DML that arrives through the query entry point (`execute`) — as every ADBC client
+/// does, since the C ABI exposes only `ExecuteQuery` — onto the read/write transaction path instead
+/// of a read-only single-use one, which Spanner rejects for DML.
+pub(crate) fn is_dml(sql: &str) -> bool {
+    first_keyword(sql).is_some_and(|kw| DML_KEYWORDS.contains(&kw.as_str()))
 }
 
 /// Split a (possibly multi-statement) SQL string into individual, trimmed, non-empty statements.
@@ -147,6 +159,26 @@ mod tests {
             "",
         ] {
             assert!(!is_ddl(sql), "should not be DDL: {sql}");
+        }
+    }
+
+    #[test]
+    fn detects_dml() {
+        for sql in [
+            "INSERT INTO t (id) VALUES (1)",
+            "  update t SET c = 1 WHERE id = 1",
+            "DELETE FROM t WHERE true",
+            "/* c */ insert into t (id) values (1)",
+        ] {
+            assert!(is_dml(sql), "should be DML: {sql}");
+        }
+        for sql in [
+            "SELECT 1",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "CREATE TABLE t (id INT64) PRIMARY KEY (id)",
+            "",
+        ] {
+            assert!(!is_dml(sql), "should not be DML: {sql}");
         }
     }
 
