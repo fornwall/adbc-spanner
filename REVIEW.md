@@ -587,9 +587,16 @@ dialect failures; the Windows import-lib copy is `|| true`-optional (`libraries.
 wheel version parse greps `Cargo.toml` positionally — `cargo metadata | jq` is robust;
 `adbc-validation.yml` rebuilds arrow-adbc C++ + GoogleTest from source every run (cache it); the
 adbc-validation allowlist means new upstream tests never auto-enter the gate (periodic `--full`
-triage is manual); dead crates.io/docs.rs badges in the README; no consolidated
+triage is manual); dead crates.io/docs.rs badges in the README; ~~no consolidated
 connection/statement option tables in either README (`spanner.rows_per_batch` is missing from the
-Python one entirely); wheel docs omit the platform floors (glibc ≥ 2.35, macOS ≥ 11/10.15); no
+Python one entirely)~~ (**Fixed.** `README.md`'s *Configuration options* section now has three
+consolidated tables — database, connection and statement level — listing every option the driver
+accepts (spec `adbc.*` and vendor `spanner.*`) with value format, default and description,
+cross-checked against `src/driver.rs`/`src/connection.rs`/`src/statement.rs`/`src/lib.rs`;
+`python/README.md` gained a matching *Option reference* section that also maps each level to its
+DBAPI home (`connect()` kwargs / `db_kwargs` vs `conn_kwargs` vs `adbc_stmt_kwargs` /
+`cur.adbc_statement.set_options`), documents `spanner.rows_per_batch`, and adds a CI-executed
+cookbook snippet exercising it); wheel docs omit the platform floors (glibc ≥ 2.35, macOS ≥ 11/10.15); no
 CHANGELOG/CONTRIBUTING/versioning policy; `#![warn(missing_docs)]` absent; assorted maintainability
 polish: the four direction-specific copies of the type mapping (`bind_one` vs `bind_list` is a
 genuine 100-line duplication — fold via an element visitor, and add an "adding a type touches
