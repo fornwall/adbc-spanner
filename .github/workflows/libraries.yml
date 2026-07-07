@@ -32,12 +32,20 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
             lib: libadbc_spanner.so
+          # macos_deployment_target must match the macosx_* wheel tags in the
+          # python-wheels job; a "Verify the minimum macOS" step below fails the
+          # build if the library ever requires a newer macOS than the tag
+          # promises. Change the two together. The floors mirror the
+          # adbc-driver-manager wheels (10.15 x86-64 / 11.0 arm64) — the Python
+          # package is unusable without it, so older would gain nothing.
           - target: aarch64-apple-darwin
             runner: macos-14
             lib: libadbc_spanner.dylib
+            macos_deployment_target: "11.0"
           - target: x86_64-apple-darwin
             runner: macos-14 # cross-compiled from the arm64 runner (Apple toolchain is universal).
             lib: libadbc_spanner.dylib
+            macos_deployment_target: "10.15"
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             lib: adbc_spanner.dll
@@ -70,6 +78,11 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build shared library
+        env:
+          # On macOS, pin the minimum OS the library supports instead of inheriting it
+          # from the host SDK — rustc, cc and aws-lc's cmake all honor this variable.
+          # Empty (and read by nothing) on the other platforms.
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
         run: cargo build --release --target ${{ matrix.target }}
 
       # The Linux wheels are tagged manylinux_2_35, which promises pip that the
@@ -87,6 +100,28 @@ jobs:
           echo "highest glibc symbol version required by ${lib}: ${required}"
           if [ "$(printf '%s\n' "$required" 2.35 | sort -V | tail -1)" != "2.35" ]; then
             echo "::error::${{ matrix.lib }} requires glibc ${required}, which breaks the manylinux_2_35 wheel tag (see the python-wheels job)" >&2
+            exit 1
+          fi
+
+      # Same promise-enforcement as the glibc check above, for the macosx_* wheel tags:
+      # fail if the built dylib's minimum OS is newer than the deployment target (e.g. a
+      # dependency's build system ignoring MACOSX_DEPLOYMENT_TARGET), instead of shipping
+      # a wheel that installs fine and then fails at dlopen time on the OS the tag allows.
+      - name: Verify the minimum macOS matches the wheel tag
+        if: contains(matrix.target, 'apple-darwin')
+        run: |
+          set -euo pipefail
+          lib="target/${{ matrix.target }}/release/${{ matrix.lib }}"
+          expected="${{ matrix.macos_deployment_target }}"
+          # Modern binaries carry LC_BUILD_VERSION (minos); binaries targeting old
+          # x86_64 deployment targets get LC_VERSION_MIN_MACOSX (version) instead.
+          minos="$(otool -l "$lib" | awk '/LC_BUILD_VERSION/{v=1} v && /minos/{print $2; exit}')"
+          if [ -z "$minos" ]; then
+            minos="$(otool -l "$lib" | awk '/LC_VERSION_MIN_MACOSX/{v=1} v && /version/{print $2; exit}')"
+          fi
+          echo "minimum macOS required by ${lib}: ${minos:-<none found>} (wheel tag promises ${expected})"
+          if [ -z "$minos" ] || [ "$(printf '%s\n' "$minos" "$expected" | sort -V | tail -1)" != "$expected" ]; then
+            echo "::error::${{ matrix.lib }} requires macOS ${minos:-unknown}, which breaks the macosx_${expected/./_} wheel tag (see the python-wheels job)" >&2
             exit 1
           fi
 
@@ -211,13 +246,15 @@ jobs:
           # target | lib filename | wheel platform tag.
           # NOTE: the manylinux tag matches the pinned ubuntu-22.04 build
           # runners (glibc 2.35), and the build job's "Verify glibc requirement"
-          # step enforces it. If you change either the runners or these tags,
-          # change the other (and the check) to match.
+          # step enforces it. Likewise the macosx tags match the build job's
+          # macos_deployment_target values, enforced by its "Verify the minimum
+          # macOS" step. If you change any of these tags, change the build job
+          # (and its check) to match.
           rows=(
             "x86_64-unknown-linux-gnu|libadbc_spanner.so|manylinux_2_35_x86_64"
             "aarch64-unknown-linux-gnu|libadbc_spanner.so|manylinux_2_35_aarch64"
             "aarch64-apple-darwin|libadbc_spanner.dylib|macosx_11_0_arm64"
-            "x86_64-apple-darwin|libadbc_spanner.dylib|macosx_10_12_x86_64"
+            "x86_64-apple-darwin|libadbc_spanner.dylib|macosx_10_15_x86_64"
             "x86_64-pc-windows-msvc|adbc_spanner.dll|win_amd64"
             "aarch64-pc-windows-msvc|adbc_spanner.dll|win_arm64"
           )
