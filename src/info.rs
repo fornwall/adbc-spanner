@@ -11,14 +11,11 @@ use std::sync::Arc;
 use adbc_core::error::{Result, Status};
 use adbc_core::options::InfoCode;
 use adbc_core::schemas::GET_INFO_SCHEMA;
-use arrow_array::{
-    new_empty_array, ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray, UInt32Array,
-    UnionArray,
-};
-use arrow_buffer::ScalarBuffer;
-use arrow_schema::{ArrowError, DataType, UnionFields};
+use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray, UInt32Array};
+use arrow_schema::{ArrowError, DataType};
 
 use crate::error::err;
+use crate::nested::dense_union;
 use crate::{DRIVER_NAME, DRIVER_VERSION, VENDOR_NAME};
 
 /// Type ids of the `info_value` union branches this driver populates (see [`GET_INFO_SCHEMA`]:
@@ -135,41 +132,24 @@ pub(crate) fn build(codes: Option<HashSet<InfoCode>>) -> Result<RecordBatch> {
     let string_child: ArrayRef = Arc::new(StringArray::from_iter(strings));
     let bool_child: ArrayRef = Arc::new(BooleanArray::from_iter(bools));
     let int_child: ArrayRef = Arc::new(Int64Array::from_iter(ints));
-    let children: Vec<ArrayRef> =
-        union_child_arrays(&union_fields, &string_child, &bool_child, &int_child);
-
-    let info_value = UnionArray::try_new(
-        union_fields,
-        ScalarBuffer::from(type_ids),
-        Some(ScalarBuffer::from(offsets)),
-        children,
-    )
-    .map_err(arrow_err)?;
+    // Only branches 0–2 carry values; `dense_union` fills the remaining branches (3–5) with empty
+    // children so the union type still matches GET_INFO_SCHEMA exactly.
+    let info_value = dense_union(
+        &union_fields,
+        &[
+            (STRING_VALUE, string_child),
+            (BOOL_VALUE, bool_child),
+            (INT64_VALUE, int_child),
+        ],
+        type_ids,
+        offsets,
+    )?;
 
     RecordBatch::try_new(
         GET_INFO_SCHEMA.clone(),
         vec![Arc::new(UInt32Array::from(names)), Arc::new(info_value)],
     )
     .map_err(arrow_err)
-}
-
-/// Assemble the union's child arrays in field order: the branches we populate get their built
-/// arrays, every other branch an empty array of the right type (no row references them).
-fn union_child_arrays(
-    fields: &UnionFields,
-    string_child: &ArrayRef,
-    bool_child: &ArrayRef,
-    int_child: &ArrayRef,
-) -> Vec<ArrayRef> {
-    fields
-        .iter()
-        .map(|(id, field)| match id {
-            STRING_VALUE => string_child.clone(),
-            BOOL_VALUE => bool_child.clone(),
-            INT64_VALUE => int_child.clone(),
-            _ => new_empty_array(field.data_type()),
-        })
-        .collect()
 }
 
 fn arrow_err(e: ArrowError) -> adbc_core::error::Error {
@@ -182,7 +162,7 @@ fn arrow_err(e: ArrowError) -> adbc_core::error::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::Array;
+    use arrow_array::{Array, UnionArray};
 
     #[test]
     fn build_matches_schema_and_reports_defaults() {
