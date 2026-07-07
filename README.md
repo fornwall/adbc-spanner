@@ -38,6 +38,11 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
 - Transactions: autocommit by default, or manual multi-statement transactions (set
   `adbc.connection.autocommit` to `false`, then `commit`/`rollback`). In manual mode DML is buffered
   and applied atomically in one read/write transaction on commit.
+- Read-only connections: set the standard `adbc.connection.readonly` connection option to `true` to
+  reject all writes on that connection — DML, DDL and bulk ingest fail with an `InvalidState` error,
+  while queries still run. Accepts `true`/`false` (default `false`) and round-trips through
+  `get_option`. The flag is captured when a statement is created, so toggling it applies to
+  statements created afterwards.
 - [Stale reads](https://cloud.google.com/spanner/docs/timestamp-bounds): queries read at a **strong**
   bound by default, but the `spanner.read.staleness` and `spanner.read.timestamp` options (settable on
   a connection — where they become the default for its statements — or per statement) request a

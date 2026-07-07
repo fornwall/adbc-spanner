@@ -53,6 +53,20 @@ Options mirror the driver's `spanner.*` keys:
 | `impersonate_scopes=`           | `spanner.impersonate.scopes`           |
 | `impersonate_lifetime=`         | `spanner.impersonate.lifetime`         |
 
+Standard `adbc.connection.*` options are passed through `conn_kwargs=`. To open a
+**read-only connection** — one that rejects DML, DDL and ingest (they raise, while
+queries still run) — pass `conn_kwargs={"adbc.connection.readonly": "true"}`:
+
+```python
+# docs-test: skip
+import adbc_driver_spanner.dbapi as spanner
+
+with spanner.connect(database="projects/p/instances/i/databases/d",
+                     conn_kwargs={"adbc.connection.readonly": "true"}) as conn:
+    conn.cursor().execute("SELECT 1")   # ok
+    # any INSERT/UPDATE/DELETE, DDL or adbc_ingest raises
+```
+
 Credentials default to Application Default Credentials; pass `keyfile=` /
 `keyfile_json=` for a service account, or point at the emulator:
 

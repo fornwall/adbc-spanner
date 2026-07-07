@@ -64,7 +64,9 @@ Key design points:
   `adbc.connection.transaction.isolation_level` option is honoured for read/write transactions:
   `serializable` and `repeatable_read` map to the client's `IsolationLevel` (applied via
   `TransactionRunnerBuilder::set_isolation_level`), `default` leaves the database default, and the
-  other spec levels are rejected with `NotImplemented`.
+  other spec levels are rejected with `NotImplemented`. The standard `adbc.connection.readonly`
+  option (default `false`) makes a connection reject all writes — DML/DDL/ingest fail with
+  `InvalidState`, queries still run; the flag is snapshotted into each statement at creation.
 - **Stale reads.** Read-only queries default to a strong bound. `spanner.read.staleness`
   (`exact:<duration>` / `max:<duration>`) and `spanner.read.timestamp` (RFC3339, optionally prefixed
   `read:` / `min:`) request a non-strong `TimestampBound` — parsed in `src/staleness.rs` (`ReadBound`
