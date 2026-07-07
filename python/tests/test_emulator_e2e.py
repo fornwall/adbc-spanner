@@ -103,6 +103,54 @@ def test_bulk_ingest_append(emulator_database):
         conn.close()
 
 
+def test_execute_partitions_round_trip(emulator_database):
+    # Partitioned execution: adbc_execute_partitions splits a scan into opaque
+    # descriptors and adbc_read_partition reads each back; their union must be the
+    # full result set, each row once. Data Boost + max_partitions are statement
+    # options set on the underlying ADBC statement (the emulator ignores Data
+    # Boost but still accepts the flag, exercising the plumbing).
+    conn = _connect(emulator_database, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS AdbcPyPartition")
+            cur.execute("CREATE TABLE AdbcPyPartition (Id INT64 NOT NULL) PRIMARY KEY (Id)")
+            cur.execute(
+                "INSERT INTO AdbcPyPartition (Id) "
+                "SELECT n FROM UNNEST(GENERATE_ARRAY(1, 200)) AS n"
+            )
+
+        with conn.cursor() as cur:
+            cur.adbc_statement.set_options(
+                **{
+                    "adbc.spanner.data_boost_enabled": "true",
+                    "adbc.spanner.max_partitions": "4",
+                }
+            )
+            # A single-table scan is partitionable (no ORDER BY: not partitionable).
+            partitions, schema = cur.adbc_execute_partitions(
+                "SELECT Id FROM AdbcPyPartition"
+            )
+        assert len(partitions) >= 1
+        assert schema is not None
+        assert schema.names == ["Id"]
+
+        # Read every partition back — a fresh cursor per descriptor — and union ids.
+        seen: set[int] = set()
+        for token in partitions:
+            with conn.cursor() as cur:
+                cur.adbc_read_partition(token)
+                table = cur.fetch_arrow_table()
+            assert table.schema.names == ["Id"]
+            ids = table.column("Id").to_pylist()
+            # No id may appear in more than one partition.
+            assert seen.isdisjoint(ids)
+            seen.update(ids)
+
+        assert seen == set(range(1, 201))
+    finally:
+        conn.close()
+
+
 def test_manual_commit_and_rollback(emulator_database):
     # autocommit off => the driver buffers DML and applies it atomically on commit.
     conn = _connect(emulator_database, autocommit=False)

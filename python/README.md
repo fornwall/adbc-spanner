@@ -52,6 +52,40 @@ spanner.connect(database="projects/p/instances/i/databases/d",
                 endpoint="localhost:9010", emulator=True)
 ```
 
+## Partitioned reads and Data Boost
+
+A large scan can be split into independent partitions and read in parallel —
+optionally on Spanner's serverless [Data Boost] compute, so the work is isolated
+from your provisioned instance. This uses the ADBC partitioned-execution
+extension (`adbc_execute_partitions` / `adbc_read_partition`):
+
+```python
+import adbc_driver_spanner.dbapi as spanner
+
+with spanner.connect(database="projects/p/instances/i/databases/d") as conn:
+    with conn.cursor() as cur:
+        # Optional statement options, set on the underlying ADBC statement:
+        cur.adbc_statement.set_options(**{
+            "adbc.spanner.data_boost_enabled": "true",  # run on Data Boost
+            "adbc.spanner.max_partitions": "8",          # cap the partition count
+        })
+        partitions, schema = cur.adbc_execute_partitions("SELECT * FROM Singers")
+
+    # Each descriptor is opaque bytes; it can be shipped to another worker,
+    # process, or connection and read independently.
+    for token in partitions:
+        with conn.cursor() as cur:
+            cur.adbc_read_partition(token)
+            table = cur.fetch_arrow_table()
+            ...
+```
+
+The Data Boost choice is baked into each descriptor, so it is honoured wherever
+the partition is read. Only single-table scans are partitionable — queries with
+an `ORDER BY` or aggregation are not.
+
+[Data Boost]: https://cloud.google.com/spanner/docs/databoost/databoost-overview
+
 ## How this package is built
 
 The wheel is **data-only**: it does not compile anything at install time and
