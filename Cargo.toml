@@ -29,6 +29,12 @@ allow-branch = ["main"]
 tag-name = "v{{version}}"
 tag-message = "Release {{version}}"
 pre-release-commit-message = "Release {{version}}"
+# Keep the Python package's checked-in dev-fallback version in step with the crate. Release
+# wheels do not depend on it (CI overwrites the file from the pushed tag), this just stops the
+# committed copy from drifting.
+pre-release-replacements = [
+    { file = "python/adbc_driver_spanner/_version.py", search = "__version__ = \"[0-9][^\"]*\"", replace = "__version__ = \"{{version}}\"", exactly = 1 },
+]
 # Publishing is disabled while the google-cloud-* crates are pinned to git (see the dependency
 # note below) — crates.io rejects git dependencies. Re-enable once those are versioned releases.
 publish = false

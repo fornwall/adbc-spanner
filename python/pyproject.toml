@@ -1,5 +1,7 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+# >=77 for the PEP 639 string `license` + `license-files` below; it also vendors
+# bdist_wheel, so the separate `wheel` requirement is gone.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,6 +11,9 @@ description = "ADBC (Arrow Database Connectivity) driver for Google Cloud Spanne
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
+# A checked-in copy of the repository's LICENSE (Apache-2.0 §4 requires shipping the
+# license text with the wheel, which bundles the compiled driver).
+license-files = ["LICENSE"]
 authors = [{ name = "Fredrik Fornwall", email = "fredrik@fornwall.net" }]
 keywords = ["adbc", "arrow", "spanner", "database", "gcp"]
 classifiers = [
@@ -22,7 +27,9 @@ classifiers = [
     "Programming Language :: Rust",
     "Topic :: Database",
 ]
-dependencies = ["adbc-driver-manager"]
+# >=1.0 covers everything the wrapper uses (AdbcDatabase/dbapi.connect with
+# driver/entrypoint, dbapi autocommit) and keeps pip off ancient pre-1.0 releases.
+dependencies = ["adbc-driver-manager>=1.0"]
 
 [project.optional-dependencies]
 # Arrow result helpers used by the DBAPI layer (fetch_arrow_table/fetch_df).
