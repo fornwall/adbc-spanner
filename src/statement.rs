@@ -113,9 +113,15 @@ impl SpannerStatement {
     fn build_bound_statements(&self, sql: &str) -> Result<Vec<SpannerSql>> {
         let mut statements = Vec::new();
         for batch in &self.bound {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            // Resolve the column→parameter mapping once per batch (it lexes `sql`), then reuse it
+            // for every row instead of re-lexing the SQL per bound row.
+            let names = bind::resolve_parameter_names(sql, batch)?;
             for row in 0..batch.num_rows() {
                 statements
-                    .push(bind::bind_params(SpannerSql::builder(sql), sql, batch, row)?.build());
+                    .push(bind::bind_params(SpannerSql::builder(sql), &names, batch, row)?.build());
             }
         }
         Ok(statements)
@@ -392,7 +398,8 @@ impl SpannerStatement {
         }
         if let Some(batch) = self.bound.first() {
             if batch.num_rows() > 0 {
-                builder = bind::bind_params(builder, sql, batch, 0)?;
+                let names = bind::resolve_parameter_names(sql, batch)?;
+                builder = bind::bind_params(builder, &names, batch, 0)?;
             }
         }
         Ok(builder.build())
@@ -637,7 +644,8 @@ impl Statement for SpannerStatement {
             // `@param` references resolve.
             if let Some(batch) = bound.first() {
                 if batch.num_rows() > 0 {
-                    builder = bind::bind_params(builder, &sql, batch, 0)?;
+                    let names = bind::resolve_parameter_names(&sql, batch)?;
+                    builder = bind::bind_params(builder, &names, batch, 0)?;
                 }
             }
             let result_set = transaction
