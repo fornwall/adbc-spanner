@@ -33,7 +33,7 @@ def option_kwargs(
     keyfile_json: typing.Optional[str] = None,
     db_kwargs: typing.Optional[typing.Mapping[str, str]] = None,
 ) -> typing.Dict[str, str]:
-    """Translate the friendly connection kwargs into ``adbc.spanner.*`` options.
+    """Translate the friendly connection kwargs into ``spanner.*`` options.
 
     Shared by :func:`connect` and :func:`adbc_driver_spanner.dbapi.connect` so the
     two entry points map parameters identically. ``db_kwargs`` is an escape hatch
@@ -42,15 +42,15 @@ def option_kwargs(
     options: typing.Dict[str, str] = {}
     # Friendly kwargs -> the driver's option keys (see src/lib.rs).
     if database is not None:
-        options["adbc.spanner.database"] = database
+        options["spanner.database"] = database
     if endpoint is not None:
-        options["adbc.spanner.endpoint"] = endpoint
+        options["spanner.endpoint"] = endpoint
     if emulator:
-        options["adbc.spanner.emulator"] = "true"
+        options["spanner.emulator"] = "true"
     if keyfile is not None:
-        options["adbc.spanner.keyfile"] = keyfile
+        options["spanner.keyfile"] = keyfile
     if keyfile_json is not None:
-        options["adbc.spanner.keyfile_json"] = keyfile_json
+        options["spanner.keyfile_json"] = keyfile_json
     if db_kwargs:
         options.update(db_kwargs)
     return options
@@ -82,7 +82,7 @@ def connect(
         Service-account credentials, as a path or inline JSON. Omit both to use
         Application Default Credentials.
     db_kwargs:
-        Escape hatch for raw ``adbc.spanner.*`` option keys, merged last.
+        Escape hatch for raw ``spanner.*`` option keys, merged last.
 
     For a DBAPI 2.0 connection, prefer :func:`adbc_driver_spanner.dbapi.connect`.
     """

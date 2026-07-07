@@ -41,7 +41,7 @@ SpannerDriver ──▶ SpannerDatabase ──▶ SpannerConnection ──▶ Sp
   ingest.
 - `src/conversion.rs` — Spanner result set → Arrow schema + typed arrays (the type mapping lives
   here), plus `SpannerBatchReader`, the streaming `RecordBatchReader` that `execute` returns (pulls
-  rows in bounded chunks of `adbc.spanner.rows_per_batch`, default 8192).
+  rows in bounded chunks of `spanner.rows_per_batch`, default 8192).
 - `src/runtime.rs` — a shared Tokio runtime; the ADBC traits are sync while the Spanner client is
   async, so every call bridges via `runtime.block_on(...)`. The runtime is created once by the
   driver and shared via `Arc` into every database/connection/statement.
@@ -176,7 +176,7 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
 
 - Match surrounding style; keep `fmt`/`clippy` clean (CI fails otherwise).
 - Supported so far: streaming queries (`execute` returns a lazy `SpannerBatchReader` that converts
-  bounded row chunks to Arrow on demand; chunk size via `adbc.spanner.rows_per_batch`), DML, DDL (via
+  bounded row chunks to Arrow on demand; chunk size via `spanner.rows_per_batch`), DML, DDL (via
   admin `UpdateDatabaseDdl`), manual transactions
   (buffer-and-commit), native Arrow types for DATE/TIMESTAMP/NUMERIC and native `List`/`Struct` for
   ARRAY/STRUCT, parameter binding + bulk ingest, `get_info` (static driver/vendor metadata),
@@ -194,8 +194,8 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   `Partition::execute` on the connection's client, streaming rows to Arrow via the same
   `stream_query` path as `execute`. This works because the client's session is **multiplexed** and
   `Arc`-shared across the connection's cloned `DatabaseClient`s, so a descriptor stays valid after
-  the producing statement is gone. `adbc.spanner.data_boost_enabled` (statement option) bakes Data
-  Boost into each descriptor; `adbc.spanner.max_partitions` hints the partition count. The emulator
+  the producing statement is gone. `spanner.data_boost_enabled` (statement option) bakes Data
+  Boost into each descriptor; `spanner.max_partitions` hints the partition count. The emulator
   supports the Partition RPCs (it ignores Data Boost) — covered by `execute_partitions_round_trip` in
   `tests/integration.rs`.
 - Still returning `NotImplemented` (keep the pattern until implemented): Substrait
