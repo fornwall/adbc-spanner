@@ -18,14 +18,22 @@
 //! | `TIMESTAMP`                                 | `Timestamp(Nanosecond, "UTC")`    |
 //! | `NUMERIC`                                   | `Decimal128(38, 9)`               |
 //! | `BYTES`                                     | `Binary`                          |
-//! | `STRING`/`JSON`/`UUID`/`INTERVAL`/`ENUM`    | `Utf8`                            |
+//! | `STRING`/`UUID`/`INTERVAL`/`ENUM`/`PROTO`   | `Utf8`                            |
+//! | `JSON`                                      | `Utf8` + `arrow.json` extension   |
 //! | `ARRAY<T>`                                  | `List<T>`                         |
 //! | `STRUCT<..>`                                | `Struct<..>`                      |
 //!
 //! `ARRAY` and `STRUCT` map to native Arrow `List`/`Struct` recursively, so nested shapes like
 //! `ARRAY<STRUCT<..>>` round-trip with full type fidelity. (Struct field metadata comes from
 //! [`Type::struct_type`](google_cloud_spanner::value::Type::struct_type).)
+//!
+//! `JSON` columns keep `Utf8` storage (the value bytes are the JSON text) but carry the canonical
+//! `arrow.json` extension type as field metadata (`ARROW:extension:name` = `arrow.json`), so Arrow
+//! consumers that understand the extension recognize the logical JSON type. The extension lives on
+//! the [`Field`], not the [`DataType`]; for `ARRAY<JSON>` it sits on the list's child (`item`)
+//! field. The other Utf8-backed codes stay plain, untagged `Utf8`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use adbc_core::error::{Result, Status};
@@ -51,6 +59,13 @@ const NUMERIC_PRECISION: u8 = 38;
 const NUMERIC_SCALE: i8 = 9;
 /// Spanner `TIMESTAMP` values are absolute instants in UTC.
 const TIMESTAMP_TZ: &str = "UTC";
+
+/// Arrow field-metadata key naming a canonical extension type.
+const ARROW_EXTENSION_NAME: &str = "ARROW:extension:name";
+/// Arrow field-metadata key carrying an extension type's serialized parameters.
+const ARROW_EXTENSION_METADATA: &str = "ARROW:extension:metadata";
+/// Canonical Arrow extension name for JSON stored as a Utf8 (string) column.
+const ARROW_JSON_EXTENSION: &str = "arrow.json";
 
 /// Drain a Spanner [`ResultSet`] and materialise it as a single Arrow [`RecordBatch`] together with
 /// its schema.
@@ -170,9 +185,9 @@ pub(crate) fn build_schema(
             let fields: Vec<Field> = names
                 .iter()
                 .enumerate()
-                .map(|(i, name)| {
-                    let data_type = types.get(i).map(arrow_type).unwrap_or(DataType::Utf8);
-                    Field::new(name, data_type, true)
+                .map(|(i, name)| match types.get(i) {
+                    Some(ty) => arrow_field(name, ty, true),
+                    None => Field::new(name, DataType::Utf8, true),
                 })
                 .collect();
             return Arc::new(Schema::new(fields));
@@ -184,6 +199,34 @@ pub(crate) fn build_schema(
         .map(|i| Field::new(format!("col{i}"), DataType::Utf8, true))
         .collect();
     Arc::new(Schema::new(fields))
+}
+
+/// Build an Arrow [`Field`] for a Spanner column [`Type`], attaching the canonical `arrow.json`
+/// extension metadata when the column is `JSON`.
+///
+/// The storage type stays `Utf8` (the value bytes are the JSON text); only the field metadata marks
+/// it as logical JSON, so consumers that understand the extension (pyarrow, DuckDB, polars) can
+/// recognize it while others still read plain strings. Only `TypeCode::Json` is tagged — the other
+/// Utf8-backed codes (`STRING`, `UUID`, `INTERVAL`, `ENUM`, `PROTO`) stay untagged.
+fn arrow_field(name: impl Into<String>, ty: &Type, nullable: bool) -> Field {
+    let field = Field::new(name, arrow_type(ty), nullable);
+    if ty.code() == TypeCode::Json {
+        field.with_metadata(json_extension_metadata())
+    } else {
+        field
+    }
+}
+
+/// The two `ARROW:extension:*` field-metadata keys that mark a Utf8 column as canonical `arrow.json`.
+/// The metadata value is the empty string, which is valid (and conventional) for `arrow.json`.
+fn json_extension_metadata() -> HashMap<String, String> {
+    HashMap::from([
+        (
+            ARROW_EXTENSION_NAME.to_string(),
+            ARROW_JSON_EXTENSION.to_string(),
+        ),
+        (ARROW_EXTENSION_METADATA.to_string(), String::new()),
+    ])
 }
 
 /// Map a Spanner column [`Type`] to an Arrow [`DataType`].
@@ -199,10 +242,12 @@ fn arrow_type(ty: &Type) -> DataType {
         TypeCode::Numeric => DataType::Decimal128(NUMERIC_PRECISION, NUMERIC_SCALE),
         TypeCode::Struct => struct_arrow_type(ty),
         TypeCode::Array => match ty.array_element_type() {
-            // ARRAY<T> → Arrow List<T> (recursively; T may itself be a STRUCT). Spanner does not
-            // allow arrays of arrays; fall back to JSON text for anything unexpected.
+            // ARRAY<T> → Arrow List<T> (recursively; T may itself be a STRUCT). The element field is
+            // built via `arrow_field`, so an `ARRAY<JSON>` carries the `arrow.json` extension on the
+            // list's child (`item`) field, not the top-level List. Spanner does not allow arrays of
+            // arrays; fall back to JSON text for anything unexpected.
             Some(element) if !matches!(element.code(), TypeCode::Array | TypeCode::Unspecified) => {
-                DataType::List(Arc::new(Field::new(LIST_ITEM, arrow_type(&element), true)))
+                DataType::List(Arc::new(arrow_field(LIST_ITEM, &element, true)))
             }
             _ => DataType::Utf8,
         },
@@ -231,7 +276,7 @@ fn struct_fields(st: &google_cloud_spanner::model::StructType) -> Fields {
                 .cloned()
                 .map(Type::from)
                 .unwrap_or_default();
-            Field::new(&f.name, arrow_type(&field_type), true)
+            arrow_field(&f.name, &field_type, true)
         })
         .collect()
 }
@@ -510,6 +555,65 @@ fn value_to_json(value: &Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::Array;
+    use google_cloud_spanner::value::ToValue;
+
+    /// The `arrow.json` extension name attached to a Field's metadata, if any.
+    fn extension_name(field: &Field) -> Option<&str> {
+        field
+            .metadata()
+            .get(ARROW_EXTENSION_NAME)
+            .map(String::as_str)
+    }
+
+    #[test]
+    fn json_column_is_tagged_arrow_json() {
+        let field = arrow_field("payload", &google_cloud_spanner::types::json(), true);
+        // Storage type stays Utf8; only the field metadata marks it as logical JSON.
+        assert_eq!(field.data_type(), &DataType::Utf8);
+        assert_eq!(extension_name(&field), Some(ARROW_JSON_EXTENSION));
+        // Both canonical extension keys are present (metadata value is the empty string).
+        assert_eq!(
+            field
+                .metadata()
+                .get(ARROW_EXTENSION_METADATA)
+                .map(String::as_str),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn string_column_is_not_tagged() {
+        // Guards against over-tagging: plain STRING must stay untagged Utf8.
+        let field = arrow_field("name", &google_cloud_spanner::types::string(), true);
+        assert_eq!(field.data_type(), &DataType::Utf8);
+        assert_eq!(extension_name(&field), None);
+        assert!(field.metadata().is_empty());
+    }
+
+    #[test]
+    fn array_of_json_tags_the_item_field() {
+        let element = google_cloud_spanner::types::json();
+        let field = arrow_field("tags", &google_cloud_spanner::types::array(element), true);
+        // Top-level List field carries no extension; its child (`item`) field does.
+        assert_eq!(extension_name(&field), None);
+        let DataType::List(item) = field.data_type() else {
+            panic!("expected a List data type, got {:?}", field.data_type());
+        };
+        assert_eq!(item.data_type(), &DataType::Utf8);
+        assert_eq!(extension_name(item), Some(ARROW_JSON_EXTENSION));
+    }
+
+    #[test]
+    fn json_value_round_trips_as_utf8_text() {
+        // The value path is unchanged: JSON text is kept verbatim as a Utf8 string.
+        let text = r#"{"a":1,"b":[true,null]}"#;
+        let value = text.to_value();
+        let array = build_array(&DataType::Utf8, &[Some(&value)]).unwrap();
+        let strings = array.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(strings.len(), 1);
+        assert_eq!(strings.value(0), text);
+    }
 
     #[test]
     fn dates_to_epoch_days() {

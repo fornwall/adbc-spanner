@@ -153,13 +153,21 @@ Credentials are resolved in this order:
 | `TIMESTAMP`                                 | `Timestamp(Nanosecond, "UTC")`    |
 | `NUMERIC`                                   | `Decimal128(38, 9)`               |
 | `BYTES`                                     | `Binary`                          |
-| `STRING` / `JSON` / `UUID` / `INTERVAL` / `ENUM` | `Utf8`                       |
+| `STRING` / `UUID` / `INTERVAL` / `ENUM` / `PROTO` | `Utf8`                      |
+| `JSON`                                      | `Utf8` + `arrow.json` extension   |
 | `ARRAY<T>`                                  | `List<T>` (recursive)             |
 | `STRUCT<..>`                                | `Struct<..>` (recursive)          |
 
 `NULL`s are represented as null slots in the corresponding Arrow array. `ARRAY` and `STRUCT` map to
 native Arrow `List`/`Struct` recursively, so nested shapes like `ARRAY<STRUCT<..>>` round-trip with
 full type fidelity.
+
+`JSON` columns keep `Utf8` storage (the value bytes are the JSON text) but carry the canonical
+[`arrow.json`](https://arrow.apache.org/docs/format/CanonicalExtensions.html#json) extension type as
+field metadata (`ARROW:extension:name` = `arrow.json`), so Arrow consumers that understand the
+extension recognize the logical JSON type while others still read plain strings. The extension is
+attached to the Arrow `Field`, not the storage `DataType`; for `ARRAY<JSON>` it sits on the list's
+child (`item`) field.
 
 `TIMESTAMP` is read at full nanosecond precision (matching the bind/write path). Arrow stores
 `Timestamp(Nanosecond)` as an `i64` count of nanoseconds since the Unix epoch, which spans only
