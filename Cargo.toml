@@ -105,9 +105,12 @@ broken_intra_doc_links = "deny"
 private_intra_doc_links = "warn"
 
 [profile.release]
-# Smaller shipped shared libraries.
+# Smaller shipped shared libraries. codegen-units = 1 shaves ~21% off the cdylib
+# (17.8 → 14.0 MB) for ~2x the clean-build codegen time; lto = "fat" measured as
+# no further win over thin, so keep thin.
 strip = true
 lto = "thin"
+codegen-units = 1
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync"] }
