@@ -19,7 +19,10 @@
 # type/* cases currently error/fail until Spanner-dialect overrides are added under
 # python/validation/queries/spanner/. See python/validation/README.md. This script therefore does
 # not gate CI; it is an exploratory coverage harness.
-set -uo pipefail
+#
+# -e matters here: without it a failed `cargo build` let the suite proceed and
+# validate a *stale* previously-built cdylib — plausible-looking results for old code.
+set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -37,8 +40,15 @@ fi
 echo ">> building the adbc-spanner cdylib"
 cargo build
 
-echo ">> ensuring the validation suite is installed (pinned $VALIDATION_REF)"
-if ! "$PYTHON" -c "import adbc_drivers_validation" >/dev/null 2>&1; then
+# The pin must hold even when *some* version is already installed: import-existence
+# alone silently kept whatever ref happened to be present, defeating "pinned so the
+# corpus/behaviour is reproducible". pip records the resolved commit in the
+# installed distribution's direct_url metadata, which `pip freeze` reports as
+# `pkg @ git+URL@<sha>` — compare that against the pin and reinstall on mismatch.
+installed_ref="$("$PYTHON" -m pip freeze 2>/dev/null \
+  | sed -n 's/^adbc[-_]drivers[-_]validation @ git+.*@//p' | head -n 1)"
+if [ "$installed_ref" != "$VALIDATION_REF" ]; then
+  echo ">> installing the validation suite at pinned $VALIDATION_REF (installed: ${installed_ref:-none})"
   "$PYTHON" -m pip install --quiet \
     "adbc_drivers_validation @ git+https://github.com/adbc-drivers/validation@${VALIDATION_REF}" \
     pyarrow pytest
@@ -56,11 +66,24 @@ if [ -n "${SPANNER_EMULATOR_HOST:-}" ]; then
   curl -sf -X POST "$rest/v1/projects/test-project/instances/test-instance/databases" \
     -H 'Content-Type: application/json' \
     -d '{"createStatement":"CREATE DATABASE `adbc-test`"}' >/dev/null 2>&1 || true
+  # The creation calls above are deliberately idempotent (|| true: the instance and
+  # database may already exist from a previous run), so this wait is the actual
+  # gate — and it must fail loudly if the database never appears, rather than let
+  # pytest run against a database that does not exist.
+  ready=0
   for _ in $(seq 1 40); do
-    curl -sf "$rest/v1/projects/test-project/instances/test-instance/databases" 2>/dev/null \
-      | grep -q 'adbc-test' && break
+    if curl -sf "$rest/v1/projects/test-project/instances/test-instance/databases" 2>/dev/null \
+        | grep -q 'adbc-test'; then
+      ready=1
+      break
+    fi
     sleep 0.25
   done
+  if [ "$ready" -ne 1 ]; then
+    echo "!! emulator database adbc-test did not become listable at $rest within 10s" >&2
+    echo "!! (is the emulator at SPANNER_EMULATOR_HOST=$SPANNER_EMULATOR_HOST healthy?)" >&2
+    exit 1
+  fi
 else
   IFS='.' read -r p i d <<<"$SPANNER_GCP_DATABASE"
   export ADBC_SPANNER_DATABASE="projects/$p/instances/$i/databases/$d"

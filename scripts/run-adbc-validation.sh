@@ -93,14 +93,24 @@ if [ -n "${SPANNER_EMULATOR_HOST:-}" ]; then
   curl -sf -X POST "$rest/v1/projects/test-project/instances/test-instance/databases" \
     -H 'Content-Type: application/json' \
     -d '{"createStatement":"CREATE DATABASE `adbc-test`"}' >/dev/null 2>&1 || true
-  # Wait for the database to be listable before connecting.
+  # Wait for the database to be listable before connecting. The creation calls above
+  # are deliberately idempotent (|| true), so this wait is the actual gate — and it
+  # must fail loudly if the database never appears, rather than let the suite run
+  # against a database that does not exist.
+  ready=0
   for _ in $(seq 1 40); do
     if curl -sf "$rest/v1/projects/test-project/instances/test-instance/databases" 2>/dev/null \
         | grep -q 'adbc-test'; then
+      ready=1
       break
     fi
     sleep 0.25
   done
+  if [ "$ready" -ne 1 ]; then
+    echo "!! emulator database adbc-test did not become listable at $rest within 10s" >&2
+    echo "!! (is the emulator at SPANNER_EMULATOR_HOST=$SPANNER_EMULATOR_HOST healthy?)" >&2
+    exit 1
+  fi
 else
   # Real Cloud Spanner target: project.instance.database -> the driver's URI form.
   IFS='.' read -r p i d <<<"$SPANNER_GCP_DATABASE"
