@@ -17,9 +17,8 @@
 # The suite's base query corpus assumes a portable SQL dialect (no mandatory PRIMARY KEY,
 # INTEGER/BIGINT type names, positional $1 parameters); the Spanner-dialect overrides under
 # python/validation/queries/spanner/ cover the corpus, so this run GATES CI
-# (foundry-validation.yml). Cases blocked on pending upstream suite fixes are strict xfails —
-# see _PENDING_UPSTREAM_XFAILS in python/validation/tests/conftest.py and
-# python/validation/README.md.
+# (foundry-validation.yml). Every case passes or skips with a reason — no expected failures;
+# see python/validation/README.md.
 #
 # -e matters here: without it a failed `cargo build` let the suite proceed and
 # validate a *stale* previously-built cdylib — plausible-looking results for old code.
@@ -28,8 +27,12 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Pinned so the corpus/behaviour is reproducible; bump deliberately.
-VALIDATION_REF="${ADBC_VALIDATION_REF:-575a41bfd96b09d9d8a057d0ea1e66a27a315475}"
+# Pinned so the corpus/behaviour is reproducible; bump deliberately. Pinned to the
+# fornwall/validation fork, which carries the two suite fixes (test_rows_affected DDL
+# override + bulk_ingest_synthetic_column) our overrides depend on, staged ahead of an
+# upstream (adbc-drivers/validation) submission.
+VALIDATION_REF="${ADBC_VALIDATION_REF:-7046e6d8256afd5c6b968d9e35f03bd8867278a4}"
+VALIDATION_REPO="${ADBC_VALIDATION_REPO:-fornwall/validation}"
 PYTHON="${PYTHON:-python3}"
 EMULATOR_DATABASE="projects/test-project/instances/test-instance/databases/adbc-test"
 
@@ -51,7 +54,7 @@ installed_ref="$("$PYTHON" -m pip freeze 2>/dev/null \
 if [ "$installed_ref" != "$VALIDATION_REF" ]; then
   echo ">> installing the validation suite at pinned $VALIDATION_REF (installed: ${installed_ref:-none})"
   "$PYTHON" -m pip install --quiet \
-    "adbc_drivers_validation @ git+https://github.com/adbc-drivers/validation@${VALIDATION_REF}" \
+    "adbc_drivers_validation @ git+https://github.com/${VALIDATION_REPO}@${VALIDATION_REF}" \
     pyarrow pytest
 fi
 
