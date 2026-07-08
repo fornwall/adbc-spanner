@@ -105,7 +105,6 @@
 mod bind;
 mod connection;
 mod conversion;
-mod ddl;
 mod driver;
 mod error;
 #[cfg(feature = "ffi")]
@@ -118,6 +117,7 @@ mod options;
 mod request;
 mod retry;
 mod runtime;
+mod sql;
 mod staleness;
 mod statement;
 mod statistics;
@@ -135,15 +135,15 @@ pub use statement::SpannerStatement;
 pub mod fuzzing {
     /// Split a `;`-separated SQL batch into individual statements (quote/comment aware).
     pub fn split_statements(sql: &str) -> Vec<String> {
-        crate::ddl::split_statements(sql)
+        crate::sql::split_statements(sql)
     }
     /// Whether the SQL begins with a DDL statement.
     pub fn is_ddl(sql: &str) -> bool {
-        crate::ddl::is_ddl(sql)
+        crate::sql::is_ddl(sql)
     }
     /// Whether the SQL contains a top-level `THEN RETURN` clause.
     pub fn is_dml_returning(sql: &str) -> bool {
-        crate::ddl::is_dml_returning(sql)
+        crate::sql::is_dml_returning(sql)
     }
     /// Parse a Spanner `DATE` string into Arrow `Date32` days.
     pub fn parse_date_days(s: &str) -> Option<i32> {
@@ -164,23 +164,23 @@ pub mod fuzzing {
     /// The first SQL keyword, uppercased — skipping whitespace, comments, and `@{…}` statement
     /// hints.
     pub fn first_keyword(sql: &str) -> Option<String> {
-        crate::ddl::first_keyword(sql)
+        crate::sql::first_keyword(sql)
     }
     /// Whether the SQL begins with a DML statement (`INSERT`/`UPDATE`/`DELETE`).
     pub fn is_dml(sql: &str) -> bool {
-        crate::ddl::is_dml(sql)
+        crate::sql::is_dml(sql)
     }
     /// Strip trailing top-level `;` terminators from a single-statement query.
     pub fn strip_trailing_terminators(sql: &str) -> String {
-        crate::ddl::strip_trailing_terminators(sql)
+        crate::sql::strip_trailing_terminators(sql)
     }
     /// The distinct `@name` bind parameters of a query, in first-appearance order.
     pub fn named_parameters(sql: &str) -> Vec<String> {
-        crate::bind::named_parameters(sql)
+        crate::sql::named_parameters(sql)
     }
     /// Backtick-quote a Spanner identifier (GoogleSQL backslash escaping).
     pub fn quote_ident(ident: &str) -> String {
-        crate::bind::quote_ident(ident)
+        crate::sql::quote_ident(ident)
     }
     /// Resolve the column→parameter pairing for `sql` against a batch whose columns are named
     /// `column_names` (built here as nullable `Int64`; the pairing never looks at types), under the

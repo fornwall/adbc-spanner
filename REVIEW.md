@@ -873,7 +873,18 @@ keep the string getter's `NotFound` unchanged, while a set-but-non-integer value
 `InvalidArguments` naming the option and value — `NotFound` again means only "option unset". As a
 bonus, integer-valued options (`spanner.impersonate.lifetime`, `spanner.rows_per_batch`,
 `spanner.max_partitions`) are now gettable as ints at every level that stores them; covered by
-offline unit tests in `src/options.rs` and `src/driver.rs`), SQL-text helpers scattered across three modules.
+offline unit tests in `src/options.rs` and `src/driver.rs`), ~~SQL-text helpers scattered across
+three modules~~ (**Fixed.** The GoogleSQL-lexer module `src/ddl.rs` was renamed to `src/sql.rs` — the
+single home for the driver's SQL-text concerns — and the three pure SQL-text helpers that lived in
+`src/bind.rs` (`quote_ident`, `qualified_table`, `named_parameters`, the last of which already
+delegated to the lexer) moved there next to `lex`/`split_statements`/`first_keyword`/
+`strip_trailing_terminators`/`is_dml_returning`, with their unit tests. A pure, behavior-preserving
+structural move — only relocation + re-export + call-site path updates (`crate::ddl::` → `crate::sql::`,
+`bind::` → `crate::sql::` at the few callers, plus the `fuzzing` re-exports); no logic changed, verified
+by the unchanged unit tests (all 233 lib tests pass, `clippy -D warnings` and `fmt --check` clean).
+`like_match` stays in `src/connection.rs` with its catalog-filter feature, and the Arrow-batch-aware
+`resolve_parameter_names` / mutation-form `mutation_table` stay in `src/bind.rs`, as those are not pure
+SQL-text helpers.)
 
 ---
 
