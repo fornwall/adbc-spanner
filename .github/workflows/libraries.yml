@@ -166,20 +166,30 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # Linux x86-64 *musl* (Alpine) library, for the musllinux_1_2 wheel. Kept out of the
-  # matrix above because it cannot be produced on the glibc runners: aws-lc-rs (the
+  # Linux *musl* (Alpine) libraries, for the musllinux_1_2 wheels. Kept out of the
+  # matrix above because they cannot be produced on the glibc runners: aws-lc-rs (the
   # hardwired TLS backend) has no pure-Rust option, so its C code must be compiled by a
   # musl toolchain, and — critically — a musl *cdylib* has to link *dynamically* (rustc
   # drops the cdylib crate-type entirely under the musl target's default crt-static),
   # which needs a musl-native libgcc that Ubuntu's `musl-tools` does not ship (a
   # cross-linked .so ends up pulling glibc's libc/libgcc instead). Building inside
   # Alpine, whose native gcc/libgcc are musl, is the clean path: `cargo build` there
-  # targets x86_64-unknown-linux-musl natively, and RUSTFLAGS=-Ctarget-feature=-crt-static
+  # targets <arch>-unknown-linux-musl natively, and RUSTFLAGS=-Ctarget-feature=-crt-static
   # keeps the cdylib dynamic so it dlopen()s on Alpine. Only the compile runs in the
   # container; checkout/package/upload run on the host so the JS actions work normally.
+  # Each arch builds natively on its own runner (x86-64 on ubuntu-22.04, aarch64 on
+  # ubuntu-22.04-arm) so the aws-lc C compiles native — no musl cross-toolchain needed.
   build-musl:
-    name: x86_64-unknown-linux-musl
-    runs-on: ubuntu-22.04
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
     steps:
@@ -188,8 +198,10 @@ jobs:
       # The rust:alpine image is digest-pinned for the same reason the actions above are
       # SHA-pinned: this job compiles a binary that tagged releases attach and the PyPI
       # wheel bundles, so a hijacked mutable tag must not be able to tamper with it. The
-      # trailing comment names the tag the digest was resolved from; bump both together
-      # to move the musl build's Rust toolchain forward.
+      # digest points at the multi-arch image index, so `docker run` pulls the matching
+      # amd64/arm64 variant for whichever runner this matrix leg lands on. The trailing
+      # comment names the tag the digest was resolved from; bump both together to move
+      # the musl build's Rust toolchain forward.
       - name: Build shared library (Alpine/musl)
         run: |
           set -euo pipefail
@@ -228,7 +240,7 @@ jobs:
       - name: Package
         run: |
           set -euo pipefail
-          staging="adbc-spanner-x86_64-unknown-linux-musl"
+          staging="adbc-spanner-${{ matrix.target }}"
           mkdir -p "$staging" dist
           cp target/release/libadbc_spanner.so "$staging/"
           cp README.md LICENSE "$staging/"
@@ -238,7 +250,7 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
-          name: adbc-spanner-x86_64-unknown-linux-musl
+          name: adbc-spanner-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
 
@@ -423,6 +435,7 @@ jobs:
             "x86_64-unknown-linux-gnu|libadbc_spanner.so|manylinux_2_35_x86_64"
             "aarch64-unknown-linux-gnu|libadbc_spanner.so|manylinux_2_35_aarch64"
             "x86_64-unknown-linux-musl|libadbc_spanner.so|musllinux_1_2_x86_64"
+            "aarch64-unknown-linux-musl|libadbc_spanner.so|musllinux_1_2_aarch64"
             "aarch64-apple-darwin|libadbc_spanner.dylib|macosx_11_0_arm64"
             "x86_64-apple-darwin|libadbc_spanner.dylib|macosx_10_15_x86_64"
             "x86_64-pc-windows-msvc|adbc_spanner.dll|win_amd64"
@@ -481,8 +494,8 @@ jobs:
         run: |
           set -euo pipefail
           # Only the native glibc (manylinux x86_64) wheel is installable on this
-          # glibc runner, so smoke-test that one; the musllinux wheel is only
-          # inspected above (pip on glibc rejects it, and it needs an Alpine host).
+          # glibc runner, so smoke-test that one; the musllinux wheels are only
+          # inspected above (pip on glibc rejects them, and they need an Alpine host).
           # Install the actual built wheel — not the source tree the unit-test job
           # uses — to confirm the bundled library resolves.
           whl="$(ls python/wheelhouse/*manylinux_2_35_x86_64.whl)"
