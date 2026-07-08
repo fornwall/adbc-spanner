@@ -115,6 +115,15 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   descriptor, and `Connection::read_partition()` streams one partition's rows back as Arrow.
   `spanner.data_boost_enabled` bakes [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview)
   into the descriptors; `spanner.max_partitions` hints the partition count.
+- Error reporting: a Spanner/gRPC failure maps onto the closest ADBC status, keeps the exact numeric
+  gRPC code in the ADBC error's `vendor_code` (so a retry loop can detect `ABORTED` = 10 precisely),
+  and forwards the response's structured
+  [`google.rpc.Status` details](https://cloud.google.com/apis/design/errors) into the ADBC error's
+  *details*: each detail becomes a `(key, value)` pair whose key is the lowercased proto type name
+  (e.g. `google.rpc.retryinfo`, `google.rpc.errorinfo`) and whose value is the detail's ProtoJSON
+  encoding as UTF-8 bytes (self-describing via `"@type"`; no `-bin` key suffix since the value is
+  text, not binary protobuf). Most useful: on `ABORTED`, Spanner's `RetryInfo` detail carries the
+  server-recommended `retryDelay` to wait before retrying the transaction.
 
 Not supported (returns `NotImplemented`, by nature of Spanner): **Substrait** — Spanner executes
 GoogleSQL/PostgreSQL text and has no Substrait support.
