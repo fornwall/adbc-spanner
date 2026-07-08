@@ -40,8 +40,8 @@ use adbc_driver_manager::ManagedDriver;
 use adbc_spanner::{SpannerConnection, SpannerDatabase, SpannerDriver};
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int16Array, Int64Array, ListArray, RecordBatch, RecordBatchReader, StringArray, StructArray,
-    TimestampMicrosecondArray, TimestampNanosecondArray, UnionArray,
+    Int16Array, Int64Array, ListArray, RecordBatch, RecordBatchIterator, RecordBatchReader,
+    StringArray, StructArray, TimestampMicrosecondArray, TimestampNanosecondArray, UnionArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::{NaiveDate, SecondsFormat};
@@ -1218,12 +1218,21 @@ fn query_and_dml_round_trip() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(created.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
-    // `create` mode on an already-existing table is the error path: the driver emits a
-    // `CREATE TABLE` (no `IF NOT EXISTS`), which Spanner rejects because `AdbcCreate` still exists.
-    // Unlike append-mode ingest, create-mode failures are not remapped, so the underlying DDL error
-    // surfaces directly — we only assert that it fails and that nothing was inserted.
+    // `create` mode on an already-existing table is the ADBC-contractual error path: the driver
+    // emits a `CREATE TABLE` (no `IF NOT EXISTS`), Spanner rejects it because `AdbcCreate` still
+    // exists, and the driver remaps the DDL failure onto `AlreadyExists` — naming the table — so
+    // consumers can branch on the status (e.g. to fall back to append). Nothing may be inserted.
     let create_on_existing = ingest_into(&mut connection, "AdbcCreate", "create")
         .expect_err("create-mode ingest onto an existing table must fail");
+    assert_eq!(
+        create_on_existing.status,
+        adbc_core::error::Status::AlreadyExists,
+        "create onto an existing table must be AlreadyExists, got: {create_on_existing:?}"
+    );
+    assert!(
+        create_on_existing.message.contains("AdbcCreate"),
+        "the error must name the target table: {create_on_existing:?}"
+    );
     assert_eq!(
         count_rows(&mut connection, "AdbcCreate"),
         2,
@@ -2093,6 +2102,444 @@ fn timestamp_precision_modes_round_trip() {
     let mut drop_ts = connection.new_statement().expect("new statement");
     drop_ts.set_sql_query("DROP TABLE AdbcTsPrecision").unwrap();
     drop_ts.execute_update().expect("drop timestamp table");
+}
+
+/// Edge cases of the bulk-ingest surface, each mapped to a bug a peer ADBC driver shipped:
+/// zero-row batches inside a bound stream (the Snowflake driver silently lost the rows after a
+/// mid-stream empty batch, apache/arrow-adbc#1866), binding before setting the ingest options
+/// (Flight SQL's `TestBulkIngestBindBeforeOptions`, fixed for all drivers in driver-manager
+/// apache/arrow-adbc#4308), bound data with no destination at all, an ingest target with no bound
+/// data, full reuse of one statement handle across ingest → DML → ingest (the DuckDB ADBC suite's
+/// reuse chain), and a duplicate primary key surfacing as `AlreadyExists` naming the target table
+/// (DuckDB's ingest errors shipped table-less until duckdb/duckdb#22146).
+#[test]
+fn bulk_ingest_edge_cases() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping bulk_ingest_edge_cases");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    let mut ddl = connection.new_statement().expect("new statement");
+    ddl.set_sql_query(
+        "DROP TABLE IF EXISTS AdbcEdge; \
+         CREATE TABLE AdbcEdge (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
+    )
+    .unwrap();
+    ddl.execute_update().expect("create edge table");
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("Id", DataType::Int64, false),
+        Field::new("Name", DataType::Utf8, false),
+    ]));
+    let batch = |ids: &[i64]| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(
+                    ids.iter().map(|i| format!("name-{i}")).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    };
+    let empty = || RecordBatch::new_empty(schema.clone());
+    // A fresh statement pre-configured to append into AdbcEdge.
+    let append_stmt = |connection: &mut SpannerConnection| {
+        let mut s = connection.new_statement().expect("new statement");
+        s.set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcEdge".into()),
+        )
+        .unwrap();
+        s.set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .unwrap();
+        s
+    };
+
+    // --- Zero-row batches in a bound stream, in FIRST, MIDDLE and LAST position. Every row from
+    // the non-empty batches must land — a mid-stream empty batch must not truncate the ingest.
+    let mut zero_rows = append_stmt(&mut connection);
+    zero_rows
+        .bind_stream(Box::new(RecordBatchIterator::new(
+            [empty(), batch(&[1, 2]), empty(), batch(&[3]), empty()].map(Ok),
+            schema.clone(),
+        )))
+        .expect("bind stream with zero-row batches");
+    assert_eq!(
+        zero_rows
+            .execute_update()
+            .expect("ingest around zero-row batches"),
+        Some(3),
+        "all rows from the non-empty batches must land; empty batches contribute nothing"
+    );
+    assert_eq!(count_rows(&mut connection, "AdbcEdge"), 3);
+
+    // A stream of only zero-row batches ingests zero rows successfully (no empty commit is sent —
+    // the empty-chunk guard is unit-tested offline in src/statement.rs).
+    let mut all_empty = append_stmt(&mut connection);
+    all_empty
+        .bind_stream(Box::new(RecordBatchIterator::new(
+            [empty(), empty()].map(Ok),
+            schema.clone(),
+        )))
+        .expect("bind all-empty stream");
+    assert_eq!(
+        all_empty
+            .execute_update()
+            .expect("all-empty ingest succeeds"),
+        Some(0)
+    );
+    assert_eq!(count_rows(&mut connection, "AdbcEdge"), 3);
+
+    // The same zero-row-batch stream in MANUAL transaction mode: buffered (None), all rows from
+    // the non-empty batches applied on commit.
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("disable autocommit");
+    let mut manual = append_stmt(&mut connection);
+    manual
+        .bind_stream(Box::new(RecordBatchIterator::new(
+            [empty(), batch(&[4]), empty(), batch(&[5]), empty()].map(Ok),
+            schema.clone(),
+        )))
+        .expect("bind manual-mode stream with zero-row batches");
+    assert_eq!(
+        manual.execute_update().expect("buffered ingest"),
+        None,
+        "a manual-mode ingest must buffer its mutations"
+    );
+    connection.commit().expect("commit buffered ingest");
+    assert_eq!(
+        count_rows(&mut connection, "AdbcEdge"),
+        5,
+        "every row around the zero-row batches must land on commit"
+    );
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("true".into()),
+        )
+        .expect("re-enable autocommit");
+
+    // Create-mode with a zero-row FIRST batch: the created table's schema comes from that empty
+    // batch, and the later rows land.
+    let mut create = connection.new_statement().expect("new statement");
+    create
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcEdgeCreate".into()),
+        )
+        .unwrap();
+    create
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("create".into()),
+        )
+        .unwrap();
+    create
+        .bind_stream(Box::new(RecordBatchIterator::new(
+            [empty(), batch(&[1])].map(Ok),
+            schema.clone(),
+        )))
+        .expect("bind create-mode stream with an empty first batch");
+    assert_eq!(
+        create
+            .execute_update()
+            .expect("create-mode ingest with an empty first batch"),
+        Some(1),
+        "the table schema must come from the zero-row first batch"
+    );
+    let mut drop_edge_create = connection.new_statement().expect("new statement");
+    drop_edge_create
+        .set_sql_query("DROP TABLE AdbcEdgeCreate")
+        .unwrap();
+    drop_edge_create
+        .execute_update()
+        .expect("drop AdbcEdgeCreate");
+
+    // --- Bind BEFORE the ingest options: the bound data and the ingest options may arrive in
+    // either order.
+    let mut before = connection.new_statement().expect("new statement");
+    before.bind(batch(&[6])).expect("bind before options");
+    before
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcEdge".into()),
+        )
+        .unwrap();
+    before
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .unwrap();
+    assert_eq!(
+        before.execute_update().expect("bind-before-options ingest"),
+        Some(1),
+        "binding before setting the ingest target must work"
+    );
+    assert_eq!(count_rows(&mut connection, "AdbcEdge"), 6);
+
+    // Bound data with NO destination at all (no ingest target, no SQL): a clean InvalidState that
+    // names the missing ingest option, on BOTH entry points. The failed attempts must not consume
+    // the bound data, so supplying the target afterwards still ingests it.
+    let mut nowhere = connection.new_statement().expect("new statement");
+    nowhere.bind(batch(&[7])).expect("bind without destination");
+    let update_err = nowhere
+        .execute_update()
+        .expect_err("execute_update with bound data but no destination must fail");
+    let execute_err = nowhere
+        .execute()
+        .err()
+        .expect("execute with bound data but no destination must fail");
+    for error in [update_err, execute_err] {
+        assert_eq!(
+            error.status,
+            adbc_core::error::Status::InvalidState,
+            "bound data without a destination must be InvalidState, got: {error:?}"
+        );
+        assert!(
+            error.message.contains("adbc.ingest.target_table"),
+            "the error must name the missing ingest option: {error:?}"
+        );
+    }
+    nowhere
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcEdge".into()),
+        )
+        .unwrap();
+    assert_eq!(
+        nowhere
+            .execute_update()
+            .expect("ingest after supplying the destination"),
+        Some(1),
+        "the failed no-destination attempts must not have consumed the bound data"
+    );
+    assert_eq!(count_rows(&mut connection, "AdbcEdge"), 7);
+
+    // --- An ingest target with NO bound data: InvalidState on both entry points.
+    let mut nodata = append_stmt(&mut connection);
+    let error = nodata
+        .execute_update()
+        .expect_err("ingest with no bound data must fail");
+    assert_eq!(
+        error.status,
+        adbc_core::error::Status::InvalidState,
+        "ingest with no bound data must be InvalidState, got: {error:?}"
+    );
+    assert!(
+        error.message.contains("no data has been bound"),
+        "unexpected message: {error:?}"
+    );
+    let error = nodata
+        .execute()
+        .err()
+        .expect("ingest via execute with no bound data must fail");
+    assert_eq!(
+        error.status,
+        adbc_core::error::Status::InvalidState,
+        "ingest via execute with no bound data must be InvalidState, got: {error:?}"
+    );
+
+    // --- Full reuse of ONE statement handle: ingest → DML via execute_update → ingest again.
+    // Each mode switch must clear the other's state, in both directions.
+    let mut handle = append_stmt(&mut connection);
+    handle
+        .bind(batch(&[10, 11]))
+        .expect("bind first reuse ingest");
+    assert_eq!(
+        handle.execute_update().expect("first reuse ingest"),
+        Some(2)
+    );
+    // Switching to SQL clears the ingest target (observable through get_option)...
+    handle
+        .set_sql_query("INSERT INTO AdbcEdge (Id, Name) VALUES (12, 'dml')")
+        .unwrap();
+    assert!(
+        handle
+            .get_option_string(OptionStatement::TargetTable)
+            .is_err(),
+        "set_sql_query must clear the ingest target"
+    );
+    assert_eq!(
+        handle.execute_update().expect("DML on the reused handle"),
+        Some(1)
+    );
+    // ...and re-setting the target clears the stale DML, so the handle ingests again instead of
+    // re-running the INSERT.
+    handle
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcEdge".into()),
+        )
+        .unwrap();
+    handle
+        .bind(batch(&[13, 14]))
+        .expect("bind second reuse ingest");
+    assert_eq!(
+        handle.execute_update().expect("second reuse ingest"),
+        Some(2),
+        "the re-set ingest target must win over the stale DML"
+    );
+    assert_eq!(count_rows(&mut connection, "AdbcEdge"), 12);
+
+    // --- Duplicate primary key: insert mutations keep INSERT semantics, so re-ingesting an
+    // existing key fails with AlreadyExists — naming the target table, and not misreported as a
+    // schema mismatch.
+    let mut dup = append_stmt(&mut connection);
+    dup.bind(batch(&[1])).expect("bind duplicate-key row");
+    let error = dup
+        .execute_update()
+        .expect_err("duplicate-PK ingest must fail");
+    assert_eq!(
+        error.status,
+        adbc_core::error::Status::AlreadyExists,
+        "a duplicate primary key must surface as AlreadyExists, got: {error:?}"
+    );
+    assert!(
+        error.message.contains("AdbcEdge"),
+        "the error must name the target table: {error:?}"
+    );
+    assert!(
+        !error.message.contains("incompatible"),
+        "a duplicate key must not be misreported as a schema mismatch: {error:?}"
+    );
+    assert_eq!(
+        count_rows(&mut connection, "AdbcEdge"),
+        12,
+        "the rejected duplicate must not change the table"
+    );
+
+    let mut drop_edge = connection.new_statement().expect("new statement");
+    drop_edge.set_sql_query("DROP TABLE AdbcEdge").unwrap();
+    drop_edge.execute_update().expect("drop edge table");
+}
+
+/// A multi-chunk autocommit ingest that fails midway — a later chunk duplicates a primary key an
+/// earlier chunk committed — must report how many rows those earlier chunks already committed.
+/// The count is known exactly (the sum of the committed chunk sizes), so the caller learns the
+/// table's actual state instead of guessing. The duplicate key also keeps its `AlreadyExists`
+/// status through the append-failure remap, naming the table.
+#[test]
+fn bulk_ingest_mid_chunk_failure_reports_committed_rows() {
+    let Some(target) = test_target() else {
+        eprintln!(
+            "no Spanner target set — skipping bulk_ingest_mid_chunk_failure_reports_committed_rows"
+        );
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    let mut ddl = connection.new_statement().expect("new statement");
+    ddl.set_sql_query(
+        "DROP TABLE IF EXISTS AdbcMidFail; \
+         CREATE TABLE AdbcMidFail (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
+    )
+    .unwrap();
+    ddl.execute_update().expect("create midfail table");
+
+    // Six ~1.1 MB rows force at least two chunks under the ~4 MiB per-chunk byte budget (the same
+    // shape as `bulk_ingest_chunks_past_the_byte_budget`). The LAST row reuses the FIRST row's
+    // primary key, so wherever the chunk boundaries fall the duplicate sits in a later chunk than
+    // its victim: the first chunk always commits, and the chunk holding the last row always fails.
+    const ROWS: usize = 6;
+    const VALUE_LEN: usize = 1_100_000;
+    let mut ids: Vec<i64> = (0..ROWS as i64).collect();
+    ids[ROWS - 1] = 0; // duplicate of the first row's key
+    let names: Vec<String> = (0..ROWS)
+        .map(|i| char::from(b'a' + i as u8).to_string().repeat(VALUE_LEN))
+        .collect();
+    let rows = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("Id", DataType::Int64, false),
+            Field::new("Name", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(
+                names.iter().map(String::as_str).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+
+    let mut ingest = connection.new_statement().expect("new statement");
+    ingest
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcMidFail".into()),
+        )
+        .unwrap();
+    ingest
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .unwrap();
+    ingest.bind(rows).expect("bind mid-fail ingest rows");
+    let error = ingest
+        .execute_update()
+        .expect_err("the duplicate key in a later chunk must fail the ingest");
+
+    // The duplicate key keeps AlreadyExists through the append remap, naming the table.
+    assert_eq!(
+        error.status,
+        adbc_core::error::Status::AlreadyExists,
+        "a duplicate key in a later chunk must be AlreadyExists, got: {error:?}"
+    );
+    assert!(
+        error.message.contains("AdbcMidFail"),
+        "the error must name the target table: {error:?}"
+    );
+
+    // The earlier chunks' rows stayed committed (per-chunk commits are not atomic as a whole),
+    // and the error reports their exact count.
+    let committed = count_rows(&mut connection, "AdbcMidFail");
+    assert!(
+        committed > 0 && committed < ROWS as i64,
+        "a mid-ingest failure must leave exactly the earlier chunks' rows, found {committed}"
+    );
+    assert!(
+        error.message.contains(&format!(
+            "{committed} row(s) from this bulk ingest's earlier chunks were already committed"
+        )),
+        "the error must report the rows already committed ({committed} found in the table): {error:?}"
+    );
+
+    let mut drop_midfail = connection.new_statement().expect("new statement");
+    drop_midfail
+        .set_sql_query("DROP TABLE AdbcMidFail")
+        .unwrap();
+    drop_midfail.execute_update().expect("drop midfail table");
 }
 
 /// Flatten a collected `get_objects` result into the table names it contains, across all

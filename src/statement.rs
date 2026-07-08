@@ -236,10 +236,13 @@ impl SpannerStatement {
     /// mandates.
     ///
     /// A successful (or, in manual-transaction mode, merely buffered) outcome is returned unchanged.
-    /// On failure the target table is probed via the shared [`table_exists`](crate::connection::table_exists)
-    /// query: a missing table becomes [`Status::NotFound`], and an existing table — so the insert
-    /// must have failed because the bound data's schema is incompatible with the table's — becomes
-    /// [`Status::AlreadyExists`]. Only these two cases are remapped; the original Spanner error's
+    /// A failure that already carries [`Status::AlreadyExists`] — a bound row duplicating a primary
+    /// key already in the table, since insert mutations keep `INSERT` semantics — keeps that status
+    /// and just gets the target table's name folded into the message. Any other failure probes the
+    /// target table via the shared [`table_exists`](crate::connection::table_exists) query: a
+    /// missing table becomes [`Status::NotFound`], and an existing table — so the insert must have
+    /// failed because the bound data's schema is incompatible with the table's — becomes
+    /// [`Status::AlreadyExists`]. Only these cases are remapped; the original Spanner error's
     /// detail is folded into the message. If the probe itself fails (e.g. a transport error) that
     /// probe error is surfaced instead, so a genuine outage is not masked as a schema mismatch.
     fn remap_ingest_append_error(
@@ -251,6 +254,20 @@ impl SpannerStatement {
             Ok(count) => return Ok(count),
             Err(error) => error,
         };
+        // Already `AlreadyExists`: a duplicate primary key. The status is the one the contract
+        // wants — name the target table (consumers key off it) instead of running the exists
+        // probe, whose "incompatible schema" wording would misreport a duplicate key.
+        if error.status == Status::AlreadyExists {
+            let mut named = err(
+                format!(
+                    "bulk ingest append into table {table:?} failed: {}",
+                    error.message
+                ),
+                Status::AlreadyExists,
+            );
+            named.vendor_code = error.vendor_code;
+            return Err(named);
+        }
         // Probe the target table in its schema (`adbc.ingest.target_db_schema`, empty = Spanner's
         // default, unnamed schema).
         let db_schema = self.target_db_schema.as_deref().unwrap_or("");
@@ -307,7 +324,8 @@ impl SpannerStatement {
     ///
     /// An ingest small enough for one chunk (the common case) applies atomically; one large enough
     /// to need several chunks does **not** — each chunk commits in its own transaction, so a
-    /// mid-ingest failure leaves the earlier chunks' rows committed.
+    /// mid-ingest failure leaves the earlier chunks' rows committed (the error reports their exact
+    /// count — see [`note_rows_already_committed`]).
     fn run_ingest(&mut self, table: &str) -> Result<Option<i64>> {
         if self.is_read_only() {
             return Err(invalid_state("cannot ingest: the connection is read-only"));
@@ -315,22 +333,65 @@ impl SpannerStatement {
         if self.bound.is_empty() {
             return Err(invalid_state("cannot ingest: no data has been bound"));
         }
+        let result = self.run_bound_ingest(table);
+        // The bound data is consumed by the ingest attempt either way — including a failed
+        // create-mode DDL: a reused statement handle must not silently re-ingest stale rows after
+        // a failure.
+        self.bound.clear();
+        result
+    }
+
+    /// The body of [`run_ingest`](Self::run_ingest), split out so its caller clears the bound data
+    /// on every exit path (success, failed DDL, failed insert) in one place.
+    fn run_bound_ingest(&self, table: &str) -> Result<Option<i64>> {
         let ingest_ddl = self.build_ingest_table_ddl(table, self.ingest_mode)?;
         // `append` (the default) is the only mode that inserts into a pre-existing table, so it is
         // the only one whose failure the ADBC spec wants remapped to NotFound / AlreadyExists.
         // `build_ingest_table_ddl` returns `None` for exactly that mode.
         let is_append = ingest_ddl.is_none();
         if let Some(ddl) = ingest_ddl {
-            self.run_ddl(ddl)?;
+            self.run_ddl(ddl)
+                .map_err(|error| self.remap_ingest_create_error(table, error))?;
         }
         let result = self.run_ingest_mutations(table);
-        // The bound data is consumed by the ingest attempt either way: a reused statement handle
-        // must not silently re-ingest stale rows after a failure.
-        self.bound.clear();
         if is_append {
             self.remap_ingest_append_error(table, result)
         } else {
             result
+        }
+    }
+
+    /// Remap a failed `create`-mode ingest DDL onto [`Status::AlreadyExists`] when the target
+    /// table already exists.
+    ///
+    /// `create` mode promises to build the table, so hitting an existing one is the
+    /// ADBC-contractual `AlreadyExists` — consumers branch on that status (e.g. to fall back to
+    /// append). Spanner reports it as a generic schema-change failure ("Duplicate name in
+    /// schema"), so the existence is confirmed via the shared
+    /// [`table_exists`](crate::connection::table_exists) probe and the remapped message names the
+    /// table. Only `create` is remapped: `create_append` guards with `IF NOT EXISTS` and `replace`
+    /// drops first, so their DDL failures are never about the table already existing. If the table
+    /// is absent — or the probe itself fails — the original DDL error surfaces unchanged.
+    fn remap_ingest_create_error(&self, table: &str, error: Error) -> Error {
+        if !matches!(self.ingest_mode, Some(IngestMode::Create)) {
+            return error;
+        }
+        let db_schema = self.target_db_schema.as_deref().unwrap_or("");
+        match crate::connection::table_exists(
+            &self.runtime,
+            &self.client,
+            &self.cancel,
+            db_schema,
+            table,
+        ) {
+            Ok(true) => err(
+                format!(
+                    "bulk ingest create target table {table:?} already exists ({})",
+                    error.message
+                ),
+                Status::AlreadyExists,
+            ),
+            _ => error,
         }
     }
 
@@ -359,8 +420,10 @@ impl SpannerStatement {
     /// is already there). An ingest that fits [`IngestChunkBudget`]'s conservative budgets still
     /// commits as a single atomic transaction; only an ingest big enough to need several chunks —
     /// one that could not have committed at all as one transaction — loses whole-ingest atomicity.
-    /// Building per chunk also bounds memory: only one chunk of mutations is materialised at a
-    /// time, instead of all N rows up front.
+    /// When a later chunk's commit fails, the error reports exactly how many rows the earlier
+    /// chunks already committed (see [`note_rows_already_committed`]), so the caller knows the
+    /// table's state. Building per chunk also bounds memory: only one chunk of mutations is
+    /// materialised at a time, instead of all N rows up front.
     fn run_ingest_mutations(&self, table: &str) -> Result<Option<i64>> {
         // Mutations name their target table directly (no SQL quoting; a named schema joins with a
         // plain dot).
@@ -387,14 +450,18 @@ impl SpannerStatement {
             let row_bytes = batch.get_array_memory_size() / batch.num_rows().max(1);
             for row in 0..batch.num_rows() {
                 if !budget.fits(columns, row_bytes) {
-                    total += self.write_mutation_chunk(std::mem::take(&mut chunk))?;
+                    total += self
+                        .write_mutation_chunk(std::mem::take(&mut chunk))
+                        .map_err(|e| note_rows_already_committed(e, total))?;
                     budget = IngestChunkBudget::default();
                 }
                 chunk.push(bind::insert_mutation(&target, batch, row)?);
                 budget.add(columns, row_bytes);
             }
         }
-        total += self.write_mutation_chunk(chunk)?;
+        total += self
+            .write_mutation_chunk(chunk)
+            .map_err(|e| note_rows_already_committed(e, total))?;
         Ok(Some(total))
     }
 
@@ -680,6 +747,22 @@ impl SpannerStatement {
         }
         Ok(builder.build())
     }
+
+    /// Guard for [`execute`](Statement::execute) / [`execute_update`](Statement::execute_update)
+    /// when data has been bound but there is nothing to apply it to — neither a SQL query nor a
+    /// bulk-ingest target. Binding *before* setting `adbc.ingest.target_table` is legal (the bind
+    /// and the ingest options may arrive in either order), so this can only be diagnosed at
+    /// execution time — and the message names both remedies, instead of the plain "no SQL query
+    /// set" error that would hide the missing ingest option.
+    fn check_bound_has_destination(&self) -> Result<()> {
+        if self.sql.is_none() && self.target_table.is_none() && !self.bound.is_empty() {
+            return Err(invalid_state(
+                "data has been bound but no SQL query or bulk-ingest target is set; call \
+                 set_sql_query or set the adbc.ingest.target_table option before executing",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Optionable for SpannerStatement {
@@ -855,6 +938,7 @@ impl Statement for SpannerStatement {
                 return Ok(Self::empty_reader());
             }
         }
+        self.check_bound_has_destination()?;
         let sql = self.sql()?;
         if crate::ddl::is_ddl(&sql) {
             self.run_ddl(crate::ddl::split_statements(&sql))?;
@@ -931,6 +1015,7 @@ impl Statement for SpannerStatement {
                 return self.run_ingest(&table);
             }
         }
+        self.check_bound_has_destination()?;
 
         let sql = self.sql()?;
         if crate::ddl::is_ddl(&sql) {
@@ -1215,6 +1300,32 @@ fn rows_per_batch_option(value: OptionValue) -> Result<usize> {
     crate::options::positive_usize(value, "rows_per_batch")
 }
 
+/// Annotate a failed chunk commit of a multi-chunk autocommit ingest with the number of rows the
+/// earlier chunks have already committed.
+///
+/// Each chunk commits in its own transaction (see
+/// [`SpannerStatement::run_ingest_mutations`]), so a mid-ingest failure leaves the earlier chunks'
+/// rows in the table. The count is known exactly — it is the sum of the committed chunk sizes —
+/// and reporting it tells the caller what state the table was left in instead of making them
+/// guess. A failure in the first (or only) chunk committed nothing and passes through unchanged.
+/// The status and `vendor_code` are preserved, so callers still branch on the underlying failure
+/// (e.g. `AlreadyExists` for a duplicate primary key).
+fn note_rows_already_committed(error: Error, committed: i64) -> Error {
+    if committed == 0 {
+        return error;
+    }
+    let mut annotated = err(
+        format!(
+            "{} ({committed} row(s) from this bulk ingest's earlier chunks were already \
+             committed and remain in the table)",
+            error.message
+        ),
+        error.status,
+    );
+    annotated.vendor_code = error.vendor_code;
+    annotated
+}
+
 /// Per-chunk mutation budget for bulk ingest. Spanner caps a single commit at ~80,000 mutations,
 /// and an insert mutation counts roughly its column count **plus** secondary-index entries the
 /// driver cannot see, so the budget stays at a quarter of the cap to leave headroom for indexed
@@ -1317,6 +1428,44 @@ mod tests {
         assert_eq!(chunk_lengths(3, usize::MAX, usize::MAX), vec![1, 1, 1]);
         // Zero-cost rows never cut: everything fits in one chunk.
         assert_eq!(chunk_lengths(100_000, 0, 0), vec![100_000]);
+    }
+
+    #[test]
+    fn ingest_of_zero_rows_emits_no_chunks() {
+        // Bound batches holding no rows at all (e.g. a stream of zero-row batches) must produce no
+        // commit chunk — the trailing `write_mutation_chunk` guards the empty case, so nothing is
+        // sent to Spanner.
+        assert_eq!(chunk_lengths(0, 10, 100), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn mid_ingest_failure_notes_committed_rows() {
+        let source = || {
+            let mut e = err("Spanner error: row already exists", Status::AlreadyExists);
+            e.vendor_code = 6; // gRPC ALREADY_EXISTS
+            e
+        };
+        // First-chunk failure: nothing was committed, the error passes through untouched.
+        let untouched = note_rows_already_committed(source(), 0);
+        assert_eq!(untouched.message, "Spanner error: row already exists");
+        assert_eq!(untouched.status, Status::AlreadyExists);
+        // Later-chunk failure: the exact committed row count is reported, and the status and
+        // vendor_code survive so callers still branch on the underlying failure.
+        let annotated = note_rows_already_committed(source(), 4_000);
+        assert!(
+            annotated
+                .message
+                .contains("4000 row(s) from this bulk ingest's earlier chunks were already"),
+            "{}",
+            annotated.message
+        );
+        assert!(
+            annotated.message.contains("row already exists"),
+            "the original failure must stay in the message: {}",
+            annotated.message
+        );
+        assert_eq!(annotated.status, Status::AlreadyExists);
+        assert_eq!(annotated.vendor_code, 6);
     }
 
     #[test]
