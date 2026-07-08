@@ -114,6 +114,7 @@ are handy from Python:
 | -------------------------- | ---------- | --------------------------------------------------------------------------------------------- |
 | `adbc.connection.readonly` | connection | `"true"` rejects all writes on the connection (see below); queries still run.                 |
 | `spanner.read.staleness`   | conn/stmt  | Serve reads from a bounded-stale snapshot, e.g. `"max:10s"` or `"exact:5s"`, for lower latency. |
+| `spanner.query.optimizer_version` | conn/stmt | Pin the query optimizer version, e.g. `"6"` or `"latest"` (also `spanner.query.optimizer_statistics_package`). |
 | `spanner.rows_per_batch`   | statement  | Rows per streamed Arrow batch (default `8192`); lower it to cap peak memory.                   |
 
 ### Read-only connections

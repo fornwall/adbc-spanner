@@ -335,7 +335,12 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   `spanner.transaction.tag` connection-only; parsed/applied via `RequestConfig` in `src/request.rs`
   — every user statement builder goes through `SpannerStatement::sql_builder`, `run_batch_dml`
   tags the `ExecuteBatchDml` batch and the runner [commit priority + transaction tag; the client
-  has no batch-level priority setter], driver-internal metadata queries stay untagged), and RPC
+  has no batch-level priority setter], driver-internal metadata queries stay untagged), query
+  optimizer options (`spanner.query.optimizer_version` and
+  `spanner.query.optimizer_statistics_package` at connection + statement level [statement inherits,
+  then overrides; `""` unsets — the staleness pattern; opaque pass-through strings, round-trip via
+  `get_option`] — `QueryOptionsConfig` in `src/query_options.rs` sets `QueryOptions` on the query
+  statement builder via `SpannerStatement::sql_builder`), and RPC
   timeouts (`spanner.rpc.timeout_seconds.{query,update,fetch}` at connection + statement level
   [statement inherits, then overrides; `""` unsets, `0` disables; f64 seconds, finite +
   non-negative, round-trip via `get_option`/`get_option_double` — `RpcTimeouts` in
