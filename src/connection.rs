@@ -708,17 +708,13 @@ impl Optionable for SpannerConnection {
     }
 
     fn get_option_int(&self, key: Self::Option) -> Result<i64> {
-        Err(err(
-            format!("option {} is not an integer", connection_option_name(&key)),
-            Status::NotFound,
-        ))
+        let what = format!("option {}", connection_option_name(&key));
+        crate::options::int_from_stored_string(self.get_option_string(key), &what)
     }
 
     fn get_option_double(&self, key: Self::Option) -> Result<f64> {
-        Err(err(
-            format!("option {} is not a double", connection_option_name(&key)),
-            Status::NotFound,
-        ))
+        let what = format!("option {}", connection_option_name(&key));
+        crate::options::double_from_stored_string(self.get_option_string(key), &what)
     }
 }
 
