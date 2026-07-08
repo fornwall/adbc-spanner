@@ -81,6 +81,7 @@ path, not the original URI.
 | `spanner.max_timestamp_precision` | `nanoseconds_error_on_overflow` or `microseconds` (see [Timestamp precision](#timestamp-precision)); `""` resets to the default | `nanoseconds_error_on_overflow` | yes, always (the effective mode) | How `TIMESTAMP` columns map to Arrow: `Timestamp(Nanosecond, "UTC")` with a loud error on instants outside ~1677–2262 (the default), or `Timestamp(Microsecond, "UTC")` covering Spanner's full 0001–9999 range (sub-microsecond digits truncate toward negative infinity). Becomes the default for statements this connection creates (statements may override); also governs `get_table_schema` and `read_partition`, which have no statement. |
 | `spanner.request.priority` | `low`, `medium` or `high` (case-insensitive); `""` unsets | unset (service default, high) | yes, when set (the canonical lowercase form) | [Request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions) applied to every query/DML statement the driver builds, and the commit priority of every read/write transaction. Becomes the default for statements this connection creates (statements may override). |
 | `spanner.request.tag` | free-form string; `""` unsets | unset | yes, when set | [Request tag](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags) attached to every query/DML request the driver builds (surfaced in query/transaction statistics). Becomes the default for statements this connection creates (statements may override). Driver-internal metadata queries stay untagged. |
+| `spanner.directed_read` | `include`/`exclude` replica selection (see [Directed reads](#directed-reads)); `""` unsets | unset (Spanner's own routing) | yes, when set (the raw, trimmed value) | [Directed read](https://docs.cloud.google.com/spanner/docs/directed-reads) replica selection applied to **read-only queries** (Spanner rejects it on writes). Becomes the default for statements this connection creates (statements may override). |
 | `spanner.query.optimizer_version` | opaque version string, e.g. `"6"` or `"latest"`; `""` unsets | unset (database/service default) | yes, when set (the raw value) | [Query optimizer version](https://docs.cloud.google.com/spanner/docs/query-optimizer/manage-query-optimizer) applied as a `QueryOptions` on every query statement the driver builds. Becomes the default for statements this connection creates (statements may override). |
 | `spanner.query.optimizer_statistics_package` | opaque statistics-package name; `""` unsets | unset (database default) | yes, when set (the raw value) | [Optimizer statistics package](https://docs.cloud.google.com/spanner/docs/query-optimizer/statistics-packages) applied as a `QueryOptions` on every query statement the driver builds. Same inheritance as `spanner.query.optimizer_version`. |
 | `spanner.transaction.tag` | free-form string; `""` unsets | unset | yes, when set | Transaction tag attached to every read/write transaction the driver builds (autocommit DML, the manual-mode commit, ingest commits). Connection level only. |
@@ -107,6 +108,7 @@ has a single, unnamed catalog and default schema — and cannot be set.
 | `spanner.max_timestamp_precision` | as the connection option; `""` resets to the **driver** default | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement timestamp-precision override (see [Timestamp precision](#timestamp-precision)). Note `""` resets to the driver default (`nanoseconds_error_on_overflow`), not to the connection's value. |
 | `spanner.request.priority` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement request-priority override. |
 | `spanner.request.tag` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement request-tag override. |
+| `spanner.directed_read` | as the connection option (see [Directed reads](#directed-reads)); `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement directed-read override. Applies to this statement's read-only queries only. |
 | `spanner.max_commit_delay` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement max-commit-delay override. |
 | `spanner.query.optimizer_version` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement optimizer-version override. |
 | `spanner.query.optimizer_statistics_package` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement optimizer-statistics-package override. |
@@ -153,6 +155,43 @@ with `""`). Because Spanner accepts the bounded-staleness kinds (`max:` / `min:`
 single-use transactions, contexts that need a multi-use read-only transaction (a bound query over
 several parameter rows, `execute_partitions`) pin them to their most-stale legal equivalent
 (`max:<d>` → exact staleness `<d>`, `min:<t>` → read timestamp `<t>`).
+
+## Directed reads
+
+[Directed reads](https://docs.cloud.google.com/spanner/docs/directed-reads) steer where a read-only
+query is served — to (or away from) replicas in a given region and/or of a given type.
+`spanner.directed_read` — available at connection *and* statement level — carries the selection as a
+small grammar:
+
+```text
+<mode> [ ":" <selection> ("," <selection>)* ] [ ";auto_failover_disabled" ]
+```
+
+- `<mode>` is `include` or `exclude` (case-insensitive):
+  - `include` — an **ordered preference** list; Spanner tries the selections in turn.
+  - `exclude` — replicas Spanner routes **around**.
+- Each `<selection>` is `<location>`, `<location>:<type>`, or `:<type>` (at least one of the two):
+  - `<location>` is a region such as `us-east1`.
+  - `<type>` is `read_write`, `read_only` or `any` (case-insensitive). Omitted or `any` matches every
+    replica type.
+- The optional `;auto_failover_disabled` suffix — valid only with `include` — stops Spanner from
+  falling back to a replica outside the list when the listed replicas are unavailable.
+
+Examples:
+
+- `include:us-east1` — prefer any replica in `us-east1`.
+- `include:us-east1:read_only,us-east4:read_write` — prefer a read-only replica in `us-east1`, then a
+  read-write replica in `us-east4`.
+- `exclude:us-central1` — never route to replicas in `us-central1`.
+- `include:us-east1;auto_failover_disabled` — prefer `us-east1` and do not fail over elsewhere.
+- `include::read_only` — prefer any read-only replica, in any location.
+
+Directed reads apply to **read-only queries only**: the driver attaches them to its query paths
+(autocommit and manual mode, including parameterized/bound queries and `execute_partitions`) and
+never to DML/DDL, which Spanner would reject. Values are trimmed before parsing; malformed values
+fail with `InvalidArguments`. Unset (the default) leaves Spanner's own routing; set `""` to unset. A
+statement inherits the connection's value at creation and may override it (including clearing it with
+`""`).
 
 ## Timestamp precision
 

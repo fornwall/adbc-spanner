@@ -64,6 +64,12 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   `spanner.transaction.tag` (connection-level) tags every read/write transaction the driver builds.
   See [troubleshooting with tags](https://cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags).
   Driver-internal metadata queries (`get_objects`, schema probes, …) are not tagged/prioritised.
+- [Directed reads](https://cloud.google.com/spanner/docs/directed-reads): `spanner.directed_read`
+  (connection- or statement-level) steers **read-only queries** to specific replicas — `include:<sel>`
+  (an ordered preference list) or `exclude:<sel>` (replicas to avoid), where each `<sel>` is
+  `<location>`, `<location>:<type>` or `:<type>` (`<type>` is `read_write`/`read_only`/`any`), plus an
+  optional `;auto_failover_disabled` on `include`. E.g. `include:us-east1:read_only,us-east4`. Applies
+  to queries only (Spanner rejects directed reads on writes); see [docs/options.md](docs/options.md#directed-reads).
 - Commit batching: `spanner.max_commit_delay` sets the [maximum commit delay](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions)
   Spanner may add to a read/write commit so it can batch it with others (trading a little latency for
   throughput). It applies at every read/write commit the driver builds — autocommit DML, the
@@ -294,6 +300,7 @@ database path, not the original URI.
 | `spanner.max_timestamp_precision`            | How `TIMESTAMP` maps to Arrow: `nanoseconds_error_on_overflow` (default) or `microseconds` (full 0001–9999 range) — see [Type mapping](#type-mapping); inherited by the connection's statements. |
 | `spanner.request.priority`                   | [Request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions) (`low`/`medium`/`high`) for queries, DML and commits; inherited by the connection's statements. |
 | `spanner.request.tag`                        | [Request tag](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags) attached to every query/DML request; inherited by the connection's statements. |
+| `spanner.directed_read`                      | [Directed read](https://docs.cloud.google.com/spanner/docs/directed-reads) replica selection (`include`/`exclude` + `location:type`) for read-only queries; inherited by the connection's statements. |
 | `spanner.query.optimizer_version`            | [Query optimizer version](https://docs.cloud.google.com/spanner/docs/query-optimizer/manage-query-optimizer) (e.g. `"6"`/`"latest"`) applied to every query; inherited by the connection's statements. |
 | `spanner.query.optimizer_statistics_package` | [Optimizer statistics package](https://docs.cloud.google.com/spanner/docs/query-optimizer/statistics-packages) applied to every query; inherited by the connection's statements. |
 | `spanner.transaction.tag`                    | Transaction tag attached to every read/write transaction the driver builds. Connection-level only. |
@@ -316,6 +323,7 @@ database path, not the original URI.
 | `spanner.max_timestamp_precision`            | Per-statement timestamp-precision override (`""` resets to the driver default). |
 | `spanner.request.priority`                   | Per-statement request-priority override. |
 | `spanner.request.tag`                        | Per-statement request-tag override. |
+| `spanner.directed_read`                      | Per-statement directed-read override (applies to read-only queries). |
 | `spanner.max_commit_delay`                   | Per-statement max-commit-delay override. |
 | `spanner.query.optimizer_version`            | Per-statement optimizer-version override. |
 | `spanner.query.optimizer_statistics_package` | Per-statement optimizer-statistics-package override. |

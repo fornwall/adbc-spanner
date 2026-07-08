@@ -35,6 +35,7 @@ use crate::connection::{SharedTxn, apply_isolation};
 use crate::conversion::{
     TimestampPrecision, result_set_to_batch, stream_bound_query, stream_query,
 };
+use crate::directed_read::DirectedRead;
 use crate::error::{
     err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
 };
@@ -123,6 +124,10 @@ pub struct SpannerStatement {
     /// request tag are overridable per statement. The transaction tag (connection-level only)
     /// rides along for the read/write transaction runners this statement builds.
     request: RequestConfig,
+    /// Directed-read replica selection (`spanner.directed_read`), inherited from the connection at
+    /// creation time and overridable per statement. Applied to this statement's read-only query
+    /// paths only (Spanner rejects it on writes). Unset by default (Spanner's own routing).
+    directed_read: DirectedRead,
     /// Query optimizer options (`spanner.query.optimizer_version` /
     /// `spanner.query.optimizer_statistics_package`), inherited from the connection at creation time
     /// and overridable per statement. Applied to every query statement builder this statement
@@ -157,6 +162,7 @@ impl SpannerStatement {
         isolation: IsolationLevel,
         read_staleness: ReadStaleness,
         request: RequestConfig,
+        directed_read: DirectedRead,
         query_options: QueryOptionsConfig,
         timestamp_precision: TimestampPrecision,
         timeouts: RpcTimeouts,
@@ -184,6 +190,7 @@ impl SpannerStatement {
             max_partitions: None,
             read_staleness,
             request,
+            directed_read,
             query_options,
             timestamp_precision,
             timeouts,
@@ -210,8 +217,19 @@ impl SpannerStatement {
         )
     }
 
-    /// Build one Spanner statement per bound row, binding its columns as named parameters.
-    fn build_bound_statements(&self, sql: &str) -> Result<Vec<SpannerSql>> {
+    /// A Spanner statement builder for a **read-only query** `sql`: [`sql_builder`](Self::sql_builder)
+    /// plus this statement's directed-read replica selection (`spanner.directed_read`). Used only on
+    /// the read-only query paths — Spanner rejects directed reads on a read/write transaction, so the
+    /// DML paths keep using [`sql_builder`](Self::sql_builder) directly.
+    fn read_sql_builder(&self, sql: &str) -> StatementBuilder {
+        self.directed_read.apply_to_statement(self.sql_builder(sql))
+    }
+
+    /// Build one Spanner statement per bound row, binding its columns as named parameters. When
+    /// `for_read` the per-row builders carry the directed-read replica selection
+    /// (`spanner.directed_read`) — the read-only bound-query path; the DML (`THEN RETURN`) path
+    /// passes `false` so directed reads never reach a read/write transaction.
+    fn build_bound_statements(&self, sql: &str, for_read: bool) -> Result<Vec<SpannerSql>> {
         let mut statements = Vec::new();
         for batch in &self.bound {
             if batch.num_rows() == 0 {
@@ -221,8 +239,12 @@ impl SpannerStatement {
             // for every row instead of re-lexing the SQL per bound row.
             let names = bind::resolve_parameter_names(sql, batch, self.bind_by_name)?;
             for row in 0..batch.num_rows() {
-                statements
-                    .push(bind::bind_params(self.sql_builder(sql), &names, batch, row)?.build());
+                let builder = if for_read {
+                    self.read_sql_builder(sql)
+                } else {
+                    self.sql_builder(sql)
+                };
+                statements.push(bind::bind_params(builder, &names, batch, row)?.build());
             }
         }
         Ok(statements)
@@ -340,7 +362,7 @@ impl SpannerStatement {
     /// statements so the whole batch is applied atomically. Shared by `execute` and `execute_update`.
     fn build_dml_statements(&self, sql: &str) -> Result<Vec<SpannerSql>> {
         if !self.bound.is_empty() {
-            self.build_bound_statements(sql)
+            self.build_bound_statements(sql, false)
         } else {
             Ok(crate::sql::split_statements(sql)
                 .into_iter()
@@ -691,7 +713,7 @@ impl SpannerStatement {
                 .map(|s| self.sql_builder(&s).build())
                 .collect()
         } else {
-            self.build_bound_statements(sql)?
+            self.build_bound_statements(sql, false)?
         };
         let (batches, schema, affected) = self.execute_returning_dml(statements)?;
         Ok(DmlOutcome::Returning {
@@ -717,7 +739,7 @@ impl SpannerStatement {
         &self,
         sql: &str,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        let mut statements = self.build_bound_statements(sql)?;
+        let mut statements = self.build_bound_statements(sql, true)?;
         let client = self.client.clone();
         let runtime = self.runtime.clone();
         let cancel = self.cancel.clone();
@@ -835,7 +857,7 @@ impl SpannerStatement {
     /// partitioned query itself. Only the first bound row is used — partitioned execution has no
     /// per-row fan-out, so extra bound rows are ignored.
     fn build_query_statement(&self, sql: &str, plan: bool) -> Result<SpannerSql> {
-        let mut builder = self.sql_builder(sql);
+        let mut builder = self.read_sql_builder(sql);
         if plan {
             builder = builder.set_query_mode(QueryMode::Plan);
         }
@@ -935,6 +957,9 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) if k == crate::OPTION_REQUEST_TAG => {
                 self.request.set_request_tag(value)?;
             }
+            OptionStatement::Other(k) if k == crate::OPTION_DIRECTED_READ => {
+                self.directed_read.set(value)?;
+            }
             OptionStatement::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => {
                 self.request.set_max_commit_delay(value)?;
             }
@@ -1013,6 +1038,9 @@ impl Optionable for SpannerStatement {
             }
             OptionStatement::Other(k) if k == crate::OPTION_REQUEST_TAG => {
                 self.request.request_tag_string().map(str::to_string)
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_DIRECTED_READ => {
+                self.directed_read.option_string().map(str::to_string)
             }
             OptionStatement::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => {
                 self.request.max_commit_delay_string().map(str::to_string)
@@ -1156,7 +1184,7 @@ impl Statement for SpannerStatement {
         let batch_size = self.rows_per_batch;
         let precision = self.timestamp_precision;
         let bound = self.read_staleness.timestamp_bound()?;
-        let statement = self.sql_builder(&sql).build();
+        let statement = self.read_sql_builder(&sql).build();
         let fetch_timeout = self.timeouts.fetch_timeout();
         // Stream the result: `stream_query` fetches the first chunk (settling the schema) and the
         // returned reader converts the rest to Arrow one bounded chunk at a time as it is
@@ -1240,7 +1268,7 @@ impl Statement for SpannerStatement {
         // QueryMode::Plan analyses the query and returns its column metadata without scanning
         // any data, so dbt can introspect a model's output columns without wrapping it in a
         // `SELECT ... WHERE false` subquery.
-        let plan_builder = self.sql_builder(&sql).set_query_mode(QueryMode::Plan);
+        let plan_builder = self.read_sql_builder(&sql).set_query_mode(QueryMode::Plan);
         // The schema probe is a query execution, so the query timeout bounds it.
         let schema = block_on_cancellable(
             &self.runtime,

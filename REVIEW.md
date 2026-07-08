@@ -733,7 +733,19 @@ statement level [statement inherits, then overrides; `""` unsets; opaque pass-th
 round-tripping via `get_option`] — `QueryOptionsConfig` in `src/query_options.rs` sets `QueryOptions`
 on the query statement builder via `SpannerStatement::sql_builder`; offline unit tests cover the
 round-trip/unset, non-string rejection, and clone inheritance
-[`query_options::tests`].); directed reads, commit stats,
+[`query_options::tests`].); ~~directed reads~~
+(**Fixed.** `spanner.directed_read` at connection + statement level [statement inherits, then
+overrides; `""` unsets; round-trips through `get_option`] selects replicas for **read-only queries**
+via the grammar `<mode>[:<sel>,...][;auto_failover_disabled]` — `<mode>` is `include`/`exclude`, each
+`<sel>` is `<location>[:<type>]`/`:<type>` with `<type>` ∈ `read_write`/`read_only`/`any`. Parsed by
+`DirectedRead`/`parse` in the new `src/directed_read.rs` [offline unit tests: valid forms,
+case/whitespace, the auto-failover flag, malformed → `InvalidArguments`, the built client options,
+and clone-inheritance], built into the client `DirectedReadOptions`, and applied via
+`StatementBuilder::set_directed_read_options` on the read-only query paths only
+[`SpannerStatement::read_sql_builder` feeds `execute`, the bound-query path, `execute_partitions`, and
+the `execute_schema` PLAN probe]; DML/DDL keep the plain `sql_builder` since Spanner rejects directed
+reads on a read/write transaction. Documented in `README.md`, `python/README.md`, `docs/options.md`
+[grammar + examples], the `OPTION_DIRECTED_READ` rustdoc, and the CLAUDE.md feature list.), commit stats,
 ~~`max_commit_delay`~~ (**Fixed.** Added the `spanner.max_commit_delay` connection **and** statement
 option — a duration in `0..=500ms` (staleness grammar, `""` unsets, round-trips via `get_option`),
 stored on `RequestConfig` in `src/request.rs` and applied via the client's `set_max_commit_delay`
