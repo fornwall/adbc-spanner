@@ -128,6 +128,89 @@ pub mod fuzzing {
     pub fn like_match(pattern: &str, value: &str) -> bool {
         crate::connection::like_match(pattern, value)
     }
+    /// The first SQL keyword, uppercased — skipping whitespace, comments, and `@{…}` statement
+    /// hints.
+    pub fn first_keyword(sql: &str) -> Option<String> {
+        crate::ddl::first_keyword(sql)
+    }
+    /// Whether the SQL begins with a DML statement (`INSERT`/`UPDATE`/`DELETE`).
+    pub fn is_dml(sql: &str) -> bool {
+        crate::ddl::is_dml(sql)
+    }
+    /// Strip trailing top-level `;` terminators from a single-statement query.
+    pub fn strip_trailing_terminators(sql: &str) -> String {
+        crate::ddl::strip_trailing_terminators(sql)
+    }
+    /// The distinct `@name` bind parameters of a query, in first-appearance order.
+    pub fn named_parameters(sql: &str) -> Vec<String> {
+        crate::bind::named_parameters(sql)
+    }
+    /// Backtick-quote a Spanner identifier (GoogleSQL backslash escaping).
+    pub fn quote_ident(ident: &str) -> String {
+        crate::bind::quote_ident(ident)
+    }
+    /// Resolve the column→parameter pairing for `sql` against a batch whose columns are named
+    /// `column_names` (built here as nullable `Int64`; the pairing never looks at types).
+    ///
+    /// Returns the resolved names, or `None` on the documented count-mismatch rejection — after
+    /// asserting the error is `InvalidArguments` (any other status, like any panic, is a bug).
+    pub fn resolve_parameter_names(sql: &str, column_names: &[String]) -> Option<Vec<String>> {
+        use arrow_array::RecordBatch;
+        use arrow_schema::{DataType, Field, Schema};
+        let fields: Vec<Field> = column_names
+            .iter()
+            .map(|name| Field::new(name, DataType::Int64, true))
+            .collect();
+        let batch = RecordBatch::new_empty(std::sync::Arc::new(Schema::new(fields)));
+        match crate::bind::resolve_parameter_names(sql, &batch) {
+            Ok(names) => Some(names),
+            Err(e) => {
+                assert_eq!(
+                    e.status,
+                    adbc_core::error::Status::InvalidArguments,
+                    "resolve_parameter_names must reject with InvalidArguments: {e:?}"
+                );
+                None
+            }
+        }
+    }
+    /// Decode an opaque partition descriptor, returning whether it decoded.
+    ///
+    /// The oracles live here (where the client's `Partition` type is in scope): a rejected
+    /// descriptor must be a clean `InvalidArguments` error — never a panic — and an accepted one
+    /// must survive a serialize → decode → serialize round trip unchanged (compared as
+    /// `serde_json::Value`, so map key order is irrelevant).
+    pub fn decode_partition(descriptor: &[u8]) -> bool {
+        match crate::connection::decode_partition(descriptor) {
+            Ok(partition) => {
+                let value =
+                    serde_json::to_value(&partition).expect("a decoded partition re-serializes");
+                let bytes =
+                    serde_json::to_vec(&value).expect("a serde_json::Value always serializes");
+                let again = crate::connection::decode_partition(&bytes)
+                    .expect("a re-serialized partition descriptor decodes");
+                assert_eq!(
+                    value,
+                    serde_json::to_value(&again).expect("a decoded partition re-serializes"),
+                    "partition descriptor round-trip changed the value"
+                );
+                true
+            }
+            Err(e) => {
+                assert_eq!(
+                    e.status,
+                    adbc_core::error::Status::InvalidArguments,
+                    "decode_partition must reject with InvalidArguments: {e:?}"
+                );
+                assert!(
+                    e.message.contains("invalid partition descriptor"),
+                    "unexpected rejection message: {}",
+                    e.message
+                );
+                false
+            }
+        }
+    }
     /// Normalize an emulator endpoint by adding an `http://` scheme when absent.
     pub fn ensure_scheme(host: &str) -> String {
         crate::driver::ensure_scheme(host)
