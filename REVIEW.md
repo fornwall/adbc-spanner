@@ -654,7 +654,10 @@ dialect failures; the Windows import-lib copy is `|| true`-optional (`libraries.
 wheel version parse greps `Cargo.toml` positionally — `cargo metadata | jq` is robust;
 `adbc-validation.yml` rebuilds arrow-adbc C++ + GoogleTest from source every run (cache it); the
 adbc-validation allowlist means new upstream tests never auto-enter the gate (periodic `--full`
-triage is manual); dead crates.io/docs.rs badges in the README; ~~no consolidated
+triage is manual); ~~dead crates.io/docs.rs badges in the README~~ (**Fixed.** The crate is unpublished
+(`publish = false`), so its crates.io/docs.rs badges pointed at nonexistent pages and rendered
+broken — both removed from `README.md`; the working GitHub Actions CI badge (and the License
+badge) are kept.); ~~no consolidated
 connection/statement option tables in either README (`spanner.rows_per_batch` is missing from the
 Python one entirely)~~ (**Fixed.** `README.md`'s *Configuration options* section now has three
 consolidated tables — database, connection and statement level — listing every option the driver
