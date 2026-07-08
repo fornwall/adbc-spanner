@@ -26,7 +26,7 @@ use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::model::execute_sql_request::QueryMode;
 use google_cloud_spanner::model::transaction_options::IsolationLevel;
 use google_cloud_spanner::model::PartitionOptions;
-use google_cloud_spanner::statement::Statement as SpannerSql;
+use google_cloud_spanner::statement::{Statement as SpannerSql, StatementBuilder};
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
 use crate::bind;
@@ -35,6 +35,7 @@ use crate::conversion::{result_set_to_batch, stream_bound_query, stream_query};
 use crate::error::{
     err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
 };
+use crate::request::RequestConfig;
 use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
 use crate::staleness::ReadStaleness;
 
@@ -98,6 +99,11 @@ pub struct SpannerStatement {
     /// (`spanner.read.staleness` / `spanner.read.timestamp`), inherited from the connection at
     /// creation time and overridable per statement. Default is a strong read.
     read_staleness: ReadStaleness,
+    /// Request priority and request/transaction tags (`spanner.request.priority` /
+    /// `spanner.request.tag`), inherited from the connection at creation time; the priority and
+    /// request tag are overridable per statement. The transaction tag (connection-level only)
+    /// rides along for the read/write transaction runners this statement builds.
+    request: RequestConfig,
     /// Cancellation signal for this statement's in-flight execution (see [`Statement::cancel`]).
     cancel: CancelSignal,
 }
@@ -112,6 +118,7 @@ impl SpannerStatement {
         read_only: Arc<AtomicBool>,
         isolation: IsolationLevel,
         read_staleness: ReadStaleness,
+        request: RequestConfig,
         txn: SharedTxn,
     ) -> Self {
         Self {
@@ -132,6 +139,7 @@ impl SpannerStatement {
             data_boost: false,
             max_partitions: None,
             read_staleness,
+            request,
             cancel: CancelSignal::new(),
         }
     }
@@ -140,6 +148,13 @@ impl SpannerStatement {
     /// attempt (never cached), so a toggle on the connection applies to this statement immediately.
     fn is_read_only(&self) -> bool {
         self.read_only.load(Ordering::Acquire)
+    }
+
+    /// A Spanner statement builder for `sql` with this statement's request priority and request
+    /// tag (`spanner.request.priority` / `spanner.request.tag`) applied. Every query/DML statement
+    /// the driver builds goes through here so the two options apply uniformly.
+    fn sql_builder(&self, sql: &str) -> StatementBuilder {
+        self.request.apply_to_statement(SpannerSql::builder(sql))
     }
 
     /// Build one Spanner statement per bound row, binding its columns as named parameters.
@@ -154,7 +169,7 @@ impl SpannerStatement {
             let names = bind::resolve_parameter_names(sql, batch)?;
             for row in 0..batch.num_rows() {
                 statements
-                    .push(bind::bind_params(SpannerSql::builder(sql), &names, batch, row)?.build());
+                    .push(bind::bind_params(self.sql_builder(sql), &names, batch, row)?.build());
             }
         }
         Ok(statements)
@@ -221,7 +236,7 @@ impl SpannerStatement {
         for batch in &self.bound {
             let sql = self.ingest_insert_sql(table, batch);
             for row in 0..batch.num_rows() {
-                statements.push(bind::bind_row(SpannerSql::builder(&sql), batch, row)?.build());
+                statements.push(bind::bind_row(self.sql_builder(&sql), batch, row)?.build());
             }
         }
         Ok(statements)
@@ -285,7 +300,7 @@ impl SpannerStatement {
         } else {
             Ok(crate::ddl::split_statements(sql)
                 .into_iter()
-                .map(|s| SpannerSql::builder(s).build())
+                .map(|s| self.sql_builder(&s).build())
                 .collect())
         }
     }
@@ -372,7 +387,7 @@ impl SpannerStatement {
                     total += self.run_dml_chunk(std::mem::take(&mut chunk))?;
                     budget = IngestChunkBudget::default();
                 }
-                chunk.push(bind::bind_row(SpannerSql::builder(&sql), batch, row)?.build());
+                chunk.push(bind::bind_row(self.sql_builder(&sql), batch, row)?.build());
                 budget.add(columns, row_bytes);
             }
         }
@@ -388,6 +403,7 @@ impl SpannerStatement {
             &self.client,
             &self.cancel,
             self.isolation.clone(),
+            self.request.clone(),
             statements,
         )
     }
@@ -423,6 +439,7 @@ impl SpannerStatement {
             &self.client,
             &self.cancel,
             self.isolation.clone(),
+            self.request.clone(),
             statements,
         )?;
         Ok(Some(count))
@@ -443,8 +460,10 @@ impl SpannerStatement {
     ) -> Result<(Vec<RecordBatch>, SchemaRef, i64)> {
         let client = self.client.clone();
         let isolation = self.isolation.clone();
+        let request = self.request.clone();
         let results = block_on_cancellable(&self.runtime, &self.cancel, async move {
-            let runner = apply_isolation(client.read_write_transaction(), isolation)
+            let runner = request
+                .apply_to_runner(apply_isolation(client.read_write_transaction(), isolation))
                 .build()
                 .await
                 .map_err(from_spanner)?;
@@ -514,7 +533,7 @@ impl SpannerStatement {
             }
             parts
                 .into_iter()
-                .map(|s| SpannerSql::builder(s).build())
+                .map(|s| self.sql_builder(&s).build())
                 .collect()
         } else {
             self.build_bound_statements(sql)?
@@ -619,7 +638,7 @@ impl SpannerStatement {
     /// partitioned query itself. Only the first bound row is used — partitioned execution has no
     /// per-row fan-out, so extra bound rows are ignored.
     fn build_query_statement(&self, sql: &str, plan: bool) -> Result<SpannerSql> {
-        let mut builder = SpannerSql::builder(sql);
+        let mut builder = self.sql_builder(sql);
         if plan {
             builder = builder.set_query_mode(QueryMode::Plan);
         }
@@ -690,6 +709,12 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) if k == crate::OPTION_READ_TIMESTAMP => {
                 self.read_staleness.set_timestamp(value)?;
             }
+            OptionStatement::Other(k) if k == crate::OPTION_REQUEST_PRIORITY => {
+                self.request.set_priority(value)?;
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_REQUEST_TAG => {
+                self.request.set_request_tag(value)?;
+            }
             other => {
                 return Err(not_implemented(&format!(
                     "statement option {}",
@@ -723,6 +748,13 @@ impl Optionable for SpannerStatement {
             }
             OptionStatement::Other(k) if k == crate::OPTION_READ_TIMESTAMP => {
                 self.read_staleness.timestamp_string().map(str::to_string)
+            }
+            // The effective value: the connection's, unless overridden on this statement.
+            OptionStatement::Other(k) if k == crate::OPTION_REQUEST_PRIORITY => {
+                self.request.priority_string().map(str::to_string)
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_REQUEST_TAG => {
+                self.request.request_tag_string().map(str::to_string)
             }
             _ => None,
         };
@@ -846,11 +878,11 @@ impl Statement for SpannerStatement {
         let cancel = self.cancel.clone();
         let batch_size = self.rows_per_batch;
         let bound = self.read_staleness.timestamp_bound()?;
+        let statement = self.sql_builder(&sql).build();
         // Stream the result: `stream_query` fetches the first chunk (settling the schema) and the
         // returned reader converts the rest to Arrow one bounded chunk at a time as it is iterated.
         let reader = block_on_cancellable(&self.runtime, &self.cancel, async move {
             let transaction = crate::staleness::single_use(&client, bound);
-            let statement = SpannerSql::builder(sql).build();
             let result_set = transaction
                 .execute_query(statement)
                 .await
@@ -902,12 +934,13 @@ impl Statement for SpannerStatement {
         check_schema_query(&sql)?;
         let client = self.client.clone();
         let bound = self.bound.clone();
+        // QueryMode::Plan analyses the query and returns its column metadata without scanning
+        // any data, so dbt can introspect a model's output columns without wrapping it in a
+        // `SELECT ... WHERE false` subquery.
+        let plan_builder = self.sql_builder(&sql).set_query_mode(QueryMode::Plan);
         let schema = block_on_cancellable(&self.runtime, &self.cancel, async move {
             let transaction = client.single_use().build();
-            // QueryMode::Plan analyses the query and returns its column metadata without scanning
-            // any data, so dbt can introspect a model's output columns without wrapping it in a
-            // `SELECT ... WHERE false` subquery.
-            let mut builder = SpannerSql::builder(sql.as_str()).set_query_mode(QueryMode::Plan);
+            let mut builder = plan_builder;
             // Bind parameters if any were provided (values are irrelevant to the schema) so that
             // `@param` references resolve.
             if let Some(batch) = bound.first() {
