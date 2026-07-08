@@ -693,7 +693,12 @@ cross-checked against `src/driver.rs`/`src/connection.rs`/`src/statement.rs`/`sr
 `python/README.md` gained a matching *Option reference* section that also maps each level to its
 DBAPI home (`connect()` kwargs / `db_kwargs` vs `conn_kwargs` vs `adbc_stmt_kwargs` /
 `cur.adbc_statement.set_options`), documents `spanner.rows_per_batch`, and adds a CI-executed
-cookbook snippet exercising it); wheel docs omit the platform floors (glibc ≥ 2.35, macOS ≥ 11/10.15); ~~no
+cookbook snippet exercising it); ~~wheel docs omit the platform floors (glibc ≥ 2.35, macOS ≥ 11/10.15)~~
+(**Fixed.** `python/README.md` gained a *Supported platforms* section — a table mapping each wheel
+to its floor, cross-checked against `.github/workflows/libraries.yml`: Linux x86-64/aarch64
+`manylinux_2_35` (glibc >= 2.35), macOS arm64 `macosx_11_0` (macOS >= 11.0), macOS x86-64
+`macosx_10_15` (macOS >= 10.15), and Windows `win_amd64`/`win_arm64`; the Install line now points at
+it, and it notes the `py3-none-<platform>` ABI-agnostic tagging); ~~no
 CHANGELOG/CONTRIBUTING/versioning policy~~ (**Fixed.** A `CHANGELOG.md` (Keep a Changelog format,
 `## [Unreleased]` on top, per-version entries for `0.1.0`–`0.6.0` derived from the git tags) and a
 `CONTRIBUTING.md` (build/test/lint commands, the emulator integration via `scripts/with-emulator.sh`,

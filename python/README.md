@@ -22,7 +22,27 @@ pip install adbc-driver-spanner[dbapi] pandas
 ```
 
 Prebuilt wheels are published for Linux (x86-64, aarch64), macOS (arm64,
-x86-64), and Windows (x86-64, arm64).
+x86-64), and Windows (x86-64, arm64). See [Supported platforms](#supported-platforms)
+for the minimum OS / glibc each wheel requires.
+
+## Supported platforms
+
+The wheels bundle a native library, so each carries a platform tag with a
+minimum-OS floor. `pip` picks the matching wheel automatically; the floors are:
+
+| Platform       | Wheel tag                | Minimum requirement                          |
+| -------------- | ------------------------ | -------------------------------------------- |
+| Linux x86-64   | `manylinux_2_35_x86_64`  | glibc >= 2.35 (e.g. Ubuntu 22.04, Debian 12) |
+| Linux aarch64  | `manylinux_2_35_aarch64` | glibc >= 2.35 (e.g. Ubuntu 22.04, Debian 12) |
+| macOS arm64    | `macosx_11_0_arm64`      | macOS >= 11.0                                |
+| macOS x86-64   | `macosx_10_15_x86_64`    | macOS >= 10.15                               |
+| Windows x86-64 | `win_amd64`              | 64-bit Windows                               |
+| Windows arm64  | `win_arm64`              | ARM64 Windows                                |
+
+Any Python 3 works — the wheels are tagged `py3-none-<platform>` (ABI-agnostic,
+platform-specific), since the package links nothing against Python. On an older
+glibc or macOS than the floor above, `pip` finds no matching wheel; build the
+native driver from source instead.
 
 ## Quickstart
 
