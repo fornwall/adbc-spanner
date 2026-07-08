@@ -646,7 +646,14 @@ queries may already work through plain SQL — one emulator test each would let 
 them; telemetry/tracing hooks as a backlog entry.
 
 **CI/misc.** No dependabot/renovate (SHA-pinned actions and the two git-pin families drift
-unmonitored); no `concurrency:` groups (rapid PR pushes re-run the full 6-platform matrix);
+unmonitored); ~~no `concurrency:` groups (rapid PR pushes re-run the full 6-platform matrix)~~
+(**Fixed.** A release-safe top-level `concurrency:` block (`group: ${{ github.workflow }}-${{
+github.ref }}`, `cancel-in-progress: ${{ github.event_name == 'pull_request' }}`) is now on
+`ci.yml`, `libraries.yml`, `adbc-validation.yml` and `foundry-validation.yml` — every workflow that
+runs on PRs. A rapid re-push cancels the superseded in-flight run for the same PR ref, but the guard
+evaluates to `false` for `push`/tag events, so main pushes and `v*` release runs — the
+`libraries.yml` build+publish path especially — are never cancelled mid-flight. `fuzz.yml` and
+`resilience.yml` have no `pull_request` trigger and were left unchanged.);
 nightly fuzz/resilience failures surface only as email and scheduled workflows auto-disable after
 60 days of inactivity — a `failure()` step opening a tracking issue would help;
 `foundry-validation` ends in `|| true`, making harness breakage indistinguishable from expected
