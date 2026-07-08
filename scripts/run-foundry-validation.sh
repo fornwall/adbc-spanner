@@ -14,11 +14,12 @@
 #   SPANNER_EMULATOR_HOST=localhost:9010 scripts/run-foundry-validation.sh
 #   scripts/run-foundry-validation.sh -k connection        # pass extra pytest args
 #
-# NOTE: the suite's base query corpus assumes a portable SQL dialect (no mandatory PRIMARY KEY,
-# INTEGER/BIGINT type names, positional $1 parameters). Spanner diverges on all three, so many
-# type/* cases currently error/fail until Spanner-dialect overrides are added under
-# python/validation/queries/spanner/. See python/validation/README.md. This script therefore does
-# not gate CI; it is an exploratory coverage harness.
+# The suite's base query corpus assumes a portable SQL dialect (no mandatory PRIMARY KEY,
+# INTEGER/BIGINT type names, positional $1 parameters); the Spanner-dialect overrides under
+# python/validation/queries/spanner/ cover the corpus, so this run GATES CI
+# (foundry-validation.yml). Cases blocked on pending upstream suite fixes are strict xfails —
+# see _PENDING_UPSTREAM_XFAILS in python/validation/tests/conftest.py and
+# python/validation/README.md.
 #
 # -e matters here: without it a failed `cargo build` let the suite proceed and
 # validate a *stale* previously-built cdylib — plausible-looking results for old code.

@@ -318,7 +318,7 @@ fn skip_leading_whitespace_and_comments(sql: &str) -> &str {
 /// (`@{HINT=value, …}`), which GoogleSQL allows before the statement proper — so hinted DML/DDL is
 /// classified by its real leading keyword, not misread as "no keyword" and routed to the wrong
 /// execution path.
-fn first_keyword(sql: &str) -> Option<String> {
+pub(crate) fn first_keyword(sql: &str) -> Option<String> {
     let mut rest = skip_leading_whitespace_and_comments(sql);
     while let Some(after) = rest.strip_prefix("@{") {
         rest = skip_leading_whitespace_and_comments(skip_hint_body(after));
