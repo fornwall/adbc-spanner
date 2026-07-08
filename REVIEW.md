@@ -703,8 +703,24 @@ never on manual `workflow_dispatch`. It uses the built-in `gh` CLI with the defa
 and a job-scoped `permissions: issues: write` to open a tracking issue (per-workflow label
 `nightly-fuzz-failure` / `nightly-resilience-failure`), or, if one is already open, comment on it —
 idempotent, so a repeated failure never spams new issues. No third-party action added.);
-`foundry-validation` ends in `|| true`, making harness breakage indistinguishable from expected
-dialect failures; ~~the Windows import-lib copy is `|| true`-optional (`libraries.yml:138`)~~ (**Fixed.** The Package
+~~`foundry-validation` ends in `|| true`, making harness breakage indistinguishable from expected
+dialect failures~~ (**Fixed.** The trailing `|| true` is gone: the workflow's "Run the Foundry
+validation suite" step now runs `scripts/run-foundry-validation.sh` directly, and the job runs on
+pushes to main and pull requests rather than being an informational, always-green `workflow_dispatch`
+run. The Spanner-dialect override corpus under `python/validation/queries/spanner/` now covers the
+whole suite — every case passes or skips with a reason, no expected failures or xfails — so genuine
+harness breakage now fails the job loudly instead of being swallowed: a failed `cargo build` or
+validation-package install (`set -euo pipefail`), an emulator/database-never-ready condition (an
+explicit `exit 1` after the create-instance/create-database `curl … || true` idempotency calls,
+which stay gated by the "database listable" readiness loop), a pytest collection/import error, a
+crashed cdylib, or any case that unexpectedly fails or errors. The one remaining way an all-green run
+could exercise no real coverage — every collected case *skipped* (pytest exits 0 when nothing fails),
+which would again make a silently-broken harness look like all-expected-dialect-skips — is now closed
+by a `pytest_sessionfinish` guard in `python/validation/tests/conftest.py`: when
+`FOUNDRY_VALIDATION_REQUIRE_PASSES` is set (the workflow sets it) it forces a `TESTS_FAILED` exit if
+the suite collected cases but none actually passed, mirroring the env-gated fail-loud convention of
+the `ADBC_TEST_REQUIRE_TARGET` skip guard; ad-hoc local `-k` runs, which don't set the flag, are
+unaffected.); ~~the Windows import-lib copy is `|| true`-optional (`libraries.yml:138`)~~ (**Fixed.** The Package
 step's Windows branch (already gated on `runner.os == Windows`) no longer copies the
 `adbc_spanner.dll.lib` with `2>/dev/null || true`; it now asserts the import library exists and
 `exit 1`s with a `::error::` message if not, so a build regression that drops it fails the job loudly
