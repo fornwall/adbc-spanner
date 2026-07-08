@@ -41,6 +41,7 @@ use crate::error::{
 use crate::request::RequestConfig;
 use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
 use crate::staleness::ReadStaleness;
+use crate::timeout::{with_timeout, RpcTimeouts};
 
 /// Default number of rows converted into each streamed Arrow batch (see
 /// [`OPTION_ROWS_PER_BATCH`](crate::OPTION_ROWS_PER_BATCH)). Also used by
@@ -119,6 +120,10 @@ pub struct SpannerStatement {
     /// result path of this statement: `execute` (plain and bound queries), DML `THEN RETURN`
     /// rows, `execute_schema`, and the `execute_partitions` schema probe.
     timestamp_precision: TimestampPrecision,
+    /// RPC timeouts (`spanner.rpc.timeout_seconds.{query,update,fetch}`), inherited from the
+    /// connection at creation time and overridable per statement. Unset (the default) means no
+    /// deadline; an expired deadline fails with [`Status::Timeout`].
+    timeouts: RpcTimeouts,
     /// Cancellation signal for this statement's in-flight execution (see [`Statement::cancel`]).
     cancel: CancelSignal,
 }
@@ -135,6 +140,7 @@ impl SpannerStatement {
         read_staleness: ReadStaleness,
         request: RequestConfig,
         timestamp_precision: TimestampPrecision,
+        timeouts: RpcTimeouts,
         txn: SharedTxn,
     ) -> Self {
         Self {
@@ -158,6 +164,7 @@ impl SpannerStatement {
             read_staleness,
             request,
             timestamp_precision,
+            timeouts,
             cancel: CancelSignal::new(),
         }
     }
@@ -479,15 +486,23 @@ impl SpannerStatement {
         let count = mutations.len() as i64;
         let client = self.client.clone();
         let request = self.request.clone();
-        block_on_cancellable(&self.runtime, &self.cancel, async move {
-            request
-                .apply_to_write_only(client.write_only_transaction())
-                .build()
-                .write(mutations)
-                .await
-                .map_err(from_spanner)?;
-            Ok::<(), Error>(())
-        })?;
+        block_on_cancellable(
+            &self.runtime,
+            &self.cancel,
+            with_timeout(
+                self.timeouts.update_timeout(),
+                crate::OPTION_RPC_TIMEOUT_UPDATE,
+                async move {
+                    request
+                        .apply_to_write_only(client.write_only_transaction())
+                        .build()
+                        .write(mutations)
+                        .await
+                        .map_err(from_spanner)?;
+                    Ok::<(), Error>(())
+                },
+            ),
+        )?;
         Ok(count)
     }
 
@@ -524,6 +539,7 @@ impl SpannerStatement {
             &self.cancel,
             self.isolation.clone(),
             self.request.clone(),
+            self.timeouts.update_timeout(),
             statements,
         )?;
         Ok(Some(count))
@@ -545,7 +561,9 @@ impl SpannerStatement {
         let client = self.client.clone();
         let isolation = self.isolation.clone();
         let request = self.request.clone();
-        let results = block_on_cancellable(&self.runtime, &self.cancel, async move {
+        // DML with THEN RETURN is a write path: the update timeout bounds the whole transaction.
+        let update_timeout = self.timeouts.update_timeout();
+        let transaction = async move {
             let runner = request
                 .apply_to_runner(apply_isolation(client.read_write_transaction(), isolation))
                 .build()
@@ -574,7 +592,16 @@ impl SpannerStatement {
                 .await
                 .map_err(from_spanner)?;
             Ok::<_, Error>(outcome.result)
-        })?;
+        };
+        let results = block_on_cancellable(
+            &self.runtime,
+            &self.cancel,
+            with_timeout(
+                update_timeout,
+                crate::OPTION_RPC_TIMEOUT_UPDATE,
+                transaction,
+            ),
+        )?;
 
         let mut schema = None;
         let mut batches = Vec::with_capacity(results.len());
@@ -656,6 +683,10 @@ impl SpannerStatement {
         let cancel = self.cancel.clone();
         let batch_size = self.rows_per_batch;
         let precision = self.timestamp_precision;
+        // The query timeout bounds the initial execution (through the first chunk); the fetch
+        // timeout bounds each later chunk as the reader is iterated.
+        let query_timeout = self.timeouts.query_timeout();
+        let fetch_timeout = self.timeouts.fetch_timeout();
         if statements.len() <= 1 {
             // Zero or one bound row. One statement is one snapshot already, and the single-use
             // transaction keeps the exact semantics of the bounded-staleness kinds.
@@ -663,33 +694,50 @@ impl SpannerStatement {
                 return Ok(Self::empty_reader());
             };
             let bound = self.read_staleness.timestamp_bound()?;
-            let reader = block_on_cancellable(&self.runtime, &self.cancel, async move {
-                let transaction = crate::staleness::single_use(&client, bound);
-                let result_set = transaction
-                    .execute_query(statement)
+            let reader = block_on_cancellable(
+                &self.runtime,
+                &self.cancel,
+                with_timeout(query_timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async move {
+                    let transaction = crate::staleness::single_use(&client, bound);
+                    let result_set = transaction
+                        .execute_query(statement)
+                        .await
+                        .map_err(from_spanner)?;
+                    stream_query(
+                        runtime,
+                        cancel,
+                        result_set,
+                        batch_size,
+                        precision,
+                        fetch_timeout,
+                    )
                     .await
-                    .map_err(from_spanner)?;
-                stream_query(runtime, cancel, result_set, batch_size, precision).await
-            })?;
+                }),
+            )?;
             return Ok(Box::new(reader));
         }
         let bound = self.read_staleness.multi_use_timestamp_bound()?;
-        let reader = block_on_cancellable(&self.runtime, &self.cancel, async move {
-            let mut builder = client.read_only_transaction();
-            if let Some(b) = bound {
-                builder = builder.set_timestamp_bound(b);
-            }
-            let transaction = builder.build().await.map_err(from_spanner)?;
-            stream_bound_query(
-                runtime,
-                cancel,
-                transaction,
-                statements,
-                batch_size,
-                precision,
-            )
-            .await
-        })?;
+        let reader = block_on_cancellable(
+            &self.runtime,
+            &self.cancel,
+            with_timeout(query_timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async move {
+                let mut builder = client.read_only_transaction();
+                if let Some(b) = bound {
+                    builder = builder.set_timestamp_bound(b);
+                }
+                let transaction = builder.build().await.map_err(from_spanner)?;
+                stream_bound_query(
+                    runtime,
+                    cancel,
+                    transaction,
+                    statements,
+                    batch_size,
+                    precision,
+                    fetch_timeout,
+                )
+                .await
+            }),
+        )?;
         Ok(Box::new(reader))
     }
 
@@ -828,6 +876,15 @@ impl Optionable for SpannerStatement {
                 // the same unset semantics as the staleness options.
                 self.timestamp_precision = TimestampPrecision::parse_option(value)?;
             }
+            OptionStatement::Other(k) if k == crate::OPTION_RPC_TIMEOUT_QUERY => {
+                self.timeouts.set_query(value)?;
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_RPC_TIMEOUT_UPDATE => {
+                self.timeouts.set_update(value)?;
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_RPC_TIMEOUT_FETCH => {
+                self.timeouts.set_fetch(value)?;
+            }
             other => {
                 return Err(not_implemented(&format!(
                     "statement option {}",
@@ -877,6 +934,16 @@ impl Optionable for SpannerStatement {
             // The effective mode: inherited from the connection at creation unless overridden.
             OptionStatement::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {
                 Some(self.timestamp_precision.as_str().to_string())
+            }
+            // The effective values: the connection's, unless overridden on this statement.
+            OptionStatement::Other(k) if k == crate::OPTION_RPC_TIMEOUT_QUERY => {
+                self.timeouts.query_string()
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_RPC_TIMEOUT_UPDATE => {
+                self.timeouts.update_string()
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_RPC_TIMEOUT_FETCH => {
+                self.timeouts.fetch_string()
             }
             _ => None,
         };
@@ -989,17 +1056,36 @@ impl Statement for SpannerStatement {
         let precision = self.timestamp_precision;
         let bound = self.read_staleness.timestamp_bound()?;
         let statement = self.sql_builder(&sql).build();
+        let fetch_timeout = self.timeouts.fetch_timeout();
         // Stream the result: `stream_query` fetches the first chunk (settling the schema) and the
         // returned reader converts the rest to Arrow one bounded chunk at a time as it is
         // iterated, with a background task prefetching the next chunk ahead of the consumer.
-        let reader = block_on_cancellable(&self.runtime, &self.cancel, async move {
-            let transaction = crate::staleness::single_use(&client, bound);
-            let result_set = transaction
-                .execute_query(statement)
-                .await
-                .map_err(from_spanner)?;
-            stream_query(runtime, cancel, result_set, batch_size, precision).await
-        })?;
+        // The query timeout bounds the initial execution through that first chunk; the fetch
+        // timeout bounds each later chunk inside the prefetch task.
+        let reader = block_on_cancellable(
+            &self.runtime,
+            &self.cancel,
+            with_timeout(
+                self.timeouts.query_timeout(),
+                crate::OPTION_RPC_TIMEOUT_QUERY,
+                async move {
+                    let transaction = crate::staleness::single_use(&client, bound);
+                    let result_set = transaction
+                        .execute_query(statement)
+                        .await
+                        .map_err(from_spanner)?;
+                    stream_query(
+                        runtime,
+                        cancel,
+                        result_set,
+                        batch_size,
+                        precision,
+                        fetch_timeout,
+                    )
+                    .await
+                },
+            ),
+        )?;
         Ok(Box::new(reader))
     }
 
@@ -1054,24 +1140,33 @@ impl Statement for SpannerStatement {
         // any data, so dbt can introspect a model's output columns without wrapping it in a
         // `SELECT ... WHERE false` subquery.
         let plan_builder = self.sql_builder(&sql).set_query_mode(QueryMode::Plan);
-        let schema = block_on_cancellable(&self.runtime, &self.cancel, async move {
-            let transaction = client.single_use().build();
-            let mut builder = plan_builder;
-            // Bind parameters if any were provided (values are irrelevant to the schema) so that
-            // `@param` references resolve.
-            if let Some(batch) = bound.first() {
-                if batch.num_rows() > 0 {
-                    let names = bind::resolve_parameter_names(&sql, batch, bind_by_name)?;
-                    builder = bind::bind_params(builder, &names, batch, 0)?;
-                }
-            }
-            let result_set = transaction
-                .execute_query(builder.build())
-                .await
-                .map_err(from_spanner)?;
-            let (schema, _batch) = result_set_to_batch(result_set, precision).await?;
-            Ok::<SchemaRef, Error>(schema)
-        })?;
+        // The schema probe is a query execution, so the query timeout bounds it.
+        let schema = block_on_cancellable(
+            &self.runtime,
+            &self.cancel,
+            with_timeout(
+                self.timeouts.query_timeout(),
+                crate::OPTION_RPC_TIMEOUT_QUERY,
+                async move {
+                    let transaction = client.single_use().build();
+                    let mut builder = plan_builder;
+                    // Bind parameters if any were provided (values are irrelevant to the schema) so
+                    // that `@param` references resolve.
+                    if let Some(batch) = bound.first() {
+                        if batch.num_rows() > 0 {
+                            let names = bind::resolve_parameter_names(&sql, batch, bind_by_name)?;
+                            builder = bind::bind_params(builder, &names, batch, 0)?;
+                        }
+                    }
+                    let result_set = transaction
+                        .execute_query(builder.build())
+                        .await
+                        .map_err(from_spanner)?;
+                    let (schema, _batch) = result_set_to_batch(result_set, precision).await?;
+                    Ok::<SchemaRef, Error>(schema)
+                },
+            ),
+        )?;
         Ok((*schema).clone())
     }
 
@@ -1116,7 +1211,9 @@ impl Statement for SpannerStatement {
         // read-only transaction, so every partition executes at that bound wherever it is read back.
         let bound = self.read_staleness.timestamp_bound()?;
 
-        let (schema, partitions) = block_on_cancellable(&self.runtime, &self.cancel, async move {
+        // Partitioning is a query-side operation: the query timeout bounds the schema probe plus
+        // the PartitionQuery call.
+        let partition_op = async move {
             // Schema via a PLAN of the query: column metadata without scanning any data.
             let plan_rs = crate::staleness::single_use(&client, bound.clone())
                 .execute_query(plan_stmt)
@@ -1151,7 +1248,16 @@ impl Statement for SpannerStatement {
                 tokens.push(crate::connection::encode_partition(&partition)?);
             }
             Ok::<_, Error>((schema, tokens))
-        })?;
+        };
+        let (schema, partitions) = block_on_cancellable(
+            &self.runtime,
+            &self.cancel,
+            with_timeout(
+                self.timeouts.query_timeout(),
+                crate::OPTION_RPC_TIMEOUT_QUERY,
+                partition_op,
+            ),
+        )?;
 
         Ok(PartitionedResult {
             partitions,

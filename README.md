@@ -66,6 +66,17 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   `spanner.transaction.tag` (connection-level) tags every read/write transaction the driver builds.
   See [troubleshooting with tags](https://cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags).
   Driver-internal metadata queries (`get_objects`, schema probes, …) are not tagged/prioritised.
+- RPC timeouts: `spanner.rpc.timeout_seconds.query` (a query's initial execution, through the first
+  chunk of its streamed result), `spanner.rpc.timeout_seconds.fetch` (each subsequent chunk fetch,
+  enforced inside the background prefetch task) and `spanner.rpc.timeout_seconds.update` (DML /
+  batch DML, the manual-mode commit, each bulk-ingest commit chunk) — settable on a connection
+  (where they become the default for its statements) or per statement, named in parallel with the
+  Flight SQL driver's `adbc.flight.sql.rpc.timeout_seconds.*`. Values are seconds (fractions
+  allowed; must be finite and non-negative; `0` disables, `""` unsets; round-trip via `get_option`
+  and `get_option_double`). Each is an overall deadline on the driver-side operation (including the
+  client's internal retries); expiry fails with ADBC `Timeout` status. Unset means no deadline —
+  the pre-existing behaviour, where only `cancel` can interrupt a hung call. DDL and driver-internal
+  metadata queries are not bounded.
 - Parameter binding: `bind`/`bind_stream` an Arrow batch whose columns become Spanner named
   parameters; each bound row runs the statement once. How columns pair with the query's `@name`
   parameters is set by the `adbc.statement.bind_by_name` statement option (the [SQLite reference
@@ -245,6 +256,9 @@ database path, not the original URI.
 | `spanner.request.priority`                   | [Request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions) (`low`/`medium`/`high`) for queries, DML and commits; inherited by the connection's statements. |
 | `spanner.request.tag`                        | [Request tag](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags) attached to every query/DML request; inherited by the connection's statements. |
 | `spanner.transaction.tag`                    | Transaction tag attached to every read/write transaction the driver builds. Connection-level only. |
+| `spanner.rpc.timeout_seconds.query`          | Deadline (seconds) on a query's initial execution; inherited by the connection's statements. |
+| `spanner.rpc.timeout_seconds.update`         | Deadline (seconds) on DML / batch-DML / commit / ingest-chunk operations; inherited by the connection's statements. |
+| `spanner.rpc.timeout_seconds.fetch`          | Deadline (seconds) on each subsequent chunk fetch of a streamed result; inherited by the connection's statements. |
 
 **Statement options** (via `set_option` on the statement):
 
@@ -258,6 +272,9 @@ database path, not the original URI.
 | `spanner.max_timestamp_precision`            | Per-statement timestamp-precision override (`""` resets to the driver default). |
 | `spanner.request.priority`                   | Per-statement request-priority override. |
 | `spanner.request.tag`                        | Per-statement request-tag override. |
+| `spanner.rpc.timeout_seconds.query`          | Per-statement query-timeout override. |
+| `spanner.rpc.timeout_seconds.update`         | Per-statement update-timeout override. |
+| `spanner.rpc.timeout_seconds.fetch`          | Per-statement fetch-timeout override. |
 | `adbc.ingest.target_table`                   | Bulk-ingest target table. |
 | `adbc.ingest.target_db_schema`               | Named schema qualifying the ingest target table. |
 | `adbc.ingest.target_catalog`                 | Only the empty catalog is accepted (Spanner has a single, unnamed catalog). |

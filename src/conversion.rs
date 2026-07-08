@@ -41,6 +41,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use adbc_core::error::{Result, Status};
 use adbc_core::options::OptionValue;
@@ -64,6 +65,7 @@ use crate::error::{err, from_spanner, invalid_argument};
 use crate::runtime::{
     block_on_cancellable, spawn_prefetch, CancelSignal, ChunkSource, SharedRuntime,
 };
+use crate::timeout::with_timeout;
 
 /// Field name used for the element of an Arrow `List` (the Arrow convention).
 const LIST_ITEM: &str = "item";
@@ -244,18 +246,26 @@ fn approx_value_bytes(value: &Value) -> usize {
 /// consumer's processing of chunk N; each [`Iterator::next`] converts one bounded chunk to Arrow
 /// rather than materialising the whole result up front. Waiting for a chunk is cancellable via the
 /// shared [`CancelSignal`], which also aborts the background fetch.
+///
+/// The first chunk pulled here is bounded by the caller's *query* deadline (the caller wraps this
+/// whole future in `spanner.rpc.timeout_seconds.query`); each background fetch after it is
+/// bounded by `fetch_timeout` (`spanner.rpc.timeout_seconds.fetch`) inside the prefetch task, so a
+/// stalled stream surfaces [`Status::Timeout`](adbc_core::error::Status::Timeout) on the
+/// consumer's next batch.
 pub(crate) async fn stream_query(
     runtime: SharedRuntime,
     cancel: CancelSignal,
     mut rs: ResultSet,
     batch_size: usize,
     precision: TimestampPrecision,
+    fetch_timeout: Option<Duration>,
 ) -> Result<SpannerBatchReader> {
     let first = pull_chunk(&mut rs, batch_size).await?;
     let schema = build_schema(rs.metadata(), first.first(), precision);
     let source = ResultSetChunks {
         result_set: rs,
         batch_size,
+        fetch_timeout,
     };
     let (chunks, task) = spawn_prefetch(&runtime, cancel.clone(), source);
     Ok(SpannerBatchReader {
@@ -269,17 +279,23 @@ pub(crate) async fn stream_query(
 }
 
 /// The prefetch task's view of a Spanner [`ResultSet`]: chunks of up to `batch_size` rows (plus
-/// the [`CHUNK_BYTE_BUDGET`]), as pulled by [`pull_chunk`].
+/// the [`CHUNK_BYTE_BUDGET`]), as pulled by [`pull_chunk`] — each pull bounded by the statement's
+/// fetch timeout (`spanner.rpc.timeout_seconds.fetch`), when set.
 struct ResultSetChunks {
     result_set: ResultSet,
     batch_size: usize,
+    fetch_timeout: Option<Duration>,
 }
 
 impl ChunkSource for ResultSetChunks {
     type Row = Row;
 
     fn next_chunk(&mut self) -> impl std::future::Future<Output = Result<Vec<Row>>> + Send {
-        pull_chunk(&mut self.result_set, self.batch_size)
+        with_timeout(
+            self.fetch_timeout,
+            crate::OPTION_RPC_TIMEOUT_FETCH,
+            pull_chunk(&mut self.result_set, self.batch_size),
+        )
     }
 }
 
@@ -380,6 +396,7 @@ pub(crate) async fn stream_bound_query(
     statements: Vec<SpannerSql>,
     batch_size: usize,
     precision: TimestampPrecision,
+    fetch_timeout: Option<Duration>,
 ) -> Result<BoundQueryBatchReader> {
     let mut statements = statements.into_iter();
     let mut result_set = match statements.next() {
@@ -409,6 +426,7 @@ pub(crate) async fn stream_bound_query(
         result_set,
         first,
         batch_size,
+        fetch_timeout,
     })
 }
 
@@ -428,6 +446,9 @@ pub(crate) struct BoundQueryBatchReader {
     /// The first chunk of rows, fetched up front to settle the schema; emitted on the first `next`.
     first: Option<Vec<Row>>,
     batch_size: usize,
+    /// Deadline for each subsequent chunk fetch (`spanner.rpc.timeout_seconds.fetch`), when set.
+    /// Also covers executing the next per-row statement when the current result set drains.
+    fetch_timeout: Option<Duration>,
 }
 
 /// Pull the next non-empty chunk for [`BoundQueryBatchReader`]: drain the current result set in
@@ -479,12 +500,17 @@ impl Iterator for BoundQueryBatchReader {
             statements,
             result_set,
             batch_size,
+            fetch_timeout,
             ..
         } = self;
         match block_on_cancellable(
             runtime,
             cancel,
-            next_bound_chunk(transaction, statements, result_set, *batch_size),
+            with_timeout(
+                *fetch_timeout,
+                crate::OPTION_RPC_TIMEOUT_FETCH,
+                next_bound_chunk(transaction, statements, result_set, *batch_size),
+            ),
         ) {
             Ok(None) => None,
             Ok(Some(rows)) => Some(build_batch(self.schema.clone(), &rows).map_err(to_arrow_error)),

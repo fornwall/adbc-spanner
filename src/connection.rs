@@ -40,6 +40,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection, OptionValue};
@@ -64,6 +65,7 @@ use crate::request::RequestConfig;
 use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
 use crate::staleness::ReadStaleness;
 use crate::statement::{SpannerStatement, DEFAULT_ROWS_PER_BATCH};
+use crate::timeout::{with_timeout, RpcTimeouts};
 
 /// Transaction state shared between a connection and the statements it creates.
 #[derive(Debug)]
@@ -240,6 +242,11 @@ pub struct SpannerConnection {
     /// Becomes the default for statements created on the connection, which may override it; also
     /// applied to `get_table_schema` and `read_partition` (which have no statement).
     timestamp_precision: TimestampPrecision,
+    /// RPC timeouts (`spanner.rpc.timeout_seconds.{query,update,fetch}`). Unset by default (no
+    /// deadline); becomes the default for statements created on the connection, which may override
+    /// each value. The connection itself applies the update timeout to its commit paths and the
+    /// query/fetch timeouts to `read_partition`.
+    timeouts: RpcTimeouts,
     txn: SharedTxn,
     /// Cancellation signal for this connection's in-flight metadata/commit operations
     /// (see [`Connection::cancel`]).
@@ -258,6 +265,7 @@ impl SpannerConnection {
             read_staleness: ReadStaleness::default(),
             request: RequestConfig::default(),
             timestamp_precision: TimestampPrecision::default(),
+            timeouts: RpcTimeouts::default(),
             txn: Arc::new(Mutex::new(TxnState::new())),
             cancel: CancelSignal::new(),
         }
@@ -278,6 +286,7 @@ impl SpannerConnection {
             &self.cancel,
             self.isolation.clone(),
             self.request.clone(),
+            self.timeouts.update_timeout(),
             statements,
             mutations,
         )?;
@@ -369,6 +378,7 @@ pub(crate) fn run_batch_dml(
     cancel: &CancelSignal,
     isolation: IsolationLevel,
     request: RequestConfig,
+    timeout: Option<Duration>,
     statements: Vec<SpannerSql>,
 ) -> Result<i64> {
     run_batch_txn(
@@ -377,6 +387,7 @@ pub(crate) fn run_batch_dml(
         cancel,
         isolation,
         request,
+        timeout,
         statements,
         Vec::new(),
     )
@@ -390,12 +401,19 @@ pub(crate) fn run_batch_dml(
 /// order they were issued in. The runner may retry the closure on abort, so both (cloned) lists
 /// are replayed on each attempt. This is the manual-transaction commit path; the DML-only wrapper
 /// is [`run_batch_dml`].
+///
+/// `timeout` — the caller's `spanner.rpc.timeout_seconds.update` value — is an overall deadline on
+/// the whole transaction (including the runner's abort retries); expiry fails with
+/// [`Status::Timeout`]. Note a commit whose confirmation the driver stopped waiting for may still
+/// have landed server-side, the usual ambiguity of any timed-out commit.
+#[allow(clippy::too_many_arguments)] // threads one connection/statement config item per argument
 pub(crate) fn run_batch_txn(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
     cancel: &CancelSignal,
     isolation: IsolationLevel,
     request: RequestConfig,
+    timeout: Option<Duration>,
     statements: Vec<SpannerSql>,
     mutations: Vec<Mutation>,
 ) -> Result<i64> {
@@ -403,7 +421,7 @@ pub(crate) fn run_batch_txn(
         return Ok(0);
     }
     let client = client.clone();
-    block_on_cancellable(runtime, cancel, async move {
+    let transaction = async move {
         // The commit priority and transaction tag ride on the runner; the request tag rides on the
         // ExecuteBatchDml batch inside the (retryable) closure.
         let runner = request
@@ -432,7 +450,12 @@ pub(crate) fn run_batch_txn(
             .await
             .map_err(from_spanner)?;
         Ok::<i64, Error>(outcome.result)
-    })
+    };
+    block_on_cancellable(
+        runtime,
+        cancel,
+        with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_UPDATE, transaction),
+    )
 }
 
 /// Validate a lookup's `catalog` argument. Spanner has a single, unnamed (`""`) catalog, so `None`
@@ -640,6 +663,15 @@ impl Optionable for SpannerConnection {
             OptionConnection::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {
                 self.timestamp_precision = TimestampPrecision::parse_option(value)?;
             }
+            OptionConnection::Other(k) if k == crate::OPTION_RPC_TIMEOUT_QUERY => {
+                self.timeouts.set_query(value)?;
+            }
+            OptionConnection::Other(k) if k == crate::OPTION_RPC_TIMEOUT_UPDATE => {
+                self.timeouts.set_update(value)?;
+            }
+            OptionConnection::Other(k) if k == crate::OPTION_RPC_TIMEOUT_FETCH => {
+                self.timeouts.set_fetch(value)?;
+            }
             other => {
                 return Err(not_implemented(&format!(
                     "unsupported Spanner connection option: {}",
@@ -711,6 +743,30 @@ impl Optionable for SpannerConnection {
             OptionConnection::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {
                 Ok(self.timestamp_precision.as_str().to_string())
             }
+            OptionConnection::Other(k) if k == crate::OPTION_RPC_TIMEOUT_QUERY => {
+                self.timeouts.query_string().ok_or_else(|| {
+                    err(
+                        format!("option {} is not set", crate::OPTION_RPC_TIMEOUT_QUERY),
+                        Status::NotFound,
+                    )
+                })
+            }
+            OptionConnection::Other(k) if k == crate::OPTION_RPC_TIMEOUT_UPDATE => {
+                self.timeouts.update_string().ok_or_else(|| {
+                    err(
+                        format!("option {} is not set", crate::OPTION_RPC_TIMEOUT_UPDATE),
+                        Status::NotFound,
+                    )
+                })
+            }
+            OptionConnection::Other(k) if k == crate::OPTION_RPC_TIMEOUT_FETCH => {
+                self.timeouts.fetch_string().ok_or_else(|| {
+                    err(
+                        format!("option {} is not set", crate::OPTION_RPC_TIMEOUT_FETCH),
+                        Status::NotFound,
+                    )
+                })
+            }
             // A Spanner database has a single, unnamed catalog and (default) schema — both the empty
             // string in INFORMATION_SCHEMA, which is what `get_objects` reports — so the "current"
             // catalog/schema are reported as "". (They can't be switched; setting them is unsupported.)
@@ -751,6 +807,7 @@ impl Connection for SpannerConnection {
             self.read_staleness.clone(),
             self.request.clone(),
             self.timestamp_precision,
+            self.timeouts,
             self.txn.clone(),
         ))
     }
@@ -1004,19 +1061,31 @@ impl Connection for SpannerConnection {
         // Stream the partition's rows to Arrow exactly like `Statement::execute`. The connection has
         // no per-statement batch-size option, so the default chunk size is used; the timestamp
         // precision is the **reading** connection's `spanner.max_timestamp_precision` (set it to the
-        // same mode as the producing statement so the descriptor's advertised schema matches).
+        // same mode as the producing statement so the descriptor's advertised schema matches). The
+        // connection's query timeout bounds the initial execute + first chunk; its fetch timeout
+        // bounds each later chunk inside the prefetch task.
         let precision = self.timestamp_precision;
-        let reader = block_on_cancellable(&self.runtime, &self.cancel, async move {
-            let result_set = partition.execute(&client).await.map_err(from_spanner)?;
-            stream_query(
-                runtime,
-                cancel,
-                result_set,
-                DEFAULT_ROWS_PER_BATCH,
-                precision,
-            )
-            .await
-        })?;
+        let fetch_timeout = self.timeouts.fetch_timeout();
+        let reader = block_on_cancellable(
+            &self.runtime,
+            &self.cancel,
+            with_timeout(
+                self.timeouts.query_timeout(),
+                crate::OPTION_RPC_TIMEOUT_QUERY,
+                async move {
+                    let result_set = partition.execute(&client).await.map_err(from_spanner)?;
+                    stream_query(
+                        runtime,
+                        cancel,
+                        result_set,
+                        DEFAULT_ROWS_PER_BATCH,
+                        precision,
+                        fetch_timeout,
+                    )
+                    .await
+                },
+            ),
+        )?;
         Ok(Box::new(reader))
     }
 }

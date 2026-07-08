@@ -6268,3 +6268,305 @@ fn zero_row_schema_fidelity() {
         assert_expected_schema(&batch.schema(), "bound query (with rows) batch schema");
     }
 }
+
+/// RPC timeouts (`spanner.rpc.timeout_seconds.{query,update,fetch}`): round-trip through the
+/// string **and** double getters at connection and statement level, statement inheritance and
+/// override, validation of bad values, generous deadlines leaving real operations untouched, and —
+/// the point of the feature — a deadline that actually fires against a live RPC surfacing ADBC
+/// `Timeout` (instead of the pre-existing behaviour, blocking until `cancel`).
+#[test]
+fn rpc_timeouts() {
+    use adbc_core::error::Status;
+    use adbc_spanner::{
+        OPTION_RPC_TIMEOUT_FETCH, OPTION_RPC_TIMEOUT_QUERY, OPTION_RPC_TIMEOUT_UPDATE,
+    };
+
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping rpc_timeouts");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    let conn_key = |k: &str| OptionConnection::Other(k.into());
+    let stmt_key = |k: &str| OptionStatement::Other(k.into());
+    const ALL: [&str; 3] = [
+        OPTION_RPC_TIMEOUT_QUERY,
+        OPTION_RPC_TIMEOUT_UPDATE,
+        OPTION_RPC_TIMEOUT_FETCH,
+    ];
+
+    // Unset options read back as NotFound, through the string and double getters alike.
+    for key in ALL {
+        let error = connection
+            .get_option_string(conn_key(key))
+            .expect_err("unset option must be NotFound");
+        assert_eq!(error.status, Status::NotFound, "{key}");
+        let error = connection
+            .get_option_double(conn_key(key))
+            .expect_err("unset option must be NotFound via the double getter too");
+        assert_eq!(error.status, Status::NotFound, "{key}");
+    }
+
+    // Set via a numeric string, an integer and a double; all round-trip through both getters.
+    connection
+        .set_option(
+            conn_key(OPTION_RPC_TIMEOUT_QUERY),
+            OptionValue::String("2.5".into()),
+        )
+        .expect("set query timeout from a string");
+    connection
+        .set_option(conn_key(OPTION_RPC_TIMEOUT_UPDATE), OptionValue::Int(30))
+        .expect("set update timeout from an int");
+    connection
+        .set_option(
+            conn_key(OPTION_RPC_TIMEOUT_FETCH),
+            OptionValue::Double(0.75),
+        )
+        .expect("set fetch timeout from a double");
+    assert_eq!(
+        connection
+            .get_option_string(conn_key(OPTION_RPC_TIMEOUT_QUERY))
+            .unwrap(),
+        "2.5"
+    );
+    assert_eq!(
+        connection
+            .get_option_double(conn_key(OPTION_RPC_TIMEOUT_QUERY))
+            .unwrap(),
+        2.5
+    );
+    assert_eq!(
+        connection
+            .get_option_string(conn_key(OPTION_RPC_TIMEOUT_UPDATE))
+            .unwrap(),
+        "30"
+    );
+    assert_eq!(
+        connection
+            .get_option_double(conn_key(OPTION_RPC_TIMEOUT_UPDATE))
+            .unwrap(),
+        30.0
+    );
+    assert_eq!(
+        connection
+            .get_option_double(conn_key(OPTION_RPC_TIMEOUT_FETCH))
+            .unwrap(),
+        0.75
+    );
+
+    // Bad values are rejected with InvalidArguments and leave the stored value untouched.
+    for bad in [
+        OptionValue::String("-1".into()),
+        OptionValue::String("abc".into()),
+        OptionValue::Double(f64::NAN),
+        OptionValue::Double(f64::INFINITY),
+        OptionValue::Int(-3),
+    ] {
+        let error = connection
+            .set_option(conn_key(OPTION_RPC_TIMEOUT_QUERY), bad)
+            .expect_err("bad timeout value must be rejected");
+        assert_eq!(error.status, Status::InvalidArguments);
+    }
+    assert_eq!(
+        connection
+            .get_option_string(conn_key(OPTION_RPC_TIMEOUT_QUERY))
+            .unwrap(),
+        "2.5"
+    );
+
+    // Statements inherit the connection's values at creation, and may override or unset each
+    // independently without leaking back.
+    let mut statement = connection.new_statement().expect("new statement");
+    assert_eq!(
+        statement
+            .get_option_double(stmt_key(OPTION_RPC_TIMEOUT_QUERY))
+            .unwrap(),
+        2.5,
+        "the statement must inherit the connection's query timeout"
+    );
+    assert_eq!(
+        statement
+            .get_option_string(stmt_key(OPTION_RPC_TIMEOUT_UPDATE))
+            .unwrap(),
+        "30"
+    );
+    statement
+        .set_option(
+            stmt_key(OPTION_RPC_TIMEOUT_QUERY),
+            OptionValue::Double(1.25),
+        )
+        .expect("override the query timeout on the statement");
+    statement
+        .set_option(
+            stmt_key(OPTION_RPC_TIMEOUT_FETCH),
+            OptionValue::String("".into()),
+        )
+        .expect("unset the inherited fetch timeout with an empty value");
+    assert_eq!(
+        statement
+            .get_option_string(stmt_key(OPTION_RPC_TIMEOUT_QUERY))
+            .unwrap(),
+        "1.25"
+    );
+    let error = statement
+        .get_option_string(stmt_key(OPTION_RPC_TIMEOUT_FETCH))
+        .expect_err("the unset fetch timeout must be NotFound");
+    assert_eq!(error.status, Status::NotFound);
+    assert_eq!(
+        connection
+            .get_option_string(conn_key(OPTION_RPC_TIMEOUT_QUERY))
+            .unwrap(),
+        "2.5",
+        "statement-level overrides must not leak back to the connection"
+    );
+    // `0` disables the deadline but still round-trips.
+    statement
+        .set_option(stmt_key(OPTION_RPC_TIMEOUT_UPDATE), OptionValue::Int(0))
+        .expect("zero disables");
+    assert_eq!(
+        statement
+            .get_option_double(stmt_key(OPTION_RPC_TIMEOUT_UPDATE))
+            .unwrap(),
+        0.0
+    );
+
+    // End-to-end with generous deadlines on the connection: DDL (deliberately unbounded), DML (the
+    // update deadline) and a multi-chunk streamed query (query deadline for the first chunk, fetch
+    // deadline for each later chunk inside the prefetch task) all succeed under 30-second limits.
+    for key in ALL {
+        connection
+            .set_option(conn_key(key), OptionValue::Int(30))
+            .expect("set a generous deadline");
+    }
+    run(
+        &mut connection,
+        "DROP TABLE IF EXISTS AdbcRpcTimeout; \
+         CREATE TABLE AdbcRpcTimeout (Id INT64) PRIMARY KEY (Id)",
+    );
+    let mut insert = connection.new_statement().expect("new statement");
+    insert
+        .set_sql_query(
+            "INSERT INTO AdbcRpcTimeout (Id) SELECT n FROM UNNEST(GENERATE_ARRAY(1, 100)) AS n",
+        )
+        .unwrap();
+    assert_eq!(
+        insert.execute_update().expect("bounded insert"),
+        Some(100),
+        "a generous update deadline must not affect a fast DML"
+    );
+    let mut query = connection.new_statement().expect("new statement");
+    query
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionValue::Int(40),
+        )
+        .expect("small batches so the fetch deadline path is exercised across chunks");
+    query
+        .set_sql_query("SELECT Id FROM AdbcRpcTimeout ORDER BY Id")
+        .unwrap();
+    let batches = query
+        .execute()
+        .expect("bounded streaming query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect bounded streamed batches");
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        100
+    );
+    assert!(
+        batches.len() > 1,
+        "expected several chunks so the fetch deadline actually bounded later fetches"
+    );
+
+    // A deadline that fires: a microsecond query timeout cannot be met by any real RPC, so the
+    // statement must fail with ADBC `Timeout` naming the option — not hang, not panic.
+    let mut tiny = connection.new_statement().expect("new statement");
+    tiny.set_option(
+        stmt_key(OPTION_RPC_TIMEOUT_QUERY),
+        OptionValue::String("0.000001".into()),
+    )
+    .expect("set a microsecond query deadline");
+    tiny.set_sql_query("SELECT Id FROM AdbcRpcTimeout ORDER BY Id")
+        .unwrap();
+    // The query deadline covers the initial execution (through the first chunk), so `execute`
+    // itself fails — no reader is produced.
+    let error = match tiny.execute() {
+        Ok(_) => panic!("a microsecond query deadline must expire"),
+        Err(error) => error,
+    };
+    assert_eq!(error.status, Status::Timeout, "{error:?}");
+    assert!(
+        error.message.contains(OPTION_RPC_TIMEOUT_QUERY),
+        "the timeout error must name the responsible option: {}",
+        error.message
+    );
+
+    // The update deadline fires on the write path too, as a plain ADBC error with Timeout status.
+    let mut tiny_dml = connection.new_statement().expect("new statement");
+    tiny_dml
+        .set_option(
+            stmt_key(OPTION_RPC_TIMEOUT_UPDATE),
+            OptionValue::Double(0.000001),
+        )
+        .expect("set a microsecond update deadline");
+    tiny_dml
+        .set_sql_query("UPDATE AdbcRpcTimeout SET Id = Id WHERE FALSE")
+        .unwrap();
+    let error = tiny_dml
+        .execute_update()
+        .expect_err("a microsecond update deadline must expire");
+    assert_eq!(error.status, Status::Timeout, "{error:?}");
+    assert!(
+        error.message.contains(OPTION_RPC_TIMEOUT_UPDATE),
+        "{}",
+        error.message
+    );
+
+    // Raising the deadline on the same statements makes them work again — an expired deadline
+    // poisons nothing.
+    tiny.set_option(stmt_key(OPTION_RPC_TIMEOUT_QUERY), OptionValue::Int(30))
+        .expect("raise the query deadline");
+    let batches = tiny
+        .execute()
+        .expect("query after a raised deadline")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        100
+    );
+    tiny_dml
+        .set_option(stmt_key(OPTION_RPC_TIMEOUT_UPDATE), OptionValue::Int(30))
+        .expect("raise the update deadline");
+    assert_eq!(
+        tiny_dml
+            .execute_update()
+            .expect("DML after a raised deadline"),
+        Some(0)
+    );
+
+    // Unsetting at the connection level round-trips back to NotFound.
+    for key in ALL {
+        connection
+            .set_option(conn_key(key), OptionValue::String("".into()))
+            .expect("unset with an empty value");
+        let error = connection
+            .get_option_string(conn_key(key))
+            .expect_err("an unset option must be NotFound");
+        assert_eq!(error.status, Status::NotFound, "{key}");
+    }
+
+    let mut drop = connection.new_statement().expect("new statement");
+    drop.set_sql_query("DROP TABLE AdbcRpcTimeout").unwrap();
+    drop.execute_update().expect("drop rpc-timeout table");
+}

@@ -120,6 +120,7 @@ mod runtime;
 mod staleness;
 mod statement;
 mod statistics;
+mod timeout;
 
 pub use connection::SpannerConnection;
 pub use driver::{SpannerDatabase, SpannerDriver};
@@ -496,6 +497,48 @@ pub const OPTION_REQUEST_PRIORITY: &str = "spanner.request.priority";
 /// statements it creates; a statement may override it.
 pub const OPTION_REQUEST_TAG: &str = "spanner.request.tag";
 
+/// Driver-specific connection **and** statement option: the **query timeout**, in seconds — an
+/// overall deadline on the *initial execution* of a query: the `ExecuteStreamingSql` call plus the
+/// first chunk of a streamed result, the `execute_schema` / `execute_partitions` probes, and the
+/// initial fetch of [`Connection::read_partition`](adbc_core::Connection::read_partition).
+/// Subsequent chunk fetches of a streamed result are bounded by [`OPTION_RPC_TIMEOUT_FETCH`]
+/// instead. An expired deadline fails with [`Status::Timeout`](adbc_core::error::Status::Timeout).
+///
+/// The value is a finite, non-negative number of seconds (fractions allowed; `NaN`/infinities are
+/// rejected), accepted as a numeric string, an integer, or a double; it round-trips through
+/// `get_option` and `get_option_double`. `0` disables the timeout; an empty string unsets it.
+/// Unset (the default) means no deadline. Set on a connection it becomes the default for
+/// statements it creates; a statement may override it. DDL and driver-internal metadata queries
+/// are not bounded. Naming parallels the Flight SQL ADBC driver's
+/// `adbc.flight.sql.rpc.timeout_seconds.*` options; the full semantics are in
+/// [docs/options.md](https://github.com/fornwall/adbc-spanner/blob/main/docs/options.md#rpc-timeouts).
+pub const OPTION_RPC_TIMEOUT_QUERY: &str = "spanner.rpc.timeout_seconds.query";
+
+/// Driver-specific connection **and** statement option: the **update timeout**, in seconds — an
+/// overall deadline on each write operation: an autocommit DML / batch-DML read/write transaction,
+/// the manual-mode commit (including re-enabling autocommit, which commits the buffer), and each
+/// bulk-ingest commit chunk. The deadline covers the whole driver-side operation, including any
+/// retries the client performs within it. An expired deadline fails with
+/// [`Status::Timeout`](adbc_core::error::Status::Timeout) — note Spanner may still have committed
+/// a transaction whose confirmation the driver stopped waiting for, the usual ambiguity of any
+/// timed-out commit.
+///
+/// Value syntax, validation, `0`/`""` handling, round-trip and inheritance are as
+/// [`OPTION_RPC_TIMEOUT_QUERY`]. DDL (an admin long-running operation) is not bounded.
+pub const OPTION_RPC_TIMEOUT_UPDATE: &str = "spanner.rpc.timeout_seconds.update";
+
+/// Driver-specific connection **and** statement option: the **fetch timeout**, in seconds — an
+/// overall deadline on *each subsequent chunk fetch* of a streamed result (after the first chunk,
+/// which [`OPTION_RPC_TIMEOUT_QUERY`] covers), enforced inside the background prefetch task so a
+/// stalled stream fails the consumer's next batch with
+/// [`Status::Timeout`](adbc_core::error::Status::Timeout) instead of hanging. For a bound
+/// (parameterized) query over several rows it also covers executing each per-row statement as the
+/// stream advances.
+///
+/// Value syntax, validation, `0`/`""` handling, round-trip and inheritance are as
+/// [`OPTION_RPC_TIMEOUT_QUERY`].
+pub const OPTION_RPC_TIMEOUT_FETCH: &str = "spanner.rpc.timeout_seconds.fetch";
+
 /// Driver-specific **connection** option: a free-form **transaction tag**, applied wherever the
 /// driver builds a read/write transaction (autocommit DML, the manual-mode commit, ingest commits)
 /// and attached by Spanner to every operation of that transaction. Unset by default; set an empty
@@ -566,6 +609,9 @@ mod options_doc_tests {
             crate::OPTION_REQUEST_TAG,
             crate::OPTION_TRANSACTION_TAG,
             crate::OPTION_MAX_TIMESTAMP_PRECISION,
+            crate::OPTION_RPC_TIMEOUT_QUERY,
+            crate::OPTION_RPC_TIMEOUT_UPDATE,
+            crate::OPTION_RPC_TIMEOUT_FETCH,
             // Standard ADBC (spec) options the driver handles.
             constants::ADBC_OPTION_URI,
             constants::ADBC_CONNECTION_OPTION_AUTOCOMMIT,

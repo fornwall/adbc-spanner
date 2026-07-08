@@ -69,7 +69,10 @@ CI runs it non-gating via `.github/workflows/resilience.yml` (manual dispatch + 
   inside the client indefinitely — the driver call neither succeeds nor errors until the network
   heals (then it succeeds) or something cancels it. Two consequences: a *failed* commit can only be
   produced at the SQL level (covered in `tests/integration.rs`), and an unreachable network can
-  block a commit unboundedly — the missing request-timeout knob is tracked in `REVIEW.md`.
+  block a commit unboundedly unless a deadline is configured — the
+  `spanner.rpc.timeout_seconds.update` option (see `docs/options.md`) bounds the whole commit,
+  including the client's internal retries, and fails it with ADBC `Timeout`. Unset (the default)
+  preserves the block-and-heal behaviour described above.
 
 - **Cancel is tested on the streaming read path, and needs the server to chunk.** The only in-flight
   network operation the safe (`&mut self`) Rust API lets a second thread cancel is a **streamed chunk
