@@ -115,6 +115,7 @@ mod info;
 mod nested;
 mod objects;
 mod options;
+mod query_options;
 mod request;
 mod retry;
 mod runtime;
@@ -530,6 +531,26 @@ pub const OPTION_REQUEST_PRIORITY: &str = "spanner.request.priority";
 /// statements it creates; a statement may override it.
 pub const OPTION_REQUEST_TAG: &str = "spanner.request.tag";
 
+/// Driver-specific connection **and** statement option: the query **optimizer version** Spanner
+/// uses to plan queries — a version string such as `"6"` or `"latest"`. Applied as a
+/// [`QueryOptions`](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/ExecuteSqlRequest#queryoptions)
+/// on every query statement the driver builds. The value is opaque (passed to Spanner unchanged);
+/// unset (the default) leaves the database/service default optimizer. Set an empty string to unset.
+/// Set on a connection it becomes the default for statements it creates; a statement may override
+/// it. See Spanner's
+/// [query optimizer versions](https://docs.cloud.google.com/spanner/docs/query-optimizer/manage-query-optimizer).
+pub const OPTION_QUERY_OPTIMIZER_VERSION: &str = "spanner.query.optimizer_version";
+
+/// Driver-specific connection **and** statement option: the query **optimizer statistics package**
+/// Spanner plans against — a named statistics package. Applied as a
+/// [`QueryOptions`](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/ExecuteSqlRequest#queryoptions)
+/// on every query statement the driver builds. The value is opaque (passed to Spanner unchanged);
+/// unset (the default) leaves the database default. Value handling and connection→statement
+/// inheritance are as [`OPTION_QUERY_OPTIMIZER_VERSION`]. See Spanner's
+/// [optimizer statistics packages](https://docs.cloud.google.com/spanner/docs/query-optimizer/statistics-packages).
+pub const OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE: &str =
+    "spanner.query.optimizer_statistics_package";
+
 /// Driver-specific connection **and** statement option: the **query timeout**, in seconds — an
 /// overall deadline on the *initial execution* of a query: the `ExecuteStreamingSql` call plus the
 /// first chunk of a streamed result, the `execute_schema` / `execute_partitions` probes, and the
@@ -686,6 +707,8 @@ mod options_doc_tests {
             crate::OPTION_READ_TIMESTAMP,
             crate::OPTION_REQUEST_PRIORITY,
             crate::OPTION_REQUEST_TAG,
+            crate::OPTION_QUERY_OPTIMIZER_VERSION,
+            crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE,
             crate::OPTION_TRANSACTION_TAG,
             crate::OPTION_MAX_COMMIT_DELAY,
             crate::OPTION_MAX_TIMESTAMP_PRECISION,

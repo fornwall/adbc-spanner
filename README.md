@@ -294,6 +294,8 @@ database path, not the original URI.
 | `spanner.max_timestamp_precision`            | How `TIMESTAMP` maps to Arrow: `nanoseconds_error_on_overflow` (default) or `microseconds` (full 0001–9999 range) — see [Type mapping](#type-mapping); inherited by the connection's statements. |
 | `spanner.request.priority`                   | [Request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions) (`low`/`medium`/`high`) for queries, DML and commits; inherited by the connection's statements. |
 | `spanner.request.tag`                        | [Request tag](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags) attached to every query/DML request; inherited by the connection's statements. |
+| `spanner.query.optimizer_version`            | [Query optimizer version](https://docs.cloud.google.com/spanner/docs/query-optimizer/manage-query-optimizer) (e.g. `"6"`/`"latest"`) applied to every query; inherited by the connection's statements. |
+| `spanner.query.optimizer_statistics_package` | [Optimizer statistics package](https://docs.cloud.google.com/spanner/docs/query-optimizer/statistics-packages) applied to every query; inherited by the connection's statements. |
 | `spanner.transaction.tag`                    | Transaction tag attached to every read/write transaction the driver builds. Connection-level only. |
 | `spanner.max_commit_delay`                   | [Maximum commit delay](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions) (a duration in `0..=500ms`) Spanner may add to a read/write commit to batch it with others; applies to autocommit DML, batch DML, the manual-mode commit and bulk ingest; inherited by the connection's statements. |
 | `spanner.rpc.timeout_seconds.query`          | Deadline (seconds) on a query's initial execution and the driver-internal metadata reads (`get_objects` / `get_statistics` / `get_table_schema`); inherited by the connection's statements. |
@@ -315,6 +317,8 @@ database path, not the original URI.
 | `spanner.request.priority`                   | Per-statement request-priority override. |
 | `spanner.request.tag`                        | Per-statement request-tag override. |
 | `spanner.max_commit_delay`                   | Per-statement max-commit-delay override. |
+| `spanner.query.optimizer_version`            | Per-statement optimizer-version override. |
+| `spanner.query.optimizer_statistics_package` | Per-statement optimizer-statistics-package override. |
 | `spanner.rpc.timeout_seconds.query`          | Per-statement query-timeout override. |
 | `spanner.rpc.timeout_seconds.update`         | Per-statement update-timeout override. |
 | `spanner.rpc.timeout_seconds.fetch`          | Per-statement fetch-timeout override. |
