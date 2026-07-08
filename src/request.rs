@@ -27,7 +27,9 @@
 
 use adbc_core::error::Result;
 use adbc_core::options::OptionValue;
-use google_cloud_spanner::builder::{BatchDmlBuilder, TransactionRunnerBuilder, WriteOnlyTransactionBuilder};
+use google_cloud_spanner::builder::{
+    BatchDmlBuilder, TransactionRunnerBuilder, WriteOnlyTransactionBuilder,
+};
 use google_cloud_spanner::model::request_options::Priority;
 use google_cloud_spanner::statement::StatementBuilder;
 
