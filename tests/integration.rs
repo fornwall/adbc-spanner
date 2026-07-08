@@ -6854,3 +6854,149 @@ fn rpc_timeouts() {
     drop.set_sql_query("DROP TABLE AdbcRpcTimeout").unwrap();
     drop.execute_update().expect("drop rpc-timeout table");
 }
+
+/// Opt-in **end-to-end auth** tests: drive the `spanner.keyfile` and
+/// `spanner.impersonate.target_principal` credential paths against a **real** Cloud Spanner database
+/// and prove each one authenticates by running a trivial `SELECT 1`.
+///
+/// The offline unit tests in `src/driver.rs` only assert option parsing / mutual-exclusion / the
+/// emulator guards; they never actually authenticate. These tests close that gap, but they need real
+/// credentials (which normal CI does not have), so they **self-skip cleanly** — green, no failure —
+/// whenever their env vars are unset, exactly like the `SPANNER_GCP_DATABASE` tests above. That keeps
+/// a plain `cargo test` green everywhere.
+///
+/// The emulator refuses keyfile/impersonation credentials (see the driver's emulator guard), so these
+/// tests read `SPANNER_GCP_DATABASE` directly and never touch the emulator. Env vars:
+///
+/// - `SPANNER_GCP_DATABASE` (`project.instance.database`) — the real target database, shared with the
+///   other real-backend tests. Required for both.
+/// - `SPANNER_TEST_KEYFILE` — filesystem path to a service-account JSON key. Enables
+///   `keyfile_auth_end_to_end`.
+/// - `SPANNER_TEST_IMPERSONATE_TARGET_PRINCIPAL` — a service-account email to impersonate (the base
+///   credentials come from ADC). Enables `impersonation_auth_end_to_end`.
+mod auth_end_to_end {
+    use super::*;
+    use adbc_spanner::{OPTION_IMPERSONATE_TARGET_PRINCIPAL, OPTION_KEYFILE};
+
+    /// Resolve the **real** Cloud Spanner target from `SPANNER_GCP_DATABASE` alone.
+    ///
+    /// Unlike [`test_target`], this ignores `SPANNER_EMULATOR_HOST` (the emulator can't exercise
+    /// these credentials) and never consults `ADBC_TEST_REQUIRE_TARGET` — the auth tests are opt-in
+    /// beyond the normal target and must skip silently when their extra credentials are absent.
+    fn gcp_database_target() -> Option<TestTarget> {
+        let spec = std::env::var("SPANNER_GCP_DATABASE")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        match spec.split('.').collect::<Vec<_>>().as_slice() {
+            [project, instance, database] => Some(TestTarget {
+                project: project.to_string(),
+                instance: instance.to_string(),
+                database: database.to_string(),
+                is_emulator: false,
+            }),
+            _ => panic!(
+                "SPANNER_GCP_DATABASE must be in 'project.instance.database' form, got {spec:?}"
+            ),
+        }
+    }
+
+    /// Read a non-empty env var, or `None` (so the caller can self-skip).
+    fn non_empty_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|s| !s.is_empty())
+    }
+
+    /// Run `SELECT 1` over the connection and assert it returns the single value `1` — enough to
+    /// prove the credential path authenticated end-to-end (a bad credential fails to connect or
+    /// errors here rather than returning a row).
+    fn assert_select_one(connection: &mut SpannerConnection) {
+        let mut statement = connection.new_statement().expect("new statement");
+        statement
+            .set_sql_query("SELECT 1 AS one")
+            .expect("set query");
+        let batches: Vec<_> = statement
+            .execute()
+            .expect("execute SELECT 1 over the authenticated connection")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read batches");
+        assert_eq!(batches.len(), 1);
+        let ones = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ones.value(0), 1);
+    }
+
+    /// Authenticate with a service-account key file (`spanner.keyfile`) and run `SELECT 1`.
+    ///
+    /// Skips unless both `SPANNER_GCP_DATABASE` and `SPANNER_TEST_KEYFILE` are set.
+    #[test]
+    fn keyfile_auth_end_to_end() {
+        let Some(target) = gcp_database_target() else {
+            eprintln!("SPANNER_GCP_DATABASE not set — skipping keyfile auth end-to-end test");
+            return;
+        };
+        let Some(keyfile) = non_empty_env("SPANNER_TEST_KEYFILE") else {
+            eprintln!("SPANNER_TEST_KEYFILE not set — skipping keyfile auth end-to-end test");
+            return;
+        };
+
+        // The database only needs to exist for `SELECT 1`; setup uses ADC, independent of the
+        // keyfile credential under test.
+        ensure_database_once(&target);
+
+        let mut driver = SpannerDriver::try_new().expect("create driver");
+        let database = driver
+            .new_database_with_opts([
+                (
+                    OptionDatabase::Uri,
+                    OptionValue::String(target.database_path()),
+                ),
+                (
+                    OptionDatabase::Other(OPTION_KEYFILE.into()),
+                    OptionValue::String(keyfile),
+                ),
+            ])
+            .expect("create database with keyfile credentials");
+        let mut connection = connect_with_retry(&database);
+        assert_select_one(&mut connection);
+    }
+
+    /// Authenticate via service-account impersonation (`spanner.impersonate.target_principal`,
+    /// layered on ADC base credentials) and run `SELECT 1`.
+    ///
+    /// Skips unless both `SPANNER_GCP_DATABASE` and `SPANNER_TEST_IMPERSONATE_TARGET_PRINCIPAL` are
+    /// set. The ambient identity (ADC) must hold the *Token Creator* role on the target principal.
+    #[test]
+    fn impersonation_auth_end_to_end() {
+        let Some(target) = gcp_database_target() else {
+            eprintln!("SPANNER_GCP_DATABASE not set — skipping impersonation auth end-to-end test");
+            return;
+        };
+        let Some(principal) = non_empty_env("SPANNER_TEST_IMPERSONATE_TARGET_PRINCIPAL") else {
+            eprintln!(
+                "SPANNER_TEST_IMPERSONATE_TARGET_PRINCIPAL not set — skipping impersonation auth \
+                 end-to-end test"
+            );
+            return;
+        };
+
+        ensure_database_once(&target);
+
+        let mut driver = SpannerDriver::try_new().expect("create driver");
+        let database = driver
+            .new_database_with_opts([
+                (
+                    OptionDatabase::Uri,
+                    OptionValue::String(target.database_path()),
+                ),
+                (
+                    OptionDatabase::Other(OPTION_IMPERSONATE_TARGET_PRINCIPAL.into()),
+                    OptionValue::String(principal),
+                ),
+            ])
+            .expect("create database with impersonation credentials");
+        let mut connection = connect_with_retry(&database);
+        assert_select_one(&mut connection);
+    }
+}
