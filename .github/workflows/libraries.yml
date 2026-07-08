@@ -39,6 +39,9 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
             lib: libadbc_spanner.so
+          # NOTE: the linux x86-64 *musl* (Alpine) library is built by the separate
+          # `build-musl` job below, not this matrix — it must be compiled inside Alpine
+          # (its gcc/libgcc are musl-native), see that job's comment for why.
           # macos_deployment_target must match the macosx_* wheel tags in the
           # python-wheels job; a "Verify the minimum macOS" step below fails the
           # build if the library ever requires a newer macOS than the tag
@@ -163,6 +166,82 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # Linux x86-64 *musl* (Alpine) library, for the musllinux_1_2 wheel. Kept out of the
+  # matrix above because it cannot be produced on the glibc runners: aws-lc-rs (the
+  # hardwired TLS backend) has no pure-Rust option, so its C code must be compiled by a
+  # musl toolchain, and — critically — a musl *cdylib* has to link *dynamically* (rustc
+  # drops the cdylib crate-type entirely under the musl target's default crt-static),
+  # which needs a musl-native libgcc that Ubuntu's `musl-tools` does not ship (a
+  # cross-linked .so ends up pulling glibc's libc/libgcc instead). Building inside
+  # Alpine, whose native gcc/libgcc are musl, is the clean path: `cargo build` there
+  # targets x86_64-unknown-linux-musl natively, and RUSTFLAGS=-Ctarget-feature=-crt-static
+  # keeps the cdylib dynamic so it dlopen()s on Alpine. Only the compile runs in the
+  # container; checkout/package/upload run on the host so the JS actions work normally.
+  build-musl:
+    name: x86_64-unknown-linux-musl
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      # The rust:alpine image is digest-pinned for the same reason the actions above are
+      # SHA-pinned: this job compiles a binary that tagged releases attach and the PyPI
+      # wheel bundles, so a hijacked mutable tag must not be able to tamper with it. The
+      # trailing comment names the tag the digest was resolved from; bump both together
+      # to move the musl build's Rust toolchain forward.
+      - name: Build shared library (Alpine/musl)
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD":/work -w /work \
+            -e CARGO_TARGET_DIR=/work/target \
+            -e RUSTFLAGS="-C target-feature=-crt-static" \
+            rust@sha256:a41f7740f8b45d45795624eec13a8b42263cc700f19f7e4e86e04d3dda08a479 \
+            sh -euc '
+              apk add --no-cache build-base cmake perl git
+              cargo build --release
+            '
+
+      # Confirm the promise the musllinux_1_2 wheel makes: a real musl object (musl
+      # loader, no glibc-versioned symbols) that exports the driver entrypoint. Docker
+      # wrote the target dir as root; read-only inspection on the host is unaffected.
+      - name: Verify the library is a musl (not glibc) shared object
+        run: |
+          set -euo pipefail
+          lib="target/release/libadbc_spanner.so"
+          if [ ! -f "$lib" ]; then
+            echo "::error::musl build produced no cdylib at $lib (crt-static dropping it?)" >&2
+            exit 1
+          fi
+          if objdump -T "$lib" | grep -qE 'GLIBC_[0-9]'; then
+            echo "::error::$lib references glibc symbols — not a musl build" >&2
+            objdump -T "$lib" | grep -E 'GLIBC_[0-9]' >&2
+            exit 1
+          fi
+          if ! nm -D --defined-only "$lib" | grep -q AdbcSpannerInit; then
+            echo "::error::$lib does not export AdbcSpannerInit" >&2
+            exit 1
+          fi
+          echo "OK: $lib is a musl shared object exporting AdbcSpannerInit"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          staging="adbc-spanner-x86_64-unknown-linux-musl"
+          mkdir -p "$staging" dist
+          cp target/release/libadbc_spanner.so "$staging/"
+          cp README.md LICENSE "$staging/"
+          tar -czf "dist/${staging}.tar.gz" "$staging"
+          ls -l dist
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: adbc-spanner-x86_64-unknown-linux-musl
+          path: dist/*
+          if-no-files-found: error
+
   # Gate every tag-triggered publish step on the commit's CI run being green. This
   # workflow (and only this one) triggers on tags, and it runs no tests itself — so
   # without this job a `cargo release --execute` (which pushes the "Release X.Y.Z"
@@ -247,7 +326,7 @@ jobs:
 
   release:
     name: Attach to GitHub Release
-    needs: [build, ci-gate, version-gate]
+    needs: [build, build-musl, ci-gate, version-gate]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -293,7 +372,7 @@ jobs:
   # runner can stamp out every platform's wheel by forcing the platform tag.
   python-wheels:
     name: Python wheels
-    needs: build
+    needs: [build, build-musl]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -343,6 +422,7 @@ jobs:
           rows=(
             "x86_64-unknown-linux-gnu|libadbc_spanner.so|manylinux_2_35_x86_64"
             "aarch64-unknown-linux-gnu|libadbc_spanner.so|manylinux_2_35_aarch64"
+            "x86_64-unknown-linux-musl|libadbc_spanner.so|musllinux_1_2_x86_64"
             "aarch64-apple-darwin|libadbc_spanner.dylib|macosx_11_0_arm64"
             "x86_64-apple-darwin|libadbc_spanner.dylib|macosx_10_15_x86_64"
             "x86_64-pc-windows-msvc|adbc_spanner.dll|win_amd64"
@@ -381,6 +461,8 @@ jobs:
           # data-only wheel with no library installs fine and then fails at runtime.
           for whl in wheelhouse/*.whl; do
             case "$whl" in
+              # Both manylinux (glibc) and musllinux (Alpine) tags contain "linux"
+              # and bundle the same .so filename.
               *linux*) lib='adbc_driver_spanner/libadbc_spanner.so' ;;
               *macosx*) lib='adbc_driver_spanner/libadbc_spanner.dylib' ;;
               *win*) lib='adbc_driver_spanner/adbc_spanner.dll' ;;
@@ -398,9 +480,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Only the native (x86_64 Linux) wheel is installable on this runner, so
-          # smoke-test that one. Install the actual built wheel — not the source
-          # tree the unit-test job uses — to confirm the bundled library resolves.
+          # Only the native glibc (manylinux x86_64) wheel is installable on this
+          # glibc runner, so smoke-test that one; the musllinux wheel is only
+          # inspected above (pip on glibc rejects it, and it needs an Alpine host).
+          # Install the actual built wheel — not the source tree the unit-test job
+          # uses — to confirm the bundled library resolves.
           whl="$(ls python/wheelhouse/*manylinux_2_35_x86_64.whl)"
           python -m pip install "$whl"
           # Import from a directory without the source tree so the *installed*
