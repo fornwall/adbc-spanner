@@ -687,8 +687,14 @@ runs on PRs. A rapid re-push cancels the superseded in-flight run for the same P
 evaluates to `false` for `push`/tag events, so main pushes and `v*` release runs — the
 `libraries.yml` build+publish path especially — are never cancelled mid-flight. `fuzz.yml` and
 `resilience.yml` have no `pull_request` trigger and were left unchanged.);
-nightly fuzz/resilience failures surface only as email and scheduled workflows auto-disable after
-60 days of inactivity — a `failure()` step opening a tracking issue would help;
+~~nightly fuzz/resilience failures surface only as email and scheduled workflows auto-disable after
+60 days of inactivity — a `failure()` step opening a tracking issue would help~~ (**Fixed.** Both
+`fuzz.yml` and `resilience.yml` gained a `report-failure` job (`needs:` the harness job) guarded by
+`if: failure() && github.event_name == 'schedule'` — so it fires only on a failed *nightly* run,
+never on manual `workflow_dispatch`. It uses the built-in `gh` CLI with the default `GITHUB_TOKEN`
+and a job-scoped `permissions: issues: write` to open a tracking issue (per-workflow label
+`nightly-fuzz-failure` / `nightly-resilience-failure`), or, if one is already open, comment on it —
+idempotent, so a repeated failure never spams new issues. No third-party action added.);
 `foundry-validation` ends in `|| true`, making harness breakage indistinguishable from expected
 dialect failures; the Windows import-lib copy is `|| true`-optional (`libraries.yml:138`); the
 wheel version parse greps `Cargo.toml` positionally — `cargo metadata | jq` is robust;
