@@ -3082,6 +3082,73 @@ fn cancel_between_stream_chunks_cancels_the_next_fetch() {
     drop.execute_update().expect("drop cancel table");
 }
 
+/// Dropping a streamed reader mid-stream — with the background prefetch fetch still in flight —
+/// must abort the prefetch task cleanly (no leak, no runtime panic) and leave the statement and
+/// connection fully usable.
+#[test]
+fn dropping_reader_mid_stream_aborts_the_prefetch() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping dropping_reader_mid_stream");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    run(
+        &mut connection,
+        "DROP TABLE IF EXISTS AdbcReaderDrop; \
+         CREATE TABLE AdbcReaderDrop (Id INT64) PRIMARY KEY (Id)",
+    );
+    run(
+        &mut connection,
+        "INSERT INTO AdbcReaderDrop (Id) \
+         SELECT n FROM UNNEST(GENERATE_ARRAY(1, 500)) AS n",
+    );
+
+    let mut query = connection.new_statement().expect("new statement");
+    // Small batches so several chunks remain unfetched when the reader is dropped.
+    query
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionValue::Int(50),
+        )
+        .expect("set rows_per_batch");
+    query
+        .set_sql_query("SELECT Id FROM AdbcReaderDrop ORDER BY Id")
+        .unwrap();
+    let mut reader = query.execute().expect("streaming query");
+    let first = reader
+        .next()
+        .expect("first batch")
+        .expect("first batch is ok");
+    assert_eq!(first.num_rows(), 50);
+    // Drop with ~9 chunks unread and the prefetch of the next one racing this drop.
+    drop(reader);
+
+    // The statement (and its shared runtime) must be unaffected: a fresh execute streams the whole
+    // result normally.
+    let batches = query
+        .execute()
+        .expect("re-execute after dropping the reader")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect re-executed batches");
+    let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(total, 500);
+
+    let mut drop = connection.new_statement().expect("new statement");
+    drop.set_sql_query("DROP TABLE AdbcReaderDrop").unwrap();
+    drop.execute_update().expect("drop reader-drop table");
+}
+
 /// The view-layout and remaining narrow Arrow types bind end-to-end: `Utf8View`/`BinaryView`
 /// (what polars and newer pyarrow emit by default), `Int8` (widened to INT64), and `Date64`
 /// (ms-at-day-boundary → DATE). Values inserted through bound parameters read back exactly.
