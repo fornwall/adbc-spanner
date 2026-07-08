@@ -574,7 +574,16 @@ truthy values with `NotImplemented` ("Spanner has no temporary tables"); `get_op
 it as `"false"`, which is always the driver's state. Unit-tested offline
 (`ingest_temporary_accepts_false_and_rejects_true` in `src/statement.rs`) plus
 set-false/round-trip/set-true-fails assertions in the ingest section of `tests/integration.rs`);
-`get_info` could report a vendor version instead of null; the upstream `adbc_ffi` shim
+~~`get_info` could report a vendor version instead of null~~ (**Fixed.** It never did — and this
+is now locked in. `InfoCode::VendorVersion` (the Spanner *server* product version) is deliberately
+absent from the reported set and, when requested explicitly, resolves to `InfoValue::Null` via the
+catch-all arm in `src/info.rs` `value_for`, so it lands in the union's string branch as a null, not
+a fabricated value or a copy of the *driver* version. Same treatment for `VendorArrowVersion` (the
+server runs no Arrow library) and the Substrait version bounds. Spanner exposes no user-visible
+server version, so null is the correct answer. The catch-all comment now spells out the intent, and
+an offline unit test (`vendor_version_is_null_not_the_driver_version` in `src/info.rs`) asserts
+`VendorVersion` yields a null while `DriverVersion` alongside it is a real non-null `DRIVER_VERSION`
+string — guarding against a future regression that starts populating it); the upstream `adbc_ffi` shim
 rejects 1.0.0 driver managers and errors on unknown `get_info` codes (both stricter than the C
 spec — upstream issues, worth tracking); ~~no `sqlstate` on errors (a coarse mapping would help
 ODBC bridges)~~ (**Won't fix.** Spanner does not surface a SQLSTATE on its errors, and the driver
