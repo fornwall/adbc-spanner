@@ -210,12 +210,25 @@ cargo build --release
 nm -D --defined-only target/release/libadbc_spanner.so | grep AdbcSpannerInit
 ```
 
-`.github/workflows/libraries.yml` builds the library for **six** targets on pushes to main, pull
-requests and tags: linux x86-64 (`ubuntu-22.04`), linux aarch64 (`ubuntu-22.04-arm`), macOS arm64
+`.github/workflows/libraries.yml` builds the library for **eight** targets on pushes to main, pull
+requests and tags: linux x86-64 glibc (`ubuntu-22.04`), linux aarch64 glibc (`ubuntu-22.04-arm`),
+macOS arm64
 (`macos-14`), macOS x86-64 (**cross-compiled** on the same `macos-14` arm64 runner, since the Apple
 toolchain is universal), windows x86-64 (`windows-latest`) and windows aarch64 (`windows-11-arm`,
 native). Every other target is built natively on its own runner. Artifacts attach to every run, and
 on `v*` tags they are attached to the GitHub Release.
+
+The remaining two targets, linux **musl** (Alpine, for the `musllinux_1_2` wheels) on x86-64 **and**
+aarch64, are built by a separate `build-musl` job rather than the matrix: a musl **cdylib** must link
+*dynamically* (rustc drops the cdylib crate-type under the musl target's default `crt-static`), which
+needs a musl-native `libgcc` that Ubuntu's `musl-tools` does not ship (a cross-linked `.so` pulls
+glibc's libc/libgcc instead — because aws-lc-rs, the hardwired TLS backend, has no pure-Rust option,
+the C is unavoidable). So `build-musl` compiles inside a digest-pinned `rust:alpine` container
+(native musl gcc/libgcc) via `docker run` with `RUSTFLAGS=-Ctarget-feature=-crt-static`; only the
+compile runs in the container, while checkout/package/upload run on the host so the pinned JS actions
+work. It is a two-leg matrix — x86-64 on `ubuntu-22.04`, aarch64 on `ubuntu-22.04-arm` — each running
+the matching arch of the multi-arch `rust:alpine` image natively (no musl cross-toolchain). `release`
+and `python-wheels` `needs:` this job in addition to `build`.
 
 ## Releasing
 

@@ -22,8 +22,9 @@ pip install "adbc-driver-spanner[dbapi]" pandas
 ```
 
 The wheels ship a prebuilt native library, so there is nothing to compile. Prebuilt wheels are
-published for Linux (x86-64, aarch64), macOS (arm64, x86-64), and Windows (x86-64, arm64) — see
-[Supported platforms](#supported-platforms) for the minimum OS / glibc each one requires.
+published for Linux (x86-64 glibc + aarch64 glibc, plus x86-64 and aarch64 musl for Alpine), macOS
+(arm64, x86-64), and Windows (x86-64, arm64) — see [Supported platforms](#supported-platforms) for
+the minimum OS / libc each one requires.
 
 ## Quickstart
 
@@ -309,6 +310,8 @@ the matching wheel automatically:
 | -------------- | ------------------------ | -------------------------------------------- |
 | Linux x86-64   | `manylinux_2_35_x86_64`  | glibc >= 2.35 (e.g. Ubuntu 22.04, Debian 12) |
 | Linux aarch64  | `manylinux_2_35_aarch64` | glibc >= 2.35 (e.g. Ubuntu 22.04, Debian 12) |
+| Linux x86-64 musl | `musllinux_1_2_x86_64` | musl libc >= 1.2 (e.g. Alpine 3.13+)         |
+| Linux aarch64 musl | `musllinux_1_2_aarch64` | musl libc >= 1.2 (e.g. Alpine 3.13+)      |
 | macOS arm64    | `macosx_11_0_arm64`      | macOS >= 11.0                                |
 | macOS x86-64   | `macosx_10_15_x86_64`    | macOS >= 10.15                               |
 | Windows x86-64 | `win_amd64`              | 64-bit Windows                               |

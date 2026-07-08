@@ -327,7 +327,33 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   (`libraries.yml:254-255`; the matrix comment already names the fix). Build in a
   `manylinux_2_28` container and lower the tag + verify step together. **(wontfix — we don't care
   about those old distributions.)**
-- **No musl (Alpine) build/wheel** — `pip install` fails on Alpine-based data-service images.
+- ~~**No musl (Alpine) build/wheel** — `pip install` fails on Alpine-based data-service images.~~
+  **Fixed.** A dedicated `build-musl` job (a two-leg matrix: x86-64 on `ubuntu-22.04`, aarch64 on
+  `ubuntu-22.04-arm`) now produces the linux musl libraries, uploaded as the
+  `adbc-spanner-{x86_64,aarch64}-unknown-linux-musl` artifacts (attached to the GitHub Release like
+  every other platform), and `python-wheels` repackages them into `musllinux_1_2_x86_64` and
+  `musllinux_1_2_aarch64` wheels. It is a
+  *separate* job, not part of the glibc matrix, because a musl build can't be produced on the glibc runners:
+  the TLS stack is hardwired to `aws-lc` (no pure-Rust `ring` option) so aws-lc-sys's C code is
+  unavoidable, and — the decisive constraint — a musl **cdylib** must link *dynamically* (rustc
+  silently drops the cdylib crate-type under the musl target's default `crt-static`, leaving only
+  the rlib), which needs a musl-native `libgcc`; Ubuntu's `musl-tools` ships no `libgcc_s.so.1`, so
+  a cross-link either fails (`cannot find libgcc_s.so.1`) or pulls glibc's libc/libgcc, defeating the
+  purpose (both were verified). So `build-musl` compiles inside a **digest-pinned `rust:alpine`**
+  container (whose native gcc/libgcc are musl) via `docker run` with
+  `RUSTFLAGS=-C target-feature=-crt-static`; only the compile runs in the container, while
+  checkout/package/upload run on the host so the SHA-pinned JS actions work normally. A verify step
+  asserts the result is a real musl object (musl loader, **no** `GLIBC_` symbols) that exports
+  `AdbcSpannerInit` — locally confirmed on x86-64: `NEEDED libc.musl-x86_64.so.1`, no glibc symbols.
+  `python-wheels` gained the `{x86_64,aarch64}-unknown-linux-musl|libadbc_spanner.so|musllinux_1_2_*`
+  rows (and both `release` and `python-wheels` now `needs: build-musl`); the freshly built musl wheels
+  are covered by the existing per-wheel inspection loop (their `*linux*` case matches `musllinux`), and
+  the glibc-runner install/import smoke test still installs only the `manylinux_2_35_x86_64` wheel — pip
+  on glibc cannot install a musllinux wheel — so the musl wheels are built and inspected but
+  deliberately not installed there. `python/README.md`'s Supported-platforms table gained the
+  `musllinux_1_2_x86_64` and `musllinux_1_2_aarch64` / "musl libc >= 1.2 (e.g. Alpine 3.13+)" rows.
+  Both arches build natively on their own runner (the multi-arch `rust:alpine` image auto-selects the
+  matching variant), so no musl cross-toolchain is involved.
 - ~~**Wheels are published without ever being installed or inspected** — no `twine check`, no
   unzip-and-assert-the-lib-is-inside, no `pip install` + import smoke test; the CI python job
   installs from the source tree, a different packaging path. All cheap on the same runner.~~
