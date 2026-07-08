@@ -33,6 +33,7 @@ def connect(
     impersonate_delegates: typing.Optional[typing.Union[str, typing.Sequence[str]]] = None,
     impersonate_scopes: typing.Optional[typing.Union[str, typing.Sequence[str]]] = None,
     impersonate_lifetime: typing.Optional[typing.Union[int, str]] = None,
+    access_token: typing.Optional[str] = None,
     db_kwargs: typing.Optional[typing.Mapping[str, str]] = None,
     conn_kwargs: typing.Optional[typing.Mapping[str, str]] = None,
     autocommit: bool = False,
@@ -54,6 +55,7 @@ def connect(
         impersonate_delegates=impersonate_delegates,
         impersonate_scopes=impersonate_scopes,
         impersonate_lifetime=impersonate_lifetime,
+        access_token=access_token,
         db_kwargs=db_kwargs,
     )
     # The driver manager builds and owns the database/connection handles here and

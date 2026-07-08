@@ -66,6 +66,16 @@ spanner.connect(database="projects/p/instances/i/databases/d",
                 impersonate_scopes=["https://www.googleapis.com/auth/cloud-platform"])
 ```
 
+Pass `access_token=` to authenticate with an OAuth 2.0 bearer token you already hold (for example
+from `gcloud auth print-access-token`). It is sent verbatim with no refresh, and is mutually
+exclusive with `keyfile=` / `keyfile_json=` / `impersonate_target_principal=`:
+
+```python
+# docs-test: skip
+spanner.connect(database="projects/p/instances/i/databases/d",
+                access_token="ya29.a0Af...")
+```
+
 To talk to the [Spanner emulator](https://cloud.google.com/spanner/docs/emulator), point at its
 endpoint and pass `emulator=True` (which connects with anonymous credentials):
 
@@ -86,6 +96,7 @@ spanner.connect(database="projects/p/instances/i/databases/d",
 | `emulator=`                       | `True` to connect with anonymous credentials for the emulator.                                  |
 | `keyfile=`                        | Path to a service-account / credential JSON file (default: Application Default Credentials).     |
 | `keyfile_json=`                   | The same credential JSON passed inline as a string instead of a file path.                      |
+| `access_token=`                   | OAuth 2.0 bearer token sent verbatim (no refresh); mutually exclusive with the keyfile / impersonation options. |
 | `impersonate_target_principal=`   | Service account to impersonate on top of the base credentials.                                  |
 | `impersonate_delegates=`          | Delegation chain for impersonation — a comma-separated string or a list of emails.              |
 | `impersonate_scopes=`             | OAuth scopes for the impersonated token (comma-separated string or list; default cloud-platform). |

@@ -35,6 +35,7 @@ def option_kwargs(
     impersonate_delegates: typing.Optional[typing.Union[str, typing.Sequence[str]]] = None,
     impersonate_scopes: typing.Optional[typing.Union[str, typing.Sequence[str]]] = None,
     impersonate_lifetime: typing.Optional[typing.Union[int, str]] = None,
+    access_token: typing.Optional[str] = None,
     db_kwargs: typing.Optional[typing.Mapping[str, str]] = None,
 ) -> typing.Dict[str, str]:
     """Translate the friendly connection kwargs into ``spanner.*`` options.
@@ -66,6 +67,10 @@ def option_kwargs(
         options["spanner.impersonate.scopes"] = _as_csv(impersonate_scopes)
     if impersonate_lifetime is not None:
         options["spanner.impersonate.lifetime"] = str(impersonate_lifetime)
+    # A caller-supplied OAuth 2.0 bearer token, sent verbatim with no refresh; mutually
+    # exclusive with the keyfile/impersonation options above.
+    if access_token is not None:
+        options["spanner.access_token"] = access_token
     if db_kwargs:
         options.update(db_kwargs)
     return options
@@ -119,6 +124,9 @@ def connect(
         the ``cloud-platform`` scope.
     impersonate_lifetime:
         Optional impersonated-token lifetime in seconds; defaults to ``3600``.
+    access_token:
+        A caller-supplied OAuth 2.0 bearer token, sent verbatim with no refresh.
+        Mutually exclusive with the keyfile/impersonation options above.
     db_kwargs:
         Escape hatch for raw ``spanner.*`` option keys, merged last.
 
@@ -134,6 +142,7 @@ def connect(
         impersonate_delegates=impersonate_delegates,
         impersonate_scopes=impersonate_scopes,
         impersonate_lifetime=impersonate_lifetime,
+        access_token=access_token,
         db_kwargs=db_kwargs,
     )
     # ** unpacking accepts the dotted, non-identifier option keys; they land in

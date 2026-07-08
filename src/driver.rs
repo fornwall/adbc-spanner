@@ -4,13 +4,17 @@ use adbc_core::error::{Result, Status};
 use adbc_core::options::{OptionDatabase, OptionValue};
 use adbc_core::{Database, Driver, Optionable};
 use google_cloud_auth::credentials::Builder as AdcCredentials;
-use google_cloud_auth::credentials::Credentials;
 use google_cloud_auth::credentials::anonymous::Builder as AnonymousCredentials;
 use google_cloud_auth::credentials::external_account::Builder as ExternalAccountCredentials;
 use google_cloud_auth::credentials::impersonated::Builder as ImpersonatedCredentials;
 use google_cloud_auth::credentials::service_account::Builder as ServiceAccountCredentials;
 use google_cloud_auth::credentials::user_account::Builder as UserAccountCredentials;
+use google_cloud_auth::credentials::{
+    CacheableResource, Credentials, CredentialsProvider, EntityTag,
+};
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
+use http::header::{AUTHORIZATION, HeaderValue};
+use http::{Extensions, HeaderMap};
 
 use crate::connection::SpannerConnection;
 use crate::error::{
@@ -18,9 +22,9 @@ use crate::error::{
 };
 use crate::runtime::{SharedRuntime, new_runtime};
 use crate::{
-    OPTION_DATABASE, OPTION_EMULATOR, OPTION_ENDPOINT, OPTION_IMPERSONATE_DELEGATES,
-    OPTION_IMPERSONATE_LIFETIME, OPTION_IMPERSONATE_SCOPES, OPTION_IMPERSONATE_TARGET_PRINCIPAL,
-    OPTION_KEYFILE, OPTION_KEYFILE_JSON,
+    OPTION_ACCESS_TOKEN, OPTION_DATABASE, OPTION_EMULATOR, OPTION_ENDPOINT,
+    OPTION_IMPERSONATE_DELEGATES, OPTION_IMPERSONATE_LIFETIME, OPTION_IMPERSONATE_SCOPES,
+    OPTION_IMPERSONATE_TARGET_PRINCIPAL, OPTION_KEYFILE, OPTION_KEYFILE_JSON,
 };
 use std::time::Duration;
 
@@ -98,6 +102,10 @@ pub struct SpannerDatabase {
     impersonate_scopes: Vec<String>,
     /// Optional impersonated-token lifetime in seconds (`None` = [`DEFAULT_IMPERSONATION_LIFETIME_SECS`]).
     impersonate_lifetime_secs: Option<u64>,
+    /// A caller-supplied OAuth 2.0 access token. When `Some`, the driver authenticates with this
+    /// bearer token directly (no refresh); it is mutually exclusive with the keyfile/impersonation
+    /// options and with emulator mode.
+    access_token: Option<String>,
 }
 
 impl SpannerDatabase {
@@ -113,6 +121,7 @@ impl SpannerDatabase {
             impersonate_delegates: Vec::new(),
             impersonate_scopes: Vec::new(),
             impersonate_lifetime_secs: None,
+            access_token: None,
         }
     }
 
@@ -194,13 +203,31 @@ impl SpannerDatabase {
 
     /// The name of the first explicitly-configured credential option, if any.
     ///
-    /// Only *driver-level* credential configuration counts: a keyfile (path or inline JSON) or an
-    /// impersonation target. Ambient Application Default Credentials (e.g. the
+    /// Only *driver-level* credential configuration counts: a keyfile (path or inline JSON), an
+    /// impersonation target, or an explicit access token. Ambient Application Default Credentials
+    /// (e.g. the
     /// `GOOGLE_APPLICATION_CREDENTIALS` environment variable or a gcloud login) are deliberately
     /// *not* reported — they are the environment's business, not an explicit driver option, and
     /// must not prevent emulator use. The remaining `spanner.impersonate.*` options are inert
     /// without a target principal, so they do not count either.
     fn explicit_credential_option(&self) -> Option<&'static str> {
+        if self.keyfile_json.is_some() {
+            Some(OPTION_KEYFILE_JSON)
+        } else if self.keyfile.is_some() {
+            Some(OPTION_KEYFILE)
+        } else if self.impersonate_target_principal.is_some() {
+            Some(OPTION_IMPERSONATE_TARGET_PRINCIPAL)
+        } else if self.access_token.is_some() {
+            Some(OPTION_ACCESS_TOKEN)
+        } else {
+            None
+        }
+    }
+
+    /// The name of the other explicit credential option that conflicts with an
+    /// [`OPTION_ACCESS_TOKEN`], if any: a keyfile (path or inline JSON) or an impersonation target.
+    /// An access token is a complete credential, so combining it with any of these is refused.
+    fn conflicting_credential_with_access_token(&self) -> Option<&'static str> {
         if self.keyfile_json.is_some() {
             Some(OPTION_KEYFILE_JSON)
         } else if self.keyfile.is_some() {
@@ -254,10 +281,24 @@ impl SpannerDatabase {
             )));
         }
 
+        // An explicit access token is a complete credential on its own — it *is* the bearer token,
+        // not a way to obtain one — so it cannot be combined with a keyfile or impersonation, which
+        // describe a *different* credential source. Reject the combination (naming the conflicting
+        // option, in the emulator-guard style) rather than silently letting one path win.
+        if self.access_token.is_some()
+            && let Some(conflict) = self.conflicting_credential_with_access_token()
+        {
+            return Err(invalid_state(format!(
+                "the `{OPTION_ACCESS_TOKEN}` option supplies a complete OAuth2 credential and \
+                 cannot be combined with the `{conflict}` option; set only one"
+            )));
+        }
+
         // Resolve the credential JSON up front (reads the key file, if any); the flow is detected
         // from its `"type"` below. In emulator mode the guard above guarantees these are unset, so
         // both resolve to `None` and anonymous credentials win.
         let credentials_json = self.credentials_json()?;
+        let access_token = self.access_token.clone();
 
         // Impersonation config, applied on top of the base credentials below when a target is set.
         let impersonate_target = self.impersonate_target_principal.clone();
@@ -275,6 +316,10 @@ impl SpannerDatabase {
             }
             if emulator {
                 builder = builder.with_credentials(AnonymousCredentials::new().build());
+            } else if let Some(token) = access_token {
+                // A caller-supplied OAuth2 bearer token, sent verbatim with no refresh. Mutual
+                // exclusion with the keyfile/impersonation options was checked above.
+                builder = builder.with_credentials(build_static_token_credentials(&token)?);
             } else if let Some(target) = impersonate_target {
                 // Build the base credential exactly as the non-impersonated path does — an explicit
                 // keyfile, or ADC when none is given — then wrap it so it is only used to mint a
@@ -365,6 +410,9 @@ impl Optionable for SpannerDatabase {
             OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_LIFETIME => {
                 self.impersonate_lifetime_secs = Some(u64_seconds_value(&key, value)?)
             }
+            OptionDatabase::Other(name) if name == OPTION_ACCESS_TOKEN => {
+                self.access_token = Some(string_value(&key, value)?)
+            }
             other => {
                 return Err(not_implemented(&format!(
                     "unsupported Spanner database option: {}",
@@ -398,6 +446,9 @@ impl Optionable for SpannerDatabase {
             OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_LIFETIME => {
                 self.impersonate_lifetime_secs.map(|secs| secs.to_string())
             }
+            // Round-trips verbatim, matching the keyfile_json convention (which likewise returns the
+            // stored secret unchanged); ADBC has no notion of a write-only option.
+            OptionDatabase::Other(name) if name == OPTION_ACCESS_TOKEN => self.access_token.clone(),
             _ => None,
         };
         value.ok_or_else(|| {
@@ -460,7 +511,7 @@ pub(crate) fn ensure_scheme(host: &str) -> String {
 /// Exactly the options that configure a [`SpannerDatabase`] besides the database path itself; the
 /// path aliases (`uri` / [`OPTION_DATABASE`]) are deliberately absent — the URI's path component is
 /// the one way to name the database. Unknown keys are rejected with `InvalidArguments`.
-const URI_QUERY_OPTIONS: [&str; 8] = [
+const URI_QUERY_OPTIONS: [&str; 9] = [
     OPTION_ENDPOINT,
     OPTION_EMULATOR,
     OPTION_KEYFILE,
@@ -469,6 +520,7 @@ const URI_QUERY_OPTIONS: [&str; 8] = [
     OPTION_IMPERSONATE_DELEGATES,
     OPTION_IMPERSONATE_SCOPES,
     OPTION_IMPERSONATE_LIFETIME,
+    OPTION_ACCESS_TOKEN,
 ];
 
 /// If `value` is a connection URI — it starts with the `spanner:` scheme (ASCII case-insensitive,
@@ -748,6 +800,68 @@ fn build_impersonated_credentials(
     })
 }
 
+/// A minimal `google-cloud-auth` [`Credentials`] backed by a fixed, caller-supplied OAuth 2.0
+/// bearer token.
+///
+/// The pinned auth crate ships no static-token credential builder, so we implement the public
+/// [`CredentialsProvider`] trait directly: every request gets the same pre-built
+/// `Authorization: Bearer <token>` header, and there is no refresh — the caller owns token
+/// validity. The `Authorization` header value is marked sensitive so it is redacted from any
+/// header logging the transport might do.
+#[derive(Debug)]
+struct StaticTokenCredentials {
+    /// The pre-built headers (`Authorization: Bearer <token>`), returned verbatim on every call.
+    headers: HeaderMap,
+    /// A stable cache tag so callers using the `EntityTag` fast-path see "not modified" — the token
+    /// never changes for the lifetime of these credentials.
+    entity_tag: EntityTag,
+}
+
+impl CredentialsProvider for StaticTokenCredentials {
+    async fn headers(
+        &self,
+        extensions: Extensions,
+    ) -> std::result::Result<
+        CacheableResource<HeaderMap>,
+        google_cloud_auth::errors::CredentialsError,
+    > {
+        match extensions.get::<EntityTag>() {
+            Some(tag) if self.entity_tag.eq(tag) => Ok(CacheableResource::NotModified),
+            _ => Ok(CacheableResource::New {
+                data: self.headers.clone(),
+                entity_tag: self.entity_tag.clone(),
+            }),
+        }
+    }
+
+    async fn universe_domain(&self) -> Option<String> {
+        // `None` means the default `googleapis.com` universe.
+        None
+    }
+}
+
+/// Build [`Credentials`] that authenticate with a fixed OAuth 2.0 bearer token.
+///
+/// The token is pre-formatted into an `Authorization: Bearer <token>` header once, here, so a
+/// malformed token (one carrying characters illegal in an HTTP header value) is rejected up front
+/// with a clean `InvalidArguments` — and the token itself is never interpolated into the error, so
+/// no token material can leak (the `scrub_credential_error` discipline).
+fn build_static_token_credentials(token: &str) -> Result<Credentials> {
+    let mut value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+        invalid_argument(format!(
+            "the `{OPTION_ACCESS_TOKEN}` option contains characters that are not valid in an HTTP \
+             Authorization header value"
+        ))
+    })?;
+    value.set_sensitive(true);
+    let mut headers = HeaderMap::new();
+    headers.insert(AUTHORIZATION, value);
+    Ok(Credentials::from(StaticTokenCredentials {
+        headers,
+        entity_tag: EntityTag::new(),
+    }))
+}
+
 /// Split a comma-separated option value (delegates, scopes) into a list, trimming surrounding
 /// whitespace and dropping empty entries so a trailing comma or spaces are harmless.
 fn comma_separated(value: &str) -> Vec<String> {
@@ -982,6 +1096,139 @@ mod tests {
         let error = db.connect().unwrap_err();
         assert_eq!(error.status, Status::InvalidState);
         assert!(error.message.contains(OPTION_IMPERSONATE_TARGET_PRINCIPAL));
+    }
+
+    #[test]
+    fn emulator_mode_with_an_access_token_is_refused() {
+        // An explicit access token trips the same emulator guard as the keyfile options: emulator
+        // mode forces anonymous credentials, so silently dropping the token would be a downgrade.
+        let mut db = new_database();
+        db.database = Some("projects/p/instances/i/databases/d".into());
+        db.emulator = true;
+        db.access_token = Some("ya29.test-token".into());
+        assert_eq!(db.explicit_credential_option(), Some(OPTION_ACCESS_TOKEN));
+        let error = db.connect().unwrap_err();
+        assert_eq!(error.status, Status::InvalidState);
+        assert!(error.message.contains("emulator mode"));
+        assert!(error.message.contains(OPTION_ACCESS_TOKEN));
+    }
+
+    #[test]
+    fn access_token_option_round_trips() {
+        // Matches the keyfile_json convention: the stored token round-trips verbatim through
+        // get_option (ADBC has no write-only option), and is unset by default.
+        let mut db = new_database();
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(OPTION_ACCESS_TOKEN.into()))
+                .unwrap_err()
+                .status,
+            Status::NotFound
+        );
+        db.set_option(
+            OptionDatabase::Other(OPTION_ACCESS_TOKEN.into()),
+            OptionValue::String("ya29.a-bearer-token".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(OPTION_ACCESS_TOKEN.into()))
+                .unwrap(),
+            "ya29.a-bearer-token"
+        );
+    }
+
+    #[test]
+    fn access_token_conflicts_with_other_credential_options() {
+        // An access token is a complete credential; combining it with a keyfile, inline keyfile
+        // JSON, or an impersonation target is a conflict that `connect()` refuses (InvalidState),
+        // naming the offender. The conflict is decided by `conflicting_credential_with_access_token`
+        // — we assert on it directly rather than through `connect()`, because CI sets
+        // `SPANNER_EMULATOR_HOST` (which the module note above explains cannot be unset in parallel
+        // tests), and its emulator guard fires first inside `connect()`, masking this branch.
+        // keyfile_json is checked first, so it wins when several are set.
+        let base = || {
+            let mut db = new_database();
+            db.access_token = Some("ya29.test-token".into());
+            db
+        };
+        // An access token on its own is a complete credential, not a conflict.
+        assert_eq!(base().conflicting_credential_with_access_token(), None);
+        for (mutate, expected) in [
+            (
+                Box::new(|db: &mut SpannerDatabase| db.keyfile = Some("/path/key.json".into()))
+                    as Box<dyn Fn(&mut SpannerDatabase)>,
+                OPTION_KEYFILE,
+            ),
+            (
+                Box::new(|db: &mut SpannerDatabase| {
+                    db.keyfile_json = Some("{\"type\":\"service_account\"}".into())
+                }),
+                OPTION_KEYFILE_JSON,
+            ),
+            (
+                Box::new(|db: &mut SpannerDatabase| {
+                    db.impersonate_target_principal =
+                        Some("target@project.iam.gserviceaccount.com".into())
+                }),
+                OPTION_IMPERSONATE_TARGET_PRINCIPAL,
+            ),
+        ] {
+            let mut db = base();
+            mutate(&mut db);
+            assert_eq!(
+                db.conflicting_credential_with_access_token(),
+                Some(expected),
+                "conflict: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn access_token_credentials_send_a_bearer_authorization_header() {
+        // The custom static-token credential emits `Authorization: Bearer <token>` verbatim, marks
+        // it sensitive, and reports "not modified" for a matching cache tag. Runs inside a runtime
+        // because `headers()` is async (though it does no I/O).
+        let credentials = build_static_token_credentials("ya29.the-token").unwrap();
+        let runtime = new_runtime().unwrap();
+        runtime.block_on(async {
+            let resource = credentials.headers(Extensions::new()).await.unwrap();
+            let (headers, tag) = match resource {
+                CacheableResource::New { entity_tag, data } => (data, entity_tag),
+                CacheableResource::NotModified => panic!("expected fresh headers"),
+            };
+            let value = headers.get(AUTHORIZATION).expect("authorization header");
+            assert_eq!(value.to_str().unwrap(), "Bearer ya29.the-token");
+            assert!(
+                value.is_sensitive(),
+                "the bearer token must be marked sensitive"
+            );
+
+            // A request carrying the same entity tag is told the headers have not changed.
+            let mut extensions = Extensions::new();
+            extensions.insert(tag);
+            assert!(matches!(
+                credentials.headers(extensions).await.unwrap(),
+                CacheableResource::NotModified
+            ));
+        });
+    }
+
+    #[test]
+    fn access_token_with_illegal_header_characters_is_rejected_without_leaking() {
+        // A token containing characters illegal in an HTTP header value (here a newline) is rejected
+        // up front, and the token material never appears in the error message.
+        const TOKEN: &str = "bad\ntoken-SECRET-do-not-leak";
+        let error = build_static_token_credentials(TOKEN).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(
+            error.message.contains(OPTION_ACCESS_TOKEN),
+            "{}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("SECRET"),
+            "access-token error leaked token material: {}",
+            error.message
+        );
     }
 
     // Only explicit driver options count as credentials: a fresh database (which would fall back to
@@ -1381,11 +1628,13 @@ mod tests {
                  &spanner.impersonate.target_principal=target%40p.iam.gserviceaccount.com\
                  &spanner.impersonate.delegates=a%40p.iam.gserviceaccount.com,b%40p.iam.gserviceaccount.com\
                  &spanner.impersonate.scopes=https://www.googleapis.com/auth/cloud-platform\
-                 &spanner.impersonate.lifetime=900"
+                 &spanner.impersonate.lifetime=900\
+                 &spanner.access_token=ya29.uri-token"
             ),
         )
         .unwrap();
         assert_eq!(db.keyfile.as_deref(), Some("/path/key.json"));
+        assert_eq!(db.access_token.as_deref(), Some("ya29.uri-token"));
         assert_eq!(
             db.keyfile_json.as_deref(),
             Some("{\"type\":\"service_account\"}")

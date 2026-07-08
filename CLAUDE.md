@@ -303,7 +303,11 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   interrupts an in-flight `block_on` op and stays latched — so a cancel between the chunk fetches of
   a streamed result still cancels the next fetch — until the object's next operation resets it),
   keyfile/keyfile_json auth (credential-type auto-detected
-  from the JSON `"type"`), and service-account impersonation
+  from the JSON `"type"`), OAuth access-token auth
+  (`spanner.access_token` — a caller-supplied bearer token sent verbatim with no refresh via a
+  minimal custom `google-cloud-auth` `CredentialsProvider`, `StaticTokenCredentials` in
+  `src/driver.rs`; mutually exclusive with keyfile/impersonation and refused in emulator mode, the
+  keyfile-guard pattern), and service-account impersonation
   (`spanner.impersonate.target_principal` enables it; optional `spanner.impersonate.delegates`
   [comma-separated chain], `spanner.impersonate.scopes` [comma-separated, defaults to
   cloud-platform], `spanner.impersonate.lifetime` [seconds, default 3600] — layered on top of the
