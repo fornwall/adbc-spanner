@@ -62,6 +62,7 @@ use crate::conversion::{TimestampPrecision, result_set_to_batch, stream_query};
 use crate::driver::Connected;
 use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
 use crate::request::RequestConfig;
+use crate::retry::RetryConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
 use crate::staleness::ReadStaleness;
 use crate::statement::{DEFAULT_ROWS_PER_BATCH, SpannerStatement};
@@ -247,6 +248,11 @@ pub struct SpannerConnection {
     /// each value. The connection itself applies the update timeout to its commit paths and the
     /// query/fetch timeouts to `read_partition`.
     timeouts: RpcTimeouts,
+    /// Retry-policy tuning (`spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds`).
+    /// Unset by default (the client's own policy); becomes the default for statements created on the
+    /// connection, which may override each knob. The connection itself applies it to its commit
+    /// paths (autocommit DML, the manual-mode commit, ingest commits).
+    retry: RetryConfig,
     txn: SharedTxn,
     /// Cancellation signal for this connection's in-flight metadata/commit operations
     /// (see [`Connection::cancel`]).
@@ -266,6 +272,7 @@ impl SpannerConnection {
             request: RequestConfig::default(),
             timestamp_precision: TimestampPrecision::default(),
             timeouts: RpcTimeouts::default(),
+            retry: RetryConfig::default(),
             txn: Arc::new(Mutex::new(TxnState::new())),
             cancel: CancelSignal::new(),
         }
@@ -286,6 +293,7 @@ impl SpannerConnection {
             &self.cancel,
             self.isolation.clone(),
             self.request.clone(),
+            self.retry,
             self.timeouts.update_timeout(),
             statements,
             mutations,
@@ -369,12 +377,14 @@ fn isolation_to_adbc_string(isolation: &IsolationLevel) -> &'static str {
 /// attempt. Shared by autocommit `execute_update`, the manual-mode commit path, and each chunk of
 /// an autocommit DML bulk ingest (which calls this once per chunk so a retry only ever clones one
 /// chunk, not the whole ingest).
+#[allow(clippy::too_many_arguments)] // threads one connection/statement config item per argument
 pub(crate) fn run_batch_dml(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
     cancel: &CancelSignal,
     isolation: IsolationLevel,
     request: RequestConfig,
+    retry: RetryConfig,
     timeout: Option<Duration>,
     statements: Vec<SpannerSql>,
 ) -> Result<i64> {
@@ -384,6 +394,7 @@ pub(crate) fn run_batch_dml(
         cancel,
         isolation,
         request,
+        retry,
         timeout,
         statements,
         Vec::new(),
@@ -410,6 +421,7 @@ pub(crate) fn run_batch_txn(
     cancel: &CancelSignal,
     isolation: IsolationLevel,
     request: RequestConfig,
+    retry: RetryConfig,
     timeout: Option<Duration>,
     statements: Vec<SpannerSql>,
     mutations: Vec<Mutation>,
@@ -421,8 +433,11 @@ pub(crate) fn run_batch_txn(
     let transaction = async move {
         // The commit priority and transaction tag ride on the runner; the request tag rides on the
         // ExecuteBatchDml batch inside the (retryable) closure.
-        let runner = request
-            .apply_to_runner(apply_isolation(client.read_write_transaction(), isolation))
+        let runner = retry
+            .apply_to_runner(
+                request
+                    .apply_to_runner(apply_isolation(client.read_write_transaction(), isolation)),
+            )
             .build()
             .await
             .map_err(from_spanner)?;
@@ -436,7 +451,8 @@ pub(crate) fn run_batch_txn(
                     if statements.is_empty() {
                         return Ok(0);
                     }
-                    let mut batch = request.apply_to_batch_dml(BatchDmlBuilder::new());
+                    let mut batch = retry
+                        .apply_to_batch_dml(request.apply_to_batch_dml(BatchDmlBuilder::new()));
                     for statement in statements {
                         batch = batch.add_statement(statement);
                     }
@@ -669,6 +685,12 @@ impl Optionable for SpannerConnection {
             OptionConnection::Other(k) if k == crate::OPTION_RPC_TIMEOUT_FETCH => {
                 self.timeouts.set_fetch(value)?;
             }
+            OptionConnection::Other(k) if k == crate::OPTION_RETRY_MAX_ATTEMPTS => {
+                self.retry.set_max_attempts(value)?;
+            }
+            OptionConnection::Other(k) if k == crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
+                self.retry.set_max_elapsed_seconds(value)?;
+            }
             other => {
                 return Err(not_implemented(&format!(
                     "unsupported Spanner connection option: {}",
@@ -764,6 +786,25 @@ impl Optionable for SpannerConnection {
                     )
                 })
             }
+            OptionConnection::Other(k) if k == crate::OPTION_RETRY_MAX_ATTEMPTS => {
+                self.retry.max_attempts_string().ok_or_else(|| {
+                    err(
+                        format!("option {} is not set", crate::OPTION_RETRY_MAX_ATTEMPTS),
+                        Status::NotFound,
+                    )
+                })
+            }
+            OptionConnection::Other(k) if k == crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
+                self.retry.max_elapsed_seconds_string().ok_or_else(|| {
+                    err(
+                        format!(
+                            "option {} is not set",
+                            crate::OPTION_RETRY_MAX_ELAPSED_SECONDS
+                        ),
+                        Status::NotFound,
+                    )
+                })
+            }
             // A Spanner database has a single, unnamed catalog and (default) schema — both the empty
             // string in INFORMATION_SCHEMA, which is what `get_objects` reports — so the "current"
             // catalog/schema are reported as "". (They can't be switched; setting them is unsupported.)
@@ -805,6 +846,7 @@ impl Connection for SpannerConnection {
             self.request.clone(),
             self.timestamp_precision,
             self.timeouts,
+            self.retry,
             self.txn.clone(),
         ))
     }

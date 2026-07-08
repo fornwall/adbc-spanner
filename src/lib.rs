@@ -116,6 +116,7 @@ mod nested;
 mod objects;
 mod options;
 mod request;
+mod retry;
 mod runtime;
 mod staleness;
 mod statement;
@@ -539,6 +540,34 @@ pub const OPTION_RPC_TIMEOUT_UPDATE: &str = "spanner.rpc.timeout_seconds.update"
 /// [`OPTION_RPC_TIMEOUT_QUERY`].
 pub const OPTION_RPC_TIMEOUT_FETCH: &str = "spanner.rpc.timeout_seconds.fetch";
 
+/// Driver-specific connection **and** statement option: the **maximum number of attempts** the
+/// Spanner client makes for a retryable RPC — the first try plus retries — as a positive integer.
+/// `1` disables retrying; unset (the default) leaves the client's own policy, which has no attempt
+/// cap.
+///
+/// The value is accepted as an integer, a whole-valued double, or a numeric string, and round-trips
+/// through `get_option` and `get_option_int`. An empty string unsets it. Setting it (or
+/// [`OPTION_RETRY_MAX_ELAPSED_SECONDS`], or both) bounds the client's default retry policy while
+/// preserving its transport-error-on-idempotent retrying; the two limits combine (the retry loop
+/// stops at whichever is reached first). Set on a connection it becomes the default for statements
+/// it creates; a statement may override it. This tunes the *per-attempt* retry loop; the separate
+/// [`OPTION_RPC_TIMEOUT_QUERY`] family bounds the *overall* per-operation wall time.
+///
+/// Mirrors the gax `RetryPolicyExt::with_attempt_limit` knob.
+pub const OPTION_RETRY_MAX_ATTEMPTS: &str = "spanner.retry.max_attempts";
+
+/// Driver-specific connection **and** statement option: the **maximum total wall-clock time**, in
+/// seconds, the Spanner client spends retrying a retryable RPC before the last error is surfaced as
+/// permanent. A finite, strictly positive number of seconds (fractions allowed); unset (the
+/// default) leaves the client's own policy, which has no elapsed-time cap.
+///
+/// The value is accepted as a numeric string, an integer, or a double, and round-trips through
+/// `get_option` and `get_option_double`. An empty string unsets it. Value handling, combination
+/// with [`OPTION_RETRY_MAX_ATTEMPTS`], and connection→statement inheritance are as that option.
+///
+/// Mirrors the gax `RetryPolicyExt::with_time_limit` knob.
+pub const OPTION_RETRY_MAX_ELAPSED_SECONDS: &str = "spanner.retry.max_elapsed_seconds";
+
 /// Driver-specific **connection** option: a free-form **transaction tag**, applied wherever the
 /// driver builds a read/write transaction (autocommit DML, the manual-mode commit, ingest commits)
 /// and attached by Spanner to every operation of that transaction. Unset by default; set an empty
@@ -612,6 +641,8 @@ mod options_doc_tests {
             crate::OPTION_RPC_TIMEOUT_QUERY,
             crate::OPTION_RPC_TIMEOUT_UPDATE,
             crate::OPTION_RPC_TIMEOUT_FETCH,
+            crate::OPTION_RETRY_MAX_ATTEMPTS,
+            crate::OPTION_RETRY_MAX_ELAPSED_SECONDS,
             // Standard ADBC (spec) options the driver handles.
             constants::ADBC_OPTION_URI,
             constants::ADBC_CONNECTION_OPTION_AUTOCOMMIT,

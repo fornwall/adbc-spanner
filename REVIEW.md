@@ -301,8 +301,10 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   bounds the wait — building the commit-fault test confirmed the client marks all data-plane RPCs
   idempotent and retries transport faults with no attempt cap, so a commit under a persistent
   fault blocks unboundedly; the `spanner.rpc.timeout_seconds.*` options now let callers bound
-  these operations, but the harness does not yet drive them under a toxic), and truncated
-  streams. (Faults during a
+  these operations, and the harness drives the update deadline under a `reset_peer` toxic in
+  `update_timeout_bounds_a_faulted_write_then_recovers_when_unset` — proving a bounded write fails
+  with `Timeout` in-deadline rather than hanging, then recovers once the deadline is unset), and
+  truncated streams. (Faults during a
   manual-transaction commit are now covered by
   `commit_under_transport_fault_never_loses_the_write`.)
 - ~~**`statement.rs` has zero unit tests**; the option-coercion error paths (`rows_per_batch=0`,
@@ -628,15 +630,30 @@ and `split_statements`-preserving), `params` covers `named_parameters` + `resolv
 exactly on count mismatch; quoting unquotes back to the input and embeds as one opaque token under
 the crate's own lexer), and `partition` covers `decode_partition` over arbitrary bytes (rejections
 are clean `InvalidArguments`, accepted descriptors survive a serialize → decode → serialize round
-trip unchanged).); `tests/resilience.rs` mutates process env in setup — safe only under
-`--test-threads=1`, worth asserting.
+trip unchanged).); ~~`tests/resilience.rs` mutates process env in setup — safe only under
+`--test-threads=1`, worth asserting.~~ (**Fixed.** The single-threaded contract is now enforced at
+runtime: a module-level `SerialGuard` (RAII over a `static AtomicUsize ACTIVE_TESTS`) is constructed
+at the start of each test body — after the self-skip check, so a plain multi-threaded `cargo test`
+with the env unset still skips cleanly — and its `new()` asserts no other test body is running,
+panicking with an actionable "re-run with `--test-threads=1`" message rather than racing the env
+swap silently; `drop` releases the slot. `ensure_setup`'s existing `DONE` mutex still serializes the
+one-time env swap, and the guard documents/enforces that no concurrent driver connection reads the
+transiently-repointed `SPANNER_EMULATOR_HOST`. Both `scripts/with-toxiproxy.sh` and `resilience.yml`
+already pass `--test-threads=1`.)
 
 **Features** (all exposed by the pinned client unless noted): request priority / request tags /
 transaction tags (`StatementBuilder::set_priority/set_request_tag`,
 `set_transaction_tag`); ~~request/attempt timeouts~~ **done** —
 `spanner.rpc.timeout_seconds.{query,update,fetch}` (overall per-operation deadlines mapped to
-ADBC `Timeout`; see `docs/options.md`), though per-attempt retry *tuning* (policies/backoff)
-remains open; PostgreSQL-dialect databases are
+ADBC `Timeout`; see `docs/options.md`); ~~per-attempt retry *tuning* (policies)~~ **done** —
+`spanner.retry.{max_attempts,max_elapsed_seconds}` (connection + statement level; bound the pinned
+client's gax retry policy via the builders' `with_retry_policy` / `with_begin_retry_policy` /
+`with_commit_retry_policy`, layering `RetryPolicyExt::{with_attempt_limit,with_time_limit}` on a
+driver-local copy of the client's `SpannerRetryPolicy` so the transport-on-idempotent retry is
+preserved — `src/retry.rs`; `RetryConfig` mirrors `RpcTimeouts`/`RequestConfig`). Custom *backoff*
+(the gax `BackoffPolicy` / `ExponentialBackoff`, settable via the same builders'
+`with_backoff_policy`) is a possible follow-up but was left out to keep the surface focused.
+PostgreSQL-dialect databases are
 unsupported *and undetected* — minimum viable is probing the dialect once and failing fast with a
 clear error; OAuth access-token auth (needs a small custom credentials impl — the auth crate has
 no static-token builder); query options (optimizer version), directed reads, commit stats,
@@ -645,8 +662,11 @@ autocommit DML); proto/enum columns (verify clean failure today); change streams
 queries may already work through plain SQL — one emulator test each would let the README claim
 them; telemetry/tracing hooks as a backlog entry.
 
-**CI/misc.** No dependabot/renovate (SHA-pinned actions and the two git-pin families drift
-unmonitored); ~~no `concurrency:` groups (rapid PR pushes re-run the full 6-platform matrix)~~
+**CI/misc.** ~~No dependabot/renovate (SHA-pinned actions and the two git-pin families drift
+unmonitored)~~ (**Fixed.** `.github/dependabot.yml` now monitors the `github-actions` and `cargo`
+ecosystems weekly; the two git-pinned families stay out of scope, since Dependabot does not bump
+git-revision deps and they are reverted manually per the CLAUDE.md checklist); ~~no `concurrency:`
+groups (rapid PR pushes re-run the full 6-platform matrix)~~
 (**Fixed.** A release-safe top-level `concurrency:` block (`group: ${{ github.workflow }}-${{
 github.ref }}`, `cancel-in-progress: ${{ github.event_name == 'pull_request' }}`) is now on
 `ci.yml`, `libraries.yml`, `adbc-validation.yml` and `foundry-validation.yml` — every workflow that
@@ -661,7 +681,10 @@ dialect failures; the Windows import-lib copy is `|| true`-optional (`libraries.
 wheel version parse greps `Cargo.toml` positionally — `cargo metadata | jq` is robust;
 `adbc-validation.yml` rebuilds arrow-adbc C++ + GoogleTest from source every run (cache it); the
 adbc-validation allowlist means new upstream tests never auto-enter the gate (periodic `--full`
-triage is manual); dead crates.io/docs.rs badges in the README; ~~no consolidated
+triage is manual); ~~dead crates.io/docs.rs badges in the README~~ (**Fixed.** The crate is unpublished
+(`publish = false`), so its crates.io/docs.rs badges pointed at nonexistent pages and rendered
+broken — both removed from `README.md`; the working GitHub Actions CI badge (and the License
+badge) are kept.); ~~no consolidated
 connection/statement option tables in either README (`spanner.rows_per_batch` is missing from the
 Python one entirely)~~ (**Fixed.** `README.md`'s *Configuration options* section now has three
 consolidated tables — database, connection and statement level — listing every option the driver
