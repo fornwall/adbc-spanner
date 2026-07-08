@@ -51,3 +51,36 @@ jobs:
         run: |
           scripts/with-toxiproxy.sh \
             cargo test --test resilience -- --nocapture --test-threads=1
+
+  # A scheduled resilience failure otherwise surfaces only as an email, and a scheduled workflow
+  # that keeps failing (or that nobody watches) auto-disables after 60 days of inactivity. Open —
+  # or comment on an already-open — tracking issue so a nightly regression stays visible in the repo.
+  # Only fires on the nightly `schedule` trigger, never on manual `workflow_dispatch` runs.
+  report-failure:
+    needs: resilience
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    # Least privilege: only this job needs to write issues.
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          label="nightly-resilience-failure"
+          title="Nightly resilience run failed"
+          # Idempotent: ensure the tracking label exists, then reuse an already-open issue instead
+          # of opening a fresh one every night.
+          gh label create "$label" --color B60205 \
+            --description "Automated: a scheduled resilience run failed" 2>/dev/null || true
+          body="A scheduled [resilience run]($RUN_URL) failed (commit ${GITHUB_SHA})."
+          existing="$(gh issue list --state open --label "$label" --limit 1 --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --label "$label" --body "$body"
+          fi
