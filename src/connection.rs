@@ -309,6 +309,9 @@ impl SpannerConnection {
             self.timeouts.update_timeout(),
             statements,
             mutations,
+            // Manual commit buffers mutations that Spanner applies at commit, so this batch is not
+            // the transaction's last request — no `last_statement` optimization here.
+            false,
         )?;
         Ok(())
     }
@@ -390,6 +393,17 @@ fn isolation_to_adbc_string(isolation: &IsolationLevel) -> &'static str {
 /// attempt. Shared by autocommit `execute_update`, the manual-mode commit path, and each chunk of
 /// an autocommit DML bulk ingest (which calls this once per chunk so a retry only ever clones one
 /// chunk, not the whole ingest).
+///
+/// `last_statement` optimization: a single-statement autocommit batch is the entire transaction —
+/// the runner runs this one-statement `ExecuteBatchDml` and immediately commits, with no further
+/// statement, read, or query in the transaction. Flagging the batch as the transaction's last
+/// request (`ExecuteBatchDmlRequest.last_statements`) lets Spanner release the transaction as part
+/// of the same round-trip, saving the separate `Commit` RPC for the common single-DML case. We
+/// only set it for `statements.len() == 1`: a multi-statement `;`-batch is deliberately left
+/// unflagged (conservative — the flag is a whole-batch assertion, and we reserve it for the
+/// unambiguous single-statement case), and mutation-carrying / manual-commit batches go through
+/// [`run_batch_txn`] with the flag off (their commit still applies buffered mutations, so the
+/// batch is *not* the transaction's last request).
 #[allow(clippy::too_many_arguments)] // threads one connection/statement config item per argument
 pub(crate) fn run_batch_dml(
     runtime: &SharedRuntime,
@@ -401,6 +415,8 @@ pub(crate) fn run_batch_dml(
     timeout: Option<Duration>,
     statements: Vec<SpannerSql>,
 ) -> Result<i64> {
+    // Free RPC saving only for the single-statement autocommit case (see the doc comment above).
+    let last_statements = statements.len() == 1;
     run_batch_txn(
         runtime,
         client,
@@ -411,6 +427,7 @@ pub(crate) fn run_batch_dml(
         timeout,
         statements,
         Vec::new(),
+        last_statements,
     )
 }
 
@@ -427,6 +444,11 @@ pub(crate) fn run_batch_dml(
 /// the whole transaction (including the runner's abort retries); expiry fails with
 /// [`Status::Timeout`]. Note a commit whose confirmation the driver stopped waiting for may still
 /// have landed server-side, the usual ambiguity of any timed-out commit.
+///
+/// `last_statements` marks this batch as the transaction's final request (see the
+/// [`run_batch_dml`] doc for the `last_statement` optimization). Callers must pass `false` unless
+/// the batch is genuinely the whole transaction: the manual-commit path buffers `mutations` that
+/// Spanner applies *at* commit, so the batch is never the last request there.
 #[allow(clippy::too_many_arguments)] // threads one connection/statement config item per argument
 pub(crate) fn run_batch_txn(
     runtime: &SharedRuntime,
@@ -438,6 +460,7 @@ pub(crate) fn run_batch_txn(
     timeout: Option<Duration>,
     statements: Vec<SpannerSql>,
     mutations: Vec<Mutation>,
+    last_statements: bool,
 ) -> Result<i64> {
     if statements.is_empty() && mutations.is_empty() {
         return Ok(0);
@@ -465,7 +488,8 @@ pub(crate) fn run_batch_txn(
                         return Ok(0);
                     }
                     let mut batch = retry
-                        .apply_to_batch_dml(request.apply_to_batch_dml(BatchDmlBuilder::new()));
+                        .apply_to_batch_dml(request.apply_to_batch_dml(BatchDmlBuilder::new()))
+                        .set_last_statements(last_statements);
                     for statement in statements {
                         batch = batch.add_statement(statement);
                     }
