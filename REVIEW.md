@@ -645,8 +645,10 @@ autocommit DML); proto/enum columns (verify clean failure today); change streams
 queries may already work through plain SQL — one emulator test each would let the README claim
 them; telemetry/tracing hooks as a backlog entry.
 
-**CI/misc.** No dependabot/renovate (SHA-pinned actions and the two git-pin families drift
-unmonitored); no `concurrency:` groups (rapid PR pushes re-run the full 6-platform matrix);
+**CI/misc.** ~~No dependabot/renovate (SHA-pinned actions and the two git-pin families drift
+unmonitored)~~ (**Fixed.** `.github/dependabot.yml` now monitors the `github-actions` and `cargo`
+ecosystems weekly; the two git-pinned families stay out of scope, since Dependabot does not bump
+git-revision deps and they are reverted manually per the CLAUDE.md checklist); no `concurrency:` groups (rapid PR pushes re-run the full 6-platform matrix);
 nightly fuzz/resilience failures surface only as email and scheduled workflows auto-disable after
 60 days of inactivity — a `failure()` step opening a tracking issue would help;
 `foundry-validation` ends in `|| true`, making harness breakage indistinguishable from expected
