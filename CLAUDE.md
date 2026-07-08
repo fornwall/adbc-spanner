@@ -304,7 +304,11 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
 - Partitioned execution (`execute_partitions`/`read_partition`): `execute_partitions` opens a batch
   read-only transaction (`DatabaseClient::batch_read_only_transaction`), calls `partition_query`, and
   serialises each `google_cloud_spanner::batch::Partition` (which carries its session + transaction
-  id + partition token, and is `serde`-serializable) into an opaque ADBC descriptor. Schema comes
+  id + partition token, and is `serde`-serializable) into an opaque ADBC descriptor — a versioned
+  JSON envelope `{"v":1,"partition":<Partition serde form>}` (`encode_partition`/`decode_partition`
+  in `src/connection.rs`; a missing or unsupported version is a clean `InvalidArguments` — the bare
+  `Partition` layout is a client-crate compatibility surface we don't control, while descriptors
+  travel between processes and driver versions). Schema comes
   from a separate `QueryMode::Plan` probe. `read_partition` deserialises a descriptor and calls
   `Partition::execute` on the connection's client, streaming rows to Arrow via the same
   `stream_query` path as `execute`. This works because the client's session is **multiplexed** and
