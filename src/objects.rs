@@ -75,6 +75,56 @@ pub(crate) struct DbSchema {
     pub tables: Vec<Table>,
 }
 
+/// Zero-based column indices into each `INFORMATION_SCHEMA` result batch read below, one module per
+/// query in [`collect_objects`], named to mirror that query's `SELECT` list. They must stay in
+/// lockstep with those `SELECT`s: reading through the names (rather than bare integers) makes a
+/// query edit that reorders or adds a column a compile-time concern here instead of a silent
+/// misread. Each module's doc comment reproduces the `SELECT` it indexes.
+mod schemata_col {
+    // `SELECT SCHEMA_NAME`
+    pub(super) const SCHEMA_NAME: usize = 0;
+}
+mod tables_col {
+    // `SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE`
+    pub(super) const TABLE_SCHEMA: usize = 0;
+    pub(super) const TABLE_NAME: usize = 1;
+    pub(super) const TABLE_TYPE: usize = 2;
+}
+mod columns_col {
+    // `SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, IS_NULLABLE, SPANNER_TYPE`
+    pub(super) const TABLE_SCHEMA: usize = 0;
+    pub(super) const TABLE_NAME: usize = 1;
+    pub(super) const COLUMN_NAME: usize = 2;
+    pub(super) const ORDINAL_POSITION: usize = 3;
+    pub(super) const IS_NULLABLE: usize = 4;
+    pub(super) const SPANNER_TYPE: usize = 5;
+}
+mod table_constraints_col {
+    // `SELECT TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE`
+    pub(super) const TABLE_SCHEMA: usize = 0;
+    pub(super) const TABLE_NAME: usize = 1;
+    pub(super) const CONSTRAINT_NAME: usize = 2;
+    pub(super) const CONSTRAINT_TYPE: usize = 3;
+}
+mod key_column_usage_col {
+    // `SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME,`
+    // ` CAST(ORDINAL_POSITION AS STRING), CAST(POSITION_IN_UNIQUE_CONSTRAINT AS STRING)`
+    pub(super) const CONSTRAINT_SCHEMA: usize = 0;
+    pub(super) const CONSTRAINT_NAME: usize = 1;
+    pub(super) const TABLE_SCHEMA: usize = 2;
+    pub(super) const TABLE_NAME: usize = 3;
+    pub(super) const COLUMN_NAME: usize = 4;
+    pub(super) const ORDINAL_POSITION: usize = 5;
+    pub(super) const POSITION_IN_UNIQUE_CONSTRAINT: usize = 6;
+}
+mod referential_constraints_col {
+    // `SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, UNIQUE_CONSTRAINT_SCHEMA, UNIQUE_CONSTRAINT_NAME`
+    pub(super) const CONSTRAINT_SCHEMA: usize = 0;
+    pub(super) const CONSTRAINT_NAME: usize = 1;
+    pub(super) const UNIQUE_CONSTRAINT_SCHEMA: usize = 2;
+    pub(super) const UNIQUE_CONSTRAINT_NAME: usize = 3;
+}
+
 /// Query `INFORMATION_SCHEMA` and assemble the schema→table→column hierarchy for `get_objects`,
 /// applying the ADBC `LIKE`/type filters and the requested depth.
 #[allow(clippy::too_many_arguments)]
@@ -209,7 +259,7 @@ pub(crate) fn collect_objects(
         }),
     )?;
 
-    let schema_names = str_col(&schema_batch, 0)?;
+    let schema_names = str_col(&schema_batch, schemata_col::SCHEMA_NAME)?;
 
     // Group each INFORMATION_SCHEMA batch ONCE into lookup maps keyed by (schema, table) — and
     // the key/referential batches by (constraint_schema, constraint_name) — so the assembly
@@ -396,7 +446,11 @@ struct KeyColumnRow<'a> {
 
 /// Group `INFORMATION_SCHEMA.TABLES` rows by `TABLE_SCHEMA`, preserving batch order within a schema.
 fn group_tables(batch: &RecordBatch) -> Result<HashMap<&str, Vec<TableRow<'_>>>> {
-    let (ts, tn, tt) = (str_col(batch, 0)?, str_col(batch, 1)?, str_col(batch, 2)?);
+    let (ts, tn, tt) = (
+        str_col(batch, tables_col::TABLE_SCHEMA)?,
+        str_col(batch, tables_col::TABLE_NAME)?,
+        str_col(batch, tables_col::TABLE_TYPE)?,
+    );
     let mut map: HashMap<&str, Vec<TableRow>> = HashMap::new();
     for r in 0..batch.num_rows() {
         map.entry(ts.value(r)).or_default().push(TableRow {
@@ -411,14 +465,14 @@ fn group_tables(batch: &RecordBatch) -> Result<HashMap<&str, Vec<TableRow<'_>>>>
 /// query's `ORDER BY`).
 fn group_columns(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<ColumnRow<'_>>>> {
     let (ts, tn, cn, nul, typ) = (
-        str_col(batch, 0)?,
-        str_col(batch, 1)?,
-        str_col(batch, 2)?,
-        str_col(batch, 4)?,
-        str_col(batch, 5)?,
+        str_col(batch, columns_col::TABLE_SCHEMA)?,
+        str_col(batch, columns_col::TABLE_NAME)?,
+        str_col(batch, columns_col::COLUMN_NAME)?,
+        str_col(batch, columns_col::IS_NULLABLE)?,
+        str_col(batch, columns_col::SPANNER_TYPE)?,
     );
     let ordinal = batch
-        .column(3)
+        .column(columns_col::ORDINAL_POSITION)
         .as_any()
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| err("ORDINAL_POSITION is not an integer", Status::Internal))?;
@@ -439,10 +493,10 @@ fn group_columns(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<Column
 /// Group `INFORMATION_SCHEMA.TABLE_CONSTRAINTS` rows by (schema, table).
 fn group_constraints(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<ConstraintRow<'_>>>> {
     let (ts, tn, cn, ct) = (
-        str_col(batch, 0)?,
-        str_col(batch, 1)?,
-        str_col(batch, 2)?,
-        str_col(batch, 3)?,
+        str_col(batch, table_constraints_col::TABLE_SCHEMA)?,
+        str_col(batch, table_constraints_col::TABLE_NAME)?,
+        str_col(batch, table_constraints_col::CONSTRAINT_NAME)?,
+        str_col(batch, table_constraints_col::CONSTRAINT_TYPE)?,
     );
     let mut map: HashMap<(&str, &str), Vec<ConstraintRow>> = HashMap::new();
     for r in 0..batch.num_rows() {
@@ -459,16 +513,14 @@ fn group_constraints(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<Co
 /// Group `INFORMATION_SCHEMA.KEY_COLUMN_USAGE` rows by (constraint_schema, constraint_name); each
 /// group keeps `ORDINAL_POSITION` order (the query's `ORDER BY`).
 fn group_key_columns(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<KeyColumnRow<'_>>>> {
-    // 0 CONSTRAINT_SCHEMA, 1 CONSTRAINT_NAME, 2 TABLE_SCHEMA, 3 TABLE_NAME, 4 COLUMN_NAME,
-    // 5 ORDINAL_POSITION, 6 POSITION_IN_UNIQUE_CONSTRAINT.
     let (kcs, kcn, kts, ktn, kcol, kord, kpos) = (
-        str_col(batch, 0)?,
-        str_col(batch, 1)?,
-        str_col(batch, 2)?,
-        str_col(batch, 3)?,
-        str_col(batch, 4)?,
-        str_col(batch, 5)?,
-        str_col(batch, 6)?,
+        str_col(batch, key_column_usage_col::CONSTRAINT_SCHEMA)?,
+        str_col(batch, key_column_usage_col::CONSTRAINT_NAME)?,
+        str_col(batch, key_column_usage_col::TABLE_SCHEMA)?,
+        str_col(batch, key_column_usage_col::TABLE_NAME)?,
+        str_col(batch, key_column_usage_col::COLUMN_NAME)?,
+        str_col(batch, key_column_usage_col::ORDINAL_POSITION)?,
+        str_col(batch, key_column_usage_col::POSITION_IN_UNIQUE_CONSTRAINT)?,
     );
     let mut map: HashMap<(&str, &str), Vec<KeyColumnRow>> = HashMap::new();
     for r in 0..batch.num_rows() {
@@ -493,12 +545,11 @@ fn group_key_columns(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<Ke
 /// mapping each foreign key to its referenced (unique_schema, unique_name). Keeps the first row per
 /// key, matching the previous `find`.
 fn group_referential(batch: &RecordBatch) -> Result<ReferentialMap<'_>> {
-    // 0 CONSTRAINT_SCHEMA, 1 CONSTRAINT_NAME, 2 UNIQUE_CONSTRAINT_SCHEMA, 3 UNIQUE_CONSTRAINT_NAME.
     let (rcs, rcn, rus, run) = (
-        str_col(batch, 0)?,
-        str_col(batch, 1)?,
-        str_col(batch, 2)?,
-        str_col(batch, 3)?,
+        str_col(batch, referential_constraints_col::CONSTRAINT_SCHEMA)?,
+        str_col(batch, referential_constraints_col::CONSTRAINT_NAME)?,
+        str_col(batch, referential_constraints_col::UNIQUE_CONSTRAINT_SCHEMA)?,
+        str_col(batch, referential_constraints_col::UNIQUE_CONSTRAINT_NAME)?,
     );
     let mut map: ReferentialMap = HashMap::new();
     for r in 0..batch.num_rows() {
