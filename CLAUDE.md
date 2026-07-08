@@ -279,10 +279,12 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   one; the rows themselves ship as native **insert mutations** — `bind::insert_mutation`, reusing
   the same `cell_value` Arrow→Spanner mapping as parameter binding — not per-row `INSERT` DML, so
   nothing is SQL-parsed/planned per row but `INSERT` semantics are kept (duplicate PK →
+  `AlreadyExists` naming the target table; `create` mode onto an existing table likewise remaps to
   `AlreadyExists`); autocommit ingests are built and committed chunk by chunk via
   `DatabaseClient::write_only_transaction` under Spanner's per-commit limits — `IngestChunkBudget`
   in `src/statement.rs`, ~rows × columns mutations + an approximate byte budget — so a multi-chunk
-  ingest commits per chunk and is not atomic as a whole, while manual-mode ingests buffer their
+  ingest commits per chunk and is not atomic as a whole (a mid-ingest chunk failure reports the
+  exact row count the earlier chunks already committed), while manual-mode ingests buffer their
   mutations unchunked (`TxnState::pending_mutations`) and commit atomically **with** the buffered
   DML in one read/write transaction via `ReadWriteTransaction::buffer` — note Spanner applies
   buffered mutations at commit, after the transaction's DML executes), `get_info` (static
