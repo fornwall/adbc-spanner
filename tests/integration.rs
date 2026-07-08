@@ -1925,6 +1925,303 @@ fn objects_table_names(batches: &[RecordBatch]) -> Vec<String> {
     names
 }
 
+/// Tiny reference implementation of the ADBC `LIKE` pattern contract (`%` = any run, `_` = one
+/// character, case-sensitive, **no** escape syntax), deliberately independent of the driver's
+/// internal `like_match` so the push-down comparison below has an outside oracle.
+fn adbc_like(pattern: &str, value: &str) -> bool {
+    fn rec(p: &[char], v: &[char]) -> bool {
+        match p.split_first() {
+            None => v.is_empty(),
+            Some((&'%', rest)) => (0..=v.len()).any(|k| rec(rest, &v[k..])),
+            Some((&'_', rest)) => !v.is_empty() && rec(rest, &v[1..]),
+            Some((c, rest)) => v.first() == Some(c) && rec(rest, &v[1..]),
+        }
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let v: Vec<char> = value.chars().collect();
+    rec(&p, &v)
+}
+
+/// Extract the column names of `table` from a collected `get_objects` result, in reported order.
+fn objects_column_names(batches: &[RecordBatch], table: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for batch in batches {
+        let schema_lists = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        for c in 0..batch.num_rows() {
+            let schemas = schema_lists.value(c);
+            let schemas = schemas.as_any().downcast_ref::<StructArray>().unwrap();
+            let table_lists = schemas
+                .column(1)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            for s in 0..schemas.len() {
+                if table_lists.is_null(s) {
+                    continue;
+                }
+                let tables = table_lists.value(s);
+                let tables = tables.as_any().downcast_ref::<StructArray>().unwrap();
+                let table_names = tables
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let column_lists = tables
+                    .column_by_name("table_columns")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .unwrap();
+                for r in 0..tables.len() {
+                    if table_names.value(r) != table || column_lists.is_null(r) {
+                        continue;
+                    }
+                    let columns = column_lists.value(r);
+                    let columns = columns.as_any().downcast_ref::<StructArray>().unwrap();
+                    let column_names = columns
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    for k in 0..columns.len() {
+                        names.push(column_names.value(k).to_string());
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+/// `get_objects` pushes the ADBC pattern filters down into the `INFORMATION_SCHEMA` queries as
+/// bound-parameter `LIKE` predicates. The push-down must be invisible: for every pattern shape,
+/// the filtered result must equal the unfiltered result filtered client-side by an independent
+/// implementation of the ADBC pattern contract. Also guards the semantics the push-down could
+/// silently break: parent skeletons for all-excluding filters, and foreign keys whose referenced
+/// table falls outside the filter.
+#[test]
+fn get_objects_filter_pushdown_matches_client_filtering() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping get_objects_filter_pushdown");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    // Distinctively-named tables covering the pattern shapes: a literal underscore in a name,
+    // a one-character variant (`_` wildcard bait), and a foreign key from GoFilterChild to
+    // GoFilterAlpha (parent deliberately NOT matched by the child-only filter below).
+    let mut ddl = connection.new_statement().expect("new statement");
+    ddl.set_sql_query(
+        "DROP TABLE IF EXISTS GoFilterChild; \
+         DROP TABLE IF EXISTS GoFilterAlpha; \
+         DROP TABLE IF EXISTS GoFilter_Beta; \
+         DROP TABLE IF EXISTS GoFilterXBeta; \
+         CREATE TABLE GoFilterAlpha (Id INT64, NameOne STRING(MAX), Name_Two STRING(MAX), \
+         NameXTwo STRING(MAX)) PRIMARY KEY (Id); \
+         CREATE TABLE GoFilter_Beta (Id INT64) PRIMARY KEY (Id); \
+         CREATE TABLE GoFilterXBeta (Id INT64) PRIMARY KEY (Id); \
+         CREATE TABLE GoFilterChild (Id INT64, AlphaId INT64, \
+         CONSTRAINT FK_GoFilterChild_Alpha FOREIGN KEY (AlphaId) \
+         REFERENCES GoFilterAlpha (Id)) PRIMARY KEY (Id)",
+    )
+    .unwrap();
+    ddl.execute_update().expect("create filter tables");
+
+    let collect = |connection: &mut SpannerConnection,
+                   table_name: Option<&str>,
+                   column_name: Option<&str>| {
+        connection
+            .get_objects(ObjectDepth::All, None, None, table_name, None, column_name)
+            .expect("get_objects")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect objects")
+    };
+
+    // The oracle: everything, filtered client-side per pattern by the independent matcher.
+    let unfiltered = collect(&mut connection, None, None);
+    let mut all_names = objects_table_names(&unfiltered);
+    all_names.sort();
+
+    let table_patterns = [
+        "GoFilterAlpha", // exact name
+        "GoFilter%",     // prefix
+        "%Alpha%",       // substring
+        "%ilter_B%",     // substring with `_` wildcard
+        "GoFilter_Beta", // `_` wildcard: matches GoFilter_Beta AND GoFilterXBeta
+        "GoFilterNone%", // matches nothing
+    ];
+    for pattern in table_patterns {
+        let mut filtered = objects_table_names(&collect(&mut connection, Some(pattern), None));
+        filtered.sort();
+        let expected: Vec<String> = all_names
+            .iter()
+            .filter(|n| adbc_like(pattern, n))
+            .cloned()
+            .collect();
+        assert_eq!(
+            filtered, expected,
+            "server-filtered result must equal client-filtered result for {pattern:?}"
+        );
+    }
+
+    // `_` stayed a wildcard through the push-down: the pattern with a literal-looking underscore
+    // matches both the underscore name and the X variant (ADBC patterns have no escape syntax).
+    let mut wildcarded =
+        objects_table_names(&collect(&mut connection, Some("GoFilter_Beta"), None));
+    wildcarded.sort();
+    assert_eq!(wildcarded, ["GoFilterXBeta", "GoFilter_Beta"]);
+
+    // Column filters, same contract: compare each pattern against the unfiltered column list.
+    let all_columns = objects_column_names(&unfiltered, "GoFilterAlpha");
+    assert_eq!(all_columns, ["Id", "NameOne", "Name_Two", "NameXTwo"]);
+    for pattern in ["Name%", "Name_Two", "%Two", "Id", "Zzz%"] {
+        let filtered = collect(&mut connection, Some("GoFilterAlpha"), Some(pattern));
+        let expected: Vec<String> = all_columns
+            .iter()
+            .filter(|n| adbc_like(pattern, n))
+            .cloned()
+            .collect();
+        assert_eq!(
+            objects_column_names(&filtered, "GoFilterAlpha"),
+            expected,
+            "column filter {pattern:?}"
+        );
+    }
+
+    // Empty-vs-null skeletons survive the push-down: a table filter matching nothing keeps every
+    // schema with an EMPTY (non-null) table list — the SCHEMATA query is not filtered by the
+    // table pattern, only TABLES is.
+    let none = collect(&mut connection, Some("GoFilterNone%"), None);
+    assert!(objects_table_names(&none).is_empty());
+    let batch = &none[0];
+    let schema_lists = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert!(schema_lists.is_valid(0));
+    let schemas = schema_lists.value(0);
+    let schemas = schemas.as_any().downcast_ref::<StructArray>().unwrap();
+    assert!(!schemas.is_empty(), "schema skeletons must be kept");
+    let table_lists = schemas
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    for s in 0..schemas.len() {
+        assert!(
+            table_lists.is_valid(s) && table_lists.value(s).is_empty(),
+            "each kept schema must carry an empty, non-null table list"
+        );
+    }
+
+    // A column filter matching nothing keeps the table with an empty, non-null column list.
+    let no_columns = collect(&mut connection, Some("GoFilterAlpha"), Some("Zzz%"));
+    assert_eq!(objects_table_names(&no_columns), ["GoFilterAlpha"]);
+    assert!(objects_column_names(&no_columns, "GoFilterAlpha").is_empty());
+
+    // Foreign keys resolve across the filter boundary: filtering to the child only, its
+    // constraint_column_usage must still name the (excluded) parent's column — the
+    // KEY_COLUMN_USAGE / REFERENTIAL_CONSTRAINTS queries are deliberately not filtered.
+    let child_only = collect(&mut connection, Some("GoFilterChild"), None);
+    assert_eq!(objects_table_names(&child_only), ["GoFilterChild"]);
+    let batch = &child_only[0];
+    let schemas = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap()
+        .value(0);
+    let schemas = schemas.as_any().downcast_ref::<StructArray>().unwrap();
+    let mut fk_usage = None;
+    let table_lists = schemas
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    for s in 0..schemas.len() {
+        if table_lists.is_null(s) {
+            continue;
+        }
+        let tables = table_lists.value(s);
+        let tables = tables.as_any().downcast_ref::<StructArray>().unwrap();
+        let constraint_lists = tables
+            .column_by_name("table_constraints")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        for r in 0..tables.len() {
+            let constraints = constraint_lists.value(r);
+            let constraints = constraints.as_any().downcast_ref::<StructArray>().unwrap();
+            let ctype = constraints
+                .column_by_name("constraint_type")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let usage_lists = constraints
+                .column_by_name("constraint_column_usage")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            for k in 0..constraints.len() {
+                if ctype.value(k) == "FOREIGN KEY" {
+                    assert!(usage_lists.is_valid(k), "FK usage list must be non-null");
+                    let usage = usage_lists.value(k);
+                    let usage = usage.as_any().downcast_ref::<StructArray>().unwrap();
+                    assert_eq!(usage.len(), 1);
+                    let fk_table = usage
+                        .column_by_name("fk_table")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    let fk_column = usage
+                        .column_by_name("fk_column_name")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    fk_usage = Some((
+                        fk_table.value(0).to_string(),
+                        fk_column.value(0).to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        fk_usage,
+        Some(("GoFilterAlpha".to_string(), "Id".to_string())),
+        "the FK must resolve its parent column even though the filter excludes the parent table"
+    );
+
+    let mut drop_tables = connection.new_statement().expect("new statement");
+    drop_tables
+        .set_sql_query(
+            "DROP TABLE GoFilterChild; DROP TABLE GoFilterAlpha; \
+             DROP TABLE GoFilter_Beta; DROP TABLE GoFilterXBeta",
+        )
+        .unwrap();
+    drop_tables.execute_update().expect("drop filter tables");
+}
+
 /// Number of generated cases per property. Each case is a full DELETE + INSERT + SELECT round trip
 /// over the network, so this is kept modest to bound the emulator wall-clock.
 const PROP_CASES: u32 = 64;
