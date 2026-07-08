@@ -924,6 +924,9 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) if k == crate::OPTION_REQUEST_TAG => {
                 self.request.set_request_tag(value)?;
             }
+            OptionStatement::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => {
+                self.request.set_max_commit_delay(value)?;
+            }
             OptionStatement::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {
                 // `""` resets to the driver default (nanoseconds), not to the connection's value —
                 // the same unset semantics as the staleness options.
@@ -993,6 +996,9 @@ impl Optionable for SpannerStatement {
             }
             OptionStatement::Other(k) if k == crate::OPTION_REQUEST_TAG => {
                 self.request.request_tag_string().map(str::to_string)
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => {
+                self.request.max_commit_delay_string().map(str::to_string)
             }
             // The effective mode: inherited from the connection at creation unless overridden.
             OptionStatement::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {

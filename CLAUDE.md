@@ -116,7 +116,7 @@ same directory (the fork tracks close to the 0.23.0 release).
 and **each is independently a crates.io publish blocker** — the crate cannot be published until
 *both* are reverted to versioned releases:
 
-1. The whole `google-cloud-*` family (spanner, auth, lro, both admin crates + `gax`)
+1. The whole `google-cloud-*` family (spanner, auth, lro, `wkt`, both admin crates + `gax`)
    is pinned to a `google-cloud-rust` git revision, because native `STRUCT` mapping needs
    `Type::struct_type()`, which is on `main` but not yet in a crates.io release.
 2. `adbc_core` and `adbc_ffi` (and the dev-dependency `adbc_driver_manager`) are pinned to a
@@ -135,12 +135,14 @@ revert a family to versioned crates.io releases. Current pinned revs:
 - `fornwall/arrow-adbc`: `786e7f3488eb71b200ece775b027a647cf42db9e`
 
 **Invariant:** the three arrow-adbc crates (`adbc_core`, `adbc_ffi`, `adbc_driver_manager`) must
-always share ONE rev; the seven `google-cloud-rust` crates likewise share ONE rev. When reverting,
+always share ONE rev; the eight `google-cloud-rust` crates likewise share ONE rev. When reverting,
 touch *every* location for that family in lockstep:
 
 - `Cargo.toml` `[dependencies]` — arrow-adbc: `adbc_core`, `adbc_ffi`; google-cloud:
-  `google-cloud-spanner`, `google-cloud-auth`, `google-cloud-lro`, `google-cloud-gax` (the last
-  names `rpc::StatusDetails` so `from_spanner` can forward `google.rpc.Status` details).
+  `google-cloud-spanner`, `google-cloud-auth`, `google-cloud-lro`, `google-cloud-gax` (this last
+  names `rpc::StatusDetails` so `from_spanner` can forward `google.rpc.Status` details),
+  `google-cloud-wkt` (names the `Duration` type `set_max_commit_delay` takes for
+  `spanner.max_commit_delay`).
 - `Cargo.toml` `[dev-dependencies]` — arrow-adbc: `adbc_driver_manager`; google-cloud:
   `google-cloud-spanner-admin-instance-v1`, `google-cloud-spanner-admin-database-v1`,
   `spanner-grpc-mock` (the mock-server harness of `tests/mock_spanner.rs`;
@@ -335,7 +337,15 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   `spanner.transaction.tag` connection-only; parsed/applied via `RequestConfig` in `src/request.rs`
   — every user statement builder goes through `SpannerStatement::sql_builder`, `run_batch_dml`
   tags the `ExecuteBatchDml` batch and the runner [commit priority + transaction tag; the client
-  has no batch-level priority setter], driver-internal metadata queries stay untagged), and RPC
+  has no batch-level priority setter], driver-internal metadata queries stay untagged), commit
+  batching (`spanner.max_commit_delay` at connection + statement level [statement inherits, then
+  overrides; `""` unsets — the staleness pattern; a duration in `0..=500ms` parsed with the shared
+  `staleness::parse_duration` grammar, out-of-range/malformed → `InvalidArguments`; round-trips via
+  `get_option`] — stored on `RequestConfig` in `src/request.rs` and applied as the client's
+  `set_max_commit_delay` [a `google_cloud_wkt::Duration`] at the same read/write **commit** sites
+  the runner / write-only builders cover: autocommit DML, the `ExecuteBatchDml` batch runner, the
+  manual-mode commit, and the ingest write-only txn — i.e. `RequestConfig::{apply_to_runner,
+  apply_to_write_only}`), and RPC
   timeouts (`spanner.rpc.timeout_seconds.{query,update,fetch}` at connection + statement level
   [statement inherits, then overrides; `""` unsets, `0` disables; f64 seconds, finite +
   non-negative, round-trip via `get_option`/`get_option_double` — `RpcTimeouts` in

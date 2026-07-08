@@ -681,6 +681,9 @@ impl Optionable for SpannerConnection {
             OptionConnection::Other(k) if k == crate::OPTION_TRANSACTION_TAG => {
                 self.request.set_transaction_tag(value)?;
             }
+            OptionConnection::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => {
+                self.request.set_max_commit_delay(value)?;
+            }
             OptionConnection::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {
                 self.timestamp_precision = TimestampPrecision::parse_option(value)?;
             }
@@ -763,6 +766,16 @@ impl Optionable for SpannerConnection {
                 .ok_or_else(|| {
                     err(
                         format!("option {} is not set", crate::OPTION_TRANSACTION_TAG),
+                        Status::NotFound,
+                    )
+                }),
+            OptionConnection::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => self
+                .request
+                .max_commit_delay_string()
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    err(
+                        format!("option {} is not set", crate::OPTION_MAX_COMMIT_DELAY),
                         Status::NotFound,
                     )
                 }),
