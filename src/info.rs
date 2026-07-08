@@ -125,7 +125,7 @@ pub(crate) fn build(codes: Option<HashSet<InfoCode>>) -> Result<RecordBatch> {
             return Err(err(
                 format!("GET_INFO_SCHEMA info_value is not a union: {other:?}"),
                 Status::Internal,
-            ))
+            ));
         }
     };
 

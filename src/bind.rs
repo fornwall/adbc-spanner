@@ -50,8 +50,8 @@
 use adbc_core::error::Result;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    ArrowPrimitiveType, Date32Type, Date64Type, Decimal128Type, Float32Type, Float64Type,
-    Int16Type, Int32Type, Int64Type, Int8Type, TimestampMicrosecondType, TimestampMillisecondType,
+    ArrowPrimitiveType, Date32Type, Date64Type, Decimal128Type, Float32Type, Float64Type, Int8Type,
+    Int16Type, Int32Type, Int64Type, TimestampMicrosecondType, TimestampMillisecondType,
     TimestampNanosecondType, TimestampSecondType,
 };
 use arrow_array::{Array, ArrayRef, OffsetSizeTrait, RecordBatch};
@@ -314,7 +314,7 @@ fn cell_value(
         other => {
             return Err(invalid_argument(format!(
                 "cannot bind parameter {name:?}: unsupported Arrow type {other:?}"
-            )))
+            )));
         }
     })
 }
@@ -459,7 +459,7 @@ fn list_cell_value(
         other => {
             return Err(invalid_argument(format!(
                 "cannot bind ARRAY parameter {name:?}: unsupported element type {other:?}"
-            )))
+            )));
         }
     })
 }
@@ -756,7 +756,7 @@ pub(crate) fn spanner_column_type(data_type: &DataType) -> Result<String> {
         other => {
             return Err(invalid_argument(format!(
                 "cannot create a Spanner column for Arrow type {other:?}"
-            )))
+            )));
         }
     })
 }
@@ -996,13 +996,17 @@ mod tests {
              `adbc_ingest_key` STRING(36) DEFAULT (GENERATE_UUID())) \
              PRIMARY KEY (`adbc_ingest_key`)"
         );
-        assert!(create_table_sql("t", None, &schema, true)
-            .unwrap()
-            .starts_with("CREATE TABLE IF NOT EXISTS `t`"));
+        assert!(
+            create_table_sql("t", None, &schema, true)
+                .unwrap()
+                .starts_with("CREATE TABLE IF NOT EXISTS `t`")
+        );
         // A named target schema (`adbc.ingest.target_db_schema`) qualifies the created table.
-        assert!(create_table_sql("t", Some("app"), &schema, false)
-            .unwrap()
-            .starts_with("CREATE TABLE `app`.`t`"));
+        assert!(
+            create_table_sql("t", Some("app"), &schema, false)
+                .unwrap()
+                .starts_with("CREATE TABLE `app`.`t`")
+        );
     }
 
     #[test]
@@ -1582,12 +1586,14 @@ mod tests {
             vec![Arc::new(arr)],
         );
         for row in 0..3 {
-            assert!(bind_row(
-                Statement::builder("INSERT INTO t (tags) VALUES (@tags)"),
-                &b,
-                row
-            )
-            .is_ok());
+            assert!(
+                bind_row(
+                    Statement::builder("INSERT INTO t (tags) VALUES (@tags)"),
+                    &b,
+                    row
+                )
+                .is_ok()
+            );
         }
     }
 

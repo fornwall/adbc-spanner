@@ -7,12 +7,12 @@
 //! maintainer) — alive for as long as any handle exists.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use adbc_core::error::{Error, Result, Status};
 use tokio::runtime::Runtime;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::error::err;

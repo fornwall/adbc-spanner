@@ -48,11 +48,7 @@ pub(crate) fn positive_i64(value: OptionValue, what: &str) -> Result<i64> {
         OptionValue::String(s) => s.parse::<i64>().map_err(|_| reject())?,
         _ => return Err(reject()),
     };
-    if n > 0 {
-        Ok(n)
-    } else {
-        Err(reject())
-    }
+    if n > 0 { Ok(n) } else { Err(reject()) }
 }
 
 /// Parse a strictly-positive `usize` option (as [`positive_i64`], narrowed to `usize`).

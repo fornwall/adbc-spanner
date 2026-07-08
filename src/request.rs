@@ -197,11 +197,7 @@ fn as_string(value: OptionValue) -> Result<String> {
 /// `None` for an empty string (the "unset" spelling), `Some` otherwise. Tags are free-form, so a
 /// non-empty value is stored verbatim (no trimming).
 fn non_empty(s: String) -> Option<String> {
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 #[cfg(test)]

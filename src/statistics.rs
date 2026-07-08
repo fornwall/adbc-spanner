@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use adbc_core::error::{Error, Result, Status};
 use arrow_array::{
-    new_null_array, Array, ArrayRef, BooleanArray, Int16Array, Int64Array, RecordBatch,
-    StringArray, StructArray,
+    Array, ArrayRef, BooleanArray, Int16Array, Int64Array, RecordBatch, StringArray, StructArray,
+    new_null_array,
 };
 use arrow_schema::{DataType, Fields, SchemaRef};
 use futures_util::stream::{self, StreamExt};
@@ -31,7 +31,7 @@ use crate::connection::{like_match, query_batch, str_col};
 use crate::conversion::result_set_to_batch;
 use crate::error::{err, from_spanner};
 use crate::nested::{arrow_err, dense_union, field, list_item, list_of, struct_fields};
-use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
+use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
 use crate::staleness::ReadStaleness;
 
 /// The `int64` branch of the `statistic_value` union (see `STATISTIC_VALUE_SCHEMA`).
@@ -330,7 +330,7 @@ fn build_statistic_struct(stat_fields: &Fields, stats: &[&Statistic]) -> Result<
             return Err(err(
                 "unexpected ADBC result schema shape: expected `statistic_value` to be a union",
                 Status::Internal,
-            ))
+            ));
         }
     };
     let int64_values: ArrayRef =

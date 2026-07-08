@@ -213,8 +213,8 @@ mod tests {
 
     #[test]
     fn maps_a_real_gax_status_error() {
-        use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
         use google_cloud_gax::error::Error as GaxError;
+        use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
 
         let gax = GaxError::service(
             RpcStatus::default()
@@ -233,8 +233,8 @@ mod tests {
 
     #[test]
     fn aborted_keeps_its_grpc_code_in_vendor_code() {
-        use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
         use google_cloud_gax::error::Error as GaxError;
+        use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
 
         let gax = GaxError::service(
             RpcStatus::default()

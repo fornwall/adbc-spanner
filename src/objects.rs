@@ -14,7 +14,7 @@ use adbc_core::error::{Result, Status};
 use adbc_core::options::ObjectDepth;
 use adbc_core::schemas::GET_OBJECTS_SCHEMA;
 use arrow_array::{
-    new_null_array, Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+    Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, StructArray, new_null_array,
 };
 use arrow_buffer::NullBuffer;
 use arrow_schema::Fields;
@@ -28,7 +28,7 @@ use crate::connection::{like_match, str_col};
 use crate::conversion::result_set_to_batch;
 use crate::error::{err, from_spanner};
 use crate::nested::{arrow_err, field, list_item, list_of, list_of_nullable, struct_fields};
-use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
+use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
 
 /// A column of a table, as returned by `get_objects`.
 pub(crate) struct Column {

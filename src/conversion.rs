@@ -63,7 +63,7 @@ use google_cloud_spanner::value::{Kind, Type, TypeCode, Value};
 
 use crate::error::{err, from_spanner, invalid_argument};
 use crate::runtime::{
-    block_on_cancellable, spawn_prefetch, CancelSignal, ChunkSource, SharedRuntime,
+    CancelSignal, ChunkSource, SharedRuntime, block_on_cancellable, spawn_prefetch,
 };
 use crate::timeout::with_timeout;
 

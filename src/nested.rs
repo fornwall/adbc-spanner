@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use adbc_core::error::{Error, Result, Status};
-use arrow_array::{new_empty_array, ArrayRef, ListArray, UnionArray};
+use arrow_array::{ArrayRef, ListArray, UnionArray, new_empty_array};
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType, FieldRef, Fields, UnionFields};
 

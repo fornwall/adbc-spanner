@@ -43,8 +43,8 @@ use adbc_spanner::{SpannerConnection, SpannerDriver};
 use arrow_array::cast::AsArray;
 use arrow_schema::{ArrowError, DataType};
 use prost::Message;
-use spanner_grpc_mock::google::spanner::v1;
 use spanner_grpc_mock::MockSpanner;
+use spanner_grpc_mock::google::spanner::v1;
 
 /// The database the driver is pointed at; the mock does not validate it, but the client sends it
 /// in `CreateSessionRequest.database` and session names are derived from it.
