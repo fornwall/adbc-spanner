@@ -847,7 +847,8 @@ impl Statement for SpannerStatement {
         let batch_size = self.rows_per_batch;
         let bound = self.read_staleness.timestamp_bound()?;
         // Stream the result: `stream_query` fetches the first chunk (settling the schema) and the
-        // returned reader converts the rest to Arrow one bounded chunk at a time as it is iterated.
+        // returned reader converts the rest to Arrow one bounded chunk at a time as it is
+        // iterated, with a background task prefetching the next chunk ahead of the consumer.
         let reader = block_on_cancellable(&self.runtime, &self.cancel, async move {
             let transaction = crate::staleness::single_use(&client, bound);
             let statement = SpannerSql::builder(sql).build();

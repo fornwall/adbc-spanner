@@ -41,7 +41,9 @@ SpannerDriver ──▶ SpannerDatabase ──▶ SpannerConnection ──▶ Sp
   ingest.
 - `src/conversion.rs` — Spanner result set → Arrow schema + typed arrays (the type mapping lives
   here), plus `SpannerBatchReader`, the streaming `RecordBatchReader` that `execute` returns (pulls
-  rows in bounded chunks of `spanner.rows_per_batch`, default 8192).
+  rows in bounded chunks of `spanner.rows_per_batch`, default 8192; a background task on the shared
+  runtime prefetches the next chunk while the consumer processes the current one — depth-1, via
+  `spawn_prefetch` in `src/runtime.rs`; cancel aborts the task, drop aborts its `JoinHandle`).
 - `src/runtime.rs` — a shared Tokio runtime; the ADBC traits are sync while the Spanner client is
   async, so every call bridges via `runtime.block_on(...)`. The runtime is created once by the
   driver and shared via `Arc` into every database/connection/statement.
@@ -255,7 +257,8 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
 
 - Match surrounding style; keep `fmt`/`clippy` clean (CI fails otherwise).
 - Supported so far: streaming queries (`execute` returns a lazy `SpannerBatchReader` that converts
-  bounded row chunks to Arrow on demand; chunk size via `spanner.rows_per_batch`), DML, DDL (via
+  bounded row chunks to Arrow on demand — chunk size via `spanner.rows_per_batch` — with a
+  background task prefetching the next chunk ahead of the consumer), DML, DDL (via
   admin `UpdateDatabaseDdl`), manual transactions
   (buffer-and-commit), native Arrow types for DATE/TIMESTAMP/NUMERIC and native `List`/`Struct` for
   ARRAY/STRUCT, parameter binding (by column name, else positionally; an `arrow.json`-tagged string

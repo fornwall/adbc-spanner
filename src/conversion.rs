@@ -54,7 +54,9 @@ use google_cloud_spanner::transaction::MultiUseReadOnlyTransaction;
 use google_cloud_spanner::value::{Kind, Type, TypeCode, Value};
 
 use crate::error::{err, from_spanner, invalid_argument};
-use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
+use crate::runtime::{
+    block_on_cancellable, spawn_prefetch, CancelSignal, ChunkSource, SharedRuntime,
+};
 
 /// Field name used for the element of an Arrow `List` (the Arrow convention).
 const LIST_ITEM: &str = "item";
@@ -163,9 +165,12 @@ fn approx_value_bytes(value: &Value) -> usize {
 /// Wrap a Spanner [`ResultSet`] as a streaming Arrow [`RecordBatchReader`].
 ///
 /// The first chunk of rows is pulled here (Spanner delivers the column metadata with the first
-/// partial result set, so this also settles the schema), and the reader yields the rest lazily,
-/// converting one bounded chunk to Arrow per [`Iterator::next`] rather than materialising the whole
-/// result up front. Each chunk fetch is cancellable via the shared [`CancelSignal`].
+/// partial result set, so this also settles the schema). The rest of the result set is handed to a
+/// background **prefetch task** on the shared runtime (see
+/// [`spawn_prefetch`](crate::runtime::spawn_prefetch)), so the fetch of chunk N+1 overlaps the
+/// consumer's processing of chunk N; each [`Iterator::next`] converts one bounded chunk to Arrow
+/// rather than materialising the whole result up front. Waiting for a chunk is cancellable via the
+/// shared [`CancelSignal`], which also aborts the background fetch.
 pub(crate) async fn stream_query(
     runtime: SharedRuntime,
     cancel: CancelSignal,
@@ -174,31 +179,67 @@ pub(crate) async fn stream_query(
 ) -> Result<SpannerBatchReader> {
     let first = pull_chunk(&mut rs, batch_size).await?;
     let schema = build_schema(rs.metadata(), first.first());
+    let source = ResultSetChunks {
+        result_set: rs,
+        batch_size,
+    };
+    let (chunks, task) = spawn_prefetch(&runtime, cancel.clone(), source);
     Ok(SpannerBatchReader {
         runtime,
         cancel,
         schema,
-        result_set: Some(rs),
         first: Some(first),
-        batch_size,
+        chunks: Some(chunks),
+        task,
     })
+}
+
+/// The prefetch task's view of a Spanner [`ResultSet`]: chunks of up to `batch_size` rows (plus
+/// the [`CHUNK_BYTE_BUDGET`]), as pulled by [`pull_chunk`].
+struct ResultSetChunks {
+    result_set: ResultSet,
+    batch_size: usize,
+}
+
+impl ChunkSource for ResultSetChunks {
+    type Row = Row;
+
+    fn next_chunk(&mut self) -> impl std::future::Future<Output = Result<Vec<Row>>> + Send {
+        pull_chunk(&mut self.result_set, self.batch_size)
+    }
 }
 
 /// A streaming [`RecordBatchReader`] over a Spanner [`ResultSet`].
 ///
-/// Rows are fetched from the server and converted to Arrow in bounded chunks of `batch_size`, so a
-/// large result set is never fully held in memory — at most one chunk of [`Row`]s plus the Arrow
-/// batch built from it. The ADBC traits are synchronous, so each `next` bridges to the async client
-/// with a cancellable `block_on`.
+/// Rows are fetched from the server and converted to Arrow in bounded chunks of
+/// `spanner.rows_per_batch` rows (plus the [`CHUNK_BYTE_BUDGET`]), so a large result set is never
+/// fully held in memory. A background task on the shared runtime **prefetches ahead of the
+/// consumer** — while `next` converts and the caller processes batch N, the fetch of batch N+1 is
+/// already in flight — keeping at most one undelivered chunk buffered plus one being fetched (in
+/// the same spirit as the BigQuery ADBC driver's buffered reader). The ADBC traits are
+/// synchronous, so each `next` bridges to the async channel with a cancellable `block_on`; a
+/// latched [`CancelSignal`] both fails the wait and stops the background fetch, and dropping the
+/// reader aborts the task.
 pub(crate) struct SpannerBatchReader {
     runtime: SharedRuntime,
     cancel: CancelSignal,
     schema: SchemaRef,
-    /// The live result set; `None` once the stream is exhausted or a chunk fetch errored.
-    result_set: Option<ResultSet>,
     /// The first chunk of rows, fetched up front to settle the schema; emitted on the first `next`.
     first: Option<Vec<Row>>,
-    batch_size: usize,
+    /// Prefetched row chunks from the background task; `None` once the stream is exhausted, a
+    /// chunk fetch errored, or the reader was cancelled.
+    chunks: Option<crate::runtime::ChunkReceiver<Row>>,
+    /// The background prefetch task, so `Drop` can abort a fetch still in flight.
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for SpannerBatchReader {
+    fn drop(&mut self) {
+        // Dropping the `chunks` receiver alone would stop the task only at its *next* send; abort
+        // also cuts a fetch still in flight, so a reader dropped mid-stream never leaves a task
+        // pulling rows in the background. Aborting an already-finished task is a no-op.
+        self.task.abort();
+    }
 }
 
 /// Surface a driver error to a `RecordBatchReader` consumer, whose only error channel is
@@ -217,16 +258,23 @@ impl Iterator for SpannerBatchReader {
         if let Some(rows) = self.first.take() {
             return Some(build_batch(self.schema.clone(), &rows).map_err(to_arrow_error));
         }
-        let rs = self.result_set.as_mut()?;
-        match block_on_cancellable(&self.runtime, &self.cancel, pull_chunk(rs, self.batch_size)) {
-            // An empty chunk means the stream is drained; drop the result set and stop.
-            Ok(rows) if rows.is_empty() => {
-                self.result_set = None;
+        let rx = self.chunks.as_mut()?;
+        // Wait for the next prefetched chunk. `block_on_cancellable` checks the sticky signal
+        // before polling (biased), so a latched cancel surfaces here even when a chunk is already
+        // buffered — a prefetched chunk never masks a cancellation.
+        match block_on_cancellable(&self.runtime, &self.cancel, async { Ok(rx.recv().await) }) {
+            // A closed channel means the prefetch task drained the stream; stop.
+            Ok(None) => {
+                self.chunks = None;
                 None
             }
-            Ok(rows) => Some(build_batch(self.schema.clone(), &rows).map_err(to_arrow_error)),
-            Err(e) => {
-                self.result_set = None;
+            Ok(Some(Ok(rows))) => {
+                Some(build_batch(self.schema.clone(), &rows).map_err(to_arrow_error))
+            }
+            // A fetch error forwarded by the task, or a cancel observed while waiting. Dropping
+            // the receiver also makes a still-running task stop at its next send.
+            Ok(Some(Err(e))) | Err(e) => {
+                self.chunks = None;
                 Some(Err(to_arrow_error(e)))
             }
         }
