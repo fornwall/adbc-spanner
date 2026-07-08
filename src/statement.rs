@@ -32,7 +32,9 @@ use google_cloud_spanner::transaction::ReadWriteTransaction;
 
 use crate::bind;
 use crate::connection::{apply_isolation, SharedTxn};
-use crate::conversion::{result_set_to_batch, stream_bound_query, stream_query};
+use crate::conversion::{
+    result_set_to_batch, stream_bound_query, stream_query, TimestampPrecision,
+};
 use crate::error::{
     err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
 };
@@ -108,6 +110,11 @@ pub struct SpannerStatement {
     /// request tag are overridable per statement. The transaction tag (connection-level only)
     /// rides along for the read/write transaction runners this statement builds.
     request: RequestConfig,
+    /// How `TIMESTAMP` columns map to Arrow (`spanner.max_timestamp_precision`), inherited from
+    /// the connection at creation time and overridable per statement. Applied uniformly to every
+    /// result path of this statement: `execute` (plain and bound queries), DML `THEN RETURN`
+    /// rows, `execute_schema`, and the `execute_partitions` schema probe.
+    timestamp_precision: TimestampPrecision,
     /// Cancellation signal for this statement's in-flight execution (see [`Statement::cancel`]).
     cancel: CancelSignal,
 }
@@ -123,6 +130,7 @@ impl SpannerStatement {
         isolation: IsolationLevel,
         read_staleness: ReadStaleness,
         request: RequestConfig,
+        timestamp_precision: TimestampPrecision,
         txn: SharedTxn,
     ) -> Self {
         Self {
@@ -144,6 +152,7 @@ impl SpannerStatement {
             max_partitions: None,
             read_staleness,
             request,
+            timestamp_precision,
             cancel: CancelSignal::new(),
         }
     }
@@ -499,7 +508,11 @@ impl SpannerStatement {
         let mut batches = Vec::with_capacity(results.len());
         let mut affected = 0i64;
         for (metadata, rows, count) in &results {
-            let (sch, batch) = crate::conversion::rows_to_batch(metadata.as_ref(), rows)?;
+            let (sch, batch) = crate::conversion::rows_to_batch(
+                metadata.as_ref(),
+                rows,
+                self.timestamp_precision,
+            )?;
             schema.get_or_insert(sch);
             batches.push(batch);
             affected += count;
@@ -570,6 +583,7 @@ impl SpannerStatement {
         let runtime = self.runtime.clone();
         let cancel = self.cancel.clone();
         let batch_size = self.rows_per_batch;
+        let precision = self.timestamp_precision;
         if statements.len() <= 1 {
             // Zero or one bound row. One statement is one snapshot already, and the single-use
             // transaction keeps the exact semantics of the bounded-staleness kinds.
@@ -583,7 +597,7 @@ impl SpannerStatement {
                     .execute_query(statement)
                     .await
                     .map_err(from_spanner)?;
-                stream_query(runtime, cancel, result_set, batch_size).await
+                stream_query(runtime, cancel, result_set, batch_size, precision).await
             })?;
             return Ok(Box::new(reader));
         }
@@ -594,7 +608,15 @@ impl SpannerStatement {
                 builder = builder.set_timestamp_bound(b);
             }
             let transaction = builder.build().await.map_err(from_spanner)?;
-            stream_bound_query(runtime, cancel, transaction, statements, batch_size).await
+            stream_bound_query(
+                runtime,
+                cancel,
+                transaction,
+                statements,
+                batch_size,
+                precision,
+            )
+            .await
         })?;
         Ok(Box::new(reader))
     }
@@ -709,6 +731,11 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) if k == crate::OPTION_REQUEST_TAG => {
                 self.request.set_request_tag(value)?;
             }
+            OptionStatement::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {
+                // `""` resets to the driver default (nanoseconds), not to the connection's value —
+                // the same unset semantics as the staleness options.
+                self.timestamp_precision = TimestampPrecision::parse_option(value)?;
+            }
             other => {
                 return Err(not_implemented(&format!(
                     "statement option {}",
@@ -750,6 +777,10 @@ impl Optionable for SpannerStatement {
             }
             OptionStatement::Other(k) if k == crate::OPTION_REQUEST_TAG => {
                 self.request.request_tag_string().map(str::to_string)
+            }
+            // The effective mode: inherited from the connection at creation unless overridden.
+            OptionStatement::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {
+                Some(self.timestamp_precision.as_str().to_string())
             }
             _ => None,
         };
@@ -858,6 +889,7 @@ impl Statement for SpannerStatement {
         let runtime = self.runtime.clone();
         let cancel = self.cancel.clone();
         let batch_size = self.rows_per_batch;
+        let precision = self.timestamp_precision;
         let bound = self.read_staleness.timestamp_bound()?;
         let statement = self.sql_builder(&sql).build();
         // Stream the result: `stream_query` fetches the first chunk (settling the schema) and the
@@ -869,7 +901,7 @@ impl Statement for SpannerStatement {
                 .execute_query(statement)
                 .await
                 .map_err(from_spanner)?;
-            stream_query(runtime, cancel, result_set, batch_size).await
+            stream_query(runtime, cancel, result_set, batch_size, precision).await
         })?;
         Ok(Box::new(reader))
     }
@@ -916,6 +948,9 @@ impl Statement for SpannerStatement {
         check_schema_query(&sql)?;
         let client = self.client.clone();
         let bound = self.bound.clone();
+        // The PLAN probe's schema must carry the same timestamp unit as the data `execute` would
+        // stream, so the advertised schema and the actual batches can never disagree.
+        let precision = self.timestamp_precision;
         // QueryMode::Plan analyses the query and returns its column metadata without scanning
         // any data, so dbt can introspect a model's output columns without wrapping it in a
         // `SELECT ... WHERE false` subquery.
@@ -935,7 +970,7 @@ impl Statement for SpannerStatement {
                 .execute_query(builder.build())
                 .await
                 .map_err(from_spanner)?;
-            let (schema, _batch) = result_set_to_batch(result_set).await?;
+            let (schema, _batch) = result_set_to_batch(result_set, precision).await?;
             Ok::<SchemaRef, Error>(schema)
         })?;
         Ok((*schema).clone())
@@ -974,6 +1009,10 @@ impl Statement for SpannerStatement {
         let client = self.client.clone();
         let data_boost = self.data_boost;
         let max_partitions = self.max_partitions;
+        // The advertised schema carries this statement's timestamp precision. Note the partitions
+        // themselves are decoded by `Connection::read_partition` under the **reading** connection's
+        // `spanner.max_timestamp_precision`, so set the two to the same mode.
+        let precision = self.timestamp_precision;
         // The partitioned read honours the statement's read staleness: it is baked into the batch
         // read-only transaction, so every partition executes at that bound wherever it is read back.
         let bound = self.read_staleness.timestamp_bound()?;
@@ -984,7 +1023,7 @@ impl Statement for SpannerStatement {
                 .execute_query(plan_stmt)
                 .await
                 .map_err(from_spanner)?;
-            let (schema, _batch) = result_set_to_batch(plan_rs).await?;
+            let (schema, _batch) = result_set_to_batch(plan_rs, precision).await?;
 
             // Partition the query across a batch read-only transaction.
             let mut txn_builder = client.batch_read_only_transaction();

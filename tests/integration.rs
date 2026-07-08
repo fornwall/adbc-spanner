@@ -1929,6 +1929,163 @@ fn bulk_ingest_chunks_past_the_byte_budget() {
     drop_chunked.execute_update().expect("drop chunked table");
 }
 
+/// `spanner.max_timestamp_precision`: a stored TIMESTAMP outside Arrow's nanosecond range
+/// (year 9999) errors loudly in the default mode — naming the column, the value and the escape
+/// hatch — and reads back exactly in `microseconds` mode, where `execute_schema` advertises the
+/// same `Timestamp(Microsecond, "UTC")` unit as the data path. Also covers connection-level
+/// inheritance, per-statement override, and `""` reset.
+#[test]
+fn timestamp_precision_modes_round_trip() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping timestamp_precision_modes_round_trip");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    let mut ddl = connection.new_statement().expect("new statement");
+    ddl.set_sql_query(
+        "DROP TABLE IF EXISTS AdbcTsPrecision; \
+         CREATE TABLE AdbcTsPrecision (Id INT64, T TIMESTAMP) PRIMARY KEY (Id)",
+    )
+    .unwrap();
+    ddl.execute_update().expect("create timestamp table");
+
+    // Year 9999 is far outside the ~1677–2262 Arrow nanosecond window; the sub-microsecond digits
+    // exercise the documented truncation. Year 1500 covers the pre-1677 side.
+    let mut ins = connection.new_statement().expect("new statement");
+    ins.set_sql_query(
+        "INSERT INTO AdbcTsPrecision (Id, T) VALUES \
+         (1, TIMESTAMP '9999-01-01T00:00:00.123456789Z'), \
+         (2, TIMESTAMP '1500-06-15T12:34:56.789012Z'), \
+         (3, NULL)",
+    )
+    .unwrap();
+    assert_eq!(ins.execute_update().expect("insert timestamps"), Some(3));
+
+    let micros_ty = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+
+    // Default mode: reading the out-of-range instant is a loud error pointing at the option.
+    let mut q = connection.new_statement().expect("new statement");
+    q.set_sql_query("SELECT T FROM AdbcTsPrecision WHERE Id = 1")
+        .unwrap();
+    // The failure may surface on `execute` (the first chunk settles the schema eagerly) or on the
+    // first batch pulled from the reader; either way the message must be diagnosable.
+    let msg = match q.execute() {
+        Err(e) => e.message,
+        Ok(reader) => match reader.collect::<Result<Vec<_>, _>>() {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("year-9999 TIMESTAMP must not decode as nanoseconds"),
+        },
+    };
+    assert!(
+        msg.contains("\"T\"")
+            && msg.contains("9999-01-01")
+            && msg.contains("spanner.max_timestamp_precision"),
+        "error should name the column, the value and the escape hatch: {msg}"
+    );
+
+    // Connection-level microseconds mode: statements inherit it, the option round-trips, and the
+    // full range reads back (with sub-microsecond digits truncated toward negative infinity).
+    connection
+        .set_option(
+            OptionConnection::Other("spanner.max_timestamp_precision".into()),
+            OptionValue::String("microseconds".into()),
+        )
+        .expect("set connection timestamp precision");
+    assert_eq!(
+        connection
+            .get_option_string(OptionConnection::Other(
+                "spanner.max_timestamp_precision".into()
+            ))
+            .unwrap(),
+        "microseconds"
+    );
+
+    let mut q = connection.new_statement().expect("new statement");
+    assert_eq!(
+        q.get_option_string(OptionStatement::Other(
+            "spanner.max_timestamp_precision".into()
+        ))
+        .unwrap(),
+        "microseconds",
+        "statement inherits the connection's mode"
+    );
+    q.set_sql_query("SELECT T FROM AdbcTsPrecision ORDER BY Id")
+        .unwrap();
+
+    // The advertised (PLAN-probe) schema must carry the same unit as the data the reader streams.
+    let planned = q.execute_schema().expect("execute_schema in micros mode");
+    assert_eq!(planned.field(0).data_type(), &micros_ty);
+
+    let reader = q.execute().expect("query in micros mode");
+    assert_eq!(reader.schema().field(0).data_type(), &micros_ty);
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect micros batches");
+    let ts = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .unwrap();
+    assert_eq!(ts.value(0), 253_370_764_800_123_456); // .123456789 truncated to .123456
+    assert_eq!(ts.value(1), -14_817_468_303_210_988); // 1500-06-15T12:34:56.789012Z
+    assert!(ts.is_null(2));
+
+    // The table-metadata surface honours the connection's mode too.
+    let table_schema = connection
+        .get_table_schema(None, None, "AdbcTsPrecision")
+        .expect("get_table_schema");
+    assert_eq!(
+        table_schema
+            .field_with_name("T")
+            .expect("T column")
+            .data_type(),
+        &micros_ty
+    );
+
+    // A statement-level `""` resets to the driver default (nanoseconds), overriding the
+    // connection's mode — and the out-of-range value errors again.
+    let mut q = connection.new_statement().expect("new statement");
+    q.set_option(
+        OptionStatement::Other("spanner.max_timestamp_precision".into()),
+        OptionValue::String(String::new()),
+    )
+    .expect("reset statement precision");
+    assert_eq!(
+        q.get_option_string(OptionStatement::Other(
+            "spanner.max_timestamp_precision".into()
+        ))
+        .unwrap(),
+        "nanoseconds_error_on_overflow"
+    );
+    q.set_sql_query("SELECT T FROM AdbcTsPrecision WHERE Id = 1")
+        .unwrap();
+    let planned = q.execute_schema().expect("execute_schema in default mode");
+    assert_eq!(
+        planned.field(0).data_type(),
+        &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+    );
+    let failed = match q.execute() {
+        Err(_) => true,
+        Ok(reader) => reader.collect::<Result<Vec<_>, _>>().is_err(),
+    };
+    assert!(failed, "statement-level reset must restore the loud error");
+
+    let mut drop_ts = connection.new_statement().expect("new statement");
+    drop_ts.set_sql_query("DROP TABLE AdbcTsPrecision").unwrap();
+    drop_ts.execute_update().expect("drop timestamp table");
+}
+
 /// Flatten a collected `get_objects` result into the table names it contains, across all
 /// catalogs and schemas.
 fn objects_table_names(batches: &[RecordBatch]) -> Vec<String> {
