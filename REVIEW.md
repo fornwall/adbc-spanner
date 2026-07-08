@@ -649,7 +649,14 @@ CHANGELOG/CONTRIBUTING/versioning policy; `#![warn(missing_docs)]` absent; assor
 polish: the four direction-specific copies of the type mapping (`bind_one` vs `bind_list` is a
 genuine 100-line duplication — fold via an element visitor, and add an "adding a type touches
 these N sites" checklist), three hand-rolled comment-skipping lexer walkers that could share one
-token iterator, ingest-mode strings matched in two places (make it an enum), positional column
+token iterator, ~~ingest-mode strings matched in two places (make it an enum)~~ (**Fixed.** The
+statement now stores `adbc_core::options::IngestMode` (the spec enum), parsed once at `set_option`
+time by `ingest_mode_option` in `src/statement.rs` — which accepts both the canonical
+`adbc.ingest.mode.*` spellings (via the `adbc_core::constants` values) and the bare short forms,
+and rejects unknown modes with the same `NotImplemented` error as before; `build_ingest_table_ddl`
+matches the enum exhaustively with no fallback arm, and `get_option` still reports the canonical
+spelling via `String::from(IngestMode)` — unit-tested offline by
+`ingest_mode_parses_both_spellings_and_rejects_unknown`), positional column
 indices into INFORMATION_SCHEMA batches, `get_option_int` inconsistencies (database vs statement,
 and "not an integer" reported as `NotFound`), SQL-text helpers scattered across three modules.
 
