@@ -57,7 +57,6 @@ use google_cloud_spanner::mutation::Mutation;
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
-use crate::bind::qualified_table;
 use crate::conversion::{TimestampPrecision, result_set_to_batch, stream_query};
 use crate::driver::Connected;
 use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
@@ -65,6 +64,7 @@ use crate::query_options::QueryOptionsConfig;
 use crate::request::RequestConfig;
 use crate::retry::RetryConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
+use crate::sql::qualified_table;
 use crate::staleness::ReadStaleness;
 use crate::statement::{DEFAULT_ROWS_PER_BATCH, SpannerStatement};
 use crate::timeout::{RpcTimeouts, with_timeout};

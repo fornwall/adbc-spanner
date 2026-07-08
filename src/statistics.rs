@@ -27,12 +27,12 @@ use futures_util::stream::{self, StreamExt};
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::Statement as SpannerSql;
 
-use crate::bind::{qualified_table, quote_ident};
 use crate::connection::{like_match, query_batch, str_col};
 use crate::conversion::result_set_to_batch;
 use crate::error::{err, from_spanner};
 use crate::nested::{arrow_err, dense_union, field, list_item, list_of, struct_fields};
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
+use crate::sql::{qualified_table, quote_ident};
 use crate::staleness::ReadStaleness;
 use crate::timeout::with_timeout;
 
