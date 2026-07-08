@@ -271,6 +271,82 @@ fn ensure_database_once(target: &TestTarget) {
     }
 }
 
+/// Connect through a `spanner:` **connection URI** — the database path as the URI path and the
+/// driver options as query parameters — instead of a bare path plus individual options, and run a
+/// query. Against the emulator the URI carries `spanner.endpoint` (percent-encoded, to exercise
+/// decoding) and `spanner.emulator=true`; against a real database the URI is just the path (ADC as
+/// usual).
+#[test]
+fn connect_via_connection_uri() {
+    let Some(target) = test_target() else {
+        eprintln!(
+            "neither SPANNER_EMULATOR_HOST nor SPANNER_GCP_DATABASE set — \
+             skipping Spanner integration test"
+        );
+        return;
+    };
+
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let uri = if target.is_emulator {
+        // The same endpoint the driver would derive from SPANNER_EMULATOR_HOST, but passed
+        // explicitly through the URI's query parameters (`://` percent-encoded).
+        let host = std::env::var("SPANNER_EMULATOR_HOST").unwrap();
+        format!(
+            "spanner:///{}?spanner.endpoint=http%3A%2F%2F{host}&spanner.emulator=true",
+            target.database_path()
+        )
+    } else {
+        format!("spanner:///{}", target.database_path())
+    };
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(OptionDatabase::Uri, OptionValue::String(uri))])
+        .expect("create database from connection URI");
+
+    // The URI expands into the underlying options: `uri` reads back as the bare database path, and
+    // the query parameters round-trip under their own option keys.
+    assert_eq!(
+        database.get_option_string(OptionDatabase::Uri).unwrap(),
+        target.database_path()
+    );
+    if target.is_emulator {
+        let host = std::env::var("SPANNER_EMULATOR_HOST").unwrap();
+        assert_eq!(
+            database
+                .get_option_string(OptionDatabase::Other("spanner.endpoint".into()))
+                .unwrap(),
+            format!("http://{host}")
+        );
+        assert_eq!(
+            database
+                .get_option_string(OptionDatabase::Other("spanner.emulator".into()))
+                .unwrap(),
+            "true"
+        );
+    }
+
+    let mut connection = connect_with_retry(&database);
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_sql_query("SELECT 1 AS one")
+        .expect("set query");
+    let batches: Vec<_> = statement
+        .execute()
+        .expect("execute over URI-configured connection")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read batches");
+    assert_eq!(batches.len(), 1);
+    let ones = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(ones.value(0), 1);
+}
+
 #[test]
 fn query_and_dml_round_trip() {
     let Some(target) = test_target() else {

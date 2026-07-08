@@ -33,7 +33,9 @@ SpannerDriver ──▶ SpannerDatabase ──▶ SpannerConnection ──▶ Sp
 ```
 
 - `src/driver.rs` — `SpannerDriver` + `SpannerDatabase`; option/config plumbing (database path,
-  endpoint, emulator, `SPANNER_EMULATOR_HOST`) and building the Spanner `DatabaseClient`.
+  endpoint, emulator, `SPANNER_EMULATOR_HOST`), `spanner:`/`cloudspanner:` connection-URI parsing
+  (path = database, `//host` authority = endpoint, query params = database options, expanded
+  eagerly on set so precedence is last-writer-wins), and building the Spanner `DatabaseClient`.
 - `src/connection.rs` — `SpannerConnection`: transaction mode (autocommit default or manual
   buffer-and-commit), `get_table_types` / `get_table_schema`.
 - `src/statement.rs` — `execute` (query → streaming Arrow reader), `execute_update` (DML/DDL, incl.
