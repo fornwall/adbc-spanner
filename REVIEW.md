@@ -645,7 +645,12 @@ cross-checked against `src/driver.rs`/`src/connection.rs`/`src/statement.rs`/`sr
 DBAPI home (`connect()` kwargs / `db_kwargs` vs `conn_kwargs` vs `adbc_stmt_kwargs` /
 `cur.adbc_statement.set_options`), documents `spanner.rows_per_batch`, and adds a CI-executed
 cookbook snippet exercising it); wheel docs omit the platform floors (glibc ≥ 2.35, macOS ≥ 11/10.15); no
-CHANGELOG/CONTRIBUTING/versioning policy; `#![warn(missing_docs)]` absent; assorted maintainability
+CHANGELOG/CONTRIBUTING/versioning policy; ~~`#![warn(missing_docs)]` absent~~ (**Fixed.**
+`src/lib.rs` now carries `#![warn(missing_docs)]`; the public surface — the four exported types, the
+option/metadata constants and the `bench_support`/`fuzzing` helper modules — was already fully
+documented, so the lint gates future additions without needing any new docs, and
+`clippy --all-targets --all-features -- -D warnings` plus `cargo doc --no-deps --all-features` stay
+clean); assorted maintainability
 polish: the four direction-specific copies of the type mapping (`bind_one` vs `bind_list` is a
 genuine 100-line duplication — fold via an element visitor, and add an "adding a type touches
 these N sites" checklist), three hand-rolled comment-skipping lexer walkers that could share one
