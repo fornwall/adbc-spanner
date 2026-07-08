@@ -8,9 +8,10 @@
 //! Setting the `adbc.connection.autocommit` option to `false` begins **manual** transaction mode.
 //! Because Spanner's client only exposes read/write transactions through a closure-based runner
 //! (there is no public begin/commit handle), the driver implements manual transactions by
-//! *buffering* DML statements and applying the whole batch atomically in a single read/write
-//! transaction on [`Connection::commit`] — which also makes the retry-on-abort safe, since the
-//! buffer is simply replayed. [`Connection::rollback`] discards the buffer.
+//! *buffering* DML statements — and the insert **mutations** of any bulk ingest — and applying the
+//! whole batch atomically in a single read/write transaction on [`Connection::commit`] — which
+//! also makes the retry-on-abort safe, since the buffer is simply replayed.
+//! [`Connection::rollback`] discards the buffer.
 //!
 //! Consequences of this model, which callers should be aware of:
 //! - In manual mode, `execute_update` on DML returns `None` (the affected-row count is not known
@@ -24,6 +25,10 @@
 //!   Commit first if a statement needs to see earlier writes.
 //! - **DML and DDL reorder:** DDL also runs immediately (DDL is never transactional in Spanner),
 //!   so DDL issued after buffered DML executes before it.
+//! - **Ingest mutations apply at commit time:** a buffered bulk ingest's insert mutations are
+//!   applied by Spanner as part of the commit itself — after every buffered DML statement in the
+//!   transaction has executed, regardless of issue order — so DML in the same transaction cannot
+//!   observe the ingested rows.
 //! - A **failed** commit keeps the buffer and the transaction open: the caller can retry
 //!   [`Connection::commit`] (replaying the batch) or [`Connection::rollback`] to discard it. The
 //!   same holds when re-enabling autocommit fails to commit the buffer: the connection stays in
@@ -47,6 +52,7 @@ use google_cloud_spanner::batch::Partition;
 use google_cloud_spanner::builder::{BatchDmlBuilder, TransactionRunnerBuilder};
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::model::transaction_options::IsolationLevel;
+use google_cloud_spanner::mutation::Mutation;
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
@@ -67,6 +73,11 @@ pub(crate) struct TxnState {
     /// statements (not raw SQL) so that parameterized DML — which carries bound values — buffers
     /// just like a plain `;`-batch does.
     pending: Vec<SpannerSql>,
+    /// Insert mutations buffered while in manual mode (a bulk ingest issued inside the manual
+    /// transaction), committed atomically with [`Self::pending`] in the same read/write transaction. Spanner
+    /// applies buffered mutations at commit time, so they land *after* every buffered DML
+    /// statement executes, regardless of the order they were issued in.
+    pending_mutations: Vec<Mutation>,
 }
 
 impl TxnState {
@@ -74,6 +85,7 @@ impl TxnState {
         Self {
             autocommit: true,
             pending: Vec::new(),
+            pending_mutations: Vec::new(),
         }
     }
 
@@ -87,36 +99,49 @@ impl TxnState {
         self.pending.push(statement);
     }
 
-    /// Atomically flip into autocommit mode and take the buffered DML that must be committed
-    /// first.
+    /// Buffer a mutation to be applied on the next commit (alongside any buffered DML).
+    pub(crate) fn buffer_mutation(&mut self, mutation: Mutation) {
+        self.pending_mutations.push(mutation);
+    }
+
+    /// Atomically flip into autocommit mode and take the buffered DML and mutations that must be
+    /// committed first.
     ///
     /// Doing both in one step — under the caller's single lock acquisition — is what closes the
     /// enable-autocommit race: `run_or_buffer` checks the mode and buffers under this same mutex,
     /// so once the mode reads autocommit no statement can add to the buffer, and the batch taken
     /// here is the complete transaction. Flipping only *after* the apply (in a later acquisition)
     /// would strand any DML buffered while the commit RPC was in flight.
-    fn enter_autocommit(&mut self) -> Vec<SpannerSql> {
+    fn enter_autocommit(&mut self) -> (Vec<SpannerSql>, Vec<Mutation>) {
         self.autocommit = true;
-        std::mem::take(&mut self.pending)
+        (
+            std::mem::take(&mut self.pending),
+            std::mem::take(&mut self.pending_mutations),
+        )
     }
 
-    /// Re-enter manual mode with `pending` re-buffered — the failure path of
+    /// Re-enter manual mode with `pending` / `mutations` re-buffered — the failure path of
     /// [`Self::enter_autocommit`], so a failed apply keeps the transaction open and replayable
     /// (retry the toggle or `commit`, or `rollback` to discard). Nothing can have buffered while
     /// autocommit was on (see `enter_autocommit`), but splice at the front anyway so replay order
     /// would survive even if that invariant ever changed.
-    fn restore_manual(&mut self, pending: Vec<SpannerSql>) {
+    fn restore_manual(&mut self, pending: Vec<SpannerSql>, mutations: Vec<Mutation>) {
         self.autocommit = false;
         self.pending.splice(0..0, pending);
+        self.pending_mutations.splice(0..0, mutations);
     }
 }
 
 #[cfg(test)]
 mod txn_state_tests {
-    use super::{SpannerSql, TxnState};
+    use super::{Mutation, SpannerSql, TxnState};
 
     fn sql(s: &str) -> SpannerSql {
         SpannerSql::builder(s).build()
+    }
+
+    fn mutation(id: i64) -> Mutation {
+        Mutation::new_insert_builder("t").set("Id").to(&id).build()
     }
 
     fn pending_sqls(st: &TxnState) -> Vec<&str> {
@@ -125,20 +150,24 @@ mod txn_state_tests {
 
     /// The mode flip and the buffer take must be one atomic step: after `enter_autocommit` the
     /// state already reads as autocommit (so `run_or_buffer`, which checks under the same mutex,
-    /// routes new DML to immediate execution) and the taken batch is the complete buffer.
+    /// routes new DML to immediate execution) and the taken batch is the complete buffer — both
+    /// the DML statements and the mutations.
     #[test]
     fn enter_autocommit_flips_and_takes_in_one_step() {
         let mut st = TxnState::new();
         st.autocommit = false;
         st.buffer(sql("UPDATE a"));
         st.buffer(sql("UPDATE b"));
-        let taken = st.enter_autocommit();
+        st.buffer_mutation(mutation(1));
+        let (taken, taken_mutations) = st.enter_autocommit();
         assert!(st.autocommit());
         assert!(st.pending.is_empty());
+        assert!(st.pending_mutations.is_empty());
         assert_eq!(
             taken.iter().map(|s| s.sql()).collect::<Vec<_>>(),
             ["UPDATE a", "UPDATE b"]
         );
+        assert_eq!(taken_mutations, [mutation(1)]);
     }
 
     /// The failure path must re-enter manual mode with the batch re-buffered — replaying the
@@ -149,13 +178,16 @@ mod txn_state_tests {
         let mut st = TxnState::new();
         st.autocommit = false;
         st.buffer(sql("UPDATE a"));
-        let taken = st.enter_autocommit();
+        st.buffer_mutation(mutation(1));
+        let (taken, taken_mutations) = st.enter_autocommit();
         // Defensively simulate a buffer written during the window (run_or_buffer cannot actually
         // do this while autocommit is on): restore must keep it, ordered after the original batch.
         st.buffer(sql("UPDATE late"));
-        st.restore_manual(taken);
+        st.buffer_mutation(mutation(2));
+        st.restore_manual(taken, taken_mutations);
         assert!(!st.autocommit());
         assert_eq!(pending_sqls(&st), ["UPDATE a", "UPDATE late"]);
+        assert_eq!(st.pending_mutations, [mutation(1), mutation(2)]);
     }
 }
 
@@ -167,10 +199,11 @@ pub(crate) type SharedTxn = Arc<Mutex<TxnState>>;
 /// # Transactions
 ///
 /// The connection is in **autocommit** mode by default. Setting `adbc.connection.autocommit` to
-/// `false` enters **manual** transaction mode, in which DML is *buffered* and applied atomically
-/// in one read/write transaction on [`Connection::commit`] ([`Connection::rollback`] discards the
-/// buffer), because the Spanner client exposes read/write transactions only through a
-/// closure-based runner (no begin/commit handle). Two consequences callers must be aware of:
+/// `false` enters **manual** transaction mode, in which DML — and the insert mutations of any bulk
+/// ingest — is *buffered* and applied atomically in one read/write transaction on
+/// [`Connection::commit`] ([`Connection::rollback`] discards the buffer), because the Spanner
+/// client exposes read/write transactions only through a closure-based runner (no begin/commit
+/// handle). Two consequences callers must be aware of:
 ///
 /// - **No read-your-writes:** queries always run immediately in a fresh read-only snapshot, so a
 ///   query does not observe DML buffered earlier in the same manual transaction — an `INSERT`
@@ -216,17 +249,22 @@ impl SpannerConnection {
         }
     }
 
-    /// Apply the buffered DML statements atomically in one read/write transaction, discarding the
-    /// affected-row count (a commit reports no count).
-    fn apply_transaction(&self, statements: Vec<SpannerSql>) -> Result<()> {
+    /// Apply the buffered DML statements and mutations atomically in one read/write transaction,
+    /// discarding the affected-row count (a commit reports no count).
+    fn apply_transaction(
+        &self,
+        statements: Vec<SpannerSql>,
+        mutations: Vec<Mutation>,
+    ) -> Result<()> {
         // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
         self.cancel.reset();
-        run_batch_dml(
+        run_batch_txn(
             &self.runtime,
             &self.client,
             &self.cancel,
             self.isolation.clone(),
             statements,
+            mutations,
         )?;
         Ok(())
     }
@@ -308,7 +346,7 @@ fn isolation_to_adbc_string(isolation: &IsolationLevel) -> &'static str {
 ///
 /// The runner may retry the closure on abort, so the (cloned) statement list is replayed on each
 /// attempt. Shared by autocommit `execute_update`, the manual-mode commit path, and each chunk of
-/// an autocommit bulk ingest (which calls this once per chunk so a retry only ever clones one
+/// an autocommit DML bulk ingest (which calls this once per chunk so a retry only ever clones one
 /// chunk, not the whole ingest).
 pub(crate) fn run_batch_dml(
     runtime: &SharedRuntime,
@@ -317,7 +355,26 @@ pub(crate) fn run_batch_dml(
     isolation: IsolationLevel,
     statements: Vec<SpannerSql>,
 ) -> Result<i64> {
-    if statements.is_empty() {
+    run_batch_txn(runtime, client, cancel, isolation, statements, Vec::new())
+}
+
+/// Apply DML `statements` and buffered `mutations` atomically in **one** read/write transaction,
+/// returning the DML statements' total affected-row count (mutations report no count).
+///
+/// The statements run via `ExecuteBatchDml`; the mutations are buffered on the transaction and
+/// applied by Spanner as part of its commit — i.e. *after* every statement has executed, whatever
+/// order they were issued in. The runner may retry the closure on abort, so both (cloned) lists
+/// are replayed on each attempt. This is the manual-transaction commit path; the DML-only wrapper
+/// is [`run_batch_dml`].
+pub(crate) fn run_batch_txn(
+    runtime: &SharedRuntime,
+    client: &DatabaseClient,
+    cancel: &CancelSignal,
+    isolation: IsolationLevel,
+    statements: Vec<SpannerSql>,
+    mutations: Vec<Mutation>,
+) -> Result<i64> {
+    if statements.is_empty() && mutations.is_empty() {
         return Ok(0);
     }
     let client = client.clone();
@@ -329,7 +386,12 @@ pub(crate) fn run_batch_dml(
         let outcome = runner
             .run(move |transaction: ReadWriteTransaction| {
                 let statements = statements.clone();
+                let mutations = mutations.clone();
                 async move {
+                    transaction.buffer(mutations)?;
+                    if statements.is_empty() {
+                        return Ok(0);
+                    }
                     let mut batch = BatchDmlBuilder::new();
                     for statement in statements {
                         batch = batch.add_statement(statement);
@@ -515,9 +577,9 @@ impl Optionable for SpannerConnection {
                         None
                     }
                 };
-                if let Some(pending) = pending {
-                    if let Err(e) = self.apply_transaction(pending.clone()) {
-                        self.txn.lock().unwrap().restore_manual(pending);
+                if let Some((pending, mutations)) = pending {
+                    if let Err(e) = self.apply_transaction(pending.clone(), mutations.clone()) {
+                        self.txn.lock().unwrap().restore_manual(pending, mutations);
                         return Err(e);
                     }
                 }
@@ -797,20 +859,23 @@ impl Connection for SpannerConnection {
         // success with nothing written. Keeping the buffer makes retry a genuine replay and
         // leaves `rollback()` available to discard instead (see the module doc for the replay
         // caveats).
-        let pending = {
+        let (pending, mutations) = {
             let st = self.txn.lock().unwrap();
             if st.autocommit {
                 return Err(invalid_state(
                     "commit invoked with autocommit enabled; no active transaction",
                 ));
             }
-            st.pending.clone()
+            (st.pending.clone(), st.pending_mutations.clone())
         };
         let applied = pending.len();
-        self.apply_transaction(pending)?;
-        // Drain exactly the statements that were applied; anything buffered concurrently while
-        // the commit RPC ran stays pending for the next commit.
-        self.txn.lock().unwrap().pending.drain(..applied);
+        let applied_mutations = mutations.len();
+        self.apply_transaction(pending, mutations)?;
+        // Drain exactly the statements/mutations that were applied; anything buffered concurrently
+        // while the commit RPC ran stays pending for the next commit.
+        let mut st = self.txn.lock().unwrap();
+        st.pending.drain(..applied);
+        st.pending_mutations.drain(..applied_mutations);
         Ok(())
     }
 
@@ -822,6 +887,7 @@ impl Connection for SpannerConnection {
             ));
         }
         st.pending.clear();
+        st.pending_mutations.clear();
         Ok(())
     }
 

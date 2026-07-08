@@ -26,6 +26,7 @@ use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::model::execute_sql_request::QueryMode;
 use google_cloud_spanner::model::transaction_options::IsolationLevel;
 use google_cloud_spanner::model::PartitionOptions;
+use google_cloud_spanner::mutation::Mutation;
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
@@ -199,34 +200,6 @@ impl SpannerStatement {
         Ok(Some(statements))
     }
 
-    /// The `INSERT` SQL for one bound batch's column set, shared by the chunked autocommit ingest
-    /// path and the manual-mode buffering path so the two cannot drift.
-    fn ingest_insert_sql(&self, table: &str, batch: &RecordBatch) -> String {
-        let columns: Vec<String> = batch
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
-        bind::insert_sql(table, self.target_db_schema.as_deref(), &columns)
-    }
-
-    /// Build one `INSERT` statement per bound row for bulk ingest into `table`.
-    ///
-    /// Only the manual-transaction buffering path materialises the full list this way; the
-    /// autocommit path builds per chunk in [`run_ingest_dml`](Self::run_ingest_dml) instead, so an
-    /// N-row ingest never holds all N statements at once.
-    fn build_ingest_statements(&self, table: &str) -> Result<Vec<SpannerSql>> {
-        let mut statements = Vec::new();
-        for batch in &self.bound {
-            let sql = self.ingest_insert_sql(table, batch);
-            for row in 0..batch.num_rows() {
-                statements.push(bind::bind_row(SpannerSql::builder(&sql), batch, row)?.build());
-            }
-        }
-        Ok(statements)
-    }
-
     /// Remap a failed `append`-mode bulk ingest onto the statuses the ADBC bulk-ingest contract
     /// mandates.
     ///
@@ -296,9 +269,9 @@ impl SpannerStatement {
     /// needs no SQL query, so an FFI caller reaches it through either the query out-pointer
     /// (`execute`) or the affected-rows path (`execute_update`). In the create/replace modes the
     /// table is first built from the ingest data's Arrow schema (with a synthetic UUID primary key)
-    /// via DDL, which Spanner runs immediately before the inserts. Returns the affected-row count
-    /// (summed across chunk transactions — see [`run_ingest_dml`](Self::run_ingest_dml)), or `None`
-    /// when the inserts were buffered for a manual-transaction commit.
+    /// via DDL, which Spanner runs immediately before the inserts. Returns the ingested-row count
+    /// (summed across chunk transactions — see [`run_ingest_mutations`](Self::run_ingest_mutations)),
+    /// or `None` when the rows were buffered for a manual-transaction commit.
     ///
     /// An ingest small enough for one chunk (the common case) applies atomically; one large enough
     /// to need several chunks does **not** — each chunk commits in its own transaction, so a
@@ -319,7 +292,7 @@ impl SpannerStatement {
         if let Some(ddl) = ingest_ddl {
             self.run_ddl(ddl)?;
         }
-        let result = self.run_ingest_dml(table);
+        let result = self.run_ingest_mutations(table);
         // The bound data is consumed by the ingest attempt either way: a reused statement handle
         // must not silently re-ingest stale rows after a failure.
         self.bound.clear();
@@ -330,38 +303,52 @@ impl SpannerStatement {
         }
     }
 
-    /// Ship the bound rows' `INSERT` statements, honouring the connection's transaction mode and
-    /// Spanner's per-commit limits.
+    /// Ship the bound rows as Spanner **insert mutations**, honouring the connection's transaction
+    /// mode and Spanner's per-commit limits.
     ///
-    /// **Manual mode** buffers every row for the next `commit`, exactly like any other DML: the
-    /// commit applies the user's whole transaction atomically, so it is never chunked (an
-    /// over-limit manual-mode ingest fails at commit, as any over-limit user transaction would).
+    /// Mutations are the `Commit` RPC's native write format: unlike the per-row parameterized
+    /// `INSERT` DML this driver used to build, they carry no SQL for Spanner to parse and plan per
+    /// row, which makes them the fast path for bulk loads. Each cell converts through the same
+    /// Arrow→Spanner value mapping as parameter binding (see [`bind::insert_mutation`]). Insert
+    /// mutations keep `INSERT` semantics — ingesting a duplicate primary key fails with
+    /// `ALREADY_EXISTS`, as the DML path's `INSERT` did. (Mutations take no isolation level:
+    /// Spanner commits blind writes serializably.)
     ///
-    /// **Autocommit mode** builds and ships the statements chunk by chunk, each chunk in its own
-    /// read/write `ExecuteBatchDml` transaction, returning the affected-row count summed across
-    /// chunks. Why chunk: Spanner caps a single commit at ~80,000 mutations — DML counts roughly
-    /// rows × columns, plus secondary-index entries — and ~100 MB, so one unchunked transaction
-    /// fails outright once the ingest crosses those cliffs (10k rows × 10 columns is already
-    /// there). An ingest that fits [`IngestChunkBudget`]'s conservative budgets still commits as a
-    /// single atomic transaction; only an ingest big enough to need several chunks — one that could
-    /// not have committed at all before — loses whole-ingest atomicity. Building per chunk also
-    /// bounds memory: only one chunk of statements is materialised (and cloned by the transaction
-    /// runner's retry closure) at a time, instead of all N rows up front.
-    fn run_ingest_dml(&self, table: &str) -> Result<Option<i64>> {
+    /// **Manual mode** buffers every row's mutation for the next `commit`, which applies them
+    /// atomically in the *same* read/write transaction as any buffered DML — Spanner applies
+    /// buffered mutations at commit time, after the transaction's DML has executed. Never chunked:
+    /// the commit applies the user's whole transaction atomically, so an over-limit manual-mode
+    /// ingest fails at commit, as any over-limit user transaction would.
+    ///
+    /// **Autocommit mode** builds and ships the mutations chunk by chunk, each chunk in its own
+    /// write-only transaction (with the client's retry/replay protection), returning the ingested
+    /// row count summed across chunks. Why chunk: Spanner caps a single commit at ~80,000 mutations
+    /// — counted roughly as rows × columns, plus secondary-index entries — and ~100 MB, so one
+    /// unchunked commit fails outright once the ingest crosses those cliffs (10k rows × 10 columns
+    /// is already there). An ingest that fits [`IngestChunkBudget`]'s conservative budgets still
+    /// commits as a single atomic transaction; only an ingest big enough to need several chunks —
+    /// one that could not have committed at all as one transaction — loses whole-ingest atomicity.
+    /// Building per chunk also bounds memory: only one chunk of mutations is materialised at a
+    /// time, instead of all N rows up front.
+    fn run_ingest_mutations(&self, table: &str) -> Result<Option<i64>> {
+        // Mutations name their target table directly (no SQL quoting; a named schema joins with a
+        // plain dot).
+        let target = bind::mutation_table(self.target_db_schema.as_deref(), table);
         {
             let mut txn = self.txn.lock().unwrap();
             if !txn.autocommit() {
-                for statement in self.build_ingest_statements(table)? {
-                    txn.buffer(statement);
+                for batch in &self.bound {
+                    for row in 0..batch.num_rows() {
+                        txn.buffer_mutation(bind::insert_mutation(&target, batch, row)?);
+                    }
                 }
                 return Ok(None);
             }
         }
         let mut total = 0_i64;
-        let mut chunk: Vec<SpannerSql> = Vec::new();
+        let mut chunk: Vec<Mutation> = Vec::new();
         let mut budget = IngestChunkBudget::default();
         for batch in &self.bound {
-            let sql = self.ingest_insert_sql(table, batch);
             let columns = batch.num_columns();
             // A cheap per-row size estimate: the batch's Arrow buffer footprint averaged over its
             // rows. Capacity-based, so it slightly over-estimates the wire size — the conservative
@@ -369,27 +356,40 @@ impl SpannerStatement {
             let row_bytes = batch.get_array_memory_size() / batch.num_rows().max(1);
             for row in 0..batch.num_rows() {
                 if !budget.fits(columns, row_bytes) {
-                    total += self.run_dml_chunk(std::mem::take(&mut chunk))?;
+                    total += self.write_mutation_chunk(std::mem::take(&mut chunk))?;
                     budget = IngestChunkBudget::default();
                 }
-                chunk.push(bind::bind_row(SpannerSql::builder(&sql), batch, row)?.build());
+                chunk.push(bind::insert_mutation(&target, batch, row)?);
                 budget.add(columns, row_bytes);
             }
         }
-        total += self.run_dml_chunk(chunk)?;
+        total += self.write_mutation_chunk(chunk)?;
         Ok(Some(total))
     }
 
-    /// Apply one ingest chunk in its own read/write transaction, returning its affected-row count
-    /// (`0` for an empty chunk, which sends nothing).
-    fn run_dml_chunk(&self, statements: Vec<SpannerSql>) -> Result<i64> {
-        crate::connection::run_batch_dml(
-            &self.runtime,
-            &self.client,
-            &self.cancel,
-            self.isolation.clone(),
-            statements,
-        )
+    /// Commit one ingest chunk in its own write-only transaction, returning its row count (`0` for
+    /// an empty chunk, which sends nothing).
+    ///
+    /// `WriteOnlyTransaction::write` carries the client's replay protection — on success the
+    /// mutations were applied exactly once, retrying internally on `ABORTED`. A commit reports no
+    /// affected-row count, but each insert mutation is exactly one row, so the chunk length is the
+    /// count.
+    fn write_mutation_chunk(&self, mutations: Vec<Mutation>) -> Result<i64> {
+        if mutations.is_empty() {
+            return Ok(0);
+        }
+        let count = mutations.len() as i64;
+        let client = self.client.clone();
+        block_on_cancellable(&self.runtime, &self.cancel, async move {
+            client
+                .write_only_transaction()
+                .build()
+                .write(mutations)
+                .await
+                .map_err(from_spanner)?;
+            Ok::<(), Error>(())
+        })?;
+        Ok(count)
     }
 
     /// An empty result reader (empty schema, no rows), for statements that yield no result set.
@@ -405,9 +405,10 @@ impl SpannerStatement {
     /// affected-row count is returned. In manual mode they are buffered for the next `commit` and
     /// `None` is returned (the count is unknown until commit). Routing user-authored DML — plain
     /// `;`-batches and parameterized DML — through here keeps it consistent with the
-    /// buffer-and-commit model. (Bulk ingest goes through [`run_ingest_dml`](Self::run_ingest_dml)
-    /// instead, which chunks the autocommit path under Spanner's commit limits; user statements are
-    /// never chunked.)
+    /// buffer-and-commit model. (Bulk ingest goes through
+    /// [`run_ingest_mutations`](Self::run_ingest_mutations) instead, which ships mutations and
+    /// chunks the autocommit path under Spanner's commit limits; user statements are never
+    /// chunked.)
     fn run_or_buffer(&self, statements: Vec<SpannerSql>) -> Result<Option<i64>> {
         {
             let mut txn = self.txn.lock().unwrap();
@@ -1133,8 +1134,9 @@ fn rows_per_batch_option(value: OptionValue) -> Result<usize> {
 }
 
 /// Per-chunk mutation budget for bulk ingest. Spanner caps a single commit at ~80,000 mutations,
-/// and DML counts roughly rows × columns **plus** secondary-index entries the driver cannot see, so
-/// the budget stays at a quarter of the cap to leave headroom for indexed tables.
+/// and an insert mutation counts roughly its column count **plus** secondary-index entries the
+/// driver cannot see, so the budget stays at a quarter of the cap to leave headroom for indexed
+/// tables.
 const INGEST_CHUNK_MUTATION_LIMIT: u64 = 20_000;
 
 /// Per-chunk approximate byte budget for bulk ingest: well under both Spanner's ~100 MB commit cap
@@ -1142,7 +1144,7 @@ const INGEST_CHUNK_MUTATION_LIMIT: u64 = 20_000;
 /// ([`IngestChunkBudget`]) is approximate.
 const INGEST_CHUNK_BYTE_BUDGET: u64 = 4 * 1024 * 1024;
 
-/// Budgets the rows of one bulk-ingest `ExecuteBatchDml` chunk against Spanner's per-commit limits.
+/// Budgets the rows of one bulk-ingest commit chunk against Spanner's per-commit limits.
 ///
 /// Each row costs its column count in mutations and an approximate byte size; a chunk is cut when
 /// the next row no longer [`fits`](Self::fits) under [`INGEST_CHUNK_MUTATION_LIMIT`] and
@@ -1177,8 +1179,9 @@ mod tests {
     use super::*;
     use adbc_core::error::Status;
 
-    /// Simulate the [`run_ingest_dml`] chunk loop for `rows` uniform rows of `columns` columns and
-    /// ~`row_bytes` bytes each, returning the chunk boundaries as per-chunk row counts.
+    /// Simulate the [`SpannerStatement::run_ingest_mutations`] chunk loop for `rows` uniform rows
+    /// of `columns` columns and ~`row_bytes` bytes each, returning the chunk boundaries as
+    /// per-chunk row counts.
     fn chunk_lengths(rows: usize, columns: usize, row_bytes: usize) -> Vec<usize> {
         let mut lengths = Vec::new();
         let mut current = 0_usize;
