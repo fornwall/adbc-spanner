@@ -60,6 +60,7 @@ enum DmlOutcome {
 }
 
 /// An ADBC statement bound to a Spanner [`DatabaseClient`].
+#[derive(Debug)]
 pub struct SpannerStatement {
     runtime: SharedRuntime,
     client: DatabaseClient,

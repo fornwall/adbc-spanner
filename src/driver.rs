@@ -33,6 +33,7 @@ const DEFAULT_IMPERSONATION_LIFETIME_SECS: u64 = 3600;
 ///
 /// The driver owns the shared Tokio runtime used to drive the asynchronous Spanner client, so a
 /// single driver instance should be reused for the lifetime of the application.
+#[derive(Debug)]
 pub struct SpannerDriver {
     runtime: SharedRuntime,
 }
@@ -80,6 +81,7 @@ impl Driver for SpannerDriver {
 ///
 /// Holds the connection parameters (the database path and, optionally, an emulator endpoint) and
 /// mints [`SpannerConnection`]s from them.
+#[derive(Debug)]
 pub struct SpannerDatabase {
     runtime: SharedRuntime,
     database: Option<String>,

@@ -212,6 +212,7 @@ pub(crate) type SharedTxn = Arc<Mutex<TxnState>>;
 ///   needs to see earlier writes.
 /// - **DML and DDL reorder:** DDL also runs immediately (DDL is never transactional in Spanner),
 ///   so DDL issued after buffered DML executes before it.
+#[derive(Debug)]
 pub struct SpannerConnection {
     runtime: SharedRuntime,
     client: DatabaseClient,
