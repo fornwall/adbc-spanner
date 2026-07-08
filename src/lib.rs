@@ -23,9 +23,9 @@
 //! projects/<project>/instances/<instance>/databases/<database>
 //! ```
 //!
-//! or as a **connection URI** with the `spanner:` scheme (`cloudspanner:` is an alias, matching
-//! the JDBC convention), whose query parameters are database-level driver options and whose
-//! optional `//host:port` authority becomes [`OPTION_ENDPOINT`]:
+//! or as a **connection URI** with the `spanner:` scheme, whose query parameters are
+//! database-level driver options and whose optional `//host:port` authority becomes
+//! [`OPTION_ENDPOINT`]:
 //!
 //! ```text
 //! spanner:///projects/<p>/instances/<i>/databases/<d>?spanner.endpoint=http://localhost:9010&spanner.emulator=true
@@ -217,9 +217,9 @@ pub mod bench_support {
 }
 
 /// Driver-specific database option: the fully-qualified Spanner database path,
-/// `projects/<project>/instances/<instance>/databases/<database>`, or a `spanner:` /
-/// `cloudspanner:` **connection URI** carrying that path plus database-level options as query
-/// parameters (see the [crate-level Configuration docs](crate#configuration)).
+/// `projects/<project>/instances/<instance>/databases/<database>`, or a `spanner:` **connection
+/// URI** carrying that path plus database-level options as query parameters (see the
+/// [crate-level Configuration docs](crate#configuration)).
 ///
 /// Equivalent to setting [`OptionDatabase::Uri`](adbc_core::options::OptionDatabase::Uri).
 pub const OPTION_DATABASE: &str = "spanner.database";

@@ -195,16 +195,15 @@ an integer or a numeric string. Every settable option round-trips through `get_o
 | `spanner.impersonate.lifetime`               | non-negative integer (seconds)    | `3600`                            | Lifetime of the impersonated token. |
 
 Instead of a bare database path, `uri` / `spanner.database` also accept a **connection URI** with
-the `spanner:` scheme (or `cloudspanner:`, the JDBC convention) whose query parameters are the
-database-level options above:
+the `spanner:` scheme whose query parameters are the database-level options above:
 
 ```text
 spanner:///projects/p/instances/i/databases/d?spanner.endpoint=http://localhost:9010&spanner.emulator=true
-cloudspanner://localhost:9010/projects/p/instances/i/databases/d
+spanner://localhost:9010/projects/p/instances/i/databases/d
 ```
 
 The URI path is the database path; an optional `//host:port` authority becomes `spanner.endpoint`
-(mirroring JDBC's `cloudspanner://host:port/projects/…` — write `spanner:///projects/…` when no
+(write `spanner:///projects/…`, with three slashes, when no
 endpoint host is intended). Query parameters must be option names from the table above (unknown
 keys are rejected); values are percent-decoded per RFC 3986 (`+` is a literal plus, not a space).
 The URI is expanded into the individual options immediately when it is set, so precedence is

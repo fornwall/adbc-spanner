@@ -120,9 +120,9 @@ impl SpannerDatabase {
     ///
     /// - A bare database path, `projects/<p>/instances/<i>/databases/<d>` — stored verbatim, exactly
     ///   as before connection URIs existed.
-    /// - A **connection URI**, recognised by a `spanner:` (or `cloudspanner:`, the JDBC convention)
-    ///   scheme — parsed by [`parse_connection_uri`] and *expanded immediately* into the underlying
-    ///   option fields, as if each part had been passed as an individual database option.
+    /// - A **connection URI**, recognised by a `spanner:` scheme — parsed by
+    ///   [`parse_connection_uri`] and *expanded immediately* into the underlying option fields, as
+    ///   if each part had been passed as an individual database option.
     ///
     /// Because the URI is expanded eagerly at `set_option` time, option precedence is purely
     /// **last-writer-wins and order-deterministic**: an explicit option set *after* the URI
@@ -474,16 +474,15 @@ const URI_QUERY_OPTIONS: [&str; 8] = [
     OPTION_IMPERSONATE_LIFETIME,
 ];
 
-/// If `value` is a connection URI — it starts with a `spanner:` or `cloudspanner:` scheme
-/// (ASCII case-insensitive, per RFC 3986) — return the remainder after the scheme. A bare
-/// database path returns `None` and is used verbatim.
+/// If `value` is a connection URI — it starts with the `spanner:` scheme (ASCII case-insensitive,
+/// per RFC 3986) — return the remainder after the scheme. A bare database path (or any other
+/// scheme) returns `None` and is used verbatim.
 fn connection_uri_remainder(value: &str) -> Option<&str> {
-    ["spanner:", "cloudspanner:"].iter().find_map(|scheme| {
-        value
-            .get(..scheme.len())
-            .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
-            .map(|_| &value[scheme.len()..])
-    })
+    const SCHEME: &str = "spanner:";
+    value
+        .get(..SCHEME.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(SCHEME))
+        .map(|_| &value[SCHEME.len()..])
 }
 
 /// The components of a parsed connection URI: the database path, the optional `//host` authority
@@ -494,19 +493,18 @@ struct ParsedConnectionUri {
     params: Vec<(String, String)>,
 }
 
-/// Parse the remainder of a `spanner:` / `cloudspanner:` connection URI (everything after the
-/// scheme), e.g.
+/// Parse the remainder of a `spanner:` connection URI (everything after the scheme), e.g.
 ///
 /// ```text
 /// spanner:///projects/p/instances/i/databases/d?spanner.endpoint=localhost:9010&spanner.emulator=true
-/// cloudspanner://emulator-host:9010/projects/p/instances/i/databases/d
+/// spanner://emulator-host:9010/projects/p/instances/i/databases/d
 /// ```
 ///
 /// - The **path** must be a full database path, `projects/<p>/instances/<i>/databases/<d>`; a
 ///   leading `/` is tolerated (`spanner:projects/…`, `spanner:/projects/…` and
 ///   `spanner:///projects/…` are equivalent).
-/// - An optional `//host[:port]` **authority** names the gRPC endpoint, mirroring JDBC's
-///   `cloudspanner://host:port/projects/…`; it is taken verbatim as the [`OPTION_ENDPOINT`] value.
+/// - An optional `//host[:port]` **authority** names the gRPC endpoint; it is taken verbatim as
+///   the [`OPTION_ENDPOINT`] value.
 /// - **Query parameters** are full driver option names from [`URI_QUERY_OPTIONS`]; unknown keys are
 ///   rejected. Keys and values are percent-decoded ([`percent_decode`]; `+` is *not* a space).
 /// - A `#fragment` is meaningless here and rejected rather than silently dropped.
@@ -1160,7 +1158,7 @@ mod tests {
         });
     }
 
-    // --- Connection URIs (`spanner:` / `cloudspanner:` schemes with query-parameter options) ---
+    // --- Connection URIs (`spanner:` scheme with query-parameter options) ---
 
     const DB_PATH: &str = "projects/p/instances/i/databases/d";
 
@@ -1190,8 +1188,7 @@ mod tests {
             format!("spanner:{DB_PATH}"),
             format!("spanner:/{DB_PATH}"),
             format!("spanner:///{DB_PATH}"),
-            format!("cloudspanner:{DB_PATH}"),
-            format!("CloudSpanner:///{DB_PATH}"), // schemes are case-insensitive
+            format!("Spanner:///{DB_PATH}"), // schemes are case-insensitive
         ] {
             let mut db = new_database();
             set_uri(&mut db, &uri).unwrap();
@@ -1201,11 +1198,24 @@ mod tests {
     }
 
     #[test]
-    fn a_host_authority_becomes_the_endpoint() {
-        // JDBC-style `cloudspanner://host:port/projects/...` — the authority is the gRPC endpoint,
-        // taken verbatim (exactly as if passed as the `spanner.endpoint` option).
+    fn a_cloudspanner_scheme_is_not_recognised() {
+        // Only `spanner:` is a connection-URI scheme; `cloudspanner:` (the JDBC convention) is
+        // deliberately not supported. Like any other unknown scheme it is not parsed as a URI —
+        // the value is stored verbatim (and rejected only later, by Spanner itself).
         let mut db = new_database();
-        set_uri(&mut db, &format!("cloudspanner://emu-host:9010/{DB_PATH}")).unwrap();
+        let uri = format!("cloudspanner:///{DB_PATH}?spanner.emulator=true");
+        set_uri(&mut db, &uri).unwrap();
+        assert_eq!(db.database.as_deref(), Some(uri.as_str()));
+        assert_eq!(db.endpoint, None);
+        assert!(!db.emulator);
+    }
+
+    #[test]
+    fn a_host_authority_becomes_the_endpoint() {
+        // `spanner://host:port/projects/...` — the authority is the gRPC endpoint, taken verbatim
+        // (exactly as if passed as the `spanner.endpoint` option).
+        let mut db = new_database();
+        set_uri(&mut db, &format!("spanner://emu-host:9010/{DB_PATH}")).unwrap();
         assert_eq!(db.database.as_deref(), Some(DB_PATH));
         assert_eq!(db.endpoint.as_deref(), Some("emu-host:9010"));
     }
@@ -1453,7 +1463,7 @@ mod tests {
         let mut db = new_database();
         db.set_option(
             OptionDatabase::Other(OPTION_DATABASE.into()),
-            OptionValue::String(format!("cloudspanner:///{DB_PATH}?spanner.emulator=1")),
+            OptionValue::String(format!("spanner:///{DB_PATH}?spanner.emulator=1")),
         )
         .unwrap();
         assert_eq!(db.database.as_deref(), Some(DB_PATH));
