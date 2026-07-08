@@ -131,10 +131,15 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   and forwards the response's structured
   [`google.rpc.Status` details](https://cloud.google.com/apis/design/errors) into the ADBC error's
   *details*: each detail becomes a `(key, value)` pair whose key is the lowercased proto type name
-  (e.g. `google.rpc.retryinfo`, `google.rpc.errorinfo`) and whose value is the detail's ProtoJSON
+  (e.g. `google.rpc.errorinfo`, `google.rpc.retryinfo`) and whose value is the detail's ProtoJSON
   encoding as UTF-8 bytes (self-describing via `"@type"`; no `-bin` key suffix since the value is
-  text, not binary protobuf). Most useful: on `ABORTED`, Spanner's `RetryInfo` detail carries the
-  server-recommended `retryDelay` to wait before retrying the transaction.
+  text, not binary protobuf). These let a caller see *why* a call failed beyond the status code —
+  for example `google.rpc.QuotaFailure` on `RESOURCE_EXHAUSTED`, `google.rpc.BadRequest` /
+  `ErrorInfo` on `INVALID_ARGUMENT`, or `google.rpc.PreconditionFailure` on `FAILED_PRECONDITION`.
+  (Spanner's `RetryInfo` on `ABORTED` is forwarded the same way, but rarely reaches a caller: the
+  client's read/write transaction runner retries aborted transactions itself — consuming that
+  `retryDelay` for its own backoff — so an `ABORTED` normally never surfaces from a DML/commit
+  path.)
 
 Not supported (returns `NotImplemented`, by nature of Spanner): **Substrait** — Spanner executes
 GoogleSQL/PostgreSQL text and has no Substrait support.

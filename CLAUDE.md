@@ -53,8 +53,11 @@ SpannerDriver ──▶ SpannerDatabase ──▶ SpannerConnection ──▶ Sp
   shared library. Gated behind the default `ffi` feature.
 - `src/error.rs` — helpers to build `adbc_core` errors. `from_spanner` takes the concrete
   `google_cloud_spanner::Error`: it maps the gRPC code onto the closest ADBC status, keeps the
-  numeric code in `vendor_code`, and forwards any `google.rpc.Status` details (RetryInfo on
-  ABORTED, ErrorInfo, BadRequest, …) into `Error.details` — key = lowercased proto type name
+  numeric code in `vendor_code`, and forwards any `google.rpc.Status` details (ErrorInfo/BadRequest
+  on INVALID_ARGUMENT, QuotaFailure on RESOURCE_EXHAUSTED, PreconditionFailure on
+  FAILED_PRECONDITION, …; RetryInfo on ABORTED is forwarded too but rarely surfaces — the client's
+  transaction runner retries aborts internally, consuming its `retryDelay`) into `Error.details` —
+  key = lowercased proto type name
   (`google.rpc.retryinfo`), value = the detail's ProtoJSON bytes (no `-bin` suffix; the pinned
   client's detail types have no binary-proto encoding). `from_builder` stays generic over
   `Display` for the status-less client-builder errors.
