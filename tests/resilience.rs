@@ -37,6 +37,17 @@
 //!   toxic (which otherwise block-and-heals, per the test above) fails with `Status::Timeout`
 //!   within the deadline — naming the option — instead of hanging; and with the deadline unset and
 //!   the fault cleared the same write succeeds, showing the expired deadline poisoned nothing.
+//! - **`mid_stream_disconnect_after_batches_surfaces_error_then_recovers`** — a `reset_peer` toxic
+//!   injected *after* the consumer has already pulled several real batches off a streaming reader
+//!   makes the next (post-buffer) chunk fetch surface a clean ADBC error rather than hang or panic
+//!   (bounded by a watchdog), and once the toxic is removed a fresh query recovers. Exercises the
+//!   resumption path, complementing `reset_peer_surfaces_error_then_recovers` (which resets a query
+//!   *before* it starts).
+//! - **`truncated_stream_surfaces_error_then_recovers`** — a `limit_data` toxic closes the
+//!   connection cleanly after a byte cap that sits above the receive buffer but well below the full
+//!   result, truncating the stream mid-flight; the reader must surface an error on the fetch past
+//!   the cap (never a silently-short "successful" result), and a fresh query recovers once the cap
+//!   is removed.
 
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -71,6 +82,10 @@ const TXN_TABLE: &str = "ResilTxn";
 // is cheap despite the volume.
 const STREAM_ROWS: i64 = 24000;
 const PAYLOAD_BYTES: usize = 2000;
+// Downstream byte cap for the truncated-stream test's `limit_data` toxic: comfortably above the
+// ~12 MB transport receive buffer (so `execute()` and the first batches succeed) but far below the
+// ~48 MB result (so the stream is cut mid-way, on a later chunk fetch, not up front).
+const TRUNCATE_AFTER_BYTES: u64 = 20 * 1024 * 1024;
 
 fn database_path() -> String {
     format!("projects/{PROJECT}/instances/{INSTANCE}/databases/{DATABASE}")
@@ -171,6 +186,16 @@ impl Toxiproxy {
         self.add_toxic(&format!(
             "{{\"name\":\"{name}\",\"type\":\"reset_peer\",\"stream\":\"downstream\",\
               \"toxicity\":1.0,\"attributes\":{{\"timeout\":{timeout_ms}}}}}"
+        ));
+    }
+
+    /// A `limit_data` toxic: close the connection cleanly once `bytes` bytes have been transmitted
+    /// downstream (server→client). This truncates a large streamed result mid-flight — an orderly
+    /// close mid-message, as opposed to `reset_peer`'s abrupt TCP RST.
+    fn add_limit_data(&self, name: &str, bytes: u64) {
+        self.add_toxic(&format!(
+            "{{\"name\":\"{name}\",\"type\":\"limit_data\",\"stream\":\"downstream\",\
+              \"toxicity\":1.0,\"attributes\":{{\"bytes\":{bytes}}}}}"
         ));
     }
 }
@@ -820,6 +845,205 @@ fn update_timeout_bounds_a_faulted_write_then_recovers_when_unset() {
         "update timeout bounded a faulted write in {elapsed:?} with Status::Timeout naming \
          spanner.rpc.timeout_seconds.update; the same write succeeded once the deadline was unset"
     );
+}
+
+/// A mid-stream transport disconnect **after** some batches have already been consumed must surface
+/// a clean ADBC error on the next chunk fetch — not a panic, not an unbounded hang, and not a
+/// silently-short result that looks complete. Then, once the fault clears, a fresh query
+/// **recovers**.
+///
+/// This is the counterpart to `reset_peer_surfaces_error_then_recovers`, which resets a query
+/// *before* it starts: here the query is already streaming and the consumer has pulled real rows
+/// off the reader before the connection dies, so it drives the resumption path (`SpannerBatchReader`
+/// fetching a later chunk over a channel that has just been reset). The result is sized well past
+/// the transport receive buffer (see `STREAM_ROWS`/`PAYLOAD_BYTES`) and read in small chunks, so
+/// plenty of rows still have to come over the network after the first few batches are consumed —
+/// guaranteeing the reset lands on a genuine mid-stream fetch rather than on already-buffered data.
+#[test]
+fn mid_stream_disconnect_after_batches_surfaces_error_then_recovers() {
+    let Some(toxi) = toxi() else {
+        eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
+        return;
+    };
+    // Enforce the single-threaded contract that makes the env swap in `ensure_setup` sound. Placed
+    // after the skip check so a plain multi-threaded `cargo test` (env unset) still self-skips.
+    let _serial = SerialGuard::new();
+    ensure_setup();
+
+    let mut connection = connect();
+    seed_stream_table(&mut connection);
+
+    // Small chunks so the reader issues many network pulls after the first, and the buffered prefix
+    // is only a fraction of the ~48 MB result.
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionValue::Int(300),
+        )
+        .expect("set rows_per_batch");
+    statement
+        .set_sql_query(format!(
+            "SELECT Id, Payload FROM {STREAM_TABLE} ORDER BY Id"
+        ))
+        .unwrap();
+
+    let mut reader = statement
+        .execute()
+        .expect("execute (first chunk) should succeed");
+
+    // Consume a few batches with no fault active — these come from the prefix `execute()` already
+    // buffered, so they must all succeed. This proves the disconnect below lands *after* real rows
+    // were delivered to the consumer, i.e. it is a genuine mid-stream disconnect.
+    let mut consumed_rows = 0usize;
+    for _ in 0..3 {
+        match reader.next() {
+            Some(Ok(batch)) => consumed_rows += batch.num_rows(),
+            Some(Err(e)) => panic!("a batch failed before any fault was injected: {e}"),
+            None => break,
+        }
+    }
+    assert!(
+        consumed_rows > 0,
+        "expected to consume at least one batch before injecting the fault"
+    );
+
+    // Now break the transport and drain the rest on a worker thread (bounded by a watchdog). Once
+    // the buffered prefix is exhausted the reader must pull a later chunk over the reset channel,
+    // which has to surface an error rather than hang or panic.
+    toxi.add_reset_peer("resil_midstream_reset", 0);
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result: Result<Vec<_>, _> = reader.collect();
+        let _ = tx.send((result.is_err(), format!("{:?}", result.err())));
+    });
+    let outcome = rx.recv_timeout(Duration::from_secs(45));
+    // Clear the toxic regardless, so a failure doesn't leave the proxy poisoned for other tests.
+    toxi.remove_toxic("resil_midstream_reset");
+
+    let Ok((is_err, err_debug)) = outcome else {
+        panic!(
+            "draining the reader after a mid-stream reset hung past the 45s watchdog — the driver \
+             did not surface the disconnect"
+        )
+    };
+    worker.join().ok();
+    assert!(
+        is_err,
+        "a mid-stream disconnect after {consumed_rows} rows were consumed must surface an error, \
+         got Ok — the driver treated a truncated stream as complete"
+    );
+    eprintln!(
+        "mid-stream disconnect surfaced a clean error after {consumed_rows} rows: {err_debug}"
+    );
+
+    // Recovery: with the toxic gone, a fresh query succeeds again once the channel re-establishes.
+    let connection = Arc::new(Mutex::new(connection));
+    let mut recovered = false;
+    for _ in 0..20 {
+        if query_one(&connection).is_ok() {
+            recovered = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(
+        recovered,
+        "driver did not recover after the mid-stream reset toxic was removed"
+    );
+    eprintln!("driver recovered after the mid-stream disconnect");
+}
+
+/// A **truncated** stream — the server-side connection closed part-way through a large result,
+/// after the driver has already received and returned some rows — must surface a clean ADBC error
+/// on the fetch that runs past the truncation point, never a silently-short (but "successful")
+/// result. Then a fresh query **recovers** once the fault clears.
+///
+/// Toxiproxy's `limit_data` toxic closes the connection cleanly after a fixed number of downstream
+/// bytes, which is exactly a truncated stream: the byte cap ([`TRUNCATE_AFTER_BYTES`]) sits above
+/// the transport receive buffer (so `execute()` and the first batches succeed) but well below the
+/// ~48 MB result (so the reader runs into the truncation while fetching a later chunk). Unlike
+/// `reset_peer` (an abrupt TCP RST), this is an orderly close mid-message, so it specifically guards
+/// against the driver mistaking a truncated result for a complete one.
+#[test]
+fn truncated_stream_surfaces_error_then_recovers() {
+    let Some(toxi) = toxi() else {
+        eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
+        return;
+    };
+    // Enforce the single-threaded contract that makes the env swap in `ensure_setup` sound. Placed
+    // after the skip check so a plain multi-threaded `cargo test` (env unset) still self-skips.
+    let _serial = SerialGuard::new();
+    ensure_setup();
+
+    let mut connection = connect();
+    seed_stream_table(&mut connection);
+
+    // Small chunks so the reader issues many network pulls after the first — plenty of fetches to
+    // run past the byte cap.
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionValue::Int(300),
+        )
+        .expect("set rows_per_batch");
+    statement
+        .set_sql_query(format!(
+            "SELECT Id, Payload FROM {STREAM_TABLE} ORDER BY Id"
+        ))
+        .unwrap();
+
+    // Install the byte cap *before* execute so it counts from the very start of the result stream,
+    // then drain the reader on a worker thread bounded by a watchdog. `execute()` succeeds (the cap
+    // is above the receive buffer) and the first batches come through, but a later chunk fetch runs
+    // past the cap onto a closed connection and must fail rather than hang or return short.
+    toxi.add_limit_data("resil_truncate", TRUNCATE_AFTER_BYTES);
+    let reader = statement
+        .execute()
+        .expect("execute (first chunk) should succeed under the byte cap");
+
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result: Result<Vec<_>, _> = reader.collect();
+        let rows: usize = result
+            .as_ref()
+            .map_or(0, |batches| batches.iter().map(|b| b.num_rows()).sum());
+        let _ = tx.send((result.is_err(), rows, format!("{:?}", result.err())));
+    });
+    let outcome = rx.recv_timeout(Duration::from_secs(45));
+    // Clear the toxic regardless, so a failure doesn't leave the proxy poisoned for other tests.
+    toxi.remove_toxic("resil_truncate");
+
+    let Ok((is_err, rows, err_debug)) = outcome else {
+        panic!(
+            "draining a truncated stream hung past the 45s watchdog — the driver did not surface \
+             the truncation"
+        )
+    };
+    worker.join().ok();
+    assert!(
+        is_err,
+        "a truncated stream must surface an error, got Ok with {rows} rows — the driver treated a \
+         truncated result as complete (the query selects all {STREAM_ROWS} rows)"
+    );
+    eprintln!("truncated stream surfaced a clean error: {err_debug}");
+
+    // Recovery: with the cap gone, a fresh query succeeds again once the channel re-establishes.
+    let connection = Arc::new(Mutex::new(connection));
+    let mut recovered = false;
+    for _ in 0..20 {
+        if query_one(&connection).is_ok() {
+            recovered = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(
+        recovered,
+        "driver did not recover after the limit_data truncation toxic was removed"
+    );
+    eprintln!("driver recovered after the truncated stream");
 }
 
 /// Run a query expected to return a single INT64 cell and return its value.
