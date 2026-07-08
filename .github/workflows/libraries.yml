@@ -215,8 +215,8 @@ jobs:
               cargo build --release
             '
 
-      # Confirm the promise the musllinux_1_2 wheel makes: a real musl object (musl
-      # loader, no glibc-versioned symbols) that exports the driver entrypoint. Docker
+      # Confirm the promise the musllinux_1_2 wheel makes: a real musl object (no
+      # *required* glibc-versioned symbols) that exports the driver entrypoint. Docker
       # wrote the target dir as root; read-only inspection on the host is unaffected.
       - name: Verify the library is a musl (not glibc) shared object
         run: |
@@ -226,10 +226,26 @@ jobs:
             echo "::error::musl build produced no cdylib at $lib (crt-static dropping it?)" >&2
             exit 1
           fi
-          if objdump -T "$lib" | grep -qE 'GLIBC_[0-9]'; then
-            echo "::error::$lib references glibc symbols — not a musl build" >&2
-            objdump -T "$lib" | grep -E 'GLIBC_[0-9]' >&2
+          # A musl build must not *require* any glibc-versioned symbol. But GCC's
+          # crtbeginS.o emits *weak, undefined* references to the legacy libgcc frame
+          # hooks (__register_frame_info / __deregister_frame_info), and on aarch64 those
+          # carry a GLIBC_2.0 version tag (they don't appear on x86-64). Being weak and
+          # undefined, musl's loader leaves them NULL and the crt code is NULL-guarded, so
+          # they are not a real glibc dependency and must not fail this check. Only a
+          # *non-weak* (GLOBAL) undefined GLIBC symbol is a genuine glibc link — parse the
+          # dynamic symbol table (Bind=$5, Ndx=$7, Name+version=$8) and fail on those.
+          strong="$(readelf -W --dyn-syms "$lib" \
+            | awk '$8 ~ /@GLIBC_/ && $7 == "UND" && $5 != "WEAK" { print $8 }' || true)"
+          if [ -n "$strong" ]; then
+            echo "::error::$lib requires glibc symbols — not a musl build" >&2
+            printf '%s\n' "$strong" >&2
             exit 1
+          fi
+          weak="$(readelf -W --dyn-syms "$lib" \
+            | awk '$8 ~ /@GLIBC_/ && $7 == "UND" && $5 == "WEAK" { print $8 }' || true)"
+          if [ -n "$weak" ]; then
+            echo "note: ignoring harmless weak-undefined glibc-tagged symbols (musl leaves them NULL):"
+            printf '  %s\n' "$weak"
           fi
           if ! nm -D --defined-only "$lib" | grep -q AdbcSpannerInit; then
             echo "::error::$lib does not export AdbcSpannerInit" >&2
