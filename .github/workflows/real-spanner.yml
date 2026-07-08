@@ -1,0 +1,129 @@
+name: Real Cloud Spanner (nightly)
+
+# Runs the integration suite against a REAL Cloud Spanner database — the only CI job that exercises
+# the non-emulator auth path (Application Default Credentials → the driver's ADC fallback), which the
+# anonymous emulator can never cover.
+#
+# Non-gating on purpose (modeled on fuzz.yml / resilience.yml): it talks to a live, billed Google
+# Cloud instance, so it must never block a PR or a push. It runs only on a nightly schedule and on
+# manual dispatch. The canonical functional suites (ci.yml / adbc-validation.yml) stay the gate.
+#
+# ── Authentication: GitHub OIDC → Workload Identity Federation ────────────────────────────────────
+# Instead of a long-lived service-account key, the job mints a short-lived GCP access token from the
+# run's OIDC identity token via `google-github-actions/auth` (needs `permissions: id-token: write`).
+# `auth` writes ADC credentials and exports GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_GHA_CREDS_PATH,
+# which the driver's ADC fallback (SpannerDatabase::connect with no emulator host and no keyfile)
+# picks up automatically — no driver change and no secret key material in the repo.
+#
+# ── Required GitHub configuration (one-time setup, before the first run) ───────────────────────────
+# Secrets (Settings → Secrets and variables → Actions → Secrets):
+#   GCP_WORKLOAD_IDENTITY_PROVIDER — full WIF provider resource name, e.g.
+#     projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>
+#   GCP_SERVICE_ACCOUNT           — the service account to impersonate, e.g.
+#     spanner-ci@<PROJECT_ID>.iam.gserviceaccount.com  (needs roles/spanner.databaseUser on the
+#     target instance; the instance itself must already exist — the test only creates the database
+#     and its tables)
+# Variables (Settings → Secrets and variables → Actions → Variables):
+#   SPANNER_GCP_DATABASE — the target database in `project.instance.database` form, e.g.
+#     my-project.ci-instance.adbc-ci
+#
+# One-time WIF setup on the Google Cloud side (mirrors how CLAUDE.md documents the PyPI publisher):
+#   1. Create a Workload Identity Pool + an OIDC provider for GitHub Actions
+#      (issuer https://token.actions.githubusercontent.com), with an attribute condition that
+#      restricts it to this repository (e.g. assertion.repository == 'fornwall/adbc-spanner').
+#   2. Grant the provider's principalSet `roles/iam.workloadIdentityUser` on the service account
+#      referenced by GCP_SERVICE_ACCOUNT.
+#   3. Grant that service account `roles/spanner.databaseUser` (and, if the database may not exist
+#      yet, `roles/spanner.databaseAdmin`) on the target Spanner instance.
+# See https://github.com/google-github-actions/auth#setup for the exact gcloud commands.
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly at 05:30 UTC (offset from the fuzz/resilience crons so the runners don't all fire at once).
+    - cron: "30 5 * * *"
+
+# Release-safe and consistent with the other workflows: never cancels a scheduled run (this workflow
+# never runs on `pull_request`, so `cancel-in-progress` is always false here).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege at the workflow level; the job below adds `id-token: write` for OIDC.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  real-spanner:
+    name: Integration suite (real Cloud Spanner, non-gating)
+    runs-on: ubuntu-latest
+
+    # OIDC needs a token to exchange for GCP credentials; contents:read to check out the repo.
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      # Point the integration test at the real database (from a repo variable, not a hardcoded id).
+      SPANNER_GCP_DATABASE: ${{ vars.SPANNER_GCP_DATABASE }}
+      # Fail LOUD (panic) instead of self-skipping if the target env wiring above is ever dropped or
+      # the secret/var is unset — otherwise the suite would pass vacuously with zero real coverage.
+      ADBC_TEST_REQUIRE_TARGET: "1"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Mint short-lived GCP credentials from this run's OIDC identity via Workload Identity
+      # Federation. Writes ADC creds + exports GOOGLE_APPLICATION_CREDENTIALS for the test.
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      # Build first so a compile error is distinct from a Spanner/auth failure in the logs.
+      - name: Build
+        run: cargo build --tests
+
+      - name: Integration tests (real Cloud Spanner)
+        run: cargo test --test integration -- --nocapture
+
+  # A scheduled real-Spanner failure otherwise surfaces only as an email, and a scheduled workflow
+  # that keeps failing (or that nobody watches) auto-disables after 60 days of inactivity. Open — or
+  # comment on an already-open — tracking issue so a nightly regression stays visible in the repo.
+  # Only fires on the nightly `schedule` trigger, never on manual `workflow_dispatch` runs.
+  report-failure:
+    needs: real-spanner
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    # Least privilege: only this job needs to write issues.
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          label="nightly-real-spanner-failure"
+          title="Nightly real Cloud Spanner run failed"
+          # Idempotent: ensure the tracking label exists, then reuse an already-open issue instead
+          # of opening a fresh one every night.
+          gh label create "$label" --color B60205 \
+            --description "Automated: a scheduled real Cloud Spanner run failed" 2>/dev/null || true
+          body="A scheduled [real Cloud Spanner run]($RUN_URL) failed (commit ${GITHUB_SHA})."
+          existing="$(gh issue list --state open --label "$label" --limit 1 --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --label "$label" --body "$body"
+          fi

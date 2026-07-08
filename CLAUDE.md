@@ -193,6 +193,14 @@ is cross-compiled, off the universal Apple toolchain) and installs NASM only on 
   service-account JSON key → `keyfile_auth_end_to_end`) and/or
   `SPANNER_TEST_IMPERSONATE_TARGET_PRINCIPAL` (a principal to impersonate, base creds from ADC →
   `impersonation_auth_end_to_end`).
+- **CI against a real database.** `.github/workflows/real-spanner.yml` runs the integration suite
+  against a real Cloud Spanner database on a nightly `schedule` + `workflow_dispatch` — non-gating
+  (never on PR/push), the only CI job that exercises the non-emulator ADC auth path. It authenticates
+  via GitHub OIDC → Workload Identity Federation (`google-github-actions/auth`, `id-token: write`)
+  and reads config from GitHub secrets `GCP_WORKLOAD_IDENTITY_PROVIDER` / `GCP_SERVICE_ACCOUNT` and
+  var `SPANNER_GCP_DATABASE`. Its top comment documents the one-time WIF setup (mirrors the PyPI
+  one-time-setup note above); a `report-failure` job opens a tracking issue on nightly failure, like
+  `fuzz.yml`/`resilience.yml`.
 - Setup creates the database/table via the admin clients (`instance_admin_builder()` /
   `database_admin_builder()` → `create_instance` [emulator only] / `create_database(..).poller()`),
   then exercises the driver (DML insert + typed SELECT). It runs once per binary behind a mutex

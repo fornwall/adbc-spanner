@@ -395,9 +395,31 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   a partial failure can no longer leave a PyPI version with no matching GitHub assets. The redundant
   inline gate was removed from `python-wheels`, whose remaining "Sync wheel version to the crate"
   step only stamps `_version.py` (no tag comparison), so the check is no longer duplicated.
-- **No CI ever touches real Cloud Spanner** — `SPANNER_GCP_DATABASE` support exists but appears in
+- ~~**No CI ever touches real Cloud Spanner** — `SPANNER_GCP_DATABASE` support exists but appears in
   no workflow; auth paths (ADC, impersonation) are untested in CI since the emulator is anonymous.
-  A scheduled non-gating workflow via GitHub OIDC → Workload Identity Federation would cover it.
+  A scheduled non-gating workflow via GitHub OIDC → Workload Identity Federation would cover it.~~
+  (fixed) **Fixed.** A new non-gating workflow `.github/workflows/real-spanner.yml` runs the
+  integration suite (`cargo test --test integration`) against a **real** Cloud Spanner database, so
+  the driver's non-emulator ADC path (`SpannerDatabase::connect`'s Application-Default-Credentials
+  fallback) — which the anonymous emulator can never exercise — is finally covered in CI. It runs
+  **only** on a nightly `schedule` (05:30 UTC, offset from the fuzz/resilience crons) and on manual
+  `workflow_dispatch`; it never runs on `pull_request`/`push`, so it does not gate normal CI, and
+  its `concurrency:` block matches the other workflows (never cancels a scheduled run). Auth uses
+  **GitHub OIDC → Workload Identity Federation** via `google-github-actions/auth` (pinned to the
+  v3.0.0 commit SHA, like every other third-party action here): the `real-spanner` job carries
+  `permissions: id-token: write` (plus `contents: read`) and the action mints short-lived GCP
+  credentials from the run's OIDC identity token — no long-lived service-account key in the repo.
+  Config comes from GitHub secrets/vars referenced by name: secrets
+  `GCP_WORKLOAD_IDENTITY_PROVIDER` (the WIF provider resource name) and `GCP_SERVICE_ACCOUNT` (the
+  service account to impersonate), and variable `SPANNER_GCP_DATABASE` (the
+  `project.instance.database` target). The job sets `ADBC_TEST_REQUIRE_TARGET=1` so a dropped/unset
+  var fails loud instead of skipping vacuously. A `report-failure` job, guarded by
+  `if: failure() && github.event_name == 'schedule'` with `permissions: issues: write`, opens (or
+  comments on) a tracking issue via the `gh` CLI — the same pattern as `fuzz.yml`/`resilience.yml`,
+  so a nightly regression stays visible instead of only emailing. The file's top comment and a note
+  in CLAUDE.md's testing section document the required secrets/vars and the one-time WIF setup. The
+  workflow itself cannot be dry-run here (no GCP project/WIF pool exists); it was validated with
+  `actionlint` (clean) and the YAML parses.
 
 ### Maintainability
 
