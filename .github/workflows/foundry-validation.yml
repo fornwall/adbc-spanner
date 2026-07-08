@@ -37,7 +37,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           # adbc-drivers-validation requires Python >= 3.13.
           python-version: "3.13"
