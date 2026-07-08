@@ -145,7 +145,11 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   (Spanner's `RetryInfo` on `ABORTED` is forwarded the same way, but rarely reaches a caller: the
   client's read/write transaction runner retries aborted transactions itself — consuming that
   `retryDelay` for its own backoff — so an `ABORTED` normally never surfaces from a DML/commit
-  path.)
+  path.) Note this per-detail, type-name-keyed ProtoJSON layout deliberately diverges from the
+  Flight SQL ADBC driver, which emits a single `grpc-status-details-bin` detail holding the whole
+  `google.rpc.Status` as binary protobuf — so a consumer written to Flight SQL's convention won't
+  interoperate. The reason is that the pinned preview client decodes details into serde-modelled
+  types whose only supported encoding is ProtoJSON, with no binary-protobuf path.
 
 Not supported (returns `NotImplemented`, by nature of Spanner): **Substrait** — Spanner executes
 GoogleSQL/PostgreSQL text and has no Substrait support.

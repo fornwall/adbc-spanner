@@ -58,6 +58,11 @@ pub(crate) fn invalid_argument(message: impl Into<String>) -> Error {
 ///   serde-modelled types whose only supported wire encoding is ProtoJSON; the format is a stable,
 ///   documented protobuf encoding that any JSON parser can consume.
 ///
+/// This per-detail, type-name-keyed ProtoJSON layout deliberately diverges from the Flight SQL ADBC
+/// driver's convention (a single `grpc-status-details-bin` detail carrying the whole `google.rpc.Status`
+/// as binary protobuf), so a consumer written to that convention won't interoperate; the pinned
+/// preview client offers no binary-protobuf encoding of details, only ProtoJSON.
+///
 /// Together with `vendor_code`, these details give a caller structured diagnostics beyond the ADBC
 /// status. Note that `RetryInfo` on `ABORTED` rarely reaches here in practice: the Spanner client's
 /// read/write transaction runner — and the write-only mutation (bulk-ingest) path — retry aborted
