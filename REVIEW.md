@@ -663,8 +663,14 @@ cross-checked against `src/driver.rs`/`src/connection.rs`/`src/statement.rs`/`sr
 `python/README.md` gained a matching *Option reference* section that also maps each level to its
 DBAPI home (`connect()` kwargs / `db_kwargs` vs `conn_kwargs` vs `adbc_stmt_kwargs` /
 `cur.adbc_statement.set_options`), documents `spanner.rows_per_batch`, and adds a CI-executed
-cookbook snippet exercising it); wheel docs omit the platform floors (glibc ≥ 2.35, macOS ≥ 11/10.15); no
-CHANGELOG/CONTRIBUTING/versioning policy; ~~`#![warn(missing_docs)]` absent~~ (**Fixed.**
+cookbook snippet exercising it); wheel docs omit the platform floors (glibc ≥ 2.35, macOS ≥ 11/10.15); ~~no
+CHANGELOG/CONTRIBUTING/versioning policy~~ (**Fixed.** A `CHANGELOG.md` (Keep a Changelog format,
+`## [Unreleased]` on top, per-version entries for `0.1.0`–`0.6.0` derived from the git tags) and a
+`CONTRIBUTING.md` (build/test/lint commands, the emulator integration via `scripts/with-emulator.sh`,
+what CI enforces, the `cargo-release`-only release process, and the SemVer versioning policy —
+pointing at the CLAUDE.md revert checklist as the source of truth for the two git-pin families rather
+than duplicating it) were added, and both name Semantic Versioning as the versioning policy);
+~~`#![warn(missing_docs)]` absent~~ (**Fixed.**
 `src/lib.rs` now carries `#![warn(missing_docs)]`; the public surface — the four exported types, the
 option/metadata constants and the `bench_support`/`fuzzing` helper modules — was already fully
 documented, so the lint gates future additions without needing any new docs, and
