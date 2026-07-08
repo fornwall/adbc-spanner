@@ -609,9 +609,21 @@ path is unit-tested offline against empty / non-JSON / truncated / wrong-shape-J
 cancel latched *between* `read_partition` chunk fetches cancels the next fetch, statements on the
 same connection are unaffected (own signal), and the connection's next operation resets the latch.
 All but the offline decode test live in `tests/integration.rs`.);
-fuzz gaps: statement-hint parsing (`first_keyword` — this exact code had a real bug),
+~~fuzz gaps: statement-hint parsing (`first_keyword` — this exact code had a real bug),
 `strip_trailing_terminators`, parameter-name extraction, `quote_ident`, partition-descriptor
-deserialization; `tests/resilience.rs` mutates process env in setup — safe only under
+deserialization~~ (**Fixed.** Three new fuzz targets, registered in `fuzz/Cargo.toml` and the
+nightly `fuzz.yml` matrix with seed corpora, each with independent oracles rather than
+panic-only: `keyword` covers `first_keyword` + `strip_trailing_terminators` (keyword is an
+uppercase word occurring verbatim in the input; `is_ddl`/`is_dml` agree with a re-stated copy of
+the keyword lists; metamorphic check that whitespace/comment/`@{…}`-hint prefixes — the exact
+surface of the real bug — never change the keyword; the strip is a verbatim substring, idempotent,
+and `split_statements`-preserving), `params` covers `named_parameters` + `resolve_parameter_names`
++ `quote_ident` (extracted names are distinct well-formed identifiers occurring verbatim as
+`@name`; the pairing follows the documented name-mode/positional contract with `InvalidArguments`
+exactly on count mismatch; quoting unquotes back to the input and embeds as one opaque token under
+the crate's own lexer), and `partition` covers `decode_partition` over arbitrary bytes (rejections
+are clean `InvalidArguments`, accepted descriptors survive a serialize → decode → serialize round
+trip unchanged).); `tests/resilience.rs` mutates process env in setup — safe only under
 `--test-threads=1`, worth asserting.
 
 **Features** (all exposed by the pinned client unless noted): request priority / request tags /

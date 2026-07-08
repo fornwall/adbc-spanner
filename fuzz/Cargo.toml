@@ -48,4 +48,25 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "keyword"
+path = "fuzz_targets/keyword.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "params"
+path = "fuzz_targets/params.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "partition"
+path = "fuzz_targets/partition.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

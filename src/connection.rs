@@ -865,7 +865,7 @@ impl Connection for SpannerConnection {
 /// serde-JSON of the client's [`Partition`]. Anything that does not decode (empty input, non-JSON
 /// bytes, or valid JSON of the wrong shape) is an [`Status::InvalidArguments`] error, never a
 /// panic. A pure function so the rejection path is unit-testable without a connection.
-fn decode_partition(descriptor: &[u8]) -> Result<Partition> {
+pub(crate) fn decode_partition(descriptor: &[u8]) -> Result<Partition> {
     serde_json::from_slice(descriptor)
         .map_err(|e| invalid_argument(format!("invalid partition descriptor: {e}")))
 }

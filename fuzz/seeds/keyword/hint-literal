@@ -1,0 +1,1 @@
+@{A='}'} DELETE FROM t WHERE true
