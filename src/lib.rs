@@ -369,8 +369,8 @@ pub const OPTION_ENDPOINT: &str = "spanner.endpoint";
 /// Driver-specific database option: when set to `true`, connect with anonymous credentials
 /// (the mode used by the Spanner emulator). Automatically enabled when `SPANNER_EMULATOR_HOST`
 /// is present in the environment. Combining emulator mode with explicitly configured credentials
-/// ([`OPTION_KEYFILE`], [`OPTION_KEYFILE_JSON`], or [`OPTION_IMPERSONATE_TARGET_PRINCIPAL`]) is
-/// refused at connect time instead of silently ignoring them.
+/// ([`OPTION_KEYFILE`], [`OPTION_KEYFILE_JSON`], [`OPTION_IMPERSONATE_TARGET_PRINCIPAL`], or
+/// [`OPTION_ACCESS_TOKEN`]) is refused at connect time instead of silently ignoring them.
 pub const OPTION_EMULATOR: &str = "spanner.emulator";
 
 /// Driver-specific database option: path to a service-account JSON key file to authenticate with
@@ -407,6 +407,21 @@ pub const OPTION_IMPERSONATE_SCOPES: &str = "spanner.impersonate.scopes";
 /// Defaults to 3600 (one hour) when unset. Only used when a target principal is set. Mirrors
 /// BigQuery's `bigquery.impersonate.lifetime`.
 pub const OPTION_IMPERSONATE_LIFETIME: &str = "spanner.impersonate.lifetime";
+
+/// Driver-specific database option: a caller-supplied OAuth 2.0 access token (a bearer token) to
+/// authenticate with directly.
+///
+/// When set, the driver sends the token verbatim as the `Authorization: Bearer <token>` header on
+/// every request and performs **no refresh** — the caller is responsible for supplying a valid,
+/// unexpired token. This is useful when a token has already been obtained out of band (for example
+/// via `gcloud auth print-access-token`, a Workload Identity exchange, or another auth library).
+///
+/// It is a complete credential in its own right and is therefore **mutually exclusive** with
+/// [`OPTION_KEYFILE`], [`OPTION_KEYFILE_JSON`], and [`OPTION_IMPERSONATE_TARGET_PRINCIPAL`]:
+/// combining it with any of them is refused at connect time with
+/// [`Status::InvalidState`](adbc_core::error::Status::InvalidState). Like the keyfile options, it
+/// also conflicts with emulator mode (which forces anonymous credentials).
+pub const OPTION_ACCESS_TOKEN: &str = "spanner.access_token";
 
 /// Driver-specific statement option: the number of rows converted into each Arrow
 /// [`RecordBatch`](arrow_array::RecordBatch) streamed by

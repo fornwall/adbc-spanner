@@ -24,6 +24,7 @@ dependencies = [
  "google-cloud-spanner",
  "google-cloud-spanner-admin-database-v1",
  "google-cloud-spanner-admin-instance-v1",
+ "http",
  "libloading 0.9.0",
  "proptest",
  "prost",

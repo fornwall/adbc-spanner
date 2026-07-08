@@ -711,8 +711,23 @@ clear error~~ (**wontfix** — not worth the effort. Reliable dialect detection 
 (it would regress connections for principals that have data-plane access but lack
 `spanner.databases.get`), and the payoff — a slightly clearer error on the rare PostgreSQL-dialect
 database — doesn't justify the extra connect-time RPC and complexity. PR #167 closed unmerged.);
-OAuth access-token auth (needs a small custom credentials impl — the auth crate has
-no static-token builder); query options (optimizer version), directed reads, commit stats,
+~~OAuth access-token auth (needs a small custom credentials impl — the auth crate has
+no static-token builder)~~ (**Fixed.** New `spanner.access_token` database option authenticates
+with a caller-supplied OAuth 2.0 bearer token. The pinned `google-cloud-auth` crate indeed ships no
+static-token builder, so the driver implements the public `CredentialsProvider` trait directly with
+`StaticTokenCredentials` in `src/driver.rs` — a minimal, refresh-free credential that returns a
+pre-built, sensitive `Authorization: Bearer <token>` header on every request (built via
+`build_static_token_credentials`, which validates the token as a header value up front and never
+interpolates it into an error, upholding the `scrub_credential_error` no-leak discipline). It is a
+complete credential, so it is mutually exclusive with `spanner.keyfile` / `spanner.keyfile_json` /
+`spanner.impersonate.target_principal` (combining them is refused at connect time with
+`InvalidState`, naming the conflict) and trips the same emulator-mode-vs-explicit-credentials guard
+as the keyfiles; it round-trips through `get_option` verbatim (matching the `keyfile_json`
+convention) and is accepted as a `spanner:` connection-URI query parameter. Wired through the
+Python wrapper as an `access_token=` kwarg and documented in `README.md`, `python/README.md`,
+`docs/options.md`, and the `OPTION_ACCESS_TOKEN` rustdoc; offline unit tests cover the round-trip,
+the three mutual-exclusion conflicts, the emulator refusal, the bearer-header emission, and the
+no-leak rejection of a malformed token.); query options (optimizer version), directed reads, commit stats,
 `max_commit_delay`, `last_statement` optimization (free RPC saving for single-statement
 autocommit DML); ~~proto/enum columns (verify clean failure today)~~ (**Fixed.** They failed
 *silently*, not cleanly: `arrow_type` in `src/conversion.rs` mapped both `TypeCode::Proto` and

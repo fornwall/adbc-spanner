@@ -254,6 +254,7 @@ every option's exact type and allowed values, default, and `get_option` round-tr
 | `spanner.impersonate.delegates`              | Delegation chain for impersonation (comma-separated). |
 | `spanner.impersonate.scopes`                 | OAuth scopes for the impersonated token (comma-separated). |
 | `spanner.impersonate.lifetime`               | Lifetime of the impersonated token, in seconds. |
+| `spanner.access_token`                       | A caller-supplied OAuth 2.0 bearer token; sent verbatim with no refresh. Mutually exclusive with the keyfile/impersonation options. |
 
 Instead of a bare database path, `uri` / `spanner.database` also accept a **connection URI** with
 the `spanner:` scheme whose query parameters are the database-level options above:
@@ -324,13 +325,26 @@ Credentials are resolved in this order:
 
 1. **Emulator** — if `SPANNER_EMULATOR_HOST` is set (or `spanner.emulator` is `true`), anonymous
    credentials are used and the endpoint is taken from the environment. Combining emulator mode
-   with explicit credentials (`spanner.keyfile`, `spanner.keyfile_json`, or
-   `spanner.impersonate.target_principal`) is refused at connect time rather than silently
-   ignoring them; ambient ADC (e.g. `GOOGLE_APPLICATION_CREDENTIALS`) does not conflict.
-2. **Service account** — a key supplied inline via `spanner.keyfile_json` or read from the path
+   with explicit credentials (`spanner.keyfile`, `spanner.keyfile_json`,
+   `spanner.impersonate.target_principal`, or `spanner.access_token`) is refused at connect time
+   rather than silently ignoring them; ambient ADC (e.g. `GOOGLE_APPLICATION_CREDENTIALS`) does not
+   conflict.
+2. **Access token** — a caller-supplied OAuth 2.0 bearer token via `spanner.access_token` (see
+   below).
+3. **Service account** — a key supplied inline via `spanner.keyfile_json` or read from the path
    in `spanner.keyfile`.
-3. **[Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)**
+4. **[Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)**
    otherwise (e.g. `GOOGLE_APPLICATION_CREDENTIALS`, gcloud login, or the metadata server).
+
+#### OAuth access token
+
+Setting `spanner.access_token` authenticates with a bearer token you have already obtained out of
+band — for example from `gcloud auth print-access-token`, a Workload Identity exchange, or another
+auth library. The token is sent verbatim as the `Authorization: Bearer <token>` header on every
+request and is **never refreshed**, so you are responsible for supplying a valid, unexpired token
+(and re-connecting once it expires). Because it is a complete credential on its own, it is mutually
+exclusive with `spanner.keyfile`, `spanner.keyfile_json`, and
+`spanner.impersonate.target_principal` — combining them is refused at connect time.
 
 #### Service-account impersonation
 
