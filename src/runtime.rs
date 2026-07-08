@@ -111,6 +111,15 @@ pub(crate) fn block_on_cancellable<T>(
     cancel: &CancelSignal,
     future: impl Future<Output = Result<T>>,
 ) -> Result<T> {
+    // Box the operation future onto the heap. `block_on` polls it on the *calling* thread's stack
+    // (in ADBC that is the application's own thread, whose stack size the driver cannot control),
+    // and the operations here compose deep client/timeout/retry/conversion futures whose debug-build
+    // state machines are large enough to sit right at the default 2 MiB thread stack. Holding the
+    // composite inline in this frame overflowed that stack on some paths (e.g. the driver-manager
+    // conformance and query/DML round-trips); the heap indirection keeps the frame flat regardless
+    // of the operation's size, at the cost of one allocation per bridged call — negligible against
+    // the RPC it wraps.
+    let future = Box::pin(future);
     runtime.block_on(async move {
         tokio::select! {
             // Check/register the cancellation waiter before polling the operation.
