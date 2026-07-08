@@ -73,6 +73,8 @@
 //! # }
 //! ```
 
+#![warn(missing_docs)]
+
 mod bind;
 mod connection;
 mod conversion;
