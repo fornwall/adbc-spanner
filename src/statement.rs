@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use adbc_core::error::{Error, Result, Status};
-use adbc_core::options::{OptionStatement, OptionValue};
+use adbc_core::options::{IngestMode, OptionStatement, OptionValue};
 use adbc_core::{Optionable, PartitionedResult, Statement};
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
@@ -83,10 +83,12 @@ pub struct SpannerStatement {
     /// (`""`) catalog, so only the empty catalog is accepted; stored solely so the option
     /// round-trips through `get_option`.
     target_catalog: Option<String>,
-    /// Ingest mode (`adbc.ingest.mode`), stored in canonical form once set so it round-trips
-    /// through `get_option`. `append` (default), `create`, `create_append`, and `replace` are
-    /// accepted; the create/replace modes build the table from the ingest data's Arrow schema.
-    ingest_mode: Option<String>,
+    /// Ingest mode (`adbc.ingest.mode`), parsed once in `set_option` (which rejects unknown
+    /// modes) so the ingest paths match it exhaustively; `get_option` reports the spec's
+    /// canonical `adbc.ingest.mode.*` spelling. `append` (default), `create`, `create_append`,
+    /// and `replace`; the create/replace modes build the table from the ingest data's Arrow
+    /// schema.
+    ingest_mode: Option<IngestMode>,
     /// Rows converted into each streamed Arrow batch by `execute` (`spanner.rows_per_batch`).
     rows_per_batch: usize,
     /// Enable Data Boost for partitioned execution (`spanner.data_boost_enabled`).
@@ -167,15 +169,15 @@ impl SpannerStatement {
     fn build_ingest_table_ddl(
         &self,
         table: &str,
-        mode: Option<&str>,
+        mode: Option<IngestMode>,
     ) -> Result<Option<Vec<String>>> {
+        // Exhaustive: unknown modes were already rejected by `set_option` (`ingest_mode_option`).
         let (if_not_exists, drop_first) = match mode {
             // Append (the default) into an existing table: no DDL.
-            None | Some("adbc.ingest.mode.append") => return Ok(None),
-            Some("adbc.ingest.mode.create") => (false, false),
-            Some("adbc.ingest.mode.create_append") => (true, false),
-            Some("adbc.ingest.mode.replace") => (false, true),
-            Some(other) => return Err(not_implemented(&format!("ingest mode {other:?}"))),
+            None | Some(IngestMode::Append) => return Ok(None),
+            Some(IngestMode::Create) => (false, false),
+            Some(IngestMode::CreateAppend) => (true, false),
+            Some(IngestMode::Replace) => (false, true),
         };
         let schema = self
             .bound
@@ -310,8 +312,7 @@ impl SpannerStatement {
         if self.bound.is_empty() {
             return Err(invalid_state("cannot ingest: no data has been bound"));
         }
-        let mode = self.ingest_mode.as_deref();
-        let ingest_ddl = self.build_ingest_table_ddl(table, mode)?;
+        let ingest_ddl = self.build_ingest_table_ddl(table, self.ingest_mode)?;
         // `append` (the default) is the only mode that inserts into a pre-existing table, so it is
         // the only one whose failure the ADBC spec wants remapped to NotFound / AlreadyExists.
         // `build_ingest_table_ddl` returns `None` for exactly that mode.
@@ -664,16 +665,7 @@ impl Optionable for SpannerStatement {
             OptionStatement::IngestMode => {
                 // Append into an existing table, or create it (from the ingest data's Arrow schema,
                 // with a synthetic UUID primary key) in the create/replace modes.
-                let canonical = match string_option(value)?.as_str() {
-                    "adbc.ingest.mode.append" | "append" => "adbc.ingest.mode.append",
-                    "adbc.ingest.mode.create" | "create" => "adbc.ingest.mode.create",
-                    "adbc.ingest.mode.create_append" | "create_append" => {
-                        "adbc.ingest.mode.create_append"
-                    }
-                    "adbc.ingest.mode.replace" | "replace" => "adbc.ingest.mode.replace",
-                    other => return Err(not_implemented(&format!("ingest mode {other:?}"))),
-                };
-                self.ingest_mode = Some(canonical.to_string());
+                self.ingest_mode = Some(ingest_mode_option(value)?);
             }
             OptionStatement::Other(k) if k == crate::OPTION_ROWS_PER_BATCH => {
                 self.rows_per_batch = rows_per_batch_option(value)?;
@@ -708,7 +700,8 @@ impl Optionable for SpannerStatement {
             // Only the spec default (`false`) is ever accepted (see `check_ingest_temporary`), so
             // the driver's state is always `false` — report exactly that.
             OptionStatement::Temporary => Some(false.to_string()),
-            OptionStatement::IngestMode => self.ingest_mode.clone(),
+            // Reported in the spec's canonical `adbc.ingest.mode.*` spelling.
+            OptionStatement::IngestMode => self.ingest_mode.map(String::from),
             OptionStatement::Other(k) if k == crate::OPTION_ROWS_PER_BATCH => {
                 Some(self.rows_per_batch.to_string())
             }
@@ -1103,6 +1096,25 @@ fn check_target_catalog(catalog: String) -> Result<String> {
     }
 }
 
+/// Parse the `adbc.ingest.mode` option into an [`IngestMode`], accepting both the spec's canonical
+/// `adbc.ingest.mode.*` spellings and the bare short forms (`append`, `create`, …). Unknown modes
+/// are rejected here — at `set_option` time — which is what lets the ingest paths
+/// ([`SpannerStatement::build_ingest_table_ddl`]) match the enum exhaustively, with no fallback arm
+/// to drift.
+fn ingest_mode_option(value: OptionValue) -> Result<IngestMode> {
+    use adbc_core::constants::{
+        ADBC_INGEST_OPTION_MODE_APPEND, ADBC_INGEST_OPTION_MODE_CREATE,
+        ADBC_INGEST_OPTION_MODE_CREATE_APPEND, ADBC_INGEST_OPTION_MODE_REPLACE,
+    };
+    match string_option(value)?.as_str() {
+        ADBC_INGEST_OPTION_MODE_APPEND | "append" => Ok(IngestMode::Append),
+        ADBC_INGEST_OPTION_MODE_CREATE | "create" => Ok(IngestMode::Create),
+        ADBC_INGEST_OPTION_MODE_CREATE_APPEND | "create_append" => Ok(IngestMode::CreateAppend),
+        ADBC_INGEST_OPTION_MODE_REPLACE | "replace" => Ok(IngestMode::Replace),
+        other => Err(not_implemented(&format!("ingest mode {other:?}"))),
+    }
+}
+
 /// Validate the `adbc.ingest.temporary` option. Spanner has no temporary tables, so only the spec
 /// default (`false`, in any of the shared boolean spellings) is accepted — as a no-op; `true` is
 /// rejected as unsupported.
@@ -1241,6 +1253,38 @@ mod tests {
         // Any named catalog is rejected as unsupported.
         let error = check_target_catalog("main".to_string()).unwrap_err();
         assert_eq!(error.status, Status::NotImplemented);
+    }
+
+    #[test]
+    fn ingest_mode_parses_both_spellings_and_rejects_unknown() {
+        // Both the spec's canonical `adbc.ingest.mode.*` spelling and the bare short form parse to
+        // the same mode, and the mode reports back (`get_option`) in canonical form.
+        for (canonical, short, mode) in [
+            ("adbc.ingest.mode.append", "append", IngestMode::Append),
+            ("adbc.ingest.mode.create", "create", IngestMode::Create),
+            (
+                "adbc.ingest.mode.create_append",
+                "create_append",
+                IngestMode::CreateAppend,
+            ),
+            ("adbc.ingest.mode.replace", "replace", IngestMode::Replace),
+        ] {
+            for spelling in [canonical, short] {
+                assert_eq!(
+                    ingest_mode_option(OptionValue::String(spelling.into())).unwrap(),
+                    mode,
+                    "spelling {spelling:?}"
+                );
+            }
+            assert_eq!(String::from(mode), canonical);
+        }
+        // Unknown modes are rejected at set_option time, as unimplemented.
+        let error = ingest_mode_option(OptionValue::String("upsert".into())).unwrap_err();
+        assert_eq!(error.status, Status::NotImplemented);
+        assert!(error.message.contains("ingest mode \"upsert\""), "{error}");
+        // Non-string values fail string coercion.
+        let error = ingest_mode_option(OptionValue::Int(1)).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
     }
 
     #[test]
