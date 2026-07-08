@@ -559,8 +559,11 @@ it as `"false"`, which is always the driver's state. Unit-tested offline
 set-false/round-trip/set-true-fails assertions in the ingest section of `tests/integration.rs`);
 `get_info` could report a vendor version instead of null; the upstream `adbc_ffi` shim
 rejects 1.0.0 driver managers and errors on unknown `get_info` codes (both stricter than the C
-spec — upstream issues, worth tracking); no `sqlstate` on errors (a coarse mapping would help
-ODBC bridges); ~~`get_table_schema` ignores the catalog argument entirely~~ (**Fixed.**
+spec — upstream issues, worth tracking); ~~no `sqlstate` on errors (a coarse mapping would help
+ODBC bridges)~~ (**Won't fix.** Spanner does not surface a SQLSTATE on its errors, and the driver
+follows the same convention as the other ADBC drivers — it does not synthesize a SQLSTATE the
+database itself does not provide, since a guessed coarse mapping would be misleading rather than
+helpful); ~~`get_table_schema` ignores the catalog argument entirely~~ (**Fixed.**
 `get_table_schema` now validates its catalog argument via a pure `check_lookup_catalog` helper in
 `src/connection.rs`: `None` and `Some("")` — Spanner's single, unnamed catalog — behave as before,
 while any other catalog name fails with `NotFound` (nothing can exist in a catalog Spanner doesn't
