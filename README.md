@@ -156,6 +156,14 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
 Not supported (returns `NotImplemented`, by nature of Spanner): **Substrait** — Spanner executes
 GoogleSQL/PostgreSQL text and has no Substrait support.
 
+**GoogleSQL only.** The driver emits GoogleSQL (`GOOGLE_STANDARD_SQL`); a **PostgreSQL-dialect**
+Spanner database is not supported. Each connection probes the database's dialect once (a best-effort
+`GetDatabase` admin metadata read) and rejects a PostgreSQL-dialect database up front with a clear
+`NotImplemented` error, rather than misbehaving obscurely on the first query. The probe is
+best-effort: if the metadata read cannot be made (for example the principal lacks
+`spanner.databases.get`), the connection proceeds unchecked rather than failing a database that would
+otherwise work.
+
 ## Shared library (loadable driver)
 
 Besides the Rust crate, this builds a C-ABI **shared library** that any ADBC driver manager can load

@@ -106,6 +106,7 @@ mod bind;
 mod connection;
 mod conversion;
 mod ddl;
+mod dialect;
 mod driver;
 mod error;
 #[cfg(feature = "ffi")]

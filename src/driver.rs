@@ -310,6 +310,20 @@ impl SpannerDatabase {
                 .build()
                 .await
                 .map_err(from_spanner)?;
+            // Detect the database's SQL dialect once, up front, so a PostgreSQL-dialect database
+            // (which the driver does not support — it emits GoogleSQL only) fails fast with a clear
+            // error instead of misbehaving obscurely on the first query.
+            //
+            // Best-effort: this reads the dialect from the Database Admin `GetDatabase` metadata
+            // call. If that call cannot be made — the principal lacks `spanner.databases.get`, or
+            // the admin endpoint is unreachable — we proceed rather than regress a connection that
+            // would otherwise work; the check only ever *rejects* on a successful response that
+            // names an unsupported dialect. The happy path (GoogleSQL) is left unchanged.
+            if let Ok(admin) = spanner.database_admin_builder().build().await
+                && let Ok(info) = admin.get_database().set_name(database.clone()).send().await
+            {
+                crate::dialect::check_supported(&info.database_dialect.to_string())?;
+            }
             Ok(Connected {
                 client,
                 spanner,

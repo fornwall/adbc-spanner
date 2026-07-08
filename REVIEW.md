@@ -666,9 +666,14 @@ driver-local copy of the client's `SpannerRetryPolicy` so the transport-on-idemp
 preserved — `src/retry.rs`; `RetryConfig` mirrors `RpcTimeouts`/`RequestConfig`). Custom *backoff*
 (the gax `BackoffPolicy` / `ExponentialBackoff`, settable via the same builders'
 `with_backoff_policy`) is a possible follow-up but was left out to keep the surface focused.
-PostgreSQL-dialect databases are
+~~PostgreSQL-dialect databases are
 unsupported *and undetected* — minimum viable is probing the dialect once and failing fast with a
-clear error; OAuth access-token auth (needs a small custom credentials impl — the auth crate has
+clear error~~ (**Fixed.** PG-dialect databases are now DETECTED (they remain unsupported by design):
+each connection probes the dialect once at `connect()` via a best-effort `GetDatabase` admin
+metadata read and rejects a non-GoogleSQL dialect with a clear `NotImplemented` error naming it —
+`src/dialect.rs` (pure `is_supported_dialect`/`check_supported`, unit-tested offline). Best-effort:
+if the metadata read can't be made (e.g. no `spanner.databases.get`) the connection proceeds
+unchecked rather than regressing a database that would otherwise work.); OAuth access-token auth (needs a small custom credentials impl — the auth crate has
 no static-token builder); query options (optimizer version), directed reads, commit stats,
 `max_commit_delay`, `last_statement` optimization (free RPC saving for single-statement
 autocommit DML); proto/enum columns (verify clean failure today); change streams and GQL graph
