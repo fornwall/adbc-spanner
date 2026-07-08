@@ -94,6 +94,11 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   descriptor, and `Connection::read_partition()` streams one partition's rows back as Arrow.
   `spanner.data_boost_enabled` bakes [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview)
   into the descriptors; `spanner.max_partitions` hints the partition count.
+- Structured errors: Spanner failures map to the closest ADBC status (e.g. `NotFound`,
+  `InvalidArguments`, `Unauthorized`), keep the numeric gRPC code in `vendor_code` (so a retry loop
+  can detect `ABORTED` = 10 exactly), and carry a coarse standard SQLSTATE class code (e.g. `42S02`
+  table not found, `42000` syntax/access rule, `28000` authentication, `40001` transaction aborted,
+  `0A000` not supported) for ODBC/JDBC bridges layered on an ADBC driver manager.
 
 Not supported (returns `NotImplemented`, by nature of Spanner): **Substrait** — Spanner executes
 GoogleSQL/PostgreSQL text and has no Substrait support.

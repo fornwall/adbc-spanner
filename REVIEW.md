@@ -559,8 +559,18 @@ it as `"false"`, which is always the driver's state. Unit-tested offline
 set-false/round-trip/set-true-fails assertions in the ingest section of `tests/integration.rs`);
 `get_info` could report a vendor version instead of null; the upstream `adbc_ffi` shim
 rejects 1.0.0 driver managers and errors on unknown `get_info` codes (both stricter than the C
-spec — upstream issues, worth tracking); no `sqlstate` on errors (a coarse mapping would help
-ODBC bridges); ~~`get_table_schema` ignores the catalog argument entirely~~ (**Fixed.**
+spec — upstream issues, worth tracking); ~~no `sqlstate` on errors (a coarse mapping would help
+ODBC bridges)~~ (**Fixed.** Every error now carries a coarse SQLSTATE, stamped centrally in
+`src/error.rs`: the shared `err()` constructor derives it from the ADBC `Status`
+(`sqlstate_for_status` — standard SQL:2011 class codes plus the X/Open CLI codes ODBC expects, e.g.
+`NotImplemented`→`0A000`, `NotFound`→`42S02`, `InvalidArguments`→`42000`, `Integrity`→`23000`,
+`IO`→`08000`, `Unauthenticated`→`28000`, `Unauthorized`→`42501`, `Internal`→`HY000`), with two
+gRPC-code refinements in `from_spanner` where the status-derived code would mislead
+(`OUT_OF_RANGE`→`22000` data exception, `ABORTED`→`40001` serialization failure) and `08001` on
+`from_builder`'s connection-establishment failures. Message/status/vendor_code are unchanged; since
+every constructor funnels through `err()`, no ad-hoc error site can miss it. Offline unit tests in
+`src/error.rs` cover the per-status table, the refinements, and the builder path.);
+~~`get_table_schema` ignores the catalog argument entirely~~ (**Fixed.**
 `get_table_schema` now validates its catalog argument via a pure `check_lookup_catalog` helper in
 `src/connection.rs`: `None` and `Some("")` — Spanner's single, unnamed catalog — behave as before,
 while any other catalog name fails with `NotFound` (nothing can exist in a catalog Spanner doesn't
