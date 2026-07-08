@@ -628,8 +628,16 @@ and `split_statements`-preserving), `params` covers `named_parameters` + `resolv
 exactly on count mismatch; quoting unquotes back to the input and embeds as one opaque token under
 the crate's own lexer), and `partition` covers `decode_partition` over arbitrary bytes (rejections
 are clean `InvalidArguments`, accepted descriptors survive a serialize → decode → serialize round
-trip unchanged).); `tests/resilience.rs` mutates process env in setup — safe only under
-`--test-threads=1`, worth asserting.
+trip unchanged).); ~~`tests/resilience.rs` mutates process env in setup — safe only under
+`--test-threads=1`, worth asserting.~~ (**Fixed.** The single-threaded contract is now enforced at
+runtime: a module-level `SerialGuard` (RAII over a `static AtomicUsize ACTIVE_TESTS`) is constructed
+at the start of each test body — after the self-skip check, so a plain multi-threaded `cargo test`
+with the env unset still skips cleanly — and its `new()` asserts no other test body is running,
+panicking with an actionable "re-run with `--test-threads=1`" message rather than racing the env
+swap silently; `drop` releases the slot. `ensure_setup`'s existing `DONE` mutex still serializes the
+one-time env swap, and the guard documents/enforces that no concurrent driver connection reads the
+transiently-repointed `SPANNER_EMULATOR_HOST`. Both `scripts/with-toxiproxy.sh` and `resilience.yml`
+already pass `--test-threads=1`.)
 
 **Features** (all exposed by the pinned client unless noted): request priority / request tags /
 transaction tags (`StatementBuilder::set_priority/set_request_tag`,
