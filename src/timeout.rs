@@ -181,7 +181,7 @@ pub(crate) async fn with_timeout<T>(
 mod tests {
     use super::*;
     use crate::runtime::{
-        block_on_cancellable, new_runtime, spawn_prefetch, CancelSignal, ChunkSource,
+        CancelSignal, ChunkSource, block_on_cancellable, new_runtime, spawn_prefetch,
     };
 
     fn s(v: &str) -> OptionValue {

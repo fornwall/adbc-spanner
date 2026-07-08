@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use adbc_core::error::{Error, Result, Status};
-use arrow_array::{new_empty_array, ArrayRef, ListArray, UnionArray};
+use arrow_array::{ArrayRef, ListArray, UnionArray, new_empty_array};
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType, FieldRef, Fields, UnionFields};
 
@@ -115,8 +115,7 @@ pub(crate) fn dense_union(
             populated
                 .iter()
                 .find(|(pid, _)| *pid == id)
-                .map(|(_, arr)| arr.clone())
-                .unwrap_or_else(|| new_empty_array(f.data_type()))
+                .map_or_else(|| new_empty_array(f.data_type()), |(_, arr)| arr.clone())
         })
         .collect();
     let union = UnionArray::try_new(

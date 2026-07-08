@@ -58,14 +58,14 @@ use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
 use crate::bind::qualified_table;
-use crate::conversion::{result_set_to_batch, stream_query, TimestampPrecision};
+use crate::conversion::{TimestampPrecision, result_set_to_batch, stream_query};
 use crate::driver::Connected;
 use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
 use crate::request::RequestConfig;
-use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
+use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
 use crate::staleness::ReadStaleness;
-use crate::statement::{SpannerStatement, DEFAULT_ROWS_PER_BATCH};
-use crate::timeout::{with_timeout, RpcTimeouts};
+use crate::statement::{DEFAULT_ROWS_PER_BATCH, SpannerStatement};
+use crate::timeout::{RpcTimeouts, with_timeout};
 
 /// Transaction state shared between a connection and the statements it creates.
 #[derive(Debug)]
@@ -330,13 +330,10 @@ pub(crate) fn apply_isolation(
 /// ignored, so callers are not misled into thinking an unsupported guarantee is in effect.
 fn parse_isolation_level(value: OptionValue) -> Result<IsolationLevel> {
     use adbc_core::constants::*;
-    let s = match value {
-        OptionValue::String(s) => s,
-        _ => {
-            return Err(invalid_argument(
-                "expected a string isolation-level option value",
-            ))
-        }
+    let OptionValue::String(s) = value else {
+        return Err(invalid_argument(
+            "expected a string isolation-level option value",
+        ));
     };
     match s.as_str() {
         ADBC_OPTION_ISOLATION_LEVEL_DEFAULT => Ok(IsolationLevel::Unspecified),
@@ -634,11 +631,11 @@ impl Optionable for SpannerConnection {
                         None
                     }
                 };
-                if let Some((pending, mutations)) = pending {
-                    if let Err(e) = self.apply_transaction(pending.clone(), mutations.clone()) {
-                        self.txn.lock().unwrap().restore_manual(pending, mutations);
-                        return Err(e);
-                    }
+                if let Some((pending, mutations)) = pending
+                    && let Err(e) = self.apply_transaction(pending.clone(), mutations.clone())
+                {
+                    self.txn.lock().unwrap().restore_manual(pending, mutations);
+                    return Err(e);
                 }
             }
             OptionConnection::ReadOnly => {
@@ -676,7 +673,7 @@ impl Optionable for SpannerConnection {
                 return Err(not_implemented(&format!(
                     "unsupported Spanner connection option: {}",
                     connection_option_name(other)
-                )))
+                )));
             }
         }
         Ok(())

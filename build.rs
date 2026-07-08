@@ -50,13 +50,12 @@ fn arrow_array_version(lock: &str) -> Option<String> {
             in_arrow_array = false;
         } else if line == "name = \"arrow-array\"" {
             in_arrow_array = true;
-        } else if in_arrow_array {
-            if let Some(v) = line
+        } else if in_arrow_array
+            && let Some(v) = line
                 .strip_prefix("version = \"")
                 .and_then(|rest| rest.strip_suffix('"'))
-            {
-                versions.push(v);
-            }
+        {
+            versions.push(v);
         }
     }
     match versions.as_slice() {

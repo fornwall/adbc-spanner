@@ -13,8 +13,8 @@
 //! does not support `THEN RETURN`); through [`Statement::execute_update`] the rows are discarded
 //! and the affected-row count is reported from the result-set stats.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{IngestMode, OptionStatement, OptionValue};
@@ -23,25 +23,25 @@ use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use google_cloud_lro::Poller as _;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
+use google_cloud_spanner::model::PartitionOptions;
 use google_cloud_spanner::model::execute_sql_request::QueryMode;
 use google_cloud_spanner::model::transaction_options::IsolationLevel;
-use google_cloud_spanner::model::PartitionOptions;
 use google_cloud_spanner::mutation::Mutation;
 use google_cloud_spanner::statement::{Statement as SpannerSql, StatementBuilder};
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
 use crate::bind;
-use crate::connection::{apply_isolation, SharedTxn};
+use crate::connection::{SharedTxn, apply_isolation};
 use crate::conversion::{
-    result_set_to_batch, stream_bound_query, stream_query, TimestampPrecision,
+    TimestampPrecision, result_set_to_batch, stream_bound_query, stream_query,
 };
 use crate::error::{
     err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
 };
 use crate::request::RequestConfig;
-use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
+use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
 use crate::staleness::ReadStaleness;
-use crate::timeout::{with_timeout, RpcTimeouts};
+use crate::timeout::{RpcTimeouts, with_timeout};
 
 /// Default number of rows converted into each streamed Arrow batch (see
 /// [`OPTION_ROWS_PER_BATCH`](crate::OPTION_ROWS_PER_BATCH)). Also used by
@@ -787,11 +787,11 @@ impl SpannerStatement {
         if plan {
             builder = builder.set_query_mode(QueryMode::Plan);
         }
-        if let Some(batch) = self.bound.first() {
-            if batch.num_rows() > 0 {
-                let names = bind::resolve_parameter_names(sql, batch, self.bind_by_name)?;
-                builder = bind::bind_params(builder, &names, batch, 0)?;
-            }
+        if let Some(batch) = self.bound.first()
+            && batch.num_rows() > 0
+        {
+            let names = bind::resolve_parameter_names(sql, batch, self.bind_by_name)?;
+            builder = bind::bind_params(builder, &names, batch, 0)?;
         }
         Ok(builder.build())
     }
@@ -889,7 +889,7 @@ impl Optionable for SpannerStatement {
                 return Err(not_implemented(&format!(
                     "statement option {}",
                     other.as_ref()
-                )))
+                )));
             }
         }
         Ok(())
@@ -999,11 +999,11 @@ impl Statement for SpannerStatement {
         // nowhere to report the affected-row count, so it is discarded. Gate on there being no SQL:
         // a query and an ingest target are mutually exclusive (each setter clears the other), so a
         // reused handle whose most recent config was a query runs that query, not a data-less ingest.
-        if self.sql.is_none() {
-            if let Some(table) = self.target_table.clone() {
-                self.run_ingest(&table)?;
-                return Ok(Self::empty_reader());
-            }
+        if self.sql.is_none()
+            && let Some(table) = self.target_table.clone()
+        {
+            self.run_ingest(&table)?;
+            return Ok(Self::empty_reader());
         }
         self.check_bound_has_destination()?;
         let sql = self.sql()?;
@@ -1096,10 +1096,10 @@ impl Statement for SpannerStatement {
         // there being no SQL for the same reason as `execute` — a query and an ingest target are
         // mutually exclusive (each setter clears the other), so a reused handle runs whichever was
         // configured most recently rather than the stale other one.
-        if self.sql.is_none() {
-            if let Some(table) = self.target_table.clone() {
-                return self.run_ingest(&table);
-            }
+        if self.sql.is_none()
+            && let Some(table) = self.target_table.clone()
+        {
+            return self.run_ingest(&table);
         }
         self.check_bound_has_destination()?;
 
@@ -1152,11 +1152,11 @@ impl Statement for SpannerStatement {
                     let mut builder = plan_builder;
                     // Bind parameters if any were provided (values are irrelevant to the schema) so
                     // that `@param` references resolve.
-                    if let Some(batch) = bound.first() {
-                        if batch.num_rows() > 0 {
-                            let names = bind::resolve_parameter_names(&sql, batch, bind_by_name)?;
-                            builder = bind::bind_params(builder, &names, batch, 0)?;
-                        }
+                    if let Some(batch) = bound.first()
+                        && batch.num_rows() > 0
+                    {
+                        let names = bind::resolve_parameter_names(&sql, batch, bind_by_name)?;
+                        builder = bind::bind_params(builder, &names, batch, 0)?;
                     }
                     let result_set = transaction
                         .execute_query(builder.build())

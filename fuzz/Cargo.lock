@@ -15,6 +15,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "google-cloud-auth",
+ "google-cloud-gax",
  "google-cloud-lro",
  "google-cloud-spanner",
  "serde_json",

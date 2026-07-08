@@ -14,7 +14,7 @@ use adbc_core::error::{Result, Status};
 use adbc_core::options::ObjectDepth;
 use adbc_core::schemas::GET_OBJECTS_SCHEMA;
 use arrow_array::{
-    new_null_array, Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+    Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, StructArray, new_null_array,
 };
 use arrow_buffer::NullBuffer;
 use arrow_schema::Fields;
@@ -28,7 +28,7 @@ use crate::connection::{like_match, str_col};
 use crate::conversion::result_set_to_batch;
 use crate::error::{err, from_spanner};
 use crate::nested::{arrow_err, field, list_item, list_of, list_of_nullable, struct_fields};
-use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
+use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
 
 /// A column of a table, as returned by `get_objects`.
 pub(crate) struct Column {
@@ -749,12 +749,12 @@ fn build_constraint_struct(
     // constraint_column_names: one non-null list<utf8> per constraint, its key columns in order.
     let names_field = field(constraint_fields, "constraint_column_names")?;
     let name_item = list_item(&names_field)?;
-    let flat_columns: Vec<&str> = constraints
-        .iter()
-        .flat_map(|c| c.columns.iter().map(String::as_str))
-        .collect();
-    let column_child: ArrayRef =
-        Arc::new(StringArray::from_iter(flat_columns.into_iter().map(Some)));
+    let column_child: ArrayRef = Arc::new(StringArray::from_iter(
+        constraints
+            .iter()
+            .flat_map(|c| c.columns.iter().map(String::as_str))
+            .map(Some),
+    ));
     let column_lengths: Vec<usize> = constraints.iter().map(|c| c.columns.len()).collect();
     let constraint_column_names = list_of(name_item, &column_lengths, column_child)?;
 
@@ -833,7 +833,7 @@ mod tests {
 
     fn sample() -> Vec<DbSchema> {
         vec![DbSchema {
-            name: "".to_string(),
+            name: String::new(),
             tables: vec![Table {
                 name: "Users".to_string(),
                 table_type: "BASE TABLE".to_string(),
@@ -1018,7 +1018,7 @@ mod tests {
         // list (tables are at/above the requested depth), never NULL.
         for depth in [ObjectDepth::Tables, ObjectDepth::Columns, ObjectDepth::All] {
             let schemas = vec![DbSchema {
-                name: "".to_string(),
+                name: String::new(),
                 tables: Vec::new(),
             }];
             let batch = build(depth, schemas).unwrap();
@@ -1049,7 +1049,7 @@ mod tests {
         // table_constraints lists at Columns/All depth, never NULL.
         for depth in [ObjectDepth::Columns, ObjectDepth::All] {
             let schemas = vec![DbSchema {
-                name: "".to_string(),
+                name: String::new(),
                 tables: vec![Table {
                     name: "Users".to_string(),
                     table_type: "BASE TABLE".to_string(),

@@ -207,7 +207,9 @@ fn ensure_setup() {
     // Fall back to the proxy host if no direct endpoint is provided (e.g. a manual run that already
     // points HOST at a real `:9010`).
     let direct = std::env::var("SPANNER_EMULATOR_DIRECT").unwrap_or_else(|_| proxy_host.clone());
-    std::env::set_var("SPANNER_EMULATOR_HOST", &direct);
+    // SAFETY: setup runs once under the `DONE` mutex, before any driver connection or other thread
+    // touches the environment, so this transient swap has no concurrent readers.
+    unsafe { std::env::set_var("SPANNER_EMULATOR_HOST", &direct) };
 
     tokio::runtime::Runtime::new()
         .expect("setup runtime")
@@ -261,7 +263,8 @@ fn ensure_setup() {
         });
 
     // Restore the proxy endpoint so the driver-under-test's data plane goes through Toxiproxy.
-    std::env::set_var("SPANNER_EMULATOR_HOST", &proxy_host);
+    // SAFETY: still under the `DONE` mutex, before any driver connection — see the note above.
+    unsafe { std::env::set_var("SPANNER_EMULATOR_HOST", &proxy_host) };
     *done = true;
 }
 

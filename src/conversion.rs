@@ -63,7 +63,7 @@ use google_cloud_spanner::value::{Kind, Type, TypeCode, Value};
 
 use crate::error::{err, from_spanner, invalid_argument};
 use crate::runtime::{
-    block_on_cancellable, spawn_prefetch, CancelSignal, ChunkSource, SharedRuntime,
+    CancelSignal, ChunkSource, SharedRuntime, block_on_cancellable, spawn_prefetch,
 };
 use crate::timeout::with_timeout;
 
@@ -554,7 +554,7 @@ pub(crate) fn build_schema(
         }
     }
 
-    let width = first_row.map(|r| r.raw_values().len()).unwrap_or(0);
+    let width = first_row.map_or(0, |r| r.raw_values().len());
     let fields: Vec<Field> = (0..width)
         .map(|i| Field::new(format!("col{i}"), DataType::Utf8, true))
         .collect();

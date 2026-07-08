@@ -1,8 +1,8 @@
 [package]
 name = "adbc-spanner"
 version = "0.6.0"
-edition = "2021"
-rust-version = "1.88"
+edition = "2024"
+rust-version = "1.96"
 license = "Apache-2.0"
 description = "ADBC (Arrow Database Connectivity) driver for Google Cloud Spanner"
 repository = "https://github.com/fornwall/adbc-spanner"
@@ -142,6 +142,22 @@ unreachable_pub = "warn"
 # which already wrap their bodies this way. The crate-wide `unsafe_code` deny/forbid and the
 # single audited allow on `mod ffi` live in `src/lib.rs` (they are feature-conditional).
 unsafe_op_in_unsafe_fn = "deny"
+
+# A few clippy idiom lints promoted from `allow`/pedantic so CI's `clippy -D warnings` keeps the
+# codebase on the modern constructions (2021→2024 edition sweep) instead of letting the older forms
+# creep back:
+#   manual_let_else        — `let ... else { return/panic }` over `let x = match { _ => diverge }`
+#   map_unwrap_or          — `.map_or(d, f)` over `.map(f).unwrap_or(d)` / `...unwrap_or_else`
+#   manual_is_variant_and  — `.is_ok_and`/`.is_some_and` over `.map(..).unwrap_or(false)` etc.
+#   manual_string_new      — `String::new()` over `"".to_string()` / `"".into()`
+#   needless_collect       — drop an intermediate `collect()` feeding a single iterator consumer
+[lints.clippy]
+manual_let_else = "warn"
+map_unwrap_or = "warn"
+manual_is_variant_and = "warn"
+manual_string_new = "warn"
+needless_collect = "warn"
+
 [lints.rustdoc]
 broken_intra_doc_links = "deny"
 private_intra_doc_links = "warn"

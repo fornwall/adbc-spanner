@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use adbc_spanner::bench_support::build_array;
 use arrow_schema::{DataType, Field, Fields, TimeUnit};
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use google_cloud_spanner::value::{ToValue, Value};
 
 /// Rows per benchmarked chunk — the driver's default `spanner.rows_per_batch`.

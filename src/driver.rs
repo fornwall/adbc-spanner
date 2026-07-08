@@ -3,20 +3,20 @@
 use adbc_core::error::{Result, Status};
 use adbc_core::options::{OptionDatabase, OptionValue};
 use adbc_core::{Database, Driver, Optionable};
+use google_cloud_auth::credentials::Builder as AdcCredentials;
+use google_cloud_auth::credentials::Credentials;
 use google_cloud_auth::credentials::anonymous::Builder as AnonymousCredentials;
 use google_cloud_auth::credentials::external_account::Builder as ExternalAccountCredentials;
 use google_cloud_auth::credentials::impersonated::Builder as ImpersonatedCredentials;
 use google_cloud_auth::credentials::service_account::Builder as ServiceAccountCredentials;
 use google_cloud_auth::credentials::user_account::Builder as UserAccountCredentials;
-use google_cloud_auth::credentials::Builder as AdcCredentials;
-use google_cloud_auth::credentials::Credentials;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 
 use crate::connection::SpannerConnection;
 use crate::error::{
     err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
 };
-use crate::runtime::{new_runtime, SharedRuntime};
+use crate::runtime::{SharedRuntime, new_runtime};
 use crate::{
     OPTION_DATABASE, OPTION_EMULATOR, OPTION_ENDPOINT, OPTION_IMPERSONATE_DELEGATES,
     OPTION_IMPERSONATE_LIFETIME, OPTION_IMPERSONATE_SCOPES, OPTION_IMPERSONATE_TARGET_PRINCIPAL,
@@ -227,13 +227,13 @@ impl SpannerDatabase {
 
         let mut endpoint = self.endpoint.clone();
         let mut emulator = self.emulator;
-        if let Ok(host) = std::env::var("SPANNER_EMULATOR_HOST") {
-            if !host.is_empty() {
-                if endpoint.is_none() {
-                    endpoint = Some(ensure_scheme(&host));
-                }
-                emulator = true;
+        if let Ok(host) = std::env::var("SPANNER_EMULATOR_HOST")
+            && !host.is_empty()
+        {
+            if endpoint.is_none() {
+                endpoint = Some(ensure_scheme(&host));
             }
+            emulator = true;
         }
 
         // Emulator mode forces anonymous credentials over plaintext `http://`. Silently dropping
@@ -241,19 +241,17 @@ impl SpannerDatabase {
         // downgrade (a stray `SPANNER_EMULATOR_HOST` redirecting real-database traffic, sans auth,
         // to an attacker-chosen endpoint), so the combination is refused instead. Ambient ADC does
         // not trip this — only explicit driver options do.
-        if emulator {
-            if let Some(option) = self.explicit_credential_option() {
-                let cause = if self.emulator {
-                    "the `spanner.emulator` option"
-                } else {
-                    "the `SPANNER_EMULATOR_HOST` environment variable"
-                };
-                return Err(invalid_state(format!(
-                    "emulator mode (enabled by {cause}) forces anonymous plaintext credentials \
-                     and would silently ignore the configured `{option}` option; unset the \
-                     credential option(s) or disable emulator mode"
-                )));
-            }
+        if emulator && let Some(option) = self.explicit_credential_option() {
+            let cause = if self.emulator {
+                "the `spanner.emulator` option"
+            } else {
+                "the `SPANNER_EMULATOR_HOST` environment variable"
+            };
+            return Err(invalid_state(format!(
+                "emulator mode (enabled by {cause}) forces anonymous plaintext credentials \
+                 and would silently ignore the configured `{option}` option; unset the \
+                 credential option(s) or disable emulator mode"
+            )));
         }
 
         // Resolve the credential JSON up front (reads the key file, if any); the flow is detected
@@ -370,7 +368,7 @@ impl Optionable for SpannerDatabase {
                 return Err(not_implemented(&format!(
                     "unsupported Spanner database option: {}",
                     option_name(other)
-                )))
+                )));
             }
         }
         Ok(())
@@ -1043,9 +1041,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
-        assert!(error
-            .message
-            .contains("failed to build service_account credentials"));
+        assert!(
+            error
+                .message
+                .contains("failed to build service_account credentials")
+        );
     }
 
     #[test]

@@ -113,11 +113,7 @@ fn test_target() -> Option<TestTarget> {
 
 /// Inner resolver for [`test_target`]; returns `None` when no target env is set.
 fn resolve_test_target() -> Option<TestTarget> {
-    if std::env::var("SPANNER_EMULATOR_HOST")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .is_some()
-    {
+    if std::env::var("SPANNER_EMULATOR_HOST").is_ok_and(|s| !s.is_empty()) {
         return Some(TestTarget {
             project: PROJECT.to_string(),
             instance: INSTANCE.to_string(),
@@ -3763,9 +3759,8 @@ fn ffi_unhappy_paths_error_instead_of_crash() {
     let (_driver, _database, mut connection) = ffi_connect(&cdylib, &target);
     let mut statement = connection.new_statement().expect("new statement");
 
-    let error = match statement.execute() {
-        Ok(_) => panic!("execute without SQL must fail"),
-        Err(error) => error,
+    let Err(error) = statement.execute() else {
+        panic!("execute without SQL must fail");
     };
     assert_eq!(error.status, Status::InvalidState, "{error:?}");
     let error = statement
@@ -5655,9 +5650,8 @@ fn read_partition_rejects_garbage_descriptors() {
         b"[1, 2, 3]",             // valid JSON that is not even an object
     ];
     for descriptor in cases {
-        let error = match connection.read_partition(descriptor) {
-            Ok(_) => panic!("descriptor {descriptor:?} must be rejected"),
-            Err(error) => error,
+        let Err(error) = connection.read_partition(descriptor) else {
+            panic!("descriptor {descriptor:?} must be rejected");
         };
         assert_eq!(
             error.status,
@@ -5891,7 +5885,10 @@ fn request_priority_and_tags() {
         )
         .expect("override priority on the statement");
     statement
-        .set_option(stmt_key(OPTION_REQUEST_TAG), OptionValue::String("".into()))
+        .set_option(
+            stmt_key(OPTION_REQUEST_TAG),
+            OptionValue::String(String::new()),
+        )
         .expect("unset the inherited request tag with an empty value");
     assert_eq!(
         statement
@@ -5966,7 +5963,7 @@ fn request_priority_and_tags() {
         OPTION_TRANSACTION_TAG,
     ] {
         connection
-            .set_option(conn_key(key), OptionValue::String("".into()))
+            .set_option(conn_key(key), OptionValue::String(String::new()))
             .expect("unset with an empty value");
         let error = connection
             .get_option_string(conn_key(key))
@@ -6409,7 +6406,7 @@ fn rpc_timeouts() {
     statement
         .set_option(
             stmt_key(OPTION_RPC_TIMEOUT_FETCH),
-            OptionValue::String("".into()),
+            OptionValue::String(String::new()),
         )
         .expect("unset the inherited fetch timeout with an empty value");
     assert_eq!(
@@ -6500,9 +6497,8 @@ fn rpc_timeouts() {
         .unwrap();
     // The query deadline covers the initial execution (through the first chunk), so `execute`
     // itself fails — no reader is produced.
-    let error = match tiny.execute() {
-        Ok(_) => panic!("a microsecond query deadline must expire"),
-        Err(error) => error,
+    let Err(error) = tiny.execute() else {
+        panic!("a microsecond query deadline must expire");
     };
     assert_eq!(error.status, Status::Timeout, "{error:?}");
     assert!(
@@ -6558,7 +6554,7 @@ fn rpc_timeouts() {
     // Unsetting at the connection level round-trips back to NotFound.
     for key in ALL {
         connection
-            .set_option(conn_key(key), OptionValue::String("".into()))
+            .set_option(conn_key(key), OptionValue::String(String::new()))
             .expect("unset with an empty value");
         let error = connection
             .get_option_string(conn_key(key))
