@@ -609,9 +609,21 @@ path is unit-tested offline against empty / non-JSON / truncated / wrong-shape-J
 cancel latched *between* `read_partition` chunk fetches cancels the next fetch, statements on the
 same connection are unaffected (own signal), and the connection's next operation resets the latch.
 All but the offline decode test live in `tests/integration.rs`.);
-fuzz gaps: statement-hint parsing (`first_keyword` — this exact code had a real bug),
+~~fuzz gaps: statement-hint parsing (`first_keyword` — this exact code had a real bug),
 `strip_trailing_terminators`, parameter-name extraction, `quote_ident`, partition-descriptor
-deserialization; `tests/resilience.rs` mutates process env in setup — safe only under
+deserialization~~ (**Fixed.** Three new fuzz targets, registered in `fuzz/Cargo.toml` and the
+nightly `fuzz.yml` matrix with seed corpora, each with independent oracles rather than
+panic-only: `keyword` covers `first_keyword` + `strip_trailing_terminators` (keyword is an
+uppercase word occurring verbatim in the input; `is_ddl`/`is_dml` agree with a re-stated copy of
+the keyword lists; metamorphic check that whitespace/comment/`@{…}`-hint prefixes — the exact
+surface of the real bug — never change the keyword; the strip is a verbatim substring, idempotent,
+and `split_statements`-preserving), `params` covers `named_parameters` + `resolve_parameter_names`
++ `quote_ident` (extracted names are distinct well-formed identifiers occurring verbatim as
+`@name`; the pairing follows the documented name-mode/positional contract with `InvalidArguments`
+exactly on count mismatch; quoting unquotes back to the input and embeds as one opaque token under
+the crate's own lexer), and `partition` covers `decode_partition` over arbitrary bytes (rejections
+are clean `InvalidArguments`, accepted descriptors survive a serialize → decode → serialize round
+trip unchanged).); `tests/resilience.rs` mutates process env in setup — safe only under
 `--test-threads=1`, worth asserting.
 
 **Features** (all exposed by the pinned client unless noted): request priority / request tags /
@@ -645,11 +657,23 @@ cross-checked against `src/driver.rs`/`src/connection.rs`/`src/statement.rs`/`sr
 DBAPI home (`connect()` kwargs / `db_kwargs` vs `conn_kwargs` vs `adbc_stmt_kwargs` /
 `cur.adbc_statement.set_options`), documents `spanner.rows_per_batch`, and adds a CI-executed
 cookbook snippet exercising it); wheel docs omit the platform floors (glibc ≥ 2.35, macOS ≥ 11/10.15); no
-CHANGELOG/CONTRIBUTING/versioning policy; `#![warn(missing_docs)]` absent; assorted maintainability
+CHANGELOG/CONTRIBUTING/versioning policy; ~~`#![warn(missing_docs)]` absent~~ (**Fixed.**
+`src/lib.rs` now carries `#![warn(missing_docs)]`; the public surface — the four exported types, the
+option/metadata constants and the `bench_support`/`fuzzing` helper modules — was already fully
+documented, so the lint gates future additions without needing any new docs, and
+`clippy --all-targets --all-features -- -D warnings` plus `cargo doc --no-deps --all-features` stay
+clean); assorted maintainability
 polish: the four direction-specific copies of the type mapping (`bind_one` vs `bind_list` is a
 genuine 100-line duplication — fold via an element visitor, and add an "adding a type touches
 these N sites" checklist), three hand-rolled comment-skipping lexer walkers that could share one
-token iterator, ingest-mode strings matched in two places (make it an enum), positional column
+token iterator, ~~ingest-mode strings matched in two places (make it an enum)~~ (**Fixed.** The
+statement now stores `adbc_core::options::IngestMode` (the spec enum), parsed once at `set_option`
+time by `ingest_mode_option` in `src/statement.rs` — which accepts both the canonical
+`adbc.ingest.mode.*` spellings (via the `adbc_core::constants` values) and the bare short forms,
+and rejects unknown modes with the same `NotImplemented` error as before; `build_ingest_table_ddl`
+matches the enum exhaustively with no fallback arm, and `get_option` still reports the canonical
+spelling via `String::from(IngestMode)` — unit-tested offline by
+`ingest_mode_parses_both_spellings_and_rejects_unknown`), positional column
 indices into INFORMATION_SCHEMA batches, `get_option_int` inconsistencies (database vs statement,
 and "not an integer" reported as `NotFound`), SQL-text helpers scattered across three modules.
 

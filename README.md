@@ -60,6 +60,12 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   optional unit suffix (`s` default, `ms`, `us`, `ns`, `m`, `h`); `spanner.read.timestamp` is an RFC
   3339 timestamp, optionally prefixed `read:` (exact, the default) or `min:` (bounded). The two are
   mutually exclusive. The staleness/timestamp is also baked into `execute_partitions()` descriptors.
+- Request priority and tags: `spanner.request.priority` (`low`/`medium`/`high`, applied to every
+  query/DML request and as the commit priority of read/write transactions) and `spanner.request.tag`
+  are settable on a connection — where they become the default for its statements — or per statement;
+  `spanner.transaction.tag` (connection-level) tags every read/write transaction the driver builds.
+  See [troubleshooting with tags](https://cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags).
+  Driver-internal metadata queries (`get_objects`, schema probes, …) are not tagged/prioritised.
 - Parameter binding: `bind`/`bind_stream` an Arrow batch whose columns become Spanner named
   parameters (a column `id` binds `@id`); each bound row runs the statement once. A bound *query*
   over several rows executes all of them in one shared read-only snapshot (a multi-use read-only
@@ -208,6 +214,9 @@ an integer or a numeric string. Every settable option round-trips through `get_o
 | `adbc.connection.transaction.isolation_level` | `adbc.connection.transaction.isolation.` + `default` / `serializable` / `repeatable_read` | `…isolation.default` | Isolation level for read/write transactions. The other spec levels are rejected with `NotImplemented`. |
 | `spanner.read.staleness`                     | `exact:<duration>` or `max:<duration>` (`<duration>`: number + optional `s`/`ms`/`us`/`ns`/`m`/`h`, `s` default) | unset (strong read) | Stale-read bound for read-only queries; becomes the default for statements the connection creates. Mutually exclusive with `spanner.read.timestamp`; set to `""` to unset. |
 | `spanner.read.timestamp`                     | RFC 3339 timestamp, optionally prefixed `read:` (exact, default) or `min:` (bounded) | unset (strong read) | Absolute read timestamp for read-only queries; same inheritance and mutual exclusion as above. |
+| `spanner.request.priority`                   | `low` / `medium` / `high` (case-insensitive) | unset (service default, high) | [Request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions) for every query/DML statement, and the commit priority of every read/write transaction; becomes the default for statements the connection creates. Set to `""` to unset. |
+| `spanner.request.tag`                        | free-form string                  | unset                             | [Request tag](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags) attached to every query/DML request; becomes the default for statements the connection creates. Set to `""` to unset. |
+| `spanner.transaction.tag`                    | free-form string                  | unset                             | Transaction tag attached to every read/write transaction the driver builds (autocommit DML, manual-mode commit, ingest commits). Connection-level only. Set to `""` to unset. |
 
 **Statement options** (via `set_option` on the statement):
 
@@ -218,6 +227,8 @@ an integer or a numeric string. Every settable option round-trips through `get_o
 | `spanner.max_partitions`                     | positive integer                  | unset (Spanner chooses)           | Hint for the maximum partition count from `execute_partitions`; Spanner may return fewer. |
 | `spanner.read.staleness`                     | as the connection option          | inherited from the connection     | Per-statement stale-read override. |
 | `spanner.read.timestamp`                     | as the connection option          | inherited from the connection     | Per-statement read-timestamp override. |
+| `spanner.request.priority`                   | as the connection option          | inherited from the connection     | Per-statement request-priority override. |
+| `spanner.request.tag`                        | as the connection option          | inherited from the connection     | Per-statement request-tag override. |
 | `adbc.ingest.target_table`                   | table name                        | unset                             | Bulk-ingest target table; setting it clears any SQL query on the statement (they are mutually exclusive). |
 | `adbc.ingest.target_db_schema`               | schema name                       | unset (default schema)            | Named schema qualifying the ingest target table (`""` selects Spanner's default, unnamed schema). |
 | `adbc.ingest.target_catalog`                 | `""` only                         | unset                             | Spanner has a single, unnamed catalog, so only the empty catalog is accepted. |

@@ -74,6 +74,8 @@
 //! # }
 //! ```
 
+#![warn(missing_docs)]
+
 mod bind;
 mod connection;
 mod conversion;
@@ -86,6 +88,7 @@ mod info;
 mod nested;
 mod objects;
 mod options;
+mod request;
 mod runtime;
 mod staleness;
 mod statement;
@@ -128,6 +131,89 @@ pub mod fuzzing {
     /// Match an ADBC `LIKE` pattern against a value.
     pub fn like_match(pattern: &str, value: &str) -> bool {
         crate::connection::like_match(pattern, value)
+    }
+    /// The first SQL keyword, uppercased — skipping whitespace, comments, and `@{…}` statement
+    /// hints.
+    pub fn first_keyword(sql: &str) -> Option<String> {
+        crate::ddl::first_keyword(sql)
+    }
+    /// Whether the SQL begins with a DML statement (`INSERT`/`UPDATE`/`DELETE`).
+    pub fn is_dml(sql: &str) -> bool {
+        crate::ddl::is_dml(sql)
+    }
+    /// Strip trailing top-level `;` terminators from a single-statement query.
+    pub fn strip_trailing_terminators(sql: &str) -> String {
+        crate::ddl::strip_trailing_terminators(sql)
+    }
+    /// The distinct `@name` bind parameters of a query, in first-appearance order.
+    pub fn named_parameters(sql: &str) -> Vec<String> {
+        crate::bind::named_parameters(sql)
+    }
+    /// Backtick-quote a Spanner identifier (GoogleSQL backslash escaping).
+    pub fn quote_ident(ident: &str) -> String {
+        crate::bind::quote_ident(ident)
+    }
+    /// Resolve the column→parameter pairing for `sql` against a batch whose columns are named
+    /// `column_names` (built here as nullable `Int64`; the pairing never looks at types).
+    ///
+    /// Returns the resolved names, or `None` on the documented count-mismatch rejection — after
+    /// asserting the error is `InvalidArguments` (any other status, like any panic, is a bug).
+    pub fn resolve_parameter_names(sql: &str, column_names: &[String]) -> Option<Vec<String>> {
+        use arrow_array::RecordBatch;
+        use arrow_schema::{DataType, Field, Schema};
+        let fields: Vec<Field> = column_names
+            .iter()
+            .map(|name| Field::new(name, DataType::Int64, true))
+            .collect();
+        let batch = RecordBatch::new_empty(std::sync::Arc::new(Schema::new(fields)));
+        match crate::bind::resolve_parameter_names(sql, &batch) {
+            Ok(names) => Some(names),
+            Err(e) => {
+                assert_eq!(
+                    e.status,
+                    adbc_core::error::Status::InvalidArguments,
+                    "resolve_parameter_names must reject with InvalidArguments: {e:?}"
+                );
+                None
+            }
+        }
+    }
+    /// Decode an opaque partition descriptor, returning whether it decoded.
+    ///
+    /// The oracles live here (where the client's `Partition` type is in scope): a rejected
+    /// descriptor must be a clean `InvalidArguments` error — never a panic — and an accepted one
+    /// must survive a serialize → decode → serialize round trip unchanged (compared as
+    /// `serde_json::Value`, so map key order is irrelevant).
+    pub fn decode_partition(descriptor: &[u8]) -> bool {
+        match crate::connection::decode_partition(descriptor) {
+            Ok(partition) => {
+                let value =
+                    serde_json::to_value(&partition).expect("a decoded partition re-serializes");
+                let bytes =
+                    serde_json::to_vec(&value).expect("a serde_json::Value always serializes");
+                let again = crate::connection::decode_partition(&bytes)
+                    .expect("a re-serialized partition descriptor decodes");
+                assert_eq!(
+                    value,
+                    serde_json::to_value(&again).expect("a decoded partition re-serializes"),
+                    "partition descriptor round-trip changed the value"
+                );
+                true
+            }
+            Err(e) => {
+                assert_eq!(
+                    e.status,
+                    adbc_core::error::Status::InvalidArguments,
+                    "decode_partition must reject with InvalidArguments: {e:?}"
+                );
+                assert!(
+                    e.message.contains("invalid partition descriptor"),
+                    "unexpected rejection message: {}",
+                    e.message
+                );
+                false
+            }
+        }
     }
     /// Normalize an emulator endpoint by adding an `http://` scheme when absent.
     pub fn ensure_scheme(host: &str) -> String {
@@ -308,6 +394,34 @@ pub const OPTION_READ_STALENESS: &str = "spanner.read.staleness";
 /// Set on a connection it becomes the default for statements it creates; a statement may override
 /// it. Unset (the default) means a **strong** read.
 pub const OPTION_READ_TIMESTAMP: &str = "spanner.read.timestamp";
+
+/// Driver-specific connection **and** statement option: the **request priority** Spanner's
+/// scheduler uses to arbitrate CPU between workloads — `low`, `medium` or `high`
+/// (case-insensitive). Applied to every query and DML statement the driver builds, and as the
+/// **commit priority** of every read/write transaction runner (autocommit DML, the manual-mode
+/// commit, ingest commits). Unset (the default) leaves the service default (high); set an empty
+/// string to unset. Set on a connection it becomes the default for statements it creates; a
+/// statement may override it. Driver-internal metadata queries (`get_objects`, schema probes, …)
+/// are not affected.
+///
+/// Modeled on the BigQuery ADBC driver's `bigquery.query.priority` option; see Spanner's
+/// [`RequestOptions.priority`](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions).
+pub const OPTION_REQUEST_PRIORITY: &str = "spanner.request.priority";
+
+/// Driver-specific connection **and** statement option: a free-form **request tag**, attached to
+/// every query/DML statement (and `ExecuteBatchDml` batch) the driver builds and surfaced in
+/// Spanner's query and transaction statistics for
+/// [troubleshooting with tags](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags).
+/// Unset by default; set an empty string to unset. Set on a connection it becomes the default for
+/// statements it creates; a statement may override it.
+pub const OPTION_REQUEST_TAG: &str = "spanner.request.tag";
+
+/// Driver-specific **connection** option: a free-form **transaction tag**, applied wherever the
+/// driver builds a read/write transaction (autocommit DML, the manual-mode commit, ingest commits)
+/// and attached by Spanner to every operation of that transaction. Unset by default; set an empty
+/// string to unset. Connection-level only (a transaction can span several statements, so there is
+/// no per-statement override).
+pub const OPTION_TRANSACTION_TAG: &str = "spanner.transaction.tag";
 
 /// The vendor name reported by [`Connection::get_info`](adbc_core::Connection::get_info).
 pub const VENDOR_NAME: &str = "Google Cloud Spanner";

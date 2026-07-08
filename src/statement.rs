@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use adbc_core::error::{Error, Result, Status};
-use adbc_core::options::{OptionStatement, OptionValue};
+use adbc_core::options::{IngestMode, OptionStatement, OptionValue};
 use adbc_core::{Optionable, PartitionedResult, Statement};
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
@@ -27,7 +27,7 @@ use google_cloud_spanner::model::execute_sql_request::QueryMode;
 use google_cloud_spanner::model::transaction_options::IsolationLevel;
 use google_cloud_spanner::model::PartitionOptions;
 use google_cloud_spanner::mutation::Mutation;
-use google_cloud_spanner::statement::Statement as SpannerSql;
+use google_cloud_spanner::statement::{Statement as SpannerSql, StatementBuilder};
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
 use crate::bind;
@@ -36,6 +36,7 @@ use crate::conversion::{result_set_to_batch, stream_bound_query, stream_query};
 use crate::error::{
     err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
 };
+use crate::request::RequestConfig;
 use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
 use crate::staleness::ReadStaleness;
 
@@ -84,10 +85,12 @@ pub struct SpannerStatement {
     /// (`""`) catalog, so only the empty catalog is accepted; stored solely so the option
     /// round-trips through `get_option`.
     target_catalog: Option<String>,
-    /// Ingest mode (`adbc.ingest.mode`), stored in canonical form once set so it round-trips
-    /// through `get_option`. `append` (default), `create`, `create_append`, and `replace` are
-    /// accepted; the create/replace modes build the table from the ingest data's Arrow schema.
-    ingest_mode: Option<String>,
+    /// Ingest mode (`adbc.ingest.mode`), parsed once in `set_option` (which rejects unknown
+    /// modes) so the ingest paths match it exhaustively; `get_option` reports the spec's
+    /// canonical `adbc.ingest.mode.*` spelling. `append` (default), `create`, `create_append`,
+    /// and `replace`; the create/replace modes build the table from the ingest data's Arrow
+    /// schema.
+    ingest_mode: Option<IngestMode>,
     /// Rows converted into each streamed Arrow batch by `execute` (`spanner.rows_per_batch`).
     rows_per_batch: usize,
     /// Enable Data Boost for partitioned execution (`spanner.data_boost_enabled`).
@@ -99,6 +102,11 @@ pub struct SpannerStatement {
     /// (`spanner.read.staleness` / `spanner.read.timestamp`), inherited from the connection at
     /// creation time and overridable per statement. Default is a strong read.
     read_staleness: ReadStaleness,
+    /// Request priority and request/transaction tags (`spanner.request.priority` /
+    /// `spanner.request.tag`), inherited from the connection at creation time; the priority and
+    /// request tag are overridable per statement. The transaction tag (connection-level only)
+    /// rides along for the read/write transaction runners this statement builds.
+    request: RequestConfig,
     /// Cancellation signal for this statement's in-flight execution (see [`Statement::cancel`]).
     cancel: CancelSignal,
 }
@@ -113,6 +121,7 @@ impl SpannerStatement {
         read_only: Arc<AtomicBool>,
         isolation: IsolationLevel,
         read_staleness: ReadStaleness,
+        request: RequestConfig,
         txn: SharedTxn,
     ) -> Self {
         Self {
@@ -133,6 +142,7 @@ impl SpannerStatement {
             data_boost: false,
             max_partitions: None,
             read_staleness,
+            request,
             cancel: CancelSignal::new(),
         }
     }
@@ -141,6 +151,13 @@ impl SpannerStatement {
     /// attempt (never cached), so a toggle on the connection applies to this statement immediately.
     fn is_read_only(&self) -> bool {
         self.read_only.load(Ordering::Acquire)
+    }
+
+    /// A Spanner statement builder for `sql` with this statement's request priority and request
+    /// tag (`spanner.request.priority` / `spanner.request.tag`) applied. Every query/DML statement
+    /// the driver builds goes through here so the two options apply uniformly.
+    fn sql_builder(&self, sql: &str) -> StatementBuilder {
+        self.request.apply_to_statement(SpannerSql::builder(sql))
     }
 
     /// Build one Spanner statement per bound row, binding its columns as named parameters.
@@ -155,7 +172,7 @@ impl SpannerStatement {
             let names = bind::resolve_parameter_names(sql, batch)?;
             for row in 0..batch.num_rows() {
                 statements
-                    .push(bind::bind_params(SpannerSql::builder(sql), &names, batch, row)?.build());
+                    .push(bind::bind_params(self.sql_builder(sql), &names, batch, row)?.build());
             }
         }
         Ok(statements)
@@ -168,15 +185,15 @@ impl SpannerStatement {
     fn build_ingest_table_ddl(
         &self,
         table: &str,
-        mode: Option<&str>,
+        mode: Option<IngestMode>,
     ) -> Result<Option<Vec<String>>> {
+        // Exhaustive: unknown modes were already rejected by `set_option` (`ingest_mode_option`).
         let (if_not_exists, drop_first) = match mode {
             // Append (the default) into an existing table: no DDL.
-            None | Some("adbc.ingest.mode.append") => return Ok(None),
-            Some("adbc.ingest.mode.create") => (false, false),
-            Some("adbc.ingest.mode.create_append") => (true, false),
-            Some("adbc.ingest.mode.replace") => (false, true),
-            Some(other) => return Err(not_implemented(&format!("ingest mode {other:?}"))),
+            None | Some(IngestMode::Append) => return Ok(None),
+            Some(IngestMode::Create) => (false, false),
+            Some(IngestMode::CreateAppend) => (true, false),
+            Some(IngestMode::Replace) => (false, true),
         };
         let schema = self
             .bound
@@ -258,7 +275,7 @@ impl SpannerStatement {
         } else {
             Ok(crate::ddl::split_statements(sql)
                 .into_iter()
-                .map(|s| SpannerSql::builder(s).build())
+                .map(|s| self.sql_builder(&s).build())
                 .collect())
         }
     }
@@ -283,8 +300,7 @@ impl SpannerStatement {
         if self.bound.is_empty() {
             return Err(invalid_state("cannot ingest: no data has been bound"));
         }
-        let mode = self.ingest_mode.as_deref();
-        let ingest_ddl = self.build_ingest_table_ddl(table, mode)?;
+        let ingest_ddl = self.build_ingest_table_ddl(table, self.ingest_mode)?;
         // `append` (the default) is the only mode that inserts into a pre-existing table, so it is
         // the only one whose failure the ADBC spec wants remapped to NotFound / AlreadyExists.
         // `build_ingest_table_ddl` returns `None` for exactly that mode.
@@ -380,9 +396,10 @@ impl SpannerStatement {
         }
         let count = mutations.len() as i64;
         let client = self.client.clone();
+        let request = self.request.clone();
         block_on_cancellable(&self.runtime, &self.cancel, async move {
-            client
-                .write_only_transaction()
+            request
+                .apply_to_write_only(client.write_only_transaction())
                 .build()
                 .write(mutations)
                 .await
@@ -424,6 +441,7 @@ impl SpannerStatement {
             &self.client,
             &self.cancel,
             self.isolation.clone(),
+            self.request.clone(),
             statements,
         )?;
         Ok(Some(count))
@@ -444,8 +462,10 @@ impl SpannerStatement {
     ) -> Result<(Vec<RecordBatch>, SchemaRef, i64)> {
         let client = self.client.clone();
         let isolation = self.isolation.clone();
+        let request = self.request.clone();
         let results = block_on_cancellable(&self.runtime, &self.cancel, async move {
-            let runner = apply_isolation(client.read_write_transaction(), isolation)
+            let runner = request
+                .apply_to_runner(apply_isolation(client.read_write_transaction(), isolation))
                 .build()
                 .await
                 .map_err(from_spanner)?;
@@ -515,7 +535,7 @@ impl SpannerStatement {
             }
             parts
                 .into_iter()
-                .map(|s| SpannerSql::builder(s).build())
+                .map(|s| self.sql_builder(&s).build())
                 .collect()
         } else {
             self.build_bound_statements(sql)?
@@ -620,7 +640,7 @@ impl SpannerStatement {
     /// partitioned query itself. Only the first bound row is used — partitioned execution has no
     /// per-row fan-out, so extra bound rows are ignored.
     fn build_query_statement(&self, sql: &str, plan: bool) -> Result<SpannerSql> {
-        let mut builder = SpannerSql::builder(sql);
+        let mut builder = self.sql_builder(sql);
         if plan {
             builder = builder.set_query_mode(QueryMode::Plan);
         }
@@ -665,16 +685,7 @@ impl Optionable for SpannerStatement {
             OptionStatement::IngestMode => {
                 // Append into an existing table, or create it (from the ingest data's Arrow schema,
                 // with a synthetic UUID primary key) in the create/replace modes.
-                let canonical = match string_option(value)?.as_str() {
-                    "adbc.ingest.mode.append" | "append" => "adbc.ingest.mode.append",
-                    "adbc.ingest.mode.create" | "create" => "adbc.ingest.mode.create",
-                    "adbc.ingest.mode.create_append" | "create_append" => {
-                        "adbc.ingest.mode.create_append"
-                    }
-                    "adbc.ingest.mode.replace" | "replace" => "adbc.ingest.mode.replace",
-                    other => return Err(not_implemented(&format!("ingest mode {other:?}"))),
-                };
-                self.ingest_mode = Some(canonical.to_string());
+                self.ingest_mode = Some(ingest_mode_option(value)?);
             }
             OptionStatement::Other(k) if k == crate::OPTION_ROWS_PER_BATCH => {
                 self.rows_per_batch = rows_per_batch_option(value)?;
@@ -690,6 +701,12 @@ impl Optionable for SpannerStatement {
             }
             OptionStatement::Other(k) if k == crate::OPTION_READ_TIMESTAMP => {
                 self.read_staleness.set_timestamp(value)?;
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_REQUEST_PRIORITY => {
+                self.request.set_priority(value)?;
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_REQUEST_TAG => {
+                self.request.set_request_tag(value)?;
             }
             other => {
                 return Err(not_implemented(&format!(
@@ -709,7 +726,8 @@ impl Optionable for SpannerStatement {
             // Only the spec default (`false`) is ever accepted (see `check_ingest_temporary`), so
             // the driver's state is always `false` — report exactly that.
             OptionStatement::Temporary => Some(false.to_string()),
-            OptionStatement::IngestMode => self.ingest_mode.clone(),
+            // Reported in the spec's canonical `adbc.ingest.mode.*` spelling.
+            OptionStatement::IngestMode => self.ingest_mode.map(String::from),
             OptionStatement::Other(k) if k == crate::OPTION_ROWS_PER_BATCH => {
                 Some(self.rows_per_batch.to_string())
             }
@@ -724,6 +742,13 @@ impl Optionable for SpannerStatement {
             }
             OptionStatement::Other(k) if k == crate::OPTION_READ_TIMESTAMP => {
                 self.read_staleness.timestamp_string().map(str::to_string)
+            }
+            // The effective value: the connection's, unless overridden on this statement.
+            OptionStatement::Other(k) if k == crate::OPTION_REQUEST_PRIORITY => {
+                self.request.priority_string().map(str::to_string)
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_REQUEST_TAG => {
+                self.request.request_tag_string().map(str::to_string)
             }
             _ => None,
         };
@@ -847,11 +872,12 @@ impl Statement for SpannerStatement {
         let cancel = self.cancel.clone();
         let batch_size = self.rows_per_batch;
         let bound = self.read_staleness.timestamp_bound()?;
+        let statement = self.sql_builder(&sql).build();
         // Stream the result: `stream_query` fetches the first chunk (settling the schema) and the
-        // returned reader converts the rest to Arrow one bounded chunk at a time as it is iterated.
+        // returned reader converts the rest to Arrow one bounded chunk at a time as it is
+        // iterated, with a background task prefetching the next chunk ahead of the consumer.
         let reader = block_on_cancellable(&self.runtime, &self.cancel, async move {
             let transaction = crate::staleness::single_use(&client, bound);
-            let statement = SpannerSql::builder(sql).build();
             let result_set = transaction
                 .execute_query(statement)
                 .await
@@ -903,12 +929,13 @@ impl Statement for SpannerStatement {
         check_schema_query(&sql)?;
         let client = self.client.clone();
         let bound = self.bound.clone();
+        // QueryMode::Plan analyses the query and returns its column metadata without scanning
+        // any data, so dbt can introspect a model's output columns without wrapping it in a
+        // `SELECT ... WHERE false` subquery.
+        let plan_builder = self.sql_builder(&sql).set_query_mode(QueryMode::Plan);
         let schema = block_on_cancellable(&self.runtime, &self.cancel, async move {
             let transaction = client.single_use().build();
-            // QueryMode::Plan analyses the query and returns its column metadata without scanning
-            // any data, so dbt can introspect a model's output columns without wrapping it in a
-            // `SELECT ... WHERE false` subquery.
-            let mut builder = SpannerSql::builder(sql.as_str()).set_query_mode(QueryMode::Plan);
+            let mut builder = plan_builder;
             // Bind parameters if any were provided (values are irrelevant to the schema) so that
             // `@param` references resolve.
             if let Some(batch) = bound.first() {
@@ -1104,6 +1131,25 @@ fn check_target_catalog(catalog: String) -> Result<String> {
     }
 }
 
+/// Parse the `adbc.ingest.mode` option into an [`IngestMode`], accepting both the spec's canonical
+/// `adbc.ingest.mode.*` spellings and the bare short forms (`append`, `create`, …). Unknown modes
+/// are rejected here — at `set_option` time — which is what lets the ingest paths
+/// ([`SpannerStatement::build_ingest_table_ddl`]) match the enum exhaustively, with no fallback arm
+/// to drift.
+fn ingest_mode_option(value: OptionValue) -> Result<IngestMode> {
+    use adbc_core::constants::{
+        ADBC_INGEST_OPTION_MODE_APPEND, ADBC_INGEST_OPTION_MODE_CREATE,
+        ADBC_INGEST_OPTION_MODE_CREATE_APPEND, ADBC_INGEST_OPTION_MODE_REPLACE,
+    };
+    match string_option(value)?.as_str() {
+        ADBC_INGEST_OPTION_MODE_APPEND | "append" => Ok(IngestMode::Append),
+        ADBC_INGEST_OPTION_MODE_CREATE | "create" => Ok(IngestMode::Create),
+        ADBC_INGEST_OPTION_MODE_CREATE_APPEND | "create_append" => Ok(IngestMode::CreateAppend),
+        ADBC_INGEST_OPTION_MODE_REPLACE | "replace" => Ok(IngestMode::Replace),
+        other => Err(not_implemented(&format!("ingest mode {other:?}"))),
+    }
+}
+
 /// Validate the `adbc.ingest.temporary` option. Spanner has no temporary tables, so only the spec
 /// default (`false`, in any of the shared boolean spellings) is accepted — as a no-op; `true` is
 /// rejected as unsupported.
@@ -1244,6 +1290,38 @@ mod tests {
         // Any named catalog is rejected as unsupported.
         let error = check_target_catalog("main".to_string()).unwrap_err();
         assert_eq!(error.status, Status::NotImplemented);
+    }
+
+    #[test]
+    fn ingest_mode_parses_both_spellings_and_rejects_unknown() {
+        // Both the spec's canonical `adbc.ingest.mode.*` spelling and the bare short form parse to
+        // the same mode, and the mode reports back (`get_option`) in canonical form.
+        for (canonical, short, mode) in [
+            ("adbc.ingest.mode.append", "append", IngestMode::Append),
+            ("adbc.ingest.mode.create", "create", IngestMode::Create),
+            (
+                "adbc.ingest.mode.create_append",
+                "create_append",
+                IngestMode::CreateAppend,
+            ),
+            ("adbc.ingest.mode.replace", "replace", IngestMode::Replace),
+        ] {
+            for spelling in [canonical, short] {
+                assert_eq!(
+                    ingest_mode_option(OptionValue::String(spelling.into())).unwrap(),
+                    mode,
+                    "spelling {spelling:?}"
+                );
+            }
+            assert_eq!(String::from(mode), canonical);
+        }
+        // Unknown modes are rejected at set_option time, as unimplemented.
+        let error = ingest_mode_option(OptionValue::String("upsert".into())).unwrap_err();
+        assert_eq!(error.status, Status::NotImplemented);
+        assert!(error.message.contains("ingest mode \"upsert\""), "{error}");
+        // Non-string values fail string coercion.
+        let error = ingest_mode_option(OptionValue::Int(1)).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
     }
 
     #[test]
