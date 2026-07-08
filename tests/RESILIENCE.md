@@ -50,6 +50,7 @@ CI runs it non-gating via `.github/workflows/resilience.yml` (manual dispatch + 
 | `bandwidth` (downstream throttle) | `cancel_interrupts_in_flight_query` | Throttling a ~48 MB result to 2000 KB/s keeps the streaming reader blocked in a real network read; `Statement::cancel` from another thread interrupts it in **milliseconds** with `Status::Cancelled`, instead of blocking ~18s for the rest of the stream. Drives the real `CancelSignal` → `block_on_cancellable` path. |
 | `reset_peer` (immediate TCP RST) | `reset_peer_surfaces_error_then_recovers` | A query under the reset surfaces a **clean ADBC error** (no panic; no unbounded hang — a watchdog thread bounds it), and once the toxic is removed a subsequent query **recovers** as the gRPC channel re-establishes through the proxy. |
 | `reset_peer` (immediate TCP RST) | `commit_under_transport_fault_never_loses_the_write` | A manual-transaction `commit()` started under the reset must **never lose the buffered DML**: the write has to land once the toxic is removed. With the pinned client the commit *blocks and heals* — it retries internally and succeeds on its own once the transport recovers (see the limitation below). If a future client surfaces the error instead, the test's other branch asserts the driver kept the buffer so a retried `commit()` replays it (guarding the take-before-apply regression, where a retried commit vacuously succeeded on an emptied buffer — a silent lost write). The buffered DML is an idempotent UPDATE, so the assertion holds regardless of whether the faulted commit reached the emulator. |
+| `reset_peer` (immediate TCP RST) | `update_timeout_bounds_a_faulted_write_then_recovers_when_unset` | With `spanner.rpc.timeout_seconds.update` set to a short deadline, an autocommit write launched under the reset — which the client would otherwise retry unboundedly (*block-and-heal*, per the row above) — fails with ADBC **`Status::Timeout`** within the deadline, naming the option, instead of hanging (a watchdog thread bounds it, so a real hang fails the test loudly). Then the **contrast**: with the deadline unset (`""`) and the toxic removed, the *same* write succeeds once the channel re-establishes — proving the expired deadline poisoned nothing (no lingering cancellation, session damage, or lost write). The idempotent `SET Val = 1` makes the recovery assertion immune to whether any faulted attempt reached the emulator. |
 
 ## Honest limitations (read this)
 
@@ -72,7 +73,10 @@ CI runs it non-gating via `.github/workflows/resilience.yml` (manual dispatch + 
   block a commit unboundedly unless a deadline is configured — the
   `spanner.rpc.timeout_seconds.update` option (see `docs/options.md`) bounds the whole commit,
   including the client's internal retries, and fails it with ADBC `Timeout`. Unset (the default)
-  preserves the block-and-heal behaviour described above.
+  preserves the block-and-heal behaviour described above. This is now driven under a toxic by
+  `update_timeout_bounds_a_faulted_write_then_recovers_when_unset` (see the table above), which puts
+  a `reset_peer` toxic in front of the emulator and asserts a deadline-bounded write fails with
+  `Timeout` in-deadline rather than hanging, then recovers once the deadline is unset.
 
 - **Cancel is tested on the streaming read path, and needs the server to chunk.** The only in-flight
   network operation the safe (`&mut self`) Rust API lets a second thread cancel is a **streamed chunk
