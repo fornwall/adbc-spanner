@@ -1766,6 +1766,48 @@ fn query_and_dml_round_trip() {
         vec!["Singers".to_string()],
         "types reported by get_table_types must round-trip as get_objects filters"
     );
+
+    // --- Depth-boundary rule: a table_type filter matching nothing must still return the
+    // catalog + db_schema skeleton, with each schema's db_schema_tables an EMPTY list — never
+    // NULL, which is reserved for levels strictly below the requested depth. (The adbc-drivers
+    // validation suite caught DuckDB shipping NULL here; see duckdb/duckdb PR #21018.)
+    let no_such_type = connection
+        .get_objects(
+            ObjectDepth::Tables,
+            None,
+            None,
+            None,
+            Some(vec!["NO SUCH TYPE"]),
+            None,
+        )
+        .expect("get_objects with a table_type filter matching nothing")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect type-filtered objects");
+    let nb = &no_such_type[0];
+    assert_eq!(nb.num_rows(), 1, "single catalog");
+    let nb_schemas = nb.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+    assert!(
+        nb_schemas.is_valid(0),
+        "catalog_db_schemas must not be NULL at Tables depth"
+    );
+    let nb_schemas = nb_schemas.value(0);
+    let nb_schemas = nb_schemas.as_any().downcast_ref::<StructArray>().unwrap();
+    assert!(
+        !nb_schemas.is_empty(),
+        "the db_schema skeleton must survive a table_type filter matching nothing"
+    );
+    let nb_tables = nb_schemas
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    for i in 0..nb_tables.len() {
+        assert!(
+            nb_tables.is_valid(i),
+            "db_schema_tables must be EMPTY, not NULL, when the filter matches nothing"
+        );
+        assert_eq!(nb_tables.value(i).len(), 0, "no tables may match");
+    }
 }
 
 /// A bulk ingest big enough to cross the driver's per-chunk byte budget (~4 MiB) is split into
