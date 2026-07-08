@@ -1349,7 +1349,10 @@ fn query_and_dml_round_trip() {
         "Bob"
     );
 
-    // Parameterized DML: update by bound @Id / @Name.
+    // Parameterized DML: update by bound @Id / @Name. The bound columns are named after the
+    // parameters but in a different order than they appear in the SQL (@Name before @Id), so this
+    // opts into by-name binding (`adbc.statement.bind_by_name=true`) rather than the default
+    // positional pairing.
     let upd = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("Id", DataType::Int64, false),
@@ -1362,6 +1365,11 @@ fn query_and_dml_round_trip() {
     )
     .unwrap();
     let mut pu = connection.new_statement().expect("new statement");
+    pu.set_option(
+        OptionStatement::Other(adbc_spanner::OPTION_BIND_BY_NAME.into()),
+        OptionValue::String("true".into()),
+    )
+    .expect("set bind_by_name=true");
     pu.set_sql_query("UPDATE AdbcBind SET Name = @Name WHERE Id = @Id")
         .unwrap();
     pu.bind(upd).expect("bind update params");
@@ -3046,11 +3054,10 @@ fn execute_streams_in_batches() {
     drop.execute_update().expect("drop stream table");
 }
 
-/// The tri-state `adbc.statement.bind_by_name` option (the ADBC SQLite reference driver's
-/// convention): unset keeps the auto-detection heuristic, `false` forces positional binding even
-/// when every bound column name coincidentally matches a query parameter, and `true` forces
-/// strict by-name binding that rejects an unmatched column. Also covers the `get_option`
-/// round-trip (`true`/`false` when set, `NotFound` when unset or reset with `""`).
+/// The `adbc.statement.bind_by_name` option (the ADBC SQLite reference driver's convention): the
+/// default (`false`) binds positionally even when every bound column name coincidentally matches a
+/// query parameter, and `true` forces strict by-name binding that rejects an unmatched column.
+/// Also covers the `get_option` round-trip (`true`/`false`, defaulting to `false`).
 #[test]
 fn bind_by_name_modes() {
     let Some(target) = test_target() else {
@@ -3086,8 +3093,8 @@ fn bind_by_name_modes() {
         )
         .unwrap()
     };
-    // Run `SELECT @a, @b` with `rows` bound under the given bind_by_name value (None = unset)
-    // and return the (@a, @b) values Spanner saw.
+    // Run `SELECT @a, @b` with `rows` bound under the given bind_by_name value (None = leave the
+    // option at its default) and return the (@a, @b) values Spanner saw.
     let query_pair = |connection: &mut SpannerConnection,
                       rows: RecordBatch,
                       mode: Option<&str>|
@@ -3103,9 +3110,11 @@ fn bind_by_name_modes() {
                 "bind_by_name must round-trip through get_option"
             );
         } else {
-            assert!(
-                s.get_option_string(bind_by_name_key()).is_err(),
-                "unset bind_by_name must read as NotFound"
+            assert_eq!(
+                s.get_option_string(bind_by_name_key())
+                    .expect("bind_by_name reads its default"),
+                "false",
+                "bind_by_name defaults to false (positional)"
             );
         }
         s.set_sql_query("SELECT @a AS a_value, @b AS b_value")
@@ -3127,28 +3136,27 @@ fn bind_by_name_modes() {
         Ok((ints(0), ints(1)))
     };
 
-    // Unset (default): every column names a parameter, so the heuristic binds BY NAME —
-    // order-independent, the swapped columns land on their namesakes.
+    // Default (option left unset): strictly positional — the swapped batch binds column 0 -> @a,
+    // column 1 -> @b, the coincidental name matches (and their order) ignored entirely.
     assert_eq!(
-        query_pair(&mut connection, batch(["b", "a"]), None).expect("heuristic name binding"),
-        (20, 10),
-        "unset bind_by_name must name-match fully-matching columns"
+        query_pair(&mut connection, batch(["b", "a"]), None).expect("default positional binding"),
+        (10, 20),
+        "the default (bind_by_name unset) must bind positionally"
     );
-    // false: strictly positional — the very same batch now binds column 0 -> @a, column 1 -> @b,
-    // the coincidental name matches (and their order) ignored entirely.
+    // false: the same positional binding, set explicitly.
     assert_eq!(
         query_pair(&mut connection, batch(["b", "a"]), Some("false")).expect("positional binding"),
         (10, 20),
         "bind_by_name=false must ignore coincidental name matches and bind positionally"
     );
-    // true: strict by-name, same result as the heuristic for fully-matching columns.
+    // true: strict by-name — order-independent, the swapped columns land on their namesakes.
     assert_eq!(
         query_pair(&mut connection, batch(["b", "a"]), Some("true")).expect("by-name binding"),
         (20, 10),
         "bind_by_name=true must bind matching columns by name"
     );
     // true with an unmatched column: a hard InvalidArguments error naming the parameter, instead
-    // of the heuristic's silent positional fallback.
+    // of a silent positional fallback.
     let error = query_pair(&mut connection, batch(["a", "x"]), Some("true"))
         .expect_err("bind_by_name=true must reject an unmatched column");
     assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
@@ -3157,23 +3165,21 @@ fn bind_by_name_modes() {
         "error must name the missing parameter: {}",
         error.message
     );
-    // Unset with the same partial match: the heuristic falls back to positional binding.
+    // The same partial match under the default (positional) binding succeeds: column 0 -> @a,
+    // column 1 -> @b, names ignored.
     assert_eq!(
-        query_pair(&mut connection, batch(["a", "x"]), None).expect("heuristic fallback"),
+        query_pair(&mut connection, batch(["a", "x"]), None).expect("default positional binding"),
         (10, 20),
-        "a partial name match under the default heuristic must bind positionally"
+        "a partial name match under the default binding must bind positionally"
     );
-    // Setting "" resets to the unset default: auto-detection again, and get_option is NotFound.
-    let mut reset = connection.new_statement().expect("new statement");
-    reset
-        .set_option(bind_by_name_key(), OptionValue::String("false".into()))
-        .expect("set bind_by_name=false");
-    reset
-        .set_option(bind_by_name_key(), OptionValue::String(String::new()))
-        .expect("reset bind_by_name");
-    assert!(
-        reset.get_option_string(bind_by_name_key()).is_err(),
-        "reset bind_by_name must read as NotFound again"
+    // An empty string is not a valid boolean and is rejected (the option has no unset state).
+    let mut invalid = connection.new_statement().expect("new statement");
+    assert_eq!(
+        invalid
+            .set_option(bind_by_name_key(), OptionValue::String(String::new()))
+            .expect_err("empty bind_by_name must be rejected")
+            .status,
+        adbc_core::error::Status::InvalidArguments,
     );
 }
 

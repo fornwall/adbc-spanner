@@ -171,12 +171,17 @@ pub mod fuzzing {
         crate::bind::quote_ident(ident)
     }
     /// Resolve the column→parameter pairing for `sql` against a batch whose columns are named
-    /// `column_names` (built here as nullable `Int64`; the pairing never looks at types), under
-    /// the default auto-detection mode (`adbc.statement.bind_by_name` unset).
+    /// `column_names` (built here as nullable `Int64`; the pairing never looks at types), under the
+    /// given `bind_by_name` mode (`adbc.statement.bind_by_name`: `false` positional, `true`
+    /// by-name).
     ///
-    /// Returns the resolved names, or `None` on the documented count-mismatch rejection — after
-    /// asserting the error is `InvalidArguments` (any other status, like any panic, is a bug).
-    pub fn resolve_parameter_names(sql: &str, column_names: &[String]) -> Option<Vec<String>> {
+    /// Returns the resolved names, or `None` on a documented rejection — after asserting the error
+    /// is `InvalidArguments` (any other status, like any panic, is a bug).
+    pub fn resolve_parameter_names(
+        sql: &str,
+        column_names: &[String],
+        bind_by_name: bool,
+    ) -> Option<Vec<String>> {
         use arrow_array::RecordBatch;
         use arrow_schema::{DataType, Field, Schema};
         let fields: Vec<Field> = column_names
@@ -184,7 +189,7 @@ pub mod fuzzing {
             .map(|name| Field::new(name, DataType::Int64, true))
             .collect();
         let batch = RecordBatch::new_empty(std::sync::Arc::new(Schema::new(fields)));
-        match crate::bind::resolve_parameter_names(sql, &batch, crate::bind::BindMode::Auto) {
+        match crate::bind::resolve_parameter_names(sql, &batch, bind_by_name) {
             Ok(names) => Some(names),
             Err(e) => {
                 assert_eq!(
@@ -385,20 +390,19 @@ pub const OPTION_MAX_PARTITIONS: &str = "spanner.max_partitions";
 
 /// Statement option controlling how bound Arrow columns pair with the query's `@name` parameters,
 /// following the ADBC SQLite reference driver's `bind_by_name` convention
-/// ([apache/arrow-adbc#3362](https://github.com/apache/arrow-adbc/issues/3362)). Tri-state:
+/// ([apache/arrow-adbc#3362](https://github.com/apache/arrow-adbc/issues/3362)). A boolean,
+/// defaulting to `false`:
 ///
-/// - **Unset** (the default): auto-detect. When **every** bound column's name matches one of the
-///   query's `@name` parameters, each column binds to `@<its own name>` (order-independent);
-///   otherwise the *i*-th column binds to the *i*-th distinct parameter in query order. This is
-///   the driver's historical behaviour — but note the pitfall the explicit modes close: a
-///   positional client whose column names all *coincidentally* match parameter names silently
-///   gets name-matched (possibly reordered) binding.
-/// - **`true`**: strict by-name. Every bound column must name a query parameter; an unmatched
-///   column fails with `InvalidArguments` naming the missing parameter.
-/// - **`false`**: strictly positional. Column names are ignored entirely.
+/// - **`false`** (the default): strictly positional. The *i*-th bound column binds to the *i*-th
+///   distinct `@name` parameter in query order; column names are ignored entirely. This is the
+///   ADBC ordinal contract that positional clients (PostgreSQL/Snowflake-style drivers, the Python
+///   DBAPI, validation suites) rely on.
+/// - **`true`**: strict by-name. Each column binds to `@<its own name>` (order-independent); a
+///   bound column that names no query parameter fails with `InvalidArguments` naming the missing
+///   parameter. Use this when the bound column names are authoritative and may not match the
+///   parameters' textual order.
 ///
-/// Accepts a boolean; an empty string (`""`) resets to the unset default. `get_option` reports
-/// `true`/`false` when set and fails with `NotFound` when unset.
+/// Accepts a boolean. `get_option` reports `true`/`false`.
 pub const OPTION_BIND_BY_NAME: &str = "adbc.statement.bind_by_name";
 
 /// Driver-specific connection **and** statement option: the **read staleness** for read-only

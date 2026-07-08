@@ -8,8 +8,8 @@ use libfuzzer_sys::fuzz_target;
 // Fuzz the bind-side SQL surfaces with an arbitrary (query, bound column names) pair: `@name`
 // parameter extraction, the column→parameter pairing, and identifier quoting. Each is checked
 // against an independent restatement of its contract, not just "doesn't panic".
-fuzz_target!(|input: (String, Vec<String>)| {
-    let (sql, column_names) = input;
+fuzz_target!(|input: (String, Vec<String>, bool)| {
+    let (sql, column_names, bind_by_name) = input;
 
     // named_parameters: every extracted name is distinct, is a well-formed parameter identifier,
     // and occurs verbatim (with its `@`) in the SQL — never synthesized or mangled.
@@ -33,16 +33,25 @@ fuzz_target!(|input: (String, Vec<String>)| {
     }
 
     // resolve_parameter_names against a batch with these column names must follow the documented
-    // contract exactly (restated here): name mode when every column name is a query parameter,
-    // positional otherwise, and a clean InvalidArguments rejection (asserted inside the wrapper)
-    // exactly when the positional counts disagree.
-    let name_mode = !column_names.is_empty() && column_names.iter().all(|c| params.contains(c));
-    match resolve_parameter_names(&sql, &column_names) {
-        Some(resolved) if name_mode => assert_eq!(resolved, column_names),
+    // contract exactly for the chosen mode (restated here):
+    // - by-name (bind_by_name = true): the columns themselves iff every column names a parameter,
+    //   else a clean InvalidArguments rejection (asserted inside the wrapper);
+    // - positional (bind_by_name = false): the query's parameters iff the counts match, else that
+    //   same clean rejection.
+    let all_named = column_names.iter().all(|c| params.contains(c));
+    match resolve_parameter_names(&sql, &column_names, bind_by_name) {
+        Some(resolved) if bind_by_name => {
+            assert!(all_named, "by-name accepted an unmatched column: {column_names:?}");
+            assert_eq!(resolved, column_names);
+        }
         Some(resolved) => assert_eq!(resolved, params),
+        None if bind_by_name => assert!(
+            !all_named,
+            "by-name rejected a fully-matching pairing: {sql:?} / {column_names:?}"
+        ),
         None => assert!(
-            !name_mode && params.len() != column_names.len(),
-            "rejected a resolvable pairing: {sql:?} / {column_names:?}"
+            params.len() != column_names.len(),
+            "positional rejected a count-matching pairing: {sql:?} / {column_names:?}"
         ),
     }
 
