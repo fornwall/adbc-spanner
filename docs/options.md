@@ -81,8 +81,8 @@ path, not the original URI.
 | `spanner.request.priority` | `low`, `medium` or `high` (case-insensitive); `""` unsets | unset (service default, high) | yes, when set (the canonical lowercase form) | [Request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions) applied to every query/DML statement the driver builds, and the commit priority of every read/write transaction. Becomes the default for statements this connection creates (statements may override). |
 | `spanner.request.tag` | free-form string; `""` unsets | unset | yes, when set | [Request tag](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags) attached to every query/DML request the driver builds (surfaced in query/transaction statistics). Becomes the default for statements this connection creates (statements may override). Driver-internal metadata queries stay untagged. |
 | `spanner.transaction.tag` | free-form string; `""` unsets | unset | yes, when set | Transaction tag attached to every read/write transaction the driver builds (autocommit DML, the manual-mode commit, ingest commits). Connection level only. |
-| `spanner.rpc.timeout_seconds.query` | finite, non-negative seconds (fractions allowed); `0` disables; `""` unsets (see [RPC timeouts](#rpc-timeouts)) | unset (no deadline) | yes, when set (also via `get_option_double`) | Overall deadline on a query's **initial execution**: the `ExecuteStreamingSql` call plus the first chunk of the streamed result, the `execute_schema` / `execute_partitions` probes, and `read_partition`'s initial fetch. Expiry fails with `Timeout`. Becomes the default for statements this connection creates (statements may override). |
-| `spanner.rpc.timeout_seconds.update` | as `…query` | unset (no deadline) | yes, when set (also via `get_option_double`) | Overall deadline on each **write** operation: an autocommit DML / batch-DML transaction, the manual-mode commit, and each bulk-ingest commit chunk (covering any retries the client performs within it). A commit whose confirmation the driver stopped waiting for may still have landed server-side — the usual ambiguity of any timed-out commit. Same inheritance as `…query`. |
+| `spanner.rpc.timeout_seconds.query` | finite, non-negative seconds (fractions allowed); `0` disables; `""` unsets (see [RPC timeouts](#rpc-timeouts)) | unset (no deadline) | yes, when set (also via `get_option_double`) | Overall deadline on a query's **initial execution**: the `ExecuteStreamingSql` call plus the first chunk of the streamed result, the `execute_schema` / `execute_partitions` probes, and `read_partition`'s initial fetch. Also bounds the driver-internal metadata **reads** (`get_objects`, `get_statistics`, `get_table_schema`, the ingest table-exists probe). Expiry fails with `Timeout`. Becomes the default for statements this connection creates (statements may override). |
+| `spanner.rpc.timeout_seconds.update` | as `…query` | unset (no deadline) | yes, when set (also via `get_option_double`) | Overall deadline on each **write** operation: an autocommit DML / batch-DML transaction, the manual-mode commit, each bulk-ingest commit chunk, and a DDL change (the admin `UpdateDatabaseDdl` call **and** its long-running-operation poll loop) — covering any retries the client performs within it. A commit whose confirmation the driver stopped waiting for may still have landed server-side — the usual ambiguity of any timed-out commit (a timed-out DDL likewise may already have applied). Same inheritance as `…query`. |
 | `spanner.rpc.timeout_seconds.fetch` | as `…query` | unset (no deadline) | yes, when set (also via `get_option_double`) | Overall deadline on **each subsequent chunk fetch** of a streamed result (after the first, which `…query` covers), enforced inside the background prefetch task so a stalled stream fails the consumer's next batch with `Timeout`. Same inheritance as `…query`. |
 | `spanner.retry.max_attempts` | positive integer; `""` unsets (see [Retry tuning](#retry-tuning)) | unset (client default, no cap) | yes, when set (also via `get_option_int`) | Cap on the number of attempts (first try + retries) the client makes for a retryable RPC; `1` disables retrying. Bounds the client's default retry policy without dropping its transport-error-on-idempotent retrying. Becomes the default for statements this connection creates (statements may override). |
 | `spanner.retry.max_elapsed_seconds` | finite, strictly positive seconds (fractions allowed); `""` unsets (see [Retry tuning](#retry-tuning)) | unset (client default, no cap) | yes, when set (also via `get_option_double`) | Cap on the total wall-clock time spent retrying a retryable RPC before the last error is surfaced. Combines with `spanner.retry.max_attempts` (whichever limit fires first wins). Same inheritance as `…max_attempts`. |
@@ -198,14 +198,18 @@ connection *and* statement level, named in parallel with the Flight SQL ADBC dri
 
 - **`query`** — the *initial execution* of a query: the `ExecuteStreamingSql` call plus the first
   chunk of the streamed result (which settles the schema), the `execute_schema` /
-  `execute_partitions` probes, and `read_partition`'s initial fetch.
+  `execute_partitions` probes, and `read_partition`'s initial fetch. It also bounds the
+  driver-internal metadata **read** queries — `get_objects`, `get_statistics` (both its
+  INFORMATION_SCHEMA discovery fetch and its per-table aggregate scans), `get_table_schema`, and the
+  bulk-ingest table-exists probe — since each is an execution of a query.
 - **`fetch`** — *each subsequent chunk fetch* of a streamed result, enforced inside the background
   prefetch task, so a stream that stalls mid-result fails the consumer's next batch instead of
   hanging. For a bound (parameterized) query over several rows it also covers executing each
   per-row statement as the stream advances.
 - **`update`** — each *write* operation: an autocommit DML / batch-DML read/write transaction, the
-  manual-mode commit (including the commit performed when autocommit is re-enabled), and each
-  bulk-ingest commit chunk.
+  manual-mode commit (including the commit performed when autocommit is re-enabled), each
+  bulk-ingest commit chunk, and a DDL change — the admin `UpdateDatabaseDdl` call **and** its
+  long-running-operation poll loop (the most dangerous unbounded path: an LRO poll with no cap).
 
 Each value is a number of **seconds**, parsed as a double (fractions allowed) from a numeric
 string, integer or double value; it must be finite and non-negative — `NaN`, the infinities and
@@ -218,9 +222,10 @@ Enforcement is an **overall deadline per operation** (a `tokio::time::timeout` a
 driver-side operation, including any retries the client performs inside it), not a per-attempt
 gRPC timeout. An expired deadline fails with ADBC `Timeout` status. Note that a timed-out *commit*
 may still have landed server-side — the usual ambiguity of any commit whose confirmation was not
-awaited. DDL (an admin long-running operation) and driver-internal metadata queries
-(`get_objects`, schema probes, statistics scans) are deliberately not bounded, mirroring the
-request-tag/priority scope.
+awaited, and a timed-out DDL change may likewise have already applied (its poll simply stopped
+being awaited). Unlike the request-tag/priority options, which leave the driver-internal metadata
+queries untagged, these timeouts *do* bound them — `query` covers the metadata reads and `update`
+covers DDL — so no driver-side network path is left able to hang unboundedly.
 
 ## Retry tuning
 

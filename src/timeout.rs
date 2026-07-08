@@ -9,14 +9,17 @@
 //! - [`OPTION_RPC_TIMEOUT_QUERY`](crate::OPTION_RPC_TIMEOUT_QUERY) — the **initial execution** of a
 //!   query: the `ExecuteStreamingSql` call plus the first chunk of a streamed result (which is what
 //!   settles the schema), the `execute_schema`/`execute_partitions` probes, and the initial fetch
-//!   of `read_partition`.
+//!   of `read_partition`. It also bounds the driver-internal metadata reads, each of which is a
+//!   query execution: `get_objects`, `get_statistics` (both its discovery fetch and its per-table
+//!   aggregate scans), `get_table_schema`, and the shared table-exists probe.
 //! - [`OPTION_RPC_TIMEOUT_FETCH`](crate::OPTION_RPC_TIMEOUT_FETCH) — **each subsequent chunk
 //!   fetch** of a streamed result, applied inside the background prefetch task
 //!   ([`spawn_prefetch`](crate::runtime::spawn_prefetch)) so a stalled stream fails the consumer's
 //!   next batch instead of hanging the prefetcher.
 //! - [`OPTION_RPC_TIMEOUT_UPDATE`](crate::OPTION_RPC_TIMEOUT_UPDATE) — the **write paths**: DML /
-//!   batch-DML read/write transactions (including the manual-mode commit) and each bulk-ingest
-//!   commit chunk.
+//!   batch-DML read/write transactions (including the manual-mode commit), each bulk-ingest commit
+//!   chunk, and DDL — the admin `UpdateDatabaseDdl` call **and** its long-running-operation poll
+//!   loop, which otherwise polls without any bound.
 //!
 //! Each value is a number of **seconds**, parsed as `f64` (fractions allowed); it must be finite
 //! and non-negative — `NaN`, the infinities and negatives are rejected with `InvalidArguments`,
@@ -28,9 +31,10 @@
 //! Enforcement is an **overall deadline** per operation via [`tokio::time::timeout`]
 //! ([`with_timeout`]), not a per-attempt gax timeout: the bound covers the whole driver-side
 //! operation, including any retries the client performs inside it. An expired deadline surfaces as
-//! [`Status::Timeout`]. DDL (an admin long-running operation) and driver-internal metadata queries
-//! (`get_objects`, schema probes, …) are deliberately not bounded — mirroring how the request
-//! tag/priority options leave them untouched.
+//! [`Status::Timeout`]. Unlike the request tag/priority options — which deliberately leave the
+//! driver-internal metadata queries untouched — these timeouts bound every driver-side network
+//! path, DDL (an admin long-running operation) and the metadata queries included, so none can hang
+//! unboundedly.
 
 use std::future::Future;
 use std::time::Duration;

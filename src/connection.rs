@@ -310,6 +310,7 @@ impl SpannerConnection {
             &self.runtime,
             &self.client,
             &self.cancel,
+            self.timeouts.query_timeout(),
             db_schema,
             table_name,
         )
@@ -494,29 +495,36 @@ pub(crate) fn table_exists(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
     cancel: &CancelSignal,
+    timeout: Option<Duration>,
     db_schema: &str,
     table_name: &str,
 ) -> Result<bool> {
     let client = client.clone();
     let (schema, table) = (db_schema.to_string(), table_name.to_string());
-    block_on_cancellable(runtime, cancel, async move {
-        let statement = SpannerSql::builder(
-            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
-             WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table",
-        )
-        .add_param("schema", &schema)
-        .add_param("table", &table)
-        .build();
-        let transaction = client.single_use().build();
-        let result_set = transaction
-            .execute_query(statement)
-            .await
-            .map_err(from_spanner)?;
-        // A TABLE_NAME probe returns only strings, so the timestamp precision is irrelevant.
-        let (_schema, batch) =
-            result_set_to_batch(result_set, TimestampPrecision::default()).await?;
-        Ok::<bool, Error>(batch.num_rows() > 0)
-    })
+    // A metadata read, so the caller's query timeout (`spanner.rpc.timeout_seconds.query`) bounds
+    // it; unset (the default) leaves it unbounded.
+    block_on_cancellable(
+        runtime,
+        cancel,
+        with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async move {
+            let statement = SpannerSql::builder(
+                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
+                 WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table",
+            )
+            .add_param("schema", &schema)
+            .add_param("table", &table)
+            .build();
+            let transaction = client.single_use().build();
+            let result_set = transaction
+                .execute_query(statement)
+                .await
+                .map_err(from_spanner)?;
+            // A TABLE_NAME probe returns only strings, so the timestamp precision is irrelevant.
+            let (_schema, batch) =
+                result_set_to_batch(result_set, TimestampPrecision::default()).await?;
+            Ok::<bool, Error>(batch.num_rows() > 0)
+        }),
+    )
 }
 
 /// Run a query and return its single materialised record batch. Shared with the `INFORMATION_SCHEMA`
@@ -898,6 +906,7 @@ impl Connection for SpannerConnection {
             &self.runtime,
             &self.client,
             &self.cancel,
+            self.timeouts.query_timeout(),
             depth,
             db_schema,
             table_name,
@@ -933,14 +942,23 @@ impl Connection for SpannerConnection {
         // The reported schema honours the connection's timestamp precision, so it matches what a
         // query on this connection would actually stream.
         let precision = self.timestamp_precision;
-        let result = block_on_cancellable(&self.runtime, &self.cancel, async move {
-            let transaction = crate::staleness::single_use(&client, bound);
-            let result_set = transaction
-                .execute_query(SpannerSql::builder(sql).build())
-                .await
-                .map_err(from_spanner)?;
-            result_set_to_batch(result_set, precision).await
-        });
+        // A metadata read, so the connection's query timeout bounds it.
+        let result = block_on_cancellable(
+            &self.runtime,
+            &self.cancel,
+            with_timeout(
+                self.timeouts.query_timeout(),
+                crate::OPTION_RPC_TIMEOUT_QUERY,
+                async move {
+                    let transaction = crate::staleness::single_use(&client, bound);
+                    let result_set = transaction
+                        .execute_query(SpannerSql::builder(sql).build())
+                        .await
+                        .map_err(from_spanner)?;
+                    result_set_to_batch(result_set, precision).await
+                },
+            ),
+        );
         match result {
             Ok((schema, _batch)) => Ok((*schema).clone()),
             // A missing table surfaces from the query analyzer as `INVALID_ARGUMENT` ("Table not
@@ -1017,6 +1035,7 @@ impl Connection for SpannerConnection {
             &self.runtime,
             &self.client,
             &self.cancel,
+            self.timeouts.query_timeout(),
             &self.read_staleness,
             db_schema,
             table_name,

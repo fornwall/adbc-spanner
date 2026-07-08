@@ -6530,9 +6530,10 @@ fn rpc_timeouts() {
         0.0
     );
 
-    // End-to-end with generous deadlines on the connection: DDL (deliberately unbounded), DML (the
-    // update deadline) and a multi-chunk streamed query (query deadline for the first chunk, fetch
-    // deadline for each later chunk inside the prefetch task) all succeed under 30-second limits.
+    // End-to-end with generous deadlines on the connection: DDL (now the update deadline, covering
+    // its long-running-operation poll loop), DML (the update deadline) and a multi-chunk streamed
+    // query (query deadline for the first chunk, fetch deadline for each later chunk inside the
+    // prefetch task) all succeed under 30-second limits.
     for key in ALL {
         connection
             .set_option(conn_key(key), OptionValue::Int(30))
@@ -6643,6 +6644,67 @@ fn rpc_timeouts() {
             .expect("DML after a raised deadline"),
         Some(0)
     );
+
+    // The update deadline also bounds DDL — the admin `UpdateDatabaseDdl` call plus its
+    // long-running-operation poll loop, which used to poll unboundedly. A microsecond update
+    // deadline on the statement makes even a trivial DDL fail fast with `Timeout` naming the
+    // option, rather than hanging in the poller.
+    let mut tiny_ddl = connection.new_statement().expect("new statement");
+    tiny_ddl
+        .set_option(
+            stmt_key(OPTION_RPC_TIMEOUT_UPDATE),
+            OptionValue::String("0.000001".into()),
+        )
+        .expect("set a microsecond update deadline for DDL");
+    tiny_ddl
+        .set_sql_query("CREATE TABLE AdbcRpcTimeoutDdl (Id INT64) PRIMARY KEY (Id)")
+        .unwrap();
+    let error = tiny_ddl
+        .execute_update()
+        .expect_err("a microsecond update deadline must expire on DDL");
+    assert_eq!(error.status, Status::Timeout, "{error:?}");
+    assert!(
+        error.message.contains(OPTION_RPC_TIMEOUT_UPDATE),
+        "the DDL timeout error must name the update option: {}",
+        error.message
+    );
+    // Best-effort cleanup in case the DDL nonetheless applied server-side before the poll gave up
+    // (a timed-out LRO may still complete): drop it if present, ignoring any error.
+    let mut drop_ddl = connection.new_statement().expect("new statement");
+    if drop_ddl
+        .set_sql_query("DROP TABLE IF EXISTS AdbcRpcTimeoutDdl")
+        .is_ok()
+    {
+        let _ = drop_ddl.execute_update();
+    }
+
+    // The query deadline bounds the driver-internal metadata reads too. A microsecond query
+    // deadline on the connection makes `get_objects` fail with `Timeout` rather than blocking in
+    // the INFORMATION_SCHEMA scan; raising it back lets the same call succeed.
+    connection
+        .set_option(
+            conn_key(OPTION_RPC_TIMEOUT_QUERY),
+            OptionValue::String("0.000001".into()),
+        )
+        .expect("set a microsecond query deadline on the connection");
+    let error = connection
+        .get_objects(ObjectDepth::All, None, None, None, None, None)
+        .err()
+        .expect("a microsecond query deadline must expire on a metadata read");
+    assert_eq!(error.status, Status::Timeout, "{error:?}");
+    assert!(
+        error.message.contains(OPTION_RPC_TIMEOUT_QUERY),
+        "the metadata timeout error must name the query option: {}",
+        error.message
+    );
+    connection
+        .set_option(conn_key(OPTION_RPC_TIMEOUT_QUERY), OptionValue::Int(30))
+        .expect("raise the connection query deadline");
+    connection
+        .get_objects(ObjectDepth::All, None, None, None, None, None)
+        .expect("get_objects after a raised deadline")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect get_objects batches");
 
     // Unsetting at the connection level round-trips back to NotFound.
     for key in ALL {

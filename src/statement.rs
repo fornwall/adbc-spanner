@@ -292,6 +292,7 @@ impl SpannerStatement {
             &self.runtime,
             &self.client,
             &self.cancel,
+            self.timeouts.query_timeout(),
             db_schema,
             table,
         )?;
@@ -398,6 +399,7 @@ impl SpannerStatement {
             &self.runtime,
             &self.client,
             &self.cancel,
+            self.timeouts.query_timeout(),
             db_schema,
             table,
         ) {
@@ -772,22 +774,34 @@ impl SpannerStatement {
         }
         let spanner = self.spanner.clone();
         let database = self.database.clone();
-        block_on_cancellable(&self.runtime, &self.cancel, async move {
-            let admin = spanner
-                .database_admin_builder()
-                .build()
-                .await
-                .map_err(from_builder)?;
-            admin
-                .update_database_ddl()
-                .set_database(database)
-                .set_statements(statements)
-                .poller()
-                .until_done()
-                .await
-                .map_err(from_spanner)?;
-            Ok::<(), Error>(())
-        })
+        // DDL is issued through the write/update path, so the update timeout bounds the whole
+        // change — the admin-client build, the `UpdateDatabaseDdl` call, **and** its long-running
+        // operation poll loop (which otherwise polls without any bound). An expired deadline fails
+        // with `Status::Timeout`; unset (the default) leaves the poll unbounded.
+        block_on_cancellable(
+            &self.runtime,
+            &self.cancel,
+            with_timeout(
+                self.timeouts.update_timeout(),
+                crate::OPTION_RPC_TIMEOUT_UPDATE,
+                async move {
+                    let admin = spanner
+                        .database_admin_builder()
+                        .build()
+                        .await
+                        .map_err(from_builder)?;
+                    admin
+                        .update_database_ddl()
+                        .set_database(database)
+                        .set_statements(statements)
+                        .poller()
+                        .until_done()
+                        .await
+                        .map_err(from_spanner)?;
+                    Ok::<(), Error>(())
+                },
+            ),
+        )
     }
 
     fn sql(&self) -> Result<String> {
