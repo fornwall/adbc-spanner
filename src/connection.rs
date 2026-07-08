@@ -54,6 +54,7 @@ use crate::bind::qualified_table;
 use crate::conversion::{result_set_to_batch, stream_query};
 use crate::driver::Connected;
 use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
+use crate::request::RequestConfig;
 use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
 use crate::staleness::ReadStaleness;
 use crate::statement::{SpannerStatement, DEFAULT_ROWS_PER_BATCH};
@@ -195,6 +196,11 @@ pub struct SpannerConnection {
     /// `spanner.read.timestamp`). The default is a strong read; this becomes the default for
     /// statements created on the connection, which may override it.
     read_staleness: ReadStaleness,
+    /// Request priority and request/transaction tags (`spanner.request.priority` /
+    /// `spanner.request.tag` / `spanner.transaction.tag`). Unset by default; becomes the default
+    /// for statements created on the connection, which may override the priority and request tag
+    /// (the transaction tag is connection-level only).
+    request: RequestConfig,
     txn: SharedTxn,
     /// Cancellation signal for this connection's in-flight metadata/commit operations
     /// (see [`Connection::cancel`]).
@@ -211,6 +217,7 @@ impl SpannerConnection {
             read_only: Arc::new(AtomicBool::new(false)),
             isolation: IsolationLevel::Unspecified,
             read_staleness: ReadStaleness::default(),
+            request: RequestConfig::default(),
             txn: Arc::new(Mutex::new(TxnState::new())),
             cancel: CancelSignal::new(),
         }
@@ -226,6 +233,7 @@ impl SpannerConnection {
             &self.client,
             &self.cancel,
             self.isolation.clone(),
+            self.request.clone(),
             statements,
         )?;
         Ok(())
@@ -315,6 +323,7 @@ pub(crate) fn run_batch_dml(
     client: &DatabaseClient,
     cancel: &CancelSignal,
     isolation: IsolationLevel,
+    request: RequestConfig,
     statements: Vec<SpannerSql>,
 ) -> Result<i64> {
     if statements.is_empty() {
@@ -322,15 +331,19 @@ pub(crate) fn run_batch_dml(
     }
     let client = client.clone();
     block_on_cancellable(runtime, cancel, async move {
-        let runner = apply_isolation(client.read_write_transaction(), isolation)
+        // The commit priority and transaction tag ride on the runner; the request tag rides on the
+        // ExecuteBatchDml batch inside the (retryable) closure.
+        let runner = request
+            .apply_to_runner(apply_isolation(client.read_write_transaction(), isolation))
             .build()
             .await
             .map_err(from_spanner)?;
         let outcome = runner
             .run(move |transaction: ReadWriteTransaction| {
                 let statements = statements.clone();
+                let request = request.clone();
                 async move {
-                    let mut batch = BatchDmlBuilder::new();
+                    let mut batch = request.apply_to_batch_dml(BatchDmlBuilder::new());
                     for statement in statements {
                         batch = batch.add_statement(statement);
                     }
@@ -532,6 +545,15 @@ impl Optionable for SpannerConnection {
             OptionConnection::Other(k) if k == crate::OPTION_READ_TIMESTAMP => {
                 self.read_staleness.set_timestamp(value)?;
             }
+            OptionConnection::Other(k) if k == crate::OPTION_REQUEST_PRIORITY => {
+                self.request.set_priority(value)?;
+            }
+            OptionConnection::Other(k) if k == crate::OPTION_REQUEST_TAG => {
+                self.request.set_request_tag(value)?;
+            }
+            OptionConnection::Other(k) if k == crate::OPTION_TRANSACTION_TAG => {
+                self.request.set_transaction_tag(value)?;
+            }
             other => {
                 return Err(not_implemented(&format!(
                     "unsupported Spanner connection option: {}",
@@ -566,6 +588,36 @@ impl Optionable for SpannerConnection {
                 .ok_or_else(|| {
                     err(
                         format!("option {} is not set", crate::OPTION_READ_TIMESTAMP),
+                        Status::NotFound,
+                    )
+                }),
+            OptionConnection::Other(k) if k == crate::OPTION_REQUEST_PRIORITY => self
+                .request
+                .priority_string()
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    err(
+                        format!("option {} is not set", crate::OPTION_REQUEST_PRIORITY),
+                        Status::NotFound,
+                    )
+                }),
+            OptionConnection::Other(k) if k == crate::OPTION_REQUEST_TAG => self
+                .request
+                .request_tag_string()
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    err(
+                        format!("option {} is not set", crate::OPTION_REQUEST_TAG),
+                        Status::NotFound,
+                    )
+                }),
+            OptionConnection::Other(k) if k == crate::OPTION_TRANSACTION_TAG => self
+                .request
+                .transaction_tag_string()
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    err(
+                        format!("option {} is not set", crate::OPTION_TRANSACTION_TAG),
                         Status::NotFound,
                     )
                 }),
@@ -611,6 +663,7 @@ impl Connection for SpannerConnection {
             self.read_only.clone(),
             self.isolation.clone(),
             self.read_staleness.clone(),
+            self.request.clone(),
             self.txn.clone(),
         ))
     }

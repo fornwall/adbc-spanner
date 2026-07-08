@@ -281,7 +281,13 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   [comma-separated chain], `spanner.impersonate.scopes` [comma-separated, defaults to
   cloud-platform], `spanner.impersonate.lifetime` [seconds, default 3600] — layered on top of the
   base credentials via `google-cloud-auth`'s `impersonated::Builder::from_source_credentials`,
-  aligned with the BigQuery ADBC driver's `impersonate.*` group).
+  aligned with the BigQuery ADBC driver's `impersonate.*` group), and request priority / tags
+  (`spanner.request.priority` [`low`/`medium`/`high`] and `spanner.request.tag` at connection +
+  statement level [statement inherits, then overrides; `""` unsets — the staleness pattern],
+  `spanner.transaction.tag` connection-only; parsed/applied via `RequestConfig` in `src/request.rs`
+  — every user statement builder goes through `SpannerStatement::sql_builder`, `run_batch_dml`
+  tags the `ExecuteBatchDml` batch and the runner [commit priority + transaction tag; the client
+  has no batch-level priority setter], driver-internal metadata queries stay untagged).
   (`get_statistics` computes exact `ROW_COUNT`/`NULL_COUNT`/`DISTINCT_COUNT` via one aggregate scan
   per table — see `src/statistics.rs`; `approximate=true` serves the same exact stats (exact values
   always satisfy an approximate request; Spanner has no cheaper source), with

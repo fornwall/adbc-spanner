@@ -87,6 +87,7 @@ mod info;
 mod nested;
 mod objects;
 mod options;
+mod request;
 mod runtime;
 mod staleness;
 mod statement;
@@ -392,6 +393,34 @@ pub const OPTION_READ_STALENESS: &str = "spanner.read.staleness";
 /// Set on a connection it becomes the default for statements it creates; a statement may override
 /// it. Unset (the default) means a **strong** read.
 pub const OPTION_READ_TIMESTAMP: &str = "spanner.read.timestamp";
+
+/// Driver-specific connection **and** statement option: the **request priority** Spanner's
+/// scheduler uses to arbitrate CPU between workloads — `low`, `medium` or `high`
+/// (case-insensitive). Applied to every query and DML statement the driver builds, and as the
+/// **commit priority** of every read/write transaction runner (autocommit DML, the manual-mode
+/// commit, ingest commits). Unset (the default) leaves the service default (high); set an empty
+/// string to unset. Set on a connection it becomes the default for statements it creates; a
+/// statement may override it. Driver-internal metadata queries (`get_objects`, schema probes, …)
+/// are not affected.
+///
+/// Modeled on the BigQuery ADBC driver's `bigquery.query.priority` option; see Spanner's
+/// [`RequestOptions.priority`](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions).
+pub const OPTION_REQUEST_PRIORITY: &str = "spanner.request.priority";
+
+/// Driver-specific connection **and** statement option: a free-form **request tag**, attached to
+/// every query/DML statement (and `ExecuteBatchDml` batch) the driver builds and surfaced in
+/// Spanner's query and transaction statistics for
+/// [troubleshooting with tags](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags).
+/// Unset by default; set an empty string to unset. Set on a connection it becomes the default for
+/// statements it creates; a statement may override it.
+pub const OPTION_REQUEST_TAG: &str = "spanner.request.tag";
+
+/// Driver-specific **connection** option: a free-form **transaction tag**, applied wherever the
+/// driver builds a read/write transaction (autocommit DML, the manual-mode commit, ingest commits)
+/// and attached by Spanner to every operation of that transaction. Unset by default; set an empty
+/// string to unset. Connection-level only (a transaction can span several statements, so there is
+/// no per-statement override).
+pub const OPTION_TRANSACTION_TAG: &str = "spanner.transaction.tag";
 
 /// The vendor name reported by [`Connection::get_info`](adbc_core::Connection::get_info).
 pub const VENDOR_NAME: &str = "Google Cloud Spanner";

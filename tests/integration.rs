@@ -4020,3 +4020,217 @@ fn connection_cancel_is_sticky_until_the_next_operation() {
     drop.set_sql_query("DROP TABLE AdbcConnCancel").unwrap();
     drop.execute_update().expect("drop conn-cancel table");
 }
+
+/// Request priority and request/transaction tags (`spanner.request.priority` /
+/// `spanner.request.tag` / `spanner.transaction.tag`): the options round-trip through
+/// `get_option`, statements inherit the connection's values and can override the priority and
+/// request tag, bad values are rejected, and a query plus DML run end-to-end with all three set
+/// (the emulator accepts and ignores priorities/tags, so this proves the wiring sends valid
+/// requests rather than asserting on scheduler behaviour).
+#[test]
+fn request_priority_and_tags() {
+    use adbc_core::error::Status;
+    use adbc_spanner::{OPTION_REQUEST_PRIORITY, OPTION_REQUEST_TAG, OPTION_TRANSACTION_TAG};
+
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping request_priority_and_tags");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    let conn_key = |k: &str| OptionConnection::Other(k.into());
+    let stmt_key = |k: &str| OptionStatement::Other(k.into());
+
+    // Unset options read back as NotFound.
+    for key in [
+        OPTION_REQUEST_PRIORITY,
+        OPTION_REQUEST_TAG,
+        OPTION_TRANSACTION_TAG,
+    ] {
+        let error = connection
+            .get_option_string(conn_key(key))
+            .expect_err("unset option must be NotFound");
+        assert_eq!(error.status, Status::NotFound, "{key}");
+    }
+
+    // Set all three at connection level; the priority is case-insensitive and reported canonically.
+    connection
+        .set_option(
+            conn_key(OPTION_REQUEST_PRIORITY),
+            OptionValue::String("MEDIUM".into()),
+        )
+        .expect("set connection priority");
+    connection
+        .set_option(
+            conn_key(OPTION_REQUEST_TAG),
+            OptionValue::String("adbc-test-request".into()),
+        )
+        .expect("set connection request tag");
+    connection
+        .set_option(
+            conn_key(OPTION_TRANSACTION_TAG),
+            OptionValue::String("adbc-test-txn".into()),
+        )
+        .expect("set connection transaction tag");
+    assert_eq!(
+        connection
+            .get_option_string(conn_key(OPTION_REQUEST_PRIORITY))
+            .unwrap(),
+        "medium"
+    );
+    assert_eq!(
+        connection
+            .get_option_string(conn_key(OPTION_REQUEST_TAG))
+            .unwrap(),
+        "adbc-test-request"
+    );
+    assert_eq!(
+        connection
+            .get_option_string(conn_key(OPTION_TRANSACTION_TAG))
+            .unwrap(),
+        "adbc-test-txn"
+    );
+
+    // A bad priority is rejected with InvalidArguments and leaves the stored value untouched.
+    let error = connection
+        .set_option(
+            conn_key(OPTION_REQUEST_PRIORITY),
+            OptionValue::String("urgent".into()),
+        )
+        .expect_err("bad priority must be rejected");
+    assert_eq!(error.status, Status::InvalidArguments);
+    assert_eq!(
+        connection
+            .get_option_string(conn_key(OPTION_REQUEST_PRIORITY))
+            .unwrap(),
+        "medium"
+    );
+
+    // Statements inherit the connection's effective values, and may override or unset them.
+    let mut statement = connection.new_statement().expect("new statement");
+    assert_eq!(
+        statement
+            .get_option_string(stmt_key(OPTION_REQUEST_PRIORITY))
+            .unwrap(),
+        "medium",
+        "the statement must inherit the connection's priority"
+    );
+    assert_eq!(
+        statement
+            .get_option_string(stmt_key(OPTION_REQUEST_TAG))
+            .unwrap(),
+        "adbc-test-request",
+        "the statement must inherit the connection's request tag"
+    );
+    statement
+        .set_option(
+            stmt_key(OPTION_REQUEST_PRIORITY),
+            OptionValue::String("high".into()),
+        )
+        .expect("override priority on the statement");
+    statement
+        .set_option(stmt_key(OPTION_REQUEST_TAG), OptionValue::String("".into()))
+        .expect("unset the inherited request tag with an empty value");
+    assert_eq!(
+        statement
+            .get_option_string(stmt_key(OPTION_REQUEST_PRIORITY))
+            .unwrap(),
+        "high"
+    );
+    let error = statement
+        .get_option_string(stmt_key(OPTION_REQUEST_TAG))
+        .expect_err("the unset request tag must be NotFound");
+    assert_eq!(error.status, Status::NotFound);
+    // The statement-level override does not leak back to the connection.
+    assert_eq!(
+        connection
+            .get_option_string(conn_key(OPTION_REQUEST_PRIORITY))
+            .unwrap(),
+        "medium"
+    );
+    assert_eq!(
+        connection
+            .get_option_string(conn_key(OPTION_REQUEST_TAG))
+            .unwrap(),
+        "adbc-test-request"
+    );
+
+    // End-to-end with all three options set on the connection: DDL + DML (a tagged read/write
+    // transaction) + a query (a tagged read) all succeed, and the results are correct.
+    run(
+        &mut connection,
+        "DROP TABLE IF EXISTS AdbcReqOpts; \
+         CREATE TABLE AdbcReqOpts (Id INT64) PRIMARY KEY (Id)",
+    );
+    let mut insert = connection.new_statement().expect("new statement");
+    insert
+        .set_sql_query("INSERT INTO AdbcReqOpts (Id) VALUES (1), (2)")
+        .unwrap();
+    assert_eq!(insert.execute_update().expect("tagged insert"), Some(2));
+    assert_eq!(count_rows(&mut connection, "AdbcReqOpts"), 2);
+
+    // A query on the overriding statement (priority high, request tag unset) also runs fine.
+    statement
+        .set_sql_query("SELECT Id FROM AdbcReqOpts ORDER BY Id")
+        .unwrap();
+    let batches = statement
+        .execute()
+        .expect("tagged query")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+
+    // A tagged parameterized DML (bound rows go through the same builders).
+    let row = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(vec![3]))],
+    )
+    .unwrap();
+    let mut bound = connection.new_statement().expect("new statement");
+    bound
+        .set_sql_query("INSERT INTO AdbcReqOpts (Id) VALUES (@Id)")
+        .unwrap();
+    bound.bind(row).expect("bind param");
+    assert_eq!(
+        bound.execute_update().expect("tagged bound insert"),
+        Some(1)
+    );
+    assert_eq!(count_rows(&mut connection, "AdbcReqOpts"), 3);
+
+    // Unsetting at the connection level round-trips back to NotFound.
+    for key in [
+        OPTION_REQUEST_PRIORITY,
+        OPTION_REQUEST_TAG,
+        OPTION_TRANSACTION_TAG,
+    ] {
+        connection
+            .set_option(conn_key(key), OptionValue::String("".into()))
+            .expect("unset with an empty value");
+        let error = connection
+            .get_option_string(conn_key(key))
+            .expect_err("an unset option must be NotFound");
+        assert_eq!(error.status, Status::NotFound, "{key}");
+    }
+    // The transaction tag is connection-level only: a statement rejects it.
+    let error = statement
+        .set_option(
+            stmt_key(OPTION_TRANSACTION_TAG),
+            OptionValue::String("nope".into()),
+        )
+        .expect_err("the transaction tag must not be settable on a statement");
+    assert_eq!(error.status, Status::NotImplemented);
+
+    let mut drop = connection.new_statement().expect("new statement");
+    drop.set_sql_query("DROP TABLE AdbcReqOpts").unwrap();
+    drop.execute_update().expect("drop reqopts table");
+}
