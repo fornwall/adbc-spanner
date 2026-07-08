@@ -32,8 +32,14 @@
 //!   idempotent and retries transport faults without an attempt cap, so such a commit *blocks and
 //!   heals* rather than erroring — a driver-level commit failure cannot be transport-injected;
 //!   the failed-commit/retry contract is covered at the SQL level in `tests/integration.rs`.)
+//! - **`update_timeout_bounds_a_faulted_write_then_recovers_when_unset`** — with
+//!   `spanner.rpc.timeout_seconds.update` set, a write launched under a persistent `reset_peer`
+//!   toxic (which otherwise block-and-heals, per the test above) fails with `Status::Timeout`
+//!   within the deadline — naming the option — instead of hanging; and with the deadline unset and
+//!   the fault cleared the same write succeeds, showing the expired deadline poisoned nothing.
 
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -186,6 +192,46 @@ fn curl(args: &[&str]) -> (u16, String) {
     (code, body)
 }
 
+/// Count of resilience tests currently executing their body. The suite must run single-threaded
+/// (see [`SerialGuard`]); this backs the runtime assertion that enforces it.
+static ACTIVE_TESTS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII guard asserting the resilience suite runs **serially** (`--test-threads=1`).
+///
+/// [`ensure_setup`] temporarily repoints the process-global `SPANNER_EMULATOR_HOST` env var (via
+/// `std::env::set_var`) while creating the database/schema against the emulator's direct admin
+/// endpoint, then restores it. Process env is process-global, so that swap — and `set_var` itself,
+/// which is not thread-safe against concurrent `getenv` — is only sound if no other test thread is
+/// running at the same time (opening a driver connection reads the env; entering setup mutates it).
+/// The whole harness is therefore designed to run single-threaded: both `scripts/with-toxiproxy.sh`
+/// and `.github/workflows/resilience.yml` pass `--test-threads=1`.
+///
+/// Constructing this guard at the start of each test's *body* (after the self-skip check, so a
+/// plain multi-threaded `cargo test` with the env unset still skips cleanly) detects a violation —
+/// two test bodies overlapping — and fails loudly with an actionable message instead of racing the
+/// env swap silently. Dropped at the end of the test, it releases the slot for the next one.
+struct SerialGuard;
+
+impl SerialGuard {
+    fn new() -> Self {
+        let previous = ACTIVE_TESTS.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            previous, 0,
+            "resilience tests must run serially, but another test body is already running. \
+             tests/resilience.rs mutates the process-global SPANNER_EMULATOR_HOST env var in \
+             ensure_setup(), which races with concurrent test threads. Re-run with \
+             `--test-threads=1` (scripts/with-toxiproxy.sh and resilience.yml already do)."
+        );
+        SerialGuard
+    }
+}
+
+impl Drop for SerialGuard {
+    fn drop(&mut self) {
+        ACTIVE_TESTS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Create the instance, database and the streaming test table once per binary. Best-effort: the
 /// create calls fail with `AlreadyExists` on a re-run, which is fine.
 ///
@@ -195,7 +241,8 @@ fn curl(args: &[&str]) -> (u16, String) {
 /// request to the wrong place and fail. Only the driver-under-test's data-plane traffic uses the
 /// proxy. We temporarily repoint `SPANNER_EMULATOR_HOST` for the duration of setup, then restore it
 /// so the tests' driver connections go through the proxy again. (Setup runs once under the mutex,
-/// before any driver connection, so the transient env swap is safe here.)
+/// before any driver connection; and every test holds a [`SerialGuard`] for its whole body, which
+/// asserts no other test runs concurrently — so the transient env swap has no concurrent reader.)
 fn ensure_setup() {
     static DONE: Mutex<bool> = Mutex::new(false);
     let mut done = DONE.lock().expect("setup lock poisoned");
@@ -337,6 +384,9 @@ fn cancel_interrupts_in_flight_query() {
         eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
         return;
     };
+    // Enforce the single-threaded contract that makes the env swap in `ensure_setup` sound. Placed
+    // after the skip check so a plain multi-threaded `cargo test` (env unset) still self-skips.
+    let _serial = SerialGuard::new();
     ensure_setup();
 
     let mut connection = connect();
@@ -428,6 +478,9 @@ fn reset_peer_surfaces_error_then_recovers() {
         eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
         return;
     };
+    // Enforce the single-threaded contract that makes the env swap in `ensure_setup` sound. Placed
+    // after the skip check so a plain multi-threaded `cargo test` (env unset) still self-skips.
+    let _serial = SerialGuard::new();
     ensure_setup();
 
     // Wrap the connection so a watchdog thread can drive a query and we can bound its wall-clock.
@@ -496,6 +549,9 @@ fn commit_under_transport_fault_never_loses_the_write() {
         eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
         return;
     };
+    // Enforce the single-threaded contract that makes the env swap in `ensure_setup` sound. Placed
+    // after the skip check so a plain multi-threaded `cargo test` (env unset) still self-skips.
+    let _serial = SerialGuard::new();
     ensure_setup();
 
     let connection = Arc::new(Mutex::new(connect()));
@@ -607,6 +663,163 @@ fn commit_under_transport_fault_never_loses_the_write() {
         )
         .expect("re-enable autocommit");
     eprintln!("the write survived a transport fault during commit");
+}
+
+/// **The RPC-timeout assertion.** With `spanner.rpc.timeout_seconds.update` set, a write launched
+/// under a *persistent* transport fault must fail with ADBC [`Status::Timeout`] within the deadline
+/// — instead of blocking indefinitely — and the error must name the responsible option. Then the
+/// contrast: with the deadline unset (and the fault cleared) the same write succeeds, proving the
+/// expired deadline poisoned nothing (no lingering cancellation, session damage, or lost write).
+///
+/// This is the toxic-driven counterpart to `commit_under_transport_fault_never_loses_the_write`,
+/// which established the behaviour this test bounds: under a `reset_peer` toxic the pinned client
+/// marks every data-plane RPC idempotent and retries with no attempt cap, so an autocommit write
+/// (a read/write transaction: begin + `ExecuteBatchDml` + commit) *blocks and heals* — it never
+/// surfaces the transport error, it just retries until the network recovers. Without a deadline
+/// that is an unbounded hang; `spanner.rpc.timeout_seconds.update` wraps the whole driver-side
+/// operation (including the client's internal retries) in a `tokio::time::timeout` and turns the
+/// hang into a prompt `Timeout`. This closes the gap `tests/RESILIENCE.md` previously flagged: the
+/// option was documented to bound a commit under a fault, but nothing drove it under a toxic.
+///
+/// The write runs on a worker thread bounded by a generous watchdog: if the deadline fails to fire
+/// the test fails loudly rather than hanging the suite. The seeded row plus the idempotent
+/// `SET Val = 1` make the recovery assertion immune to whether any faulted attempt happened to
+/// reach the emulator before the reset.
+#[test]
+fn update_timeout_bounds_a_faulted_write_then_recovers_when_unset() {
+    let Some(toxi) = toxi() else {
+        eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
+        return;
+    };
+    ensure_setup();
+
+    let connection = Arc::new(Mutex::new(connect()));
+
+    // Seed one row (Id=1, Val=0) in autocommit mode, idempotently across re-runs. This also warms
+    // the session/channel through the proxy while there is no fault, so the faulted write below is
+    // a genuine block-and-heal (retrying data-plane RPC), not a cold-start failure.
+    {
+        let mut conn = connection.lock().expect("connection lock");
+        run(&mut conn, &format!("DELETE FROM {TXN_TABLE} WHERE true"));
+        run(
+            &mut conn,
+            &format!("INSERT INTO {TXN_TABLE} (Id, Val) VALUES (1, 0)"),
+        );
+    }
+
+    // A short update deadline on the connection; the statement created below inherits it.
+    let deadline_secs = 2.0_f64;
+    connection
+        .lock()
+        .expect("connection lock")
+        .set_option(
+            OptionConnection::Other(adbc_spanner::OPTION_RPC_TIMEOUT_UPDATE.into()),
+            OptionValue::Double(deadline_secs),
+        )
+        .expect("set update timeout");
+
+    // Break the transport, then run an autocommit UPDATE on a worker thread. Under `reset_peer` the
+    // client retries internally with no cap (see the commit-fault test), so without the deadline
+    // this call would block forever; with it, it must return a `Timeout` in ~`deadline_secs`.
+    toxi.add_reset_peer("resil_update_timeout_reset", 0);
+    let (tx, rx) = mpsc::channel();
+    let write_conn = connection.clone();
+    let start = Instant::now();
+    let worker = std::thread::spawn(move || {
+        let mut conn = write_conn.lock().expect("connection lock");
+        let mut s = conn.new_statement().expect("new statement");
+        s.set_sql_query(format!("UPDATE {TXN_TABLE} SET Val = 1 WHERE Id = 1"))
+            .unwrap();
+        let result = s.execute_update();
+        let _ = tx.send(result);
+    });
+
+    // Watchdog: the 2s deadline must fire far under this bound. If it hangs past here the timeout
+    // did not bound the operation — fail loudly (leaking the worker is fine; the process reaps it).
+    let outcome = rx.recv_timeout(Duration::from_secs(30));
+    let elapsed = start.elapsed();
+    // Clear the toxic regardless, so a failure doesn't leave the proxy poisoned for other tests.
+    toxi.remove_toxic("resil_update_timeout_reset");
+
+    let Ok(result) = outcome else {
+        panic!(
+            "execute_update under a transport fault hung past the 30s watchdog — the \
+             spanner.rpc.timeout_seconds.update deadline ({deadline_secs}s) did not bound it"
+        )
+    };
+    worker.join().ok();
+
+    let error = result.expect_err(
+        "a write under a persistent transport fault should fail with Timeout, not report success",
+    );
+    assert_eq!(
+        error.status,
+        adbc_core::error::Status::Timeout,
+        "the expired deadline must surface as ADBC Timeout; got: {error:?}"
+    );
+    assert!(
+        error
+            .message
+            .contains(adbc_spanner::OPTION_RPC_TIMEOUT_UPDATE),
+        "the timeout error must name the responsible option; got: {}",
+        error.message
+    );
+    // Bounded time: it fired near the 2s deadline, nowhere near a hang. The upper bound is generous
+    // (retry backoff + scheduling) but far below the 30s watchdog, so an actual hang still fails.
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "the timeout fired after {elapsed:?}; expected ~{deadline_secs}s, well under the watchdog — \
+         a value near the watchdog would mean the deadline did not bound the retry loop"
+    );
+
+    // Contrast / recovery: unset the deadline (`""` unsets) and, with the fault gone, run the SAME
+    // write — it must succeed once the channel re-establishes through the proxy, proving the expired
+    // deadline left no lingering damage. Unbounded again, so it block-and-heals if still reconnecting.
+    connection
+        .lock()
+        .expect("connection lock")
+        .set_option(
+            OptionConnection::Other(adbc_spanner::OPTION_RPC_TIMEOUT_UPDATE.into()),
+            OptionValue::String(String::new()),
+        )
+        .expect("unset update timeout");
+    let mut recovered = false;
+    let mut last = None;
+    for _ in 0..20 {
+        let mut conn = connection.lock().expect("connection lock");
+        let mut s = conn.new_statement().expect("new statement");
+        s.set_sql_query(format!("UPDATE {TXN_TABLE} SET Val = 1 WHERE Id = 1"))
+            .unwrap();
+        match s.execute_update() {
+            Ok(_) => {
+                recovered = true;
+                break;
+            }
+            Err(e) => {
+                last = Some(e);
+                drop(conn);
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+    assert!(
+        recovered,
+        "the write did not succeed after the deadline was unset and the fault removed: {last:?}"
+    );
+
+    // The recovered write landed.
+    assert_eq!(
+        query_int(
+            &connection,
+            &format!("SELECT Val FROM {TXN_TABLE} WHERE Id = 1"),
+        ),
+        1,
+        "the write must have applied once the deadline was unset and the transport healed"
+    );
+    eprintln!(
+        "update timeout bounded a faulted write in {elapsed:?} with Status::Timeout naming \
+         spanner.rpc.timeout_seconds.update; the same write succeeded once the deadline was unset"
+    );
 }
 
 /// Run a query expected to return a single INT64 cell and return its value.

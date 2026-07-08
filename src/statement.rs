@@ -39,6 +39,7 @@ use crate::error::{
     err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
 };
 use crate::request::RequestConfig;
+use crate::retry::RetryConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
 use crate::staleness::ReadStaleness;
 use crate::timeout::{RpcTimeouts, with_timeout};
@@ -124,6 +125,11 @@ pub struct SpannerStatement {
     /// connection at creation time and overridable per statement. Unset (the default) means no
     /// deadline; an expired deadline fails with [`Status::Timeout`].
     timeouts: RpcTimeouts,
+    /// Retry-policy tuning (`spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds`),
+    /// inherited from the connection at creation time and overridable per statement. Unset (the
+    /// default) leaves the client's own retry policy; when set it bounds the client's retrying on
+    /// every statement/DML/transaction builder this statement produces.
+    retry: RetryConfig,
     /// Cancellation signal for this statement's in-flight execution (see [`Statement::cancel`]).
     cancel: CancelSignal,
 }
@@ -141,6 +147,7 @@ impl SpannerStatement {
         request: RequestConfig,
         timestamp_precision: TimestampPrecision,
         timeouts: RpcTimeouts,
+        retry: RetryConfig,
         txn: SharedTxn,
     ) -> Self {
         Self {
@@ -165,6 +172,7 @@ impl SpannerStatement {
             request,
             timestamp_precision,
             timeouts,
+            retry,
             cancel: CancelSignal::new(),
         }
     }
@@ -175,11 +183,13 @@ impl SpannerStatement {
         self.read_only.load(Ordering::Acquire)
     }
 
-    /// A Spanner statement builder for `sql` with this statement's request priority and request
-    /// tag (`spanner.request.priority` / `spanner.request.tag`) applied. Every query/DML statement
-    /// the driver builds goes through here so the two options apply uniformly.
+    /// A Spanner statement builder for `sql` with this statement's request priority / request tag
+    /// (`spanner.request.priority` / `spanner.request.tag`) and retry policy
+    /// (`spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds`) applied. Every query/DML
+    /// statement the driver builds goes through here so the options apply uniformly.
     fn sql_builder(&self, sql: &str) -> StatementBuilder {
-        self.request.apply_to_statement(SpannerSql::builder(sql))
+        self.retry
+            .apply_to_statement(self.request.apply_to_statement(SpannerSql::builder(sql)))
     }
 
     /// Build one Spanner statement per bound row, binding its columns as named parameters.
@@ -486,6 +496,7 @@ impl SpannerStatement {
         let count = mutations.len() as i64;
         let client = self.client.clone();
         let request = self.request.clone();
+        let retry = self.retry;
         block_on_cancellable(
             &self.runtime,
             &self.cancel,
@@ -493,8 +504,10 @@ impl SpannerStatement {
                 self.timeouts.update_timeout(),
                 crate::OPTION_RPC_TIMEOUT_UPDATE,
                 async move {
-                    request
-                        .apply_to_write_only(client.write_only_transaction())
+                    retry
+                        .apply_to_write_only(
+                            request.apply_to_write_only(client.write_only_transaction()),
+                        )
                         .build()
                         .write(mutations)
                         .await
@@ -539,6 +552,7 @@ impl SpannerStatement {
             &self.cancel,
             self.isolation.clone(),
             self.request.clone(),
+            self.retry,
             self.timeouts.update_timeout(),
             statements,
         )?;
@@ -561,14 +575,19 @@ impl SpannerStatement {
         let client = self.client.clone();
         let isolation = self.isolation.clone();
         let request = self.request.clone();
+        let retry = self.retry;
         // DML with THEN RETURN is a write path: the update timeout bounds the whole transaction.
         let update_timeout = self.timeouts.update_timeout();
         let transaction = async move {
-            let runner = request
-                .apply_to_runner(apply_isolation(client.read_write_transaction(), isolation))
-                .build()
-                .await
-                .map_err(from_spanner)?;
+            let runner =
+                retry
+                    .apply_to_runner(request.apply_to_runner(apply_isolation(
+                        client.read_write_transaction(),
+                        isolation,
+                    )))
+                    .build()
+                    .await
+                    .map_err(from_spanner)?;
             let outcome = runner
                 .run(move |transaction: ReadWriteTransaction| {
                     let statements = statements.clone();
@@ -885,6 +904,12 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) if k == crate::OPTION_RPC_TIMEOUT_FETCH => {
                 self.timeouts.set_fetch(value)?;
             }
+            OptionStatement::Other(k) if k == crate::OPTION_RETRY_MAX_ATTEMPTS => {
+                self.retry.set_max_attempts(value)?;
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
+                self.retry.set_max_elapsed_seconds(value)?;
+            }
             other => {
                 return Err(not_implemented(&format!(
                     "statement option {}",
@@ -944,6 +969,12 @@ impl Optionable for SpannerStatement {
             }
             OptionStatement::Other(k) if k == crate::OPTION_RPC_TIMEOUT_FETCH => {
                 self.timeouts.fetch_string()
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_RETRY_MAX_ATTEMPTS => {
+                self.retry.max_attempts_string()
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
+                self.retry.max_elapsed_seconds_string()
             }
             _ => None,
         };

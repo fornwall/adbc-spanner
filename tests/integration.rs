@@ -4037,6 +4037,99 @@ fn ffi_double_release_and_error_struct_reuse() {
     release_error_twice(&mut error);
 }
 
+/// Retry-tuning options (`spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds`)
+/// round-trip through `get_option` / `get_option_int` / `get_option_double`, inherit onto statements
+/// then override, and — most importantly — a statement carrying a bounded retry policy still
+/// executes a real query and DML successfully against the emulator (exercising the
+/// `with_retry_policy` / `with_begin_retry_policy` / `with_commit_retry_policy` apply path). This is
+/// read-only-plus-one-row so it does not need the schema serial guard.
+#[test]
+fn retry_tuning_round_trip_and_execute() {
+    let Some(target) = test_target() else {
+        eprintln!(
+            "neither SPANNER_EMULATOR_HOST nor SPANNER_GCP_DATABASE set — \
+             skipping retry-tuning integration test"
+        );
+        return;
+    };
+
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    // Connection-level round-trip, including the numeric accessors.
+    let attempts_key = OptionConnection::Other("spanner.retry.max_attempts".into());
+    let elapsed_key = OptionConnection::Other("spanner.retry.max_elapsed_seconds".into());
+    connection
+        .set_option(attempts_key.clone(), OptionValue::String("4".into()))
+        .expect("set max_attempts");
+    connection
+        .set_option(elapsed_key.clone(), OptionValue::String("30".into()))
+        .expect("set max_elapsed_seconds");
+    assert_eq!(
+        connection.get_option_string(attempts_key.clone()).unwrap(),
+        "4"
+    );
+    assert_eq!(connection.get_option_int(attempts_key.clone()).unwrap(), 4);
+    assert_eq!(
+        connection.get_option_double(elapsed_key.clone()).unwrap(),
+        30.0
+    );
+
+    // A statement inherits the connection's values, then overrides independently.
+    let st_attempts = OptionStatement::Other("spanner.retry.max_attempts".into());
+    let st_elapsed = OptionStatement::Other("spanner.retry.max_elapsed_seconds".into());
+    let mut stmt = connection.new_statement().expect("new statement");
+    assert_eq!(stmt.get_option_string(st_attempts.clone()).unwrap(), "4");
+    assert_eq!(stmt.get_option_string(st_elapsed.clone()).unwrap(), "30");
+    stmt.set_option(st_attempts.clone(), OptionValue::String("2".into()))
+        .expect("override max_attempts");
+    stmt.set_option(st_elapsed.clone(), OptionValue::String(String::new()))
+        .expect("unset max_elapsed_seconds");
+    assert_eq!(stmt.get_option_string(st_attempts.clone()).unwrap(), "2");
+    assert_eq!(
+        stmt.get_option_string(st_elapsed.clone())
+            .unwrap_err()
+            .status,
+        Status::NotFound
+    );
+
+    // A bad value is rejected and leaves the stored value intact.
+    assert_eq!(
+        stmt.set_option(st_attempts.clone(), OptionValue::String("0".into()))
+            .unwrap_err()
+            .status,
+        Status::InvalidArguments
+    );
+    assert_eq!(stmt.get_option_string(st_attempts.clone()).unwrap(), "2");
+
+    // The statement's bounded retry policy is actually applied to a live query.
+    stmt.set_sql_query("SELECT 1 AS one").unwrap();
+    let reader = stmt.execute().expect("query with bounded retry policy");
+    let rows: usize = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect")
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(rows, 1);
+
+    // And to a write path (the runner's begin+commit RPCs): a no-op DELETE commits cleanly.
+    let mut dml = connection.new_statement().expect("new statement");
+    dml.set_sql_query("DELETE FROM Singers WHERE SingerId = -987654321")
+        .unwrap();
+    dml.execute_update()
+        .expect("DML with bounded retry policy commits");
+}
+
 /// Serialize the schema-mutating / DML-heavy tests against each other. Spanner rejects a schema
 /// change while a read-write transaction is in progress on the database, so the DDL-heavy
 /// `query_and_dml_round_trip` cannot run concurrently with the DML-heavy property tests. Each holds

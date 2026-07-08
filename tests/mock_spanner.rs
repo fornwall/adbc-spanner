@@ -384,6 +384,75 @@ fn aborted_surfaces_vendor_code_10() {
     );
 }
 
+/// (a′) The companion to [`aborted_surfaces_vendor_code_10`]: the `google.rpc.RetryInfo` detail the
+/// mock attaches to its `ABORTED` status must survive **the whole real driver stack** — the gRPC
+/// `grpc-status-details-bin` trailer, the client's `google.rpc.Status` decode, and `from_spanner`'s
+/// `details_for_adbc` mapping — and land on the surfaced [`adbc_core::error::Error::details`]. This
+/// is the end-to-end complement to the `from_spanner` unit tests in `src/error.rs`, which construct
+/// gax errors directly and so never exercise the wire decode.
+///
+/// The assertion pins the exact contract `from_spanner` documents: key = the lowercased
+/// fully-qualified proto type name (`google.rpc.retryinfo`), value = the detail's ProtoJSON, whose
+/// `retryDelay` round-trips the 50 ms the mock sent (`0.05s`).
+///
+/// **Fidelity note.** This drives the driver's public `adbc_core` traits (`Connection` /
+/// `Statement`), *not* the C-ABI FFI. Empirically the detail does **not** survive the FFI boundary:
+/// the driver stores the numeric gRPC code (`ABORTED` = 10) in `vendor_code`, but the ADBC C detail
+/// transport only re-reads `ErrorGetDetail`/`ErrorGetDetailCount` when `vendor_code ==
+/// ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA` (`i32::MIN`); with any other `vendor_code` the forwarded
+/// details are dropped in the driver-manager round-trip. So the trait boundary is the highest
+/// fidelity at which the detail is actually retrievable today.
+#[test]
+fn aborted_retry_info_detail_reaches_adbc_error_details() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "aborted_retry_info_detail_reaches_adbc_error_details",
+    );
+
+    let server = MockServer::start(|mock| {
+        mock.expect_execute_streaming_sql().returning(|_| {
+            Err(aborted_with_retry_info(
+                "Transaction was aborted by the mock server",
+            ))
+        });
+    });
+
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().expect("new statement");
+    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+    let error = statement
+        .execute()
+        .err()
+        .expect("an ABORTED query must fail, not hang or succeed");
+
+    // The RetryInfo the mock attached must be forwarded into ADBC's structured error details.
+    let details = error.details.as_ref().expect(
+        "the ABORTED status carried a google.rpc.RetryInfo detail; Error.details must be Some",
+    );
+    let (_, value) = details
+        .iter()
+        .find(|(key, _)| key == "google.rpc.retryinfo")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a `google.rpc.retryinfo` detail, got keys: {:?}",
+                details.iter().map(|(k, _)| k).collect::<Vec<_>>()
+            )
+        });
+
+    // The value is the detail's self-describing ProtoJSON; parse it rather than byte-compare so the
+    // assertion states the contract (not an incidental field order).
+    let json: serde_json::Value =
+        serde_json::from_slice(value).expect("the detail value is UTF-8 ProtoJSON");
+    assert_eq!(
+        json["@type"], "type.googleapis.com/google.rpc.RetryInfo",
+        "the detail must self-describe as a RetryInfo, got: {json}"
+    );
+    assert_eq!(
+        json["retryDelay"], "0.05s",
+        "the RetryInfo's retryDelay must round-trip the 50ms the mock sent, got: {json}"
+    );
+}
+
 /// (b) `UNAVAILABLE` mid-stream: the server sends one `PartialResultSet` (with a resume token),
 /// then fails the stream. The client resumes once — from exactly the token it saw — and when the
 /// resume attempt is refused permanently, the driver surfaces a clean ADBC error: no panic, no

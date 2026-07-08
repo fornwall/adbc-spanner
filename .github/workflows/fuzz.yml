@@ -47,7 +47,7 @@ jobs:
       # skipped if the job fails — a crashing input therefore never poisons the cache; it is
       # uploaded as an artifact below instead.)
       - name: Restore the accumulated corpus
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}

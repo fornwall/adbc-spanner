@@ -9,6 +9,13 @@ on:
     tags: ["v*"]
   pull_request:
 
+# Cancel superseded PR runs (a rapid re-push cancels the in-flight run for the same
+# ref). Pushes to main and v* tag pushes are NEVER cancelled — a release build/publish
+# must always run to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -284,7 +291,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           # Only drives `setup.py bdist_wheel` to repackage the prebuilt libraries;
           # the wheel tag is forced to py3-none-<platform>, so this version does not

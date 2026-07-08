@@ -40,10 +40,12 @@ pub(crate) fn invalid_argument(message: impl Into<String>) -> Error {
 ///
 /// # Structured error details
 ///
-/// A `google.rpc.Status` may also carry structured *details* — most importantly
-/// `google.rpc.RetryInfo` on `ABORTED`, where Spanner recommends how long to back off before
-/// retrying the aborted transaction. Each detail is forwarded into the ADBC error's `details`
-/// vector as a `(key, value)` pair:
+/// A `google.rpc.Status` may also carry structured *details* that describe *why* a call failed
+/// beyond its status code — e.g. `google.rpc.QuotaFailure` on `RESOURCE_EXHAUSTED`,
+/// `google.rpc.BadRequest` or `google.rpc.ErrorInfo` on `INVALID_ARGUMENT`,
+/// `google.rpc.PreconditionFailure` on `FAILED_PRECONDITION`, or `google.rpc.RetryInfo` on
+/// `ABORTED`. Each detail is forwarded into the ADBC error's `details` vector as a `(key, value)`
+/// pair:
 ///
 /// - **key** — the lowercased fully-qualified protobuf type name of the detail message, e.g.
 ///   `google.rpc.retryinfo`, `google.rpc.errorinfo`, `google.rpc.badrequest`, `google.rpc.help`.
@@ -61,10 +63,16 @@ pub(crate) fn invalid_argument(message: impl Into<String>) -> Error {
 /// as binary protobuf), so a consumer written to that convention won't interoperate; the pinned
 /// preview client offers no binary-protobuf encoding of details, only ProtoJSON.
 ///
-/// Together with `vendor_code` this completes the retry story: a retry loop detects an exhausted
-/// abort via `vendor_code == 10` (`ABORTED`) and, when present, honours the server-recommended
-/// delay in the `google.rpc.retryinfo` detail's `retryDelay`. Errors without a gRPC status, and
-/// statuses without details, leave `details` as `None` (never `Some(vec![])`).
+/// Together with `vendor_code`, these details give a caller structured diagnostics beyond the ADBC
+/// status. Note that `RetryInfo` on `ABORTED` rarely reaches here in practice: the Spanner client's
+/// read/write transaction runner — and the write-only mutation (bulk-ingest) path — retry aborted
+/// transactions internally, *consuming* the `retryDelay` for their own backoff, under a default
+/// policy that retries indefinitely (`BasicTransactionRetryPolicy::default` in the client's
+/// `transaction_retry_policy` / `transaction_runner` modules; the driver installs no bounded
+/// override). So an `ABORTED` normally never surfaces from a DML / commit / ingest call — it is
+/// forwarded like any other detail only in the rare cases one does (a caller with its own bounded
+/// retry policy can still key off `vendor_code == 10`). Errors without a gRPC status, and statuses
+/// without details, leave `details` as `None` (never `Some(vec![])`).
 pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
     // `Error::status()` yields the structured gRPC status when present. We match on the code's
     // canonical name (e.g. "NOT_FOUND"), which is derived from the enum by the client itself — this
@@ -153,11 +161,13 @@ fn status_for_grpc_code(code_name: &str) -> Status {
         "CANCELLED" => Status::Cancelled,
         // ADBC's IO status documents "a remote service may be unavailable".
         "UNAVAILABLE" => Status::IO,
-        // ABORTED is Spanner's routine "transaction contended, please retry" signal, seen by
-        // callers only after the client's read/write runner has exhausted its retries. It is
-        // transient and environmental, not a driver or database defect, so it maps to IO rather
-        // than Internal (which reads as "driver bug"). ADBC has no closer variant; the exact code
-        // survives in `vendor_code` (ABORTED = 10) for callers with their own retry logic.
+        // ABORTED is Spanner's routine "transaction contended, please retry" signal. The client's
+        // read/write runner retries it internally (indefinitely under the default policy the driver
+        // uses), so a DML/commit/ingest caller does not normally see it; it reaches here only in the
+        // rare case the runner surfaces it. It is transient and environmental, not a driver or
+        // database defect, so it maps to IO rather than Internal (which reads as "driver bug"). ADBC
+        // has no closer variant; the exact code survives in `vendor_code` (ABORTED = 10) for callers
+        // with their own retry logic.
         "ABORTED" => Status::IO,
         // RESOURCE_EXHAUSTED, INTERNAL, UNKNOWN, DATA_LOSS, OK and anything unrecognised.
         _ => Status::Internal,

@@ -11,6 +11,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Cancel superseded PR runs (a rapid re-push cancels the in-flight run for the same
+# ref); pushes to main are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -37,7 +43,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           # adbc-drivers-validation requires Python >= 3.13.
           python-version: "3.13"
