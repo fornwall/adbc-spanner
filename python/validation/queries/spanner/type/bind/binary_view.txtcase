@@ -1,3 +1,12 @@
-// part: metadata
+// Spanner override: mandatory PRIMARY KEY, native type name, and an explicit INSERT
+// column list. The driver binds Arrow BinaryView params (src/bind.rs) like Binary.
 
-skip = "the driver does not bind Arrow BinaryView parameters"
+// part: setup_query
+
+CREATE TABLE test_binary_view (
+    res BYTES(MAX)
+) PRIMARY KEY (res)
+
+// part: bind_query
+
+INSERT INTO test_binary_view (res) VALUES ($1)

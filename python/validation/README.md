@@ -38,10 +38,13 @@ corpus assumes a portable SQL dialect that Spanner diverges from**, so per-categ
 **`type/bind/*` is done** (all pass or `skip`): the driver binds parameters positionally when the
 bound column names don't match the query's `@names`, so no per-case column renaming is needed — each
 override just supplies a Spanner `setup_query` (mandatory `PRIMARY KEY`, native type names) and an
-explicit `INSERT` column list. Cases Spanner cannot round-trip are `skip`ped with a reason: narrower
-integers (read back as `INT64`), `DECIMAL(p,s)` (Spanner `NUMERIC` is fixed 38,9), `FLOAT` (cannot be
-a primary key), `TIME`-of-day / `float16` / `fixed_size_binary` / Arrow view types (no Spanner type),
-and timestamps outside Arrow's nanosecond range.
+explicit `INSERT` column list. `FLOAT32`/`FLOAT64` — which Spanner forbids as a primary key —
+round-trip by adding a synthetic UUID key column (defaulted, so the bind `INSERT` still supplies
+only `res`), and `BinaryView`/`Utf8View` params round-trip too (the driver binds the Arrow view
+layouts like their offset kin, `src/bind.rs`). Cases Spanner cannot round-trip are `skip`ped with a
+reason: narrower integers (read back as `INT64`), `DECIMAL(p,s)` (Spanner `NUMERIC` is fixed 38,9),
+`TIME`-of-day / `float16` / `fixed_size_binary` (no Spanner type), and timestamps outside Arrow's
+nanosecond range.
 
 **`type/select/*` is done** (all pass or `skip`): each override supplies a Spanner `setup_query` —
 `idx` is the `PRIMARY KEY` and `res` the native-typed value column, with literals adjusted for
