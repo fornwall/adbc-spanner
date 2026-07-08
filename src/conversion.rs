@@ -18,8 +18,9 @@
 //! | `TIMESTAMP`                                 | `Timestamp(Nanosecond, "UTC")` (default) or `Timestamp(Microsecond, "UTC")` |
 //! | `NUMERIC`                                   | `Decimal128(38, 9)`               |
 //! | `BYTES`                                     | `Binary`                          |
-//! | `STRING`/`UUID`/`INTERVAL`/`ENUM`/`PROTO`   | `Utf8`                            |
+//! | `STRING`/`UUID`/`INTERVAL`                   | `Utf8`                            |
 //! | `JSON`                                      | `Utf8` + `arrow.json` extension   |
+//! | `PROTO`/`ENUM`                               | *(rejected — `NotImplemented`)*   |
 //! | `ARRAY<T>`                                  | `List<T>`                         |
 //! | `STRUCT<..>`                                | `Struct<..>`                      |
 //!
@@ -32,6 +33,12 @@
 //! consumers that understand the extension recognize the logical JSON type. The extension lives on
 //! the [`Field`], not the [`DataType`]; for `ARRAY<JSON>` it sits on the list's child (`item`)
 //! field. The other Utf8-backed codes stay plain, untagged `Utf8`.
+//!
+//! `PROTO` and `ENUM` have no faithful Arrow mapping — their wire form is a base64-serialized proto
+//! message / a bare enum number as a string — so, rather than silently mis-decode them into a
+//! `Utf8` stand-in the caller could mistake for real text, such a column is rejected loudly with a
+//! `NotImplemented` error naming the column and type (see `unsupported_type_error`), consistent
+//! with the strict-decode policy of the value path.
 //!
 //! The `TIMESTAMP` mapping is selected by [`TimestampPrecision`] (the
 //! `spanner.max_timestamp_precision` option): the default keeps the wire's full nanosecond
@@ -169,7 +176,7 @@ pub(crate) fn rows_to_batch(
     rows: &[Row],
     precision: TimestampPrecision,
 ) -> Result<(SchemaRef, RecordBatch)> {
-    let schema = build_schema(metadata, rows.first(), precision);
+    let schema = build_schema(metadata, rows.first(), precision)?;
     let batch = build_batch(schema.clone(), rows)?;
     Ok((schema, batch))
 }
@@ -261,7 +268,7 @@ pub(crate) async fn stream_query(
     fetch_timeout: Option<Duration>,
 ) -> Result<SpannerBatchReader> {
     let first = pull_chunk(&mut rs, batch_size).await?;
-    let schema = build_schema(rs.metadata(), first.first(), precision);
+    let schema = build_schema(rs.metadata(), first.first(), precision)?;
     let source = ResultSetChunks {
         result_set: rs,
         batch_size,
@@ -412,7 +419,7 @@ pub(crate) async fn stream_bound_query(
     let (first, schema) = match result_set.as_mut() {
         Some(rs) => {
             let rows = pull_chunk(rs, batch_size).await?;
-            let schema = build_schema(rs.metadata(), rows.first(), precision);
+            let schema = build_schema(rs.metadata(), rows.first(), precision)?;
             (Some(rows), schema)
         }
         None => (None, Arc::new(Schema::empty())),
@@ -533,11 +540,15 @@ impl RecordBatchReader for BoundQueryBatchReader {
 
 /// Build the Arrow schema for a result set from Spanner's column metadata, falling back to
 /// all-`Utf8` columns inferred from the first row's width when metadata is unavailable.
+///
+/// Fails with [`Status::NotImplemented`] if any column has a type this driver does not map to Arrow
+/// (currently `PROTO`/`ENUM`; see [`arrow_type`]/[`unsupported_type_error`]) — the error names the
+/// offending column and its type rather than silently emitting a mis-decoded stand-in column.
 pub(crate) fn build_schema(
     metadata: Option<&ResultSetMetadata>,
     first_row: Option<&Row>,
     precision: TimestampPrecision,
-) -> SchemaRef {
+) -> Result<SchemaRef> {
     if let Some(md) = metadata {
         let names = md.column_names();
         if !names.is_empty() {
@@ -546,11 +557,16 @@ pub(crate) fn build_schema(
                 .iter()
                 .enumerate()
                 .map(|(i, name)| match types.get(i) {
-                    Some(ty) => arrow_field(name, ty, true, precision),
-                    None => Field::new(name, DataType::Utf8, true),
+                    // Prefix the column name (as `build_column` does on the value path) so a
+                    // rejected PROTO/ENUM names the failing column in a wide result set.
+                    Some(ty) => arrow_field(name, ty, true, precision).map_err(|mut e| {
+                        e.message = format!("column {name:?}: {}", e.message);
+                        e
+                    }),
+                    None => Ok(Field::new(name, DataType::Utf8, true)),
                 })
-                .collect();
-            return Arc::new(Schema::new(fields));
+                .collect::<Result<_>>()?;
+            return Ok(Arc::new(Schema::new(fields)));
         }
     }
 
@@ -558,7 +574,7 @@ pub(crate) fn build_schema(
     let fields: Vec<Field> = (0..width)
         .map(|i| Field::new(format!("col{i}"), DataType::Utf8, true))
         .collect();
-    Arc::new(Schema::new(fields))
+    Ok(Arc::new(Schema::new(fields)))
 }
 
 /// Build an Arrow [`Field`] for a Spanner column [`Type`], attaching the canonical `arrow.json`
@@ -567,19 +583,39 @@ pub(crate) fn build_schema(
 /// The storage type stays `Utf8` (the value bytes are the JSON text); only the field metadata marks
 /// it as logical JSON, so consumers that understand the extension (pyarrow, DuckDB, polars) can
 /// recognize it while others still read plain strings. Only `TypeCode::Json` is tagged — the other
-/// Utf8-backed codes (`STRING`, `UUID`, `INTERVAL`, `ENUM`, `PROTO`) stay untagged.
+/// Utf8-backed codes (`STRING`, `UUID`, `INTERVAL`) stay untagged.
+///
+/// Fails with [`Status::NotImplemented`] if `ty` (or, recursively, an `ARRAY` element / `STRUCT`
+/// field type) is a `PROTO`/`ENUM` the driver does not map to Arrow — see [`unsupported_type_error`].
 fn arrow_field(
     name: impl Into<String>,
     ty: &Type,
     nullable: bool,
     precision: TimestampPrecision,
-) -> Field {
-    let field = Field::new(name, arrow_type(ty, precision), nullable);
-    if ty.code() == TypeCode::Json {
+) -> Result<Field> {
+    let field = Field::new(name, arrow_type(ty, precision)?, nullable);
+    Ok(if ty.code() == TypeCode::Json {
         field.with_metadata(json_extension_metadata())
     } else {
         field
-    }
+    })
+}
+
+/// The error for a Spanner column whose type this driver does not map to Arrow — currently `PROTO`
+/// and `ENUM`.
+///
+/// Their wire encodings (a base64-serialized proto message; a bare enum number as a string) have no
+/// faithful Arrow representation, so — consistent with the strict-decode policy of the value path —
+/// such a column is rejected with a clean [`Status::NotImplemented`] naming the unsupported type,
+/// never silently mapped to a `Utf8` stand-in the caller could mistake for real string data.
+fn unsupported_type_error(type_name: &str) -> adbc_core::error::Error {
+    err(
+        format!(
+            "Spanner {type_name} columns are not supported by this driver (no faithful Arrow \
+             mapping)"
+        ),
+        Status::NotImplemented,
+    )
 }
 
 /// Whether an Arrow [`Field`] carries the canonical `arrow.json` extension on a string storage
@@ -614,8 +650,8 @@ fn json_extension_metadata() -> HashMap<String, String> {
 /// Map a Spanner column [`Type`] to an Arrow [`DataType`]. `precision` selects the `TIMESTAMP`
 /// unit (see [`TimestampPrecision`]) and is threaded recursively, so a `TIMESTAMP` nested in an
 /// `ARRAY`/`STRUCT` maps the same as a top-level column.
-fn arrow_type(ty: &Type, precision: TimestampPrecision) -> DataType {
-    match ty.code() {
+fn arrow_type(ty: &Type, precision: TimestampPrecision) -> Result<DataType> {
+    Ok(match ty.code() {
         TypeCode::Bool => DataType::Boolean,
         TypeCode::Int64 => DataType::Int64,
         TypeCode::Float64 => DataType::Float64,
@@ -626,28 +662,34 @@ fn arrow_type(ty: &Type, precision: TimestampPrecision) -> DataType {
             DataType::Timestamp(precision.time_unit(), Some(TIMESTAMP_TZ.into()))
         }
         TypeCode::Numeric => DataType::Decimal128(NUMERIC_PRECISION, NUMERIC_SCALE),
-        TypeCode::Struct => struct_arrow_type(ty, precision),
+        TypeCode::Struct => struct_arrow_type(ty, precision)?,
         TypeCode::Array => match ty.array_element_type() {
             // ARRAY<T> → Arrow List<T> (recursively; T may itself be a STRUCT). The element field is
             // built via `arrow_field`, so an `ARRAY<JSON>` carries the `arrow.json` extension on the
-            // list's child (`item`) field, not the top-level List. Spanner does not allow arrays of
-            // arrays; fall back to JSON text for anything unexpected.
+            // list's child (`item`) field, not the top-level List. A PROTO/ENUM element is rejected
+            // by the recursive `arrow_field`, so `ARRAY<PROTO>`/`ARRAY<ENUM>` fail loudly too.
+            // Spanner does not allow arrays of arrays; fall back to JSON text for anything else.
             Some(element) if !matches!(element.code(), TypeCode::Array | TypeCode::Unspecified) => {
-                DataType::List(Arc::new(arrow_field(LIST_ITEM, &element, true, precision)))
+                DataType::List(Arc::new(arrow_field(LIST_ITEM, &element, true, precision)?))
             }
             _ => DataType::Utf8,
         },
-        // STRING, JSON, UUID, INTERVAL, ENUM, PROTO and any future/unknown code are UTF-8 text.
+        // PROTO/ENUM have no faithful Arrow mapping; reject the column loudly instead of
+        // mis-decoding it to a Utf8 stand-in (see `unsupported_type_error`).
+        TypeCode::Proto => return Err(unsupported_type_error("PROTO")),
+        TypeCode::Enum => return Err(unsupported_type_error("ENUM")),
+        // STRING, JSON, UUID, INTERVAL and any future/unknown code are UTF-8 text.
         _ => DataType::Utf8,
-    }
+    })
 }
 
 /// Map a Spanner `STRUCT` type to an Arrow `Struct`, using the field names and types from the
-/// result metadata. Falls back to `Utf8` if the struct type is somehow unavailable.
-fn struct_arrow_type(ty: &Type, precision: TimestampPrecision) -> DataType {
+/// result metadata. Falls back to `Utf8` if the struct type is somehow unavailable, and propagates
+/// an [`unsupported_type_error`] from a `PROTO`/`ENUM` field.
+fn struct_arrow_type(ty: &Type, precision: TimestampPrecision) -> Result<DataType> {
     match ty.struct_type() {
-        Some(st) => DataType::Struct(struct_fields(st, precision)),
-        None => DataType::Utf8,
+        Some(st) => Ok(DataType::Struct(struct_fields(st, precision)?)),
+        None => Ok(DataType::Utf8),
     }
 }
 
@@ -655,7 +697,7 @@ fn struct_arrow_type(ty: &Type, precision: TimestampPrecision) -> DataType {
 fn struct_fields(
     st: &google_cloud_spanner::model::StructType,
     precision: TimestampPrecision,
-) -> Fields {
+) -> Result<Fields> {
     st.fields
         .iter()
         .map(|f| {
@@ -1081,7 +1123,8 @@ mod tests {
             &google_cloud_spanner::types::json(),
             true,
             TimestampPrecision::default(),
-        );
+        )
+        .unwrap();
         // Storage type stays Utf8; only the field metadata marks it as logical JSON.
         assert_eq!(field.data_type(), &DataType::Utf8);
         assert_eq!(extension_name(&field), Some(ARROW_JSON_EXTENSION));
@@ -1103,7 +1146,8 @@ mod tests {
             &google_cloud_spanner::types::string(),
             true,
             TimestampPrecision::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(field.data_type(), &DataType::Utf8);
         assert_eq!(extension_name(&field), None);
         assert!(field.metadata().is_empty());
@@ -1117,7 +1161,8 @@ mod tests {
             &google_cloud_spanner::types::array(element),
             true,
             TimestampPrecision::default(),
-        );
+        )
+        .unwrap();
         // Top-level List field carries no extension; its child (`item`) field does.
         assert_eq!(extension_name(&field), None);
         let DataType::List(item) = field.data_type() else {
@@ -1125,6 +1170,43 @@ mod tests {
         };
         assert_eq!(item.data_type(), &DataType::Utf8);
         assert_eq!(extension_name(item), Some(ARROW_JSON_EXTENSION));
+    }
+
+    #[test]
+    fn proto_and_enum_columns_are_rejected_cleanly() {
+        use google_cloud_spanner::model;
+
+        // The pinned client exposes no public constructor for PROTO/ENUM types, so build them
+        // straight from the generated model type and wrap it.
+        for (code, name) in [
+            (model::TypeCode::Proto, "PROTO"),
+            (model::TypeCode::Enum, "ENUM"),
+        ] {
+            let ty: Type = model::Type::new().set_code(code).into();
+
+            // A PROTO/ENUM column is rejected with a clean NotImplemented naming the type — never
+            // silently mapped to a Utf8 stand-in that would mis-decode the base64 proto blob / bare
+            // enum number into what looks like real string data.
+            let err = arrow_field("payload", &ty, true, TimestampPrecision::default()).unwrap_err();
+            assert_eq!(err.status, Status::NotImplemented, "{name}");
+            assert!(
+                err.message.contains(name),
+                "message should name {name}: {:?}",
+                err.message
+            );
+
+            // The rejection also flows through the recursive element type of an ARRAY<PROTO> /
+            // ARRAY<ENUM>, so those fail loudly too rather than yielding a List<Utf8>.
+            let array_ty = google_cloud_spanner::types::array(ty);
+            let err =
+                arrow_field("arr", &array_ty, true, TimestampPrecision::default()).unwrap_err();
+            assert_eq!(err.status, Status::NotImplemented, "ARRAY<{name}>");
+            assert!(
+                err.message.contains(name),
+                "ARRAY<{name}> message should name {name}: {:?}",
+                err.message
+            );
+        }
     }
 
     #[test]
@@ -1543,7 +1625,8 @@ mod tests {
             (TimestampPrecision::Microseconds, TimeUnit::Microsecond),
         ] {
             let expected = DataType::Timestamp(unit, Some(TIMESTAMP_TZ.into()));
-            let field = arrow_field("t", &google_cloud_spanner::types::timestamp(), true, mode);
+            let field =
+                arrow_field("t", &google_cloud_spanner::types::timestamp(), true, mode).unwrap();
             assert_eq!(field.data_type(), &expected, "{mode:?}");
 
             // The data path produces an array of exactly the advertised type.
@@ -1557,7 +1640,8 @@ mod tests {
                 &google_cloud_spanner::types::array(google_cloud_spanner::types::timestamp()),
                 true,
                 mode,
-            );
+            )
+            .unwrap();
             let DataType::List(item) = list_field.data_type() else {
                 panic!("expected a List, got {:?}", list_field.data_type());
             };

@@ -688,7 +688,20 @@ database — doesn't justify the extra connect-time RPC and complexity. PR #167 
 OAuth access-token auth (needs a small custom credentials impl — the auth crate has
 no static-token builder); query options (optimizer version), directed reads, commit stats,
 `max_commit_delay`, `last_statement` optimization (free RPC saving for single-statement
-autocommit DML); proto/enum columns (verify clean failure today); change streams and GQL graph
+autocommit DML); ~~proto/enum columns (verify clean failure today)~~ (**Fixed.** They failed
+*silently*, not cleanly: `arrow_type` in `src/conversion.rs` mapped both `TypeCode::Proto` and
+`TypeCode::Enum` through the catch-all `_ => DataType::Utf8` arm, so a `PROTO` column surfaced its
+base64-serialized proto blob and an `ENUM` its bare numeric value as if they were real `STRING`
+data — a mis-decode the caller could not distinguish from genuine text. Now `arrow_type` rejects
+both with a clean `Status::NotImplemented` naming the type (`unsupported_type_error`), threaded
+through `arrow_field`/`struct_arrow_type`/`struct_fields`/`build_schema` — which prefixes the
+offending column name, as the value path's `build_column` does — so the query fails loudly at
+schema-build time instead of returning a corrupt column. The rejection recurses, so
+`ARRAY<PROTO>`/`ARRAY<ENUM>` and structs with such fields fail too. Locked in by
+`proto_and_enum_columns_are_rejected_cleanly` in `src/conversion.rs` (offline; builds the types
+straight from the generated model type, asserts the status + a type-naming message for the scalar
+and array cases); the type-mapping tables/notes in the module docs and README were updated to match.);
+change streams and GQL graph
 queries may already work through plain SQL — one emulator test each would let the README claim
 them; telemetry/tracing hooks as a backlog entry.
 

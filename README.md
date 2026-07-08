@@ -358,10 +358,11 @@ authenticates as that target. The option group mirrors the BigQuery ADBC driver'
 | `TIMESTAMP`                                 | `Timestamp(Nanosecond, "UTC")` (default) or `Timestamp(Microsecond, "UTC")` — see below |
 | `NUMERIC`                                   | `Decimal128(38, 9)`               |
 | `BYTES`                                     | `Binary`                          |
-| `STRING` / `UUID` / `INTERVAL` / `ENUM` / `PROTO` | `Utf8`                      |
+| `STRING` / `UUID` / `INTERVAL`               | `Utf8`                            |
 | `JSON`                                      | `Utf8` + `arrow.json` extension   |
 | `ARRAY<T>`                                  | `List<T>` (recursive)             |
 | `STRUCT<..>`                                | `Struct<..>` (recursive)          |
+| `PROTO` / `ENUM`                             | *unsupported — clean `NotImplemented` error* |
 
 `NULL`s are represented as null slots in the corresponding Arrow array. Decoding is strict: a
 present (non-`NULL`) wire value that cannot be decoded as its column's type surfaces an
@@ -369,6 +370,13 @@ present (non-`NULL`) wire value that cannot be decoded as its column's type surf
 null slot the caller could mistake for a genuine SQL `NULL`. `ARRAY` and `STRUCT` map to
 native Arrow `List`/`Struct` recursively, so nested shapes like `ARRAY<STRUCT<..>>` round-trip with
 full type fidelity.
+
+`PROTO` and `ENUM` columns have no faithful Arrow mapping (their wire form is a base64-serialized
+proto message / a bare enum number), so a query selecting one is rejected with a clean
+`NotImplemented` error naming the column and type — in the same spirit as strict decoding, the
+driver never mis-decodes them into a `Utf8` stand-in the caller could mistake for real string data.
+This applies recursively, so an `ARRAY<PROTO>`/`ARRAY<ENUM>` (or a struct with such a field) is
+rejected too.
 
 `JSON` columns keep `Utf8` storage (the value bytes are the JSON text) but carry the canonical
 [`arrow.json`](https://arrow.apache.org/docs/format/CanonicalExtensions.html#json) extension type as
