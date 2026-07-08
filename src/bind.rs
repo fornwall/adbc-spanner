@@ -621,80 +621,44 @@ fn numeric_string(unscaled: i128, scale: u32) -> String {
 /// appearance.
 ///
 /// Skips `@name` occurrences inside string / bytes literals and quoted identifiers — including
-/// triple-quoted (`'''…'''`/`"""…"""`) and raw (`r'…'`, `rb'…'`, …) forms, via
-/// [`crate::ddl::consume_quoted`] — and comments (`-- …`, `# …`, `/* … */`), and does not treat
-/// statement hints (`@{…}`) or system variables (`@@var`) as parameters — the same lexical rules
-/// as [`crate::ddl::split_statements`]. Used by `get_parameter_schema` when no parameter data has
-/// been bound yet.
+/// triple-quoted (`'''…'''`/`"""…"""`) and raw (`r'…'`, `rb'…'`, …) forms — and comments
+/// (`-- …`, `# …`, `/* … */`), and does not treat statement hints (`@{…}`) or system variables
+/// (`@@var`) as parameters. The lexical scan is delegated to the shared [`crate::ddl::lex`]
+/// tokenizer (the same rules as [`crate::ddl::split_statements`]), so a `@name` marker is only a
+/// parameter when the `@` character stands as its own token — never inside a literal, comment or
+/// hint body. Used by `get_parameter_schema` when no parameter data has been bound yet.
 pub(crate) fn named_parameters(sql: &str) -> Vec<String> {
+    use crate::ddl::Lexeme;
     let mut params: Vec<String> = Vec::new();
-    // The trailing identifier run, tracked to recognise raw-literal prefixes (`r'…'`).
-    let mut word = String::new();
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' | '"' | '`' => {
-                let raw = c != '`' && crate::ddl::is_raw_prefix(&word);
-                word.clear();
-                // Skip the quoted literal/identifier.
-                crate::ddl::consume_quoted(&mut chars, c, raw, |_| {});
+    let mut lexemes = crate::ddl::lex(sql).peekable();
+    while let Some(lexeme) = lexemes.next() {
+        // Only a bare `@` token can introduce a parameter; `@` inside a literal/comment/hint body
+        // is folded into that lexeme and never reaches here.
+        if lexeme != Lexeme::Other('@') {
+            continue;
+        }
+        // `.copied()` releases the peek borrow so the matched arm can advance `lexemes`.
+        match lexemes.peek().copied() {
+            // `@@var` (system variable) or `@{…}` (statement hint): not a bind parameter — consume
+            // the second marker character and keep scanning (a hint body is lexed normally).
+            Some(Lexeme::Other('@')) | Some(Lexeme::Other('{')) => {
+                lexemes.next();
             }
-            '-' if chars.peek() == Some(&'-') => {
-                word.clear();
-                skip_line_comment(&mut chars)
-            }
-            '#' => {
-                word.clear();
-                skip_line_comment(&mut chars)
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                word.clear();
-                chars.next(); // '*'
-                let mut prev = '\0';
-                for ch in chars.by_ref() {
-                    if prev == '*' && ch == '/' {
-                        break;
-                    }
-                    prev = ch;
+            // `@name`: a bind parameter. The name is the adjacent identifier run, which must start
+            // with a letter or underscore — a word run may also start with a digit (`@1` is not a
+            // parameter).
+            Some(Lexeme::Word(name))
+                if name.starts_with(|ch: char| ch == '_' || ch.is_ascii_alphabetic()) =>
+            {
+                lexemes.next();
+                if !params.iter().any(|p| p == name) {
+                    params.push(name.to_string());
                 }
             }
-            _ if c == '_' || c.is_ascii_alphanumeric() => word.push(c),
-            '@' => {
-                word.clear();
-                match chars.peek() {
-                    // `@@var` (system variable) or `@{…}` (statement hint): not a bind parameter.
-                    Some('@') | Some('{') => {
-                        chars.next();
-                    }
-                    Some(&ch) if ch == '_' || ch.is_ascii_alphabetic() => {
-                        let mut name = String::new();
-                        while let Some(&ch) = chars.peek() {
-                            if ch == '_' || ch.is_ascii_alphanumeric() {
-                                name.push(ch);
-                                chars.next();
-                            } else {
-                                break;
-                            }
-                        }
-                        if !params.iter().any(|p| p == &name) {
-                            params.push(name);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            _ => word.clear(),
+            _ => {}
         }
     }
     params
-}
-
-fn skip_line_comment(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    for ch in chars.by_ref() {
-        if ch == '\n' {
-            break;
-        }
-    }
 }
 
 /// Backtick-quote a Spanner identifier. Keeps reserved words (`create`, `index`, …) and

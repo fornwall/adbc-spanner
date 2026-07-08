@@ -40,8 +40,8 @@ pub(crate) fn is_dml(sql: &str) -> bool {
 /// Return `true` if `sql` contains a top-level `THEN RETURN` clause — DML that returns rows
 /// (`INSERT`/`UPDATE`/`DELETE ... THEN RETURN <columns>`).
 ///
-/// Scans word tokens outside string/identifier literals and comments (the same lexical rules as
-/// [`split_statements`]) for the keyword `THEN` immediately followed by `RETURN`,
+/// Scans word tokens outside string/identifier literals and comments — via the shared
+/// [`Lexer`] — for the keyword `THEN` immediately followed by `RETURN`,
 /// case-insensitively — but only at `CASE` expression nesting depth zero. GoogleSQL's `THEN
 /// RETURN` clause appears only at the top level, at the end of a DML statement; a `THEN` inside a
 /// `CASE WHEN … THEN … END` expression belongs to the CASE, so a branch expression that is a
@@ -52,78 +52,27 @@ pub(crate) fn is_dml(sql: &str) -> bool {
 pub(crate) fn is_dml_returning(sql: &str) -> bool {
     let mut previous_was_then = false;
     let mut case_depth = 0usize;
-    let mut word = String::new();
-    let mut chars = sql.chars().peekable();
-    let check_word =
-        |word: &mut String, previous_was_then: &mut bool, case_depth: &mut usize| -> bool {
-            if word.is_empty() {
-                return false;
-            }
-            let matched =
-                *previous_was_then && *case_depth == 0 && word.eq_ignore_ascii_case("RETURN");
-            *previous_was_then = word.eq_ignore_ascii_case("THEN");
-            if word.eq_ignore_ascii_case("CASE") {
-                *case_depth += 1;
-            } else if word.eq_ignore_ascii_case("END") {
-                *case_depth = case_depth.saturating_sub(1);
-            }
-            word.clear();
-            matched
-        };
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' | '"' | '`' => {
-                // The raw-prefix check must read `word` before `check_word` clears it.
-                let raw = c != '`' && is_raw_prefix(&word);
-                if check_word(&mut word, &mut previous_was_then, &mut case_depth) {
+    for lexeme in lex(sql) {
+        match lexeme {
+            Lexeme::Word(word) => {
+                if previous_was_then && case_depth == 0 && word.eq_ignore_ascii_case("RETURN") {
                     return true;
                 }
-                // A quoted literal/identifier resets the keyword window.
-                previous_was_then = false;
-                consume_quoted(&mut chars, c, raw, |_| {});
-            }
-            '-' if chars.peek() == Some(&'-') => {
-                if check_word(&mut word, &mut previous_was_then, &mut case_depth) {
-                    return true;
-                }
-                for ch in chars.by_ref() {
-                    if ch == '\n' {
-                        break;
-                    }
+                previous_was_then = word.eq_ignore_ascii_case("THEN");
+                if word.eq_ignore_ascii_case("CASE") {
+                    case_depth += 1;
+                } else if word.eq_ignore_ascii_case("END") {
+                    case_depth = case_depth.saturating_sub(1);
                 }
             }
-            '#' => {
-                if check_word(&mut word, &mut previous_was_then, &mut case_depth) {
-                    return true;
-                }
-                for ch in chars.by_ref() {
-                    if ch == '\n' {
-                        break;
-                    }
-                }
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                if check_word(&mut word, &mut previous_was_then, &mut case_depth) {
-                    return true;
-                }
-                chars.next(); // '*'
-                let mut prev = '\0';
-                for ch in chars.by_ref() {
-                    if prev == '*' && ch == '/' {
-                        break;
-                    }
-                    prev = ch;
-                }
-            }
-            _ if c == '_' || c.is_ascii_alphanumeric() => word.push(c),
-            _ => {
-                if check_word(&mut word, &mut previous_was_then, &mut case_depth) {
-                    return true;
-                }
-            }
+            // A quoted literal/identifier resets the keyword window, so `THEN 'x' RETURN` is not a
+            // clause. Comments and punctuation between the two keywords are transparent (they carry
+            // no word), matching `THEN /* keep */ RETURN` and `THEN\n  RETURN`.
+            Lexeme::Quoted(_) => previous_was_then = false,
+            Lexeme::Comment(_) | Lexeme::Other(_) => {}
         }
     }
-    check_word(&mut word, &mut previous_was_then, &mut case_depth)
+    false
 }
 
 /// Whether `word` — the identifier run immediately (adjacently) before a quote — is a GoogleSQL
@@ -182,60 +131,140 @@ pub(crate) fn consume_quoted(
     }
 }
 
-/// Split a (possibly multi-statement) SQL string into individual, trimmed, non-empty statements.
-///
-/// Splits on top-level `;`, ignoring semicolons inside string/bytes literals and quoted
-/// identifiers — including triple-quoted (`'''…'''`/`"""…"""`) and raw (`r'…'`, `rb'…'`, …) forms,
-/// see [`consume_quoted`] — and comments (`-- …`, `# …`, `/* … */`). This is shared by DDL
-/// batching (`UpdateDatabaseDdl`) and multi-statement DML batching (`ExecuteBatchDml`).
-pub(crate) fn split_statements(sql: &str) -> Vec<String> {
-    let mut statements = Vec::new();
-    let mut current = String::new();
-    // The trailing identifier run, tracked to recognise raw-literal prefixes (`r'…'`).
-    let mut word = String::new();
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' | '"' | '`' => {
-                let raw = c != '`' && is_raw_prefix(&word);
-                word.clear();
-                // A quoted literal/identifier: copy through the matching close quote.
-                current.push(c);
-                consume_quoted(&mut chars, c, raw, |ch| current.push(ch));
+/// A single GoogleSQL lexeme produced by [`lex`]. The pieces partition the input with no gaps or
+/// overlaps: concatenating `Word`/`Quoted`/`Comment` slices and `Other` chars in order reproduces
+/// the source byte-for-byte. That lets a *copying* consumer ([`split_statements`]) rebuild the text
+/// while *skipping* consumers ([`is_dml_returning`], [`named_parameters`](crate::bind::named_parameters))
+/// ignore the lexeme kinds they do not care about — all three sharing one lexer instead of a
+/// hand-rolled comment/quote walker each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lexeme<'a> {
+    /// A maximal run of identifier characters (`[A-Za-z0-9_]`): a keyword, identifier or number.
+    Word(&'a str),
+    /// A string/bytes literal or quoted identifier, delimiters included — triple-quoted, raw
+    /// (`r'…'`/`rb'…'`/`br'…'`) and backslash-escaped forms handled per [`consume_quoted`], so an
+    /// embedded quote / `;` / comment marker never ends it early.
+    Quoted(&'a str),
+    /// A `--`/`#` line comment (through its terminating newline, or end of input) or a `/* … */`
+    /// block comment, delimiters included. An unterminated comment runs to end of input.
+    Comment(&'a str),
+    /// Any other single character — whitespace, punctuation, an operator, `;`, `@`, ….
+    Other(char),
+}
+
+/// Tokenize `sql` into [`Lexeme`]s under GoogleSQL's lexical rules (the string/comment structure
+/// shared by DDL/DML batch splitting, `THEN RETURN` detection and `@name` extraction). The lexer
+/// tracks the trailing identifier run itself so it can recognise raw-literal prefixes (`r'…'`) —
+/// callers never need to; see [`consume_quoted`].
+pub(crate) fn lex(sql: &str) -> Lexer<'_> {
+    Lexer {
+        input: sql,
+        chars: sql.chars().peekable(),
+        pos: 0,
+        prev_raw_prefix: false,
+    }
+}
+
+/// The iterator behind [`lex`]. See [`Lexeme`] for the guarantees each item carries.
+pub(crate) struct Lexer<'a> {
+    input: &'a str,
+    chars: std::iter::Peekable<std::str::Chars<'a>>,
+    /// Byte offset of the next character `chars` will yield — used to slice `input`.
+    pos: usize,
+    /// Whether the immediately-preceding lexeme was an identifier run that is a raw-literal prefix,
+    /// so a quote following it (with no intervening character) opens a raw literal.
+    prev_raw_prefix: bool,
+}
+
+impl Lexer<'_> {
+    fn bump(&mut self) -> Option<char> {
+        let c = self.chars.next()?;
+        self.pos += c.len_utf8();
+        Some(c)
+    }
+
+    /// Consume a `--`/`#` line comment through its terminating newline (inclusive) or end of input.
+    /// The introducer (`#`, or the first `-`) has already been consumed.
+    fn consume_line_comment(&mut self) {
+        while let Some(ch) = self.bump() {
+            if ch == '\n' {
+                break;
             }
-            '-' if chars.peek() == Some(&'-') => {
-                word.clear();
-                copy_line_comment(&mut current, c, &mut chars)
+        }
+    }
+}
+
+fn is_ident_char(c: char) -> bool {
+    c == '_' || c.is_ascii_alphanumeric()
+}
+
+impl<'a> Iterator for Lexer<'a> {
+    type Item = Lexeme<'a>;
+
+    fn next(&mut self) -> Option<Lexeme<'a>> {
+        let start = self.pos;
+        let c = self.bump()?;
+        let lexeme = match c {
+            '\'' | '"' | '`' => {
+                let raw = c != '`' && self.prev_raw_prefix;
+                // The opening quote is already consumed; advance `pos` past the rest of the literal.
+                let mut consumed = 0usize;
+                consume_quoted(&mut self.chars, c, raw, |ch| consumed += ch.len_utf8());
+                self.pos += consumed;
+                Lexeme::Quoted(&self.input[start..self.pos])
+            }
+            '-' if self.chars.peek() == Some(&'-') => {
+                self.consume_line_comment();
+                Lexeme::Comment(&self.input[start..self.pos])
             }
             '#' => {
-                word.clear();
-                copy_line_comment(&mut current, c, &mut chars)
+                self.consume_line_comment();
+                Lexeme::Comment(&self.input[start..self.pos])
             }
-            '/' if chars.peek() == Some(&'*') => {
-                word.clear();
-                current.push(c);
-                current.push(chars.next().unwrap()); // '*'
+            '/' if self.chars.peek() == Some(&'*') => {
+                self.bump(); // '*'
                 let mut prev = '\0';
-                for ch in chars.by_ref() {
-                    current.push(ch);
+                while let Some(ch) = self.bump() {
                     if prev == '*' && ch == '/' {
                         break;
                     }
                     prev = ch;
                 }
+                Lexeme::Comment(&self.input[start..self.pos])
             }
-            ';' => {
-                word.clear();
-                push_statement(&mut statements, &mut current)
-            }
-            _ => {
-                if c == '_' || c.is_ascii_alphanumeric() {
-                    word.push(c);
-                } else {
-                    word.clear();
+            _ if is_ident_char(c) => {
+                while self.chars.peek().copied().is_some_and(is_ident_char) {
+                    self.bump();
                 }
-                current.push(c);
+                Lexeme::Word(&self.input[start..self.pos])
             }
+            _ => Lexeme::Other(c),
+        };
+        // A raw prefix must sit immediately before the quote, so only an identifier run adjacent to
+        // the next quote keeps the flag set; every other lexeme (including whitespace/punctuation)
+        // clears it.
+        self.prev_raw_prefix = matches!(lexeme, Lexeme::Word(w) if is_raw_prefix(w));
+        Some(lexeme)
+    }
+}
+
+/// Split a (possibly multi-statement) SQL string into individual, trimmed, non-empty statements.
+///
+/// Splits on top-level `;`, ignoring semicolons inside string/bytes literals and quoted
+/// identifiers — including triple-quoted (`'''…'''`/`"""…"""`) and raw (`r'…'`, `rb'…'`, …) forms,
+/// see [`consume_quoted`] — and comments (`-- …`, `# …`, `/* … */`). Both are handled by the
+/// shared [`lex`] tokenizer, which reproduces every non-`;` lexeme verbatim. This is shared by DDL
+/// batching (`UpdateDatabaseDdl`) and multi-statement DML batching (`ExecuteBatchDml`).
+pub(crate) fn split_statements(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    for lexeme in lex(sql) {
+        match lexeme {
+            // A top-level `;` ends the current statement (and is itself dropped).
+            Lexeme::Other(';') => push_statement(&mut statements, &mut current),
+            // Every other lexeme is copied through verbatim, so literals/comments survive intact.
+            Lexeme::Word(s) | Lexeme::Quoted(s) | Lexeme::Comment(s) => current.push_str(s),
+            Lexeme::Other(c) => current.push(c),
         }
     }
     push_statement(&mut statements, &mut current);
@@ -259,20 +288,6 @@ pub(crate) fn strip_trailing_terminators(sql: &str) -> String {
         statements.pop().unwrap()
     } else {
         sql.to_string()
-    }
-}
-
-fn copy_line_comment(
-    out: &mut String,
-    first: char,
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) {
-    out.push(first);
-    for ch in chars.by_ref() {
-        out.push(ch);
-        if ch == '\n' {
-            break;
-        }
     }
 }
 
@@ -501,6 +516,52 @@ mod tests {
         assert!(is_dml_returning(
             "UPDATE t SET a = b END WHERE true THEN RETURN a"
         ));
+    }
+
+    #[test]
+    fn lexer_partitions_input_byte_for_byte() {
+        // The shared lexer's core guarantee (relied on by `split_statements`' verbatim rebuild):
+        // concatenating every lexeme's source reproduces the input exactly, across all four comment
+        // forms, a raw+triple-quoted literal, a quoted identifier and a statement hint.
+        for sql in [
+            r#"SELECT r'''a\''' /* c */ FROM `t` -- x
+               WHERE s = "y;z" # h
+               @{HINT=1} AND @p = @@v"#,
+            "",
+            "-- only a comment, unterminated",
+            "/* unterminated block",
+            "r'unterminated raw",
+        ] {
+            let rebuilt: String = lex(sql)
+                .map(|lexeme| match lexeme {
+                    Lexeme::Word(s) | Lexeme::Quoted(s) | Lexeme::Comment(s) => s.to_string(),
+                    Lexeme::Other(c) => c.to_string(),
+                })
+                .collect();
+            assert_eq!(rebuilt, sql, "lexer did not partition {sql:?} exactly");
+        }
+        // Classification of a small, representative token stream. A raw prefix (`r`) is a `Word`
+        // adjacent to the following literal, which the lexer must treat as raw (so the escaped
+        // closing quote does not end it early).
+        assert_eq!(
+            lex(r"a 'b' -- c").collect::<Vec<_>>(),
+            vec![
+                Lexeme::Word("a"),
+                Lexeme::Other(' '),
+                Lexeme::Quoted("'b'"),
+                Lexeme::Other(' '),
+                Lexeme::Comment("-- c"),
+            ]
+        );
+        assert_eq!(
+            lex(r"r'x\' y").collect::<Vec<_>>(),
+            vec![
+                Lexeme::Word("r"),
+                Lexeme::Quoted(r"'x\'"),
+                Lexeme::Other(' '),
+                Lexeme::Word("y"),
+            ]
+        );
     }
 
     #[test]
