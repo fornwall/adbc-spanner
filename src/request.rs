@@ -27,7 +27,9 @@
 
 use adbc_core::error::Result;
 use adbc_core::options::OptionValue;
-use google_cloud_spanner::builder::{BatchDmlBuilder, TransactionRunnerBuilder};
+use google_cloud_spanner::builder::{
+    BatchDmlBuilder, TransactionRunnerBuilder, WriteOnlyTransactionBuilder,
+};
 use google_cloud_spanner::model::request_options::Priority;
 use google_cloud_spanner::statement::StatementBuilder;
 
@@ -157,6 +159,21 @@ impl RequestConfig {
         &self,
         mut builder: TransactionRunnerBuilder,
     ) -> TransactionRunnerBuilder {
+        if let Some(priority) = self.priority {
+            builder = builder.set_commit_priority(priority.to_client());
+        }
+        if let Some(tag) = &self.transaction_tag {
+            builder = builder.set_transaction_tag(tag.as_str());
+        }
+        builder
+    }
+
+    /// Apply the commit priority and transaction tag to a write-only transaction builder (the
+    /// mutation-based bulk-ingest commit path).
+    pub(crate) fn apply_to_write_only(
+        &self,
+        mut builder: WriteOnlyTransactionBuilder,
+    ) -> WriteOnlyTransactionBuilder {
         if let Some(priority) = self.priority {
             builder = builder.set_commit_priority(priority.to_client());
         }

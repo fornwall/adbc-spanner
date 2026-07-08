@@ -51,7 +51,8 @@
 //! ## Transactions
 //!
 //! Connections are in **autocommit** mode by default. Setting `adbc.connection.autocommit` to
-//! `false` enters manual transaction mode, in which DML is **buffered** and applied atomically in
+//! `false` enters manual transaction mode, in which DML — and any bulk ingest's insert mutations —
+//! is **buffered** and applied atomically in
 //! one read/write transaction on `commit` (the Spanner client exposes read/write transactions only
 //! through a closure-based runner, so there is no true open transaction to run statements in).
 //! Two consequences: a manual transaction has **no read-your-writes** — queries run immediately in

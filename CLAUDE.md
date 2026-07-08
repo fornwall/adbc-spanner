@@ -266,12 +266,18 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   ARRAY/STRUCT, parameter binding (by column name, else positionally; an `arrow.json`-tagged string
   column binds as a `JSON`-typed param — Spanner won't coerce STRING params into JSON columns — and
   ingest create modes map it to a `JSON` column) + bulk ingest (append and
-  create/create_append/replace — the create modes build the table from the ingest data's Arrow schema
-  with a synthetic `adbc_ingest_key` UUID primary key, since Spanner requires one; autocommit ingests
-  are built and shipped chunk by chunk under Spanner's per-commit limits — `IngestChunkBudget` in
-  `src/statement.rs`, ~rows × columns mutations + an approximate byte budget — so a multi-chunk
-  ingest commits per chunk and is not atomic as a whole, while manual-mode ingests stay buffered
-  unchunked for the commit like any other DML), `get_info` (static
+  create/create_append/replace — the create modes build the table via admin DDL from the ingest
+  data's Arrow schema with a synthetic `adbc_ingest_key` UUID primary key, since Spanner requires
+  one; the rows themselves ship as native **insert mutations** — `bind::insert_mutation`, reusing
+  the same `cell_value` Arrow→Spanner mapping as parameter binding — not per-row `INSERT` DML, so
+  nothing is SQL-parsed/planned per row but `INSERT` semantics are kept (duplicate PK →
+  `AlreadyExists`); autocommit ingests are built and committed chunk by chunk via
+  `DatabaseClient::write_only_transaction` under Spanner's per-commit limits — `IngestChunkBudget`
+  in `src/statement.rs`, ~rows × columns mutations + an approximate byte budget — so a multi-chunk
+  ingest commits per chunk and is not atomic as a whole, while manual-mode ingests buffer their
+  mutations unchunked (`TxnState::pending_mutations`) and commit atomically **with** the buffered
+  DML in one read/write transaction via `ReadWriteTransaction::buffer` — note Spanner applies
+  buffered mutations at commit, after the transaction's DML executes), `get_info` (static
   driver/vendor metadata),
   `get_objects` (incl. foreign-key `constraint_column_usage`), `get_table_types`/`get_table_schema`,
   `get_parameter_schema`, `Connection`/`Statement::cancel` (a shared, sticky `CancelSignal`

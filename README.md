@@ -36,10 +36,11 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   `;`-separated batch is submitted as a single schema change, so multi-step changes (e.g. dbt's
   intermediate-table build then rename swap) are near-atomic.
 - Transactions: autocommit by default, or manual multi-statement transactions (set
-  `adbc.connection.autocommit` to `false`, then `commit`/`rollback`). In manual mode DML is buffered
+  `adbc.connection.autocommit` to `false`, then `commit`/`rollback`). In manual mode DML — and any
+  bulk ingest's insert mutations — is buffered
   and applied atomically in one read/write transaction on commit, so `execute_update` returns `None`
   rather than an affected-row count — the count is unknown until the buffered batch commits (queries
-  and DDL still run immediately). Because only DML is buffered, a manual transaction has **no
+  and DDL still run immediately). Because only writes are buffered, a manual transaction has **no
   read-your-writes** — a query runs immediately in a fresh read-only snapshot, so an `INSERT`
   followed by a `SELECT COUNT(*)` in the same open transaction returns the *pre-insert* count — and
   **DML and DDL reorder**: DDL issued after buffered DML executes before it (Spanner DDL is never
@@ -73,11 +74,17 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   accepts the bounded-staleness kinds only on single-use transactions, a `max:<d>`/`min:<t>` bound
   is pinned there to its most-stale legal equivalent (exact staleness `<d>` / read timestamp `<t>`).
 - Bulk ingest: set `adbc.ingest.target_table`, bind an Arrow batch, and `execute_update` inserts the
-  rows into that table — in one transaction when the ingest fits Spanner's per-commit limits (~80,000
-  mutations, counted roughly as rows × columns, and ~100 MB). A larger ingest is automatically split
-  into chunks that stay well under those limits, each committed in its own transaction, so it is
-  **not atomic as a whole**: a mid-ingest failure leaves earlier chunks committed. (An ingest that
-  large could not have committed as one transaction anyway.) All four `adbc.ingest.mode` values are
+  rows into that table. Rows are shipped as native Spanner **insert mutations** (the `Commit` RPC's
+  write format) rather than per-row `INSERT` DML, so nothing is SQL-parsed or query-planned per row —
+  the fast path for bulk loads, with unchanged `INSERT` semantics (a duplicate primary key still
+  fails with `AlreadyExists`). The ingest commits in one transaction when it fits Spanner's
+  per-commit limits (~80,000 mutations, counted roughly as rows × columns, and ~100 MB). A larger
+  ingest is automatically split into chunks that stay well under those limits, each committed in its
+  own transaction, so it is **not atomic as a whole**: a mid-ingest failure leaves earlier chunks
+  committed. (An ingest that large could not have committed as one transaction anyway.) In a manual
+  transaction (`adbc.connection.autocommit=false`) the mutations are buffered — unchunked — and
+  committed atomically with any buffered DML on `commit`; Spanner applies buffered mutations at
+  commit time, after the transaction's DML has executed. All four `adbc.ingest.mode` values are
   supported:
   `append` (the default — insert into an existing table), `create` (create the table first, failing
   if it exists), `create_append` (create if absent, then insert) and `replace` (drop and recreate).

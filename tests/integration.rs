@@ -731,6 +731,62 @@ fn query_and_dml_round_trip() {
         )
         .expect("re-enable autocommit");
 
+    // Bulk ingest inside a manual transaction: the rows' insert mutations must buffer (returning
+    // None, invisible before commit) and commit atomically in the SAME transaction as buffered
+    // DML; rollback must discard them.
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("disable autocommit for ingest");
+    let buffer_ingest = |connection: &mut SpannerConnection, ids: &[i64]| {
+        let rows = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(ids.to_vec()))],
+        )
+        .unwrap();
+        let mut s = connection.new_statement().expect("new statement");
+        s.set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcTxn".into()),
+        )
+        .unwrap();
+        s.bind(rows).expect("bind manual-mode ingest rows");
+        assert_eq!(
+            s.execute_update().expect("buffered ingest"),
+            None,
+            "a manual-mode ingest must buffer its mutations (return None), not commit immediately"
+        );
+    };
+    buffer_ingest(&mut connection, &[100, 101]);
+    buffer_sql(&mut connection, "INSERT INTO AdbcTxn (Id) VALUES (102)");
+    assert_eq!(
+        count_rows(&mut connection, "AdbcTxn"),
+        6,
+        "buffered ingest mutations must not be visible before commit"
+    );
+    connection.commit().expect("commit ingest + DML");
+    assert_eq!(
+        count_rows(&mut connection, "AdbcTxn"),
+        9,
+        "commit must apply the buffered DML and the buffered ingest mutations atomically"
+    );
+    // A buffered ingest followed by rollback leaves no trace.
+    buffer_ingest(&mut connection, &[103]);
+    connection.rollback().expect("rollback buffered ingest");
+    assert_eq!(
+        count_rows(&mut connection, "AdbcTxn"),
+        9,
+        "rolled-back ingest mutations must not appear"
+    );
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("true".into()),
+        )
+        .expect("re-enable autocommit after ingest");
+
     let mut drop_txn = connection.new_statement().expect("new statement");
     drop_txn.set_sql_query("DROP TABLE AdbcTxn").unwrap();
     drop_txn.execute_update().expect("drop txn table");
