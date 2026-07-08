@@ -708,8 +708,16 @@ documented, so the lint gates future additions without needing any new docs, and
 clean); assorted maintainability
 polish: the four direction-specific copies of the type mapping (`bind_one` vs `bind_list` is a
 genuine 100-line duplication — fold via an element visitor, and add an "adding a type touches
-these N sites" checklist), three hand-rolled comment-skipping lexer walkers that could share one
-token iterator, ~~ingest-mode strings matched in two places (make it an enum)~~ (**Fixed.** The
+these N sites" checklist), ~~three hand-rolled comment-skipping lexer walkers that could share one
+token iterator~~ (**Fixed.** `split_statements`, `is_dml_returning` (both `src/ddl.rs`) and
+`named_parameters` (`src/bind.rs`) each hand-rolled the same GoogleSQL whitespace/comment/quote walk;
+they now share one `Lexer` (`src/ddl.rs::lex`) that tokenizes into `Lexeme::{Word, Quoted, Comment,
+Other}` — partitioning the input byte-for-byte so the copying consumer (`split_statements`) rebuilds
+the text while the skipping consumers ignore the pieces they don't need, with the raw-literal-prefix
+(`r'…'`) tracking centralized in the lexer. All three comment forms, triple-quoted/raw strings and
+`@{…}` handling are preserved; the `copy_line_comment`/`skip_line_comment` duplicates were removed,
+and a `lexer_partitions_input_byte_for_byte` unit test guards the shared helper), ~~ingest-mode
+strings matched in two places (make it an enum)~~ (**Fixed.** The
 statement now stores `adbc_core::options::IngestMode` (the spec enum), parsed once at `set_option`
 time by `ingest_mode_option` in `src/statement.rs` — which accepts both the canonical
 `adbc.ingest.mode.*` spellings (via the `adbc_core::constants` values) and the bare short forms,
