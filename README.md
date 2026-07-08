@@ -176,7 +176,9 @@ Options exist at three levels — **database**, **connection** and **statement**
 object they are set on. Driver-specific options use the bare `spanner.*` prefix; the standard
 `adbc.*` (spec) options the driver honours are listed alongside them. Boolean options accept
 `true`/`false` (also `1`/`0`/`yes`/`no`, case-insensitive, or an integer); integer options accept
-an integer or a numeric string. Every settable option round-trips through `get_option`.
+an integer or a numeric string. Every settable option round-trips through `get_option`. The
+complete, authoritative reference — every option with its exact type, default, and `get_option`
+round-trip behaviour — is [docs/options.md](docs/options.md).
 
 **Database options** (via `new_database_with_opts` or `set_option` on the database):
 
@@ -217,8 +219,8 @@ an integer or a numeric string. Every settable option round-trips through `get_o
 | `adbc.ingest.temporary`                      | `false` only                      | `false`                           | Spanner has no temporary tables; the spec default `false` is accepted as a no-op, `true` is rejected with `NotImplemented`. |
 | `adbc.ingest.mode`                           | `adbc.ingest.mode.append` / `…create` / `…create_append` / `…replace` (short forms `append`/`create`/`create_append`/`replace` also accepted) | append | Bulk-ingest mode (see [Status](#status) for what each mode does). |
 
-The read-only "current" catalog/schema connection options (`adbc.connection.current_catalog`,
-`adbc.connection.current_db_schema`) report `""` — Spanner has a single, unnamed catalog and
+The read-only "current" catalog/schema connection options (`adbc.connection.catalog`,
+`adbc.connection.db_schema`) report `""` — Spanner has a single, unnamed catalog and
 default schema — and cannot be set.
 
 ### Authentication
