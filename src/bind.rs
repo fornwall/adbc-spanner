@@ -3,7 +3,10 @@
 //!
 //! ADBC supplies statement parameters (and bulk-ingest rows) as an Arrow [`RecordBatch`]: each
 //! column is one parameter, and each row is one set of bindings. Spanner uses **named** query
-//! parameters (`@name`), so a bind column named `id` binds to `@id` in the SQL. Bulk ingest does
+//! parameters (`@name`), so a bind column named `id` binds to `@id` in the SQL — how the
+//! column→parameter pairing is decided (positionally by default, or by name via the
+//! `adbc.statement.bind_by_name` option) is documented on [`resolve_parameter_names`]. Bulk ingest
+//! does
 //! not go through SQL at all: each bound row becomes one insert [`Mutation`] (see
 //! [`insert_mutation`]), whose cells use the exact same Arrow→Spanner value mapping
 //! ([`cell_value`]) as parameter binding.
@@ -67,8 +70,8 @@ use crate::error::invalid_argument;
 /// `names[i]` is the parameter that column `i` binds to; it is computed once per (sql, batch) by
 /// [`resolve_parameter_names`] and passed in, so binding many rows of the same batch does not re-lex
 /// the SQL per row (an O(rows × |sql|) cost that dominated large bound DML). See
-/// [`resolve_parameter_names`] for how the column→parameter pairing is decided (by name, else
-/// positionally).
+/// [`resolve_parameter_names`] for how the column→parameter pairing is decided (positionally by
+/// default, or by name).
 pub(crate) fn bind_params(
     builder: StatementBuilder,
     names: &[String],
@@ -92,29 +95,46 @@ pub(crate) fn bind_params(
 /// Work out which parameter name each column of `batch` binds to for `sql`.
 ///
 /// ADBC's parameter model is a batch of columns matched to the query's parameters. This driver
-/// resolves the pairing two ways:
+/// resolves the pairing two ways, selected by the `adbc.statement.bind_by_name` statement option
+/// (`bind_by_name`), following the ADBC SQLite reference driver's convention
+/// (apache/arrow-adbc#3362):
 ///
-/// - **By name** (the historical behaviour): when every bound column's name is one of the query's
-///   `@name` parameters, each column binds to `@<its own name>`.
-/// - **Positionally** (the ADBC ordinal contract): otherwise the *i*-th column binds to the *i*-th
-///   distinct `@name` parameter in query order. This is what positional clients expect — most ADBC
-///   drivers (PostgreSQL, Snowflake, …) bind by position, and the Python DBAPI / validation suites
-///   pass parameters as `$1`/`?` with columns not named after the parameters.
+/// - **Positionally** (`bind_by_name = false`, the default — the ADBC ordinal contract): the
+///   *i*-th column binds to the *i*-th distinct `@name` parameter in query order; the counts must
+///   line up, and column names are ignored entirely. This is what positional clients expect — most
+///   ADBC drivers (PostgreSQL, Snowflake, …) bind by position, and the Python DBAPI / validation
+///   suites pass parameters as `$1`/`?` with columns not named after the parameters.
+/// - **By name** (`bind_by_name = true`): each column binds to `@<its own name>`,
+///   order-independent. A column whose name is not one of the query's parameters is rejected here
+///   with `InvalidArguments` naming the missing parameter (a parameter no column names is simply
+///   left unbound, which Spanner rejects at execution time). Use this when the bound column names
+///   are authoritative and may not match the parameters' textual order.
 ///
 /// Lexing the SQL to find its `@name` parameters is the expensive part, so callers resolve once per
 /// (sql, batch) and reuse the result across every row via [`bind_params`].
-pub(crate) fn resolve_parameter_names(sql: &str, batch: &RecordBatch) -> Result<Vec<String>> {
+pub(crate) fn resolve_parameter_names(
+    sql: &str,
+    batch: &RecordBatch,
+    bind_by_name: bool,
+) -> Result<Vec<String>> {
     let schema = batch.schema();
     let column_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     let params = named_parameters(sql);
-    let param_set: std::collections::HashSet<&str> = params.iter().map(String::as_str).collect();
 
-    // Name mode: every bound column corresponds to a query parameter of the same name.
-    if !column_names.is_empty() && column_names.iter().all(|c| param_set.contains(c)) {
+    // Strict by-name: every bound column must correspond to a query parameter.
+    if bind_by_name {
+        let param_set: std::collections::HashSet<&str> =
+            params.iter().map(String::as_str).collect();
+        if let Some(missing) = column_names.iter().find(|c| !param_set.contains(*c)) {
+            return Err(invalid_argument(format!(
+                "could not find parameter {missing:?}: adbc.statement.bind_by_name is true, \
+                 so every bound column must name one of the query's parameters (got {params:?})",
+            )));
+        }
         return Ok(column_names.iter().map(|c| (*c).to_string()).collect());
     }
 
-    // Positional mode: i-th column -> i-th parameter. Counts must line up.
+    // Positional (the default): i-th column -> i-th parameter. Counts must line up.
     if params.len() != column_names.len() {
         return Err(invalid_argument(format!(
             "parameter count mismatch: query references {} parameter(s) {:?} but {} column(s) were bound",
@@ -1095,28 +1115,86 @@ mod tests {
 
     #[test]
     fn resolves_parameters_by_name_when_columns_match() {
-        // Every bound column names a query parameter -> bind by name, order-independent.
+        // bind_by_name=true: every bound column names a query parameter -> bind by name,
+        // order-independent.
         let b = int_batch(&["b", "a"]);
         assert_eq!(
-            resolve_parameter_names("SELECT @a, @b", &b).unwrap(),
+            resolve_parameter_names("SELECT @a, @b", &b, true).unwrap(),
             vec!["b", "a"],
         );
     }
 
     #[test]
-    fn resolves_parameters_positionally_when_names_differ() {
-        // Columns not named after the parameters (as positional clients / the validation suite
-        // produce) -> i-th column binds to the i-th parameter in query order.
+    fn resolves_parameters_positionally_by_default() {
+        // The default (bind_by_name=false): i-th column binds to the i-th parameter in query
+        // order, column names ignored — what positional clients / the validation suite produce.
         let b = int_batch(&["res", "other"]);
         assert_eq!(
-            resolve_parameter_names("INSERT INTO t VALUES (@p1, @p2)", &b).unwrap(),
+            resolve_parameter_names("INSERT INTO t VALUES (@p1, @p2)", &b, false).unwrap(),
             vec!["p1", "p2"],
         );
-        // A single unmatched column still binds to the single parameter.
+        // A single column still binds to the single parameter.
         let one = int_batch(&["res"]);
         assert_eq!(
-            resolve_parameter_names("INSERT INTO t VALUES (@p1)", &one).unwrap(),
+            resolve_parameter_names("INSERT INTO t VALUES (@p1)", &one, false).unwrap(),
             vec!["p1"],
+        );
+    }
+
+    #[test]
+    fn by_name_mode_binds_by_name_and_leaves_extra_params_unbound() {
+        // Strict by-name: order-independent, and a query parameter no column names (@c) is simply
+        // left unbound (Spanner rejects that at execution time, not here).
+        let b = int_batch(&["b", "a"]);
+        assert_eq!(
+            resolve_parameter_names("SELECT @a, @b, @c", &b, true).unwrap(),
+            vec!["b", "a"],
+        );
+    }
+
+    #[test]
+    fn by_name_mode_rejects_an_unmatched_column_naming_the_parameter() {
+        // bind_by_name=true: a bound column with no matching query parameter is a hard
+        // InvalidArguments error naming the missing parameter — never a silent positional
+        // fallback (which is what the default bind_by_name=false does with this input).
+        let b = int_batch(&["a", "x"]);
+        let err = resolve_parameter_names("SELECT @a, @b", &b, true).unwrap_err();
+        assert_eq!(err.status, adbc_core::error::Status::InvalidArguments);
+        assert!(
+            err.message.contains("could not find parameter \"x\""),
+            "error must name the missing parameter: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn positional_binding_ignores_coincidental_name_matches() {
+        // Every column name matches a query parameter, so by-name binding would reorder the values
+        // (column "b" -> @b). The default positional binding must ignore the names entirely:
+        // column 0 binds @a, column 1 binds @b.
+        let b = int_batch(&["b", "a"]);
+        assert_eq!(
+            resolve_parameter_names("SELECT @a, @b", &b, false).unwrap(),
+            vec!["a", "b"],
+        );
+        // Contrast: by-name binding name-matches the very same input (see
+        // resolves_parameters_by_name_when_columns_match).
+        assert_eq!(
+            resolve_parameter_names("SELECT @a, @b", &b, true).unwrap(),
+            vec!["b", "a"],
+        );
+    }
+
+    #[test]
+    fn positional_mode_still_requires_matching_counts() {
+        // Even a column that names a parameter cannot save a count mismatch under the default
+        // positional binding.
+        let b = int_batch(&["a"]);
+        let err = resolve_parameter_names("SELECT @a, @b", &b, false).unwrap_err();
+        assert!(
+            err.message.contains("parameter count mismatch"),
+            "unexpected error: {}",
+            err.message
         );
     }
 
@@ -1134,7 +1212,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![2, 4])),
             ],
         );
-        let names = resolve_parameter_names("SELECT @a, @b", &b).unwrap();
+        let names = resolve_parameter_names("SELECT @a, @b", &b, false).unwrap();
         assert_eq!(names, vec!["a", "b"]);
         for row in 0..b.num_rows() {
             assert!(bind_params(Statement::builder("SELECT @a, @b"), &names, &b, row).is_ok());
@@ -1144,7 +1222,7 @@ mod tests {
     #[test]
     fn positional_binding_rejects_count_mismatch() {
         let b = int_batch(&["x", "y"]);
-        let err = resolve_parameter_names("SELECT @p1", &b).unwrap_err();
+        let err = resolve_parameter_names("SELECT @p1", &b, false).unwrap_err();
         assert!(
             err.message.contains("parameter count mismatch"),
             "unexpected error: {}",

@@ -94,6 +94,10 @@ pub struct SpannerStatement {
     /// and `replace`; the create/replace modes build the table from the ingest data's Arrow
     /// schema.
     ingest_mode: Option<IngestMode>,
+    /// How bound columns pair with the query's `@name` parameters
+    /// (`adbc.statement.bind_by_name`): `false` (the default) binds positionally, `true` forces
+    /// strict by-name. See [`bind::resolve_parameter_names`].
+    bind_by_name: bool,
     /// Rows converted into each streamed Arrow batch by `execute` (`spanner.rows_per_batch`).
     rows_per_batch: usize,
     /// Enable Data Boost for partitioned execution (`spanner.data_boost_enabled`).
@@ -147,6 +151,7 @@ impl SpannerStatement {
             target_db_schema: None,
             target_catalog: None,
             ingest_mode: None,
+            bind_by_name: false,
             rows_per_batch: DEFAULT_ROWS_PER_BATCH,
             data_boost: false,
             max_partitions: None,
@@ -179,7 +184,7 @@ impl SpannerStatement {
             }
             // Resolve the column→parameter mapping once per batch (it lexes `sql`), then reuse it
             // for every row instead of re-lexing the SQL per bound row.
-            let names = bind::resolve_parameter_names(sql, batch)?;
+            let names = bind::resolve_parameter_names(sql, batch, self.bind_by_name)?;
             for row in 0..batch.num_rows() {
                 statements
                     .push(bind::bind_params(self.sql_builder(sql), &names, batch, row)?.build());
@@ -669,7 +674,7 @@ impl SpannerStatement {
         }
         if let Some(batch) = self.bound.first() {
             if batch.num_rows() > 0 {
-                let names = bind::resolve_parameter_names(sql, batch)?;
+                let names = bind::resolve_parameter_names(sql, batch, self.bind_by_name)?;
                 builder = bind::bind_params(builder, &names, batch, 0)?;
             }
         }
@@ -709,6 +714,10 @@ impl Optionable for SpannerStatement {
                 // Append into an existing table, or create it (from the ingest data's Arrow schema,
                 // with a synthetic UUID primary key) in the create/replace modes.
                 self.ingest_mode = Some(ingest_mode_option(value)?);
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_BIND_BY_NAME => {
+                self.bind_by_name =
+                    crate::options::bool_option(value, "option adbc.statement.bind_by_name")?;
             }
             OptionStatement::Other(k) if k == crate::OPTION_ROWS_PER_BATCH => {
                 self.rows_per_batch = rows_per_batch_option(value)?;
@@ -756,6 +765,10 @@ impl Optionable for SpannerStatement {
             OptionStatement::Temporary => Some(false.to_string()),
             // Reported in the spec's canonical `adbc.ingest.mode.*` spelling.
             OptionStatement::IngestMode => self.ingest_mode.map(String::from),
+            // A plain boolean; reports "true"/"false" (the default is "false", positional).
+            OptionStatement::Other(k) if k == crate::OPTION_BIND_BY_NAME => {
+                Some(self.bind_by_name.to_string())
+            }
             OptionStatement::Other(k) if k == crate::OPTION_ROWS_PER_BATCH => {
                 Some(self.rows_per_batch.to_string())
             }
@@ -948,6 +961,7 @@ impl Statement for SpannerStatement {
         check_schema_query(&sql)?;
         let client = self.client.clone();
         let bound = self.bound.clone();
+        let bind_by_name = self.bind_by_name;
         // The PLAN probe's schema must carry the same timestamp unit as the data `execute` would
         // stream, so the advertised schema and the actual batches can never disagree.
         let precision = self.timestamp_precision;
@@ -962,7 +976,7 @@ impl Statement for SpannerStatement {
             // `@param` references resolve.
             if let Some(batch) = bound.first() {
                 if batch.num_rows() > 0 {
-                    let names = bind::resolve_parameter_names(&sql, batch)?;
+                    let names = bind::resolve_parameter_names(&sql, batch, bind_by_name)?;
                     builder = bind::bind_params(builder, &names, batch, 0)?;
                 }
             }
@@ -1438,6 +1452,24 @@ mod tests {
         // A non-string, non-int value kind is rejected outright.
         let error = bool_option(OptionValue::Double(1.0)).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
+    }
+
+    #[test]
+    fn bind_by_name_option_parses_as_a_boolean_naming_the_option() {
+        // The option is a plain boolean parsed by the shared `bool_option`; an invalid value is
+        // rejected with `InvalidArguments`, and the error names the option.
+        let what = "option adbc.statement.bind_by_name";
+        assert!(crate::options::bool_option(OptionValue::String("true".into()), what).unwrap());
+        assert!(!crate::options::bool_option(OptionValue::String("false".into()), what).unwrap());
+        assert!(crate::options::bool_option(OptionValue::Int(1), what).unwrap());
+        let error =
+            crate::options::bool_option(OptionValue::String("maybe".into()), what).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(
+            error.message.contains("adbc.statement.bind_by_name"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

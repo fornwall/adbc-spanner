@@ -67,7 +67,15 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   See [troubleshooting with tags](https://cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags).
   Driver-internal metadata queries (`get_objects`, schema probes, …) are not tagged/prioritised.
 - Parameter binding: `bind`/`bind_stream` an Arrow batch whose columns become Spanner named
-  parameters (a column `id` binds `@id`); each bound row runs the statement once. A bound *query*
+  parameters; each bound row runs the statement once. How columns pair with the query's `@name`
+  parameters is set by the `adbc.statement.bind_by_name` statement option (the [SQLite reference
+  driver's convention](https://github.com/apache/arrow-adbc/issues/3362)), a boolean defaulting to
+  `false`: **positional** (the default) binds the *i*-th bound column to the *i*-th distinct
+  parameter in query order, ignoring column names — the ADBC ordinal contract that positional
+  clients and validation suites rely on; **`true`** is strict by-name (a column `id` binds `@id`,
+  order-independent), where a bound column that names no query parameter fails with
+  `InvalidArguments` naming the missing parameter — for clients whose column names are authoritative
+  and may not match the parameters' textual order. A bound *query*
   over several rows executes all of them in one shared read-only snapshot (a multi-use read-only
   transaction at the configured staleness bound), so the per-row results are mutually consistent,
   and its results stream in `spanner.rows_per_batch` chunks like any other query. Because Spanner

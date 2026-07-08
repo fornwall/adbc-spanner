@@ -181,11 +181,17 @@ pub mod fuzzing {
         crate::bind::quote_ident(ident)
     }
     /// Resolve the column→parameter pairing for `sql` against a batch whose columns are named
-    /// `column_names` (built here as nullable `Int64`; the pairing never looks at types).
+    /// `column_names` (built here as nullable `Int64`; the pairing never looks at types), under the
+    /// given `bind_by_name` mode (`adbc.statement.bind_by_name`: `false` positional, `true`
+    /// by-name).
     ///
-    /// Returns the resolved names, or `None` on the documented count-mismatch rejection — after
-    /// asserting the error is `InvalidArguments` (any other status, like any panic, is a bug).
-    pub fn resolve_parameter_names(sql: &str, column_names: &[String]) -> Option<Vec<String>> {
+    /// Returns the resolved names, or `None` on a documented rejection — after asserting the error
+    /// is `InvalidArguments` (any other status, like any panic, is a bug).
+    pub fn resolve_parameter_names(
+        sql: &str,
+        column_names: &[String],
+        bind_by_name: bool,
+    ) -> Option<Vec<String>> {
         use arrow_array::RecordBatch;
         use arrow_schema::{DataType, Field, Schema};
         let fields: Vec<Field> = column_names
@@ -193,7 +199,7 @@ pub mod fuzzing {
             .map(|name| Field::new(name, DataType::Int64, true))
             .collect();
         let batch = RecordBatch::new_empty(std::sync::Arc::new(Schema::new(fields)));
-        match crate::bind::resolve_parameter_names(sql, &batch) {
+        match crate::bind::resolve_parameter_names(sql, &batch, bind_by_name) {
             Ok(names) => Some(names),
             Err(e) => {
                 assert_eq!(
@@ -419,6 +425,23 @@ pub const OPTION_DATA_BOOST: &str = "spanner.data_boost_enabled";
 /// [`Statement::execute_partitions`](adbc_core::Statement::execute_partitions). This is a hint —
 /// Spanner may return fewer. Accepts a positive integer; unset lets Spanner choose.
 pub const OPTION_MAX_PARTITIONS: &str = "spanner.max_partitions";
+
+/// Statement option controlling how bound Arrow columns pair with the query's `@name` parameters,
+/// following the ADBC SQLite reference driver's `bind_by_name` convention
+/// ([apache/arrow-adbc#3362](https://github.com/apache/arrow-adbc/issues/3362)). A boolean,
+/// defaulting to `false`:
+///
+/// - **`false`** (the default): strictly positional. The *i*-th bound column binds to the *i*-th
+///   distinct `@name` parameter in query order; column names are ignored entirely. This is the
+///   ADBC ordinal contract that positional clients (PostgreSQL/Snowflake-style drivers, the Python
+///   DBAPI, validation suites) rely on.
+/// - **`true`**: strict by-name. Each column binds to `@<its own name>` (order-independent); a
+///   bound column that names no query parameter fails with `InvalidArguments` naming the missing
+///   parameter. Use this when the bound column names are authoritative and may not match the
+///   parameters' textual order.
+///
+/// Accepts a boolean. `get_option` reports `true`/`false`.
+pub const OPTION_BIND_BY_NAME: &str = "adbc.statement.bind_by_name";
 
 /// Driver-specific connection **and** statement option: the **read staleness** for read-only
 /// queries, as `"exact:<duration>"` or `"max:<duration>"`.
