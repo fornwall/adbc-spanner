@@ -301,8 +301,10 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   bounds the wait — building the commit-fault test confirmed the client marks all data-plane RPCs
   idempotent and retries transport faults with no attempt cap, so a commit under a persistent
   fault blocks unboundedly; the `spanner.rpc.timeout_seconds.*` options now let callers bound
-  these operations, but the harness does not yet drive them under a toxic), and truncated
-  streams. (Faults during a
+  these operations, and the harness drives the update deadline under a `reset_peer` toxic in
+  `update_timeout_bounds_a_faulted_write_then_recovers_when_unset` — proving a bounded write fails
+  with `Timeout` in-deadline rather than hanging, then recovers once the deadline is unset), and
+  truncated streams. (Faults during a
   manual-transaction commit are now covered by
   `commit_under_transport_fault_never_loses_the_write`.)
 - ~~**`statement.rs` has zero unit tests**; the option-coercion error paths (`rows_per_batch=0`,
