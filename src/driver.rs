@@ -114,6 +114,63 @@ impl SpannerDatabase {
         }
     }
 
+    /// Handle a value set through the standard `uri` option or its [`OPTION_DATABASE`] alias.
+    ///
+    /// Two forms are accepted:
+    ///
+    /// - A bare database path, `projects/<p>/instances/<i>/databases/<d>` — stored verbatim, exactly
+    ///   as before connection URIs existed.
+    /// - A **connection URI**, recognised by a `spanner:` scheme — parsed by
+    ///   [`parse_connection_uri`] and *expanded immediately* into the underlying option fields, as
+    ///   if each part had been passed as an individual database option.
+    ///
+    /// Because the URI is expanded eagerly at `set_option` time, option precedence is purely
+    /// **last-writer-wins and order-deterministic**: an explicit option set *after* the URI
+    /// overrides what the URI carried, and setting the URI *after* an explicit option overwrites
+    /// only the fields the URI actually carries (its path, its `//host` authority, and its query
+    /// parameters — in that order, so a `spanner.endpoint` query parameter beats the authority).
+    ///
+    /// `get_option("uri")` intentionally returns the stored **database path**, not a reconstruction
+    /// of the full URI; the expanded options are readable under their own keys.
+    ///
+    /// The whole URI is validated before any field is mutated, so a rejected URI leaves the
+    /// configuration untouched.
+    fn set_database_or_uri(&mut self, value: String) -> Result<()> {
+        match connection_uri_remainder(&value) {
+            Some(remainder) => self.apply_connection_uri(remainder),
+            None => {
+                self.database = Some(value);
+                Ok(())
+            }
+        }
+    }
+
+    /// Expand a parsed connection URI (see [`parse_connection_uri`]) into this database's option
+    /// fields: path → database, authority → [`OPTION_ENDPOINT`], query parameters → the options
+    /// they name (validated against a scratch instance first, so failure leaves `self` unchanged).
+    fn apply_connection_uri(&mut self, remainder: &str) -> Result<()> {
+        let parsed = parse_connection_uri(remainder)?;
+        // Dry-run the query parameters against a scratch database so a bad *value* (e.g.
+        // `spanner.emulator=maybe`) is caught before `self` is touched at all.
+        let mut scratch = SpannerDatabase::new(self.runtime.clone());
+        for (key, value) in &parsed.params {
+            scratch.set_option(
+                OptionDatabase::Other(key.clone()),
+                OptionValue::String(value.clone()),
+            )?;
+        }
+
+        self.database = Some(parsed.database);
+        if let Some(endpoint) = parsed.endpoint {
+            self.endpoint = Some(endpoint);
+        }
+        for (key, value) in parsed.params {
+            // Cannot fail: the identical calls just succeeded on `scratch`.
+            self.set_option(OptionDatabase::Other(key), OptionValue::String(value))?;
+        }
+        Ok(())
+    }
+
     /// Resolve the inline credential JSON to use, reading the key file if a path was given. The
     /// credential flow is auto-detected from the JSON's `"type"` field in [`build_credentials_from_json`].
     /// Inline JSON ([`OPTION_KEYFILE_JSON`]) takes precedence over a file path ([`OPTION_KEYFILE`]).
@@ -275,9 +332,13 @@ impl Optionable for SpannerDatabase {
 
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
         match &key {
-            OptionDatabase::Uri => self.database = Some(string_value(&key, value)?),
+            OptionDatabase::Uri => {
+                let value = string_value(&key, value)?;
+                self.set_database_or_uri(value)?
+            }
             OptionDatabase::Other(name) if name == OPTION_DATABASE => {
-                self.database = Some(string_value(&key, value)?)
+                let value = string_value(&key, value)?;
+                self.set_database_or_uri(value)?
             }
             OptionDatabase::Other(name) if name == OPTION_ENDPOINT => {
                 self.endpoint = Some(string_value(&key, value)?)
@@ -391,6 +452,161 @@ pub(crate) fn ensure_scheme(host: &str) -> String {
     } else {
         format!("http://{host}")
     }
+}
+
+/// The database-level option names a connection URI may carry as query parameters.
+///
+/// Exactly the options that configure a [`SpannerDatabase`] besides the database path itself; the
+/// path aliases (`uri` / [`OPTION_DATABASE`]) are deliberately absent — the URI's path component is
+/// the one way to name the database. Unknown keys are rejected with `InvalidArguments`.
+const URI_QUERY_OPTIONS: [&str; 8] = [
+    OPTION_ENDPOINT,
+    OPTION_EMULATOR,
+    OPTION_KEYFILE,
+    OPTION_KEYFILE_JSON,
+    OPTION_IMPERSONATE_TARGET_PRINCIPAL,
+    OPTION_IMPERSONATE_DELEGATES,
+    OPTION_IMPERSONATE_SCOPES,
+    OPTION_IMPERSONATE_LIFETIME,
+];
+
+/// If `value` is a connection URI — it starts with the `spanner:` scheme (ASCII case-insensitive,
+/// per RFC 3986) — return the remainder after the scheme. A bare database path (or any other
+/// scheme) returns `None` and is used verbatim.
+fn connection_uri_remainder(value: &str) -> Option<&str> {
+    const SCHEME: &str = "spanner:";
+    value
+        .get(..SCHEME.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(SCHEME))
+        .map(|_| &value[SCHEME.len()..])
+}
+
+/// The components of a parsed connection URI: the database path, the optional `//host` authority
+/// (an endpoint), and the decoded query parameters in source order.
+struct ParsedConnectionUri {
+    database: String,
+    endpoint: Option<String>,
+    params: Vec<(String, String)>,
+}
+
+/// Parse the remainder of a `spanner:` connection URI (everything after the scheme), e.g.
+///
+/// ```text
+/// spanner:///projects/p/instances/i/databases/d?spanner.endpoint=localhost:9010&spanner.emulator=true
+/// spanner://emulator-host:9010/projects/p/instances/i/databases/d
+/// ```
+///
+/// - The **path** must be a full database path, `projects/<p>/instances/<i>/databases/<d>`; a
+///   leading `/` is tolerated (`spanner:projects/…`, `spanner:/projects/…` and
+///   `spanner:///projects/…` are equivalent).
+/// - An optional `//host[:port]` **authority** names the gRPC endpoint; it is taken verbatim as
+///   the [`OPTION_ENDPOINT`] value.
+/// - **Query parameters** are full driver option names from [`URI_QUERY_OPTIONS`]; unknown keys are
+///   rejected. Keys and values are percent-decoded ([`percent_decode`]; `+` is *not* a space).
+/// - A `#fragment` is meaningless here and rejected rather than silently dropped.
+fn parse_connection_uri(remainder: &str) -> Result<ParsedConnectionUri> {
+    let (remainder, fragment) = match remainder.split_once('#') {
+        Some((rest, fragment)) => (rest, Some(fragment)),
+        None => (remainder, None),
+    };
+    if fragment.is_some() {
+        return Err(invalid_argument(
+            "connection URI must not carry a #fragment",
+        ));
+    }
+
+    let (before_query, query) = match remainder.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (remainder, None),
+    };
+
+    // `//authority/path`; an empty authority (`spanner:///…`) means "no endpoint". Without the
+    // `//`, tolerate one leading `/` before the database path.
+    let (authority, path) = match before_query.strip_prefix("//") {
+        Some(after) => match after.split_once('/') {
+            Some((authority, path)) => (Some(authority), path),
+            None => (Some(after), ""),
+        },
+        None => (None, before_query.strip_prefix('/').unwrap_or(before_query)),
+    };
+    let endpoint = authority
+        .filter(|authority| !authority.is_empty())
+        .map(str::to_owned);
+
+    let database = match path.split('/').collect::<Vec<_>>().as_slice() {
+        ["projects", p, "instances", i, "databases", d]
+            if !p.is_empty() && !i.is_empty() && !d.is_empty() =>
+        {
+            path.to_owned()
+        }
+        _ => {
+            return Err(invalid_argument(format!(
+                "connection URI path {path:?} is not a Spanner database path \
+                 (projects/<project>/instances/<instance>/databases/<database>); note that in \
+                 `spanner://projects/...` the `projects` segment is parsed as a host authority — \
+                 write `spanner:///projects/...` (or `spanner:/projects/...`) when no endpoint \
+                 host is intended"
+            )));
+        }
+    };
+
+    let mut params = Vec::new();
+    for pair in query.unwrap_or("").split('&').filter(|s| !s.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode(key)?;
+        if !URI_QUERY_OPTIONS.contains(&key.as_str()) {
+            return Err(invalid_argument(format!(
+                "unknown connection URI query parameter {key:?}; supported parameters: {}",
+                URI_QUERY_OPTIONS.join(", ")
+            )));
+        }
+        params.push((key, percent_decode(value)?));
+    }
+
+    Ok(ParsedConnectionUri {
+        database,
+        endpoint,
+        params,
+    })
+}
+
+/// Percent-decode a connection-URI component (RFC 3986): each `%XX` hex escape becomes one byte,
+/// everything else passes through unchanged. Notably `+` is **not** decoded to a space (that is the
+/// `application/x-www-form-urlencoded` convention, not RFC 3986) — an inline keyfile JSON or an
+/// RFC 3339 timestamp may legitimately contain a literal `+`. Malformed escapes and non-UTF-8
+/// results are rejected with `InvalidArguments`.
+fn percent_decode(s: &str) -> Result<String> {
+    if !s.contains('%') {
+        return Ok(s.to_owned());
+    }
+    let malformed = || {
+        invalid_argument(format!(
+            "malformed percent-encoding in connection URI component {s:?}"
+        ))
+    };
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3).ok_or_else(malformed)?;
+            // `from_str_radix` tolerates a leading `+`/`-`, which is not valid percent-encoding.
+            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                return Err(malformed());
+            }
+            let hex = std::str::from_utf8(hex).map_err(|_| malformed())?;
+            out.push(u8::from_str_radix(hex, 16).map_err(|_| malformed())?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| {
+        invalid_argument(format!(
+            "connection URI component {s:?} percent-decodes to invalid UTF-8"
+        ))
+    })
 }
 
 fn option_name(key: &OptionDatabase) -> String {
@@ -982,5 +1198,335 @@ mod tests {
             );
             assert!(result.is_ok());
         });
+    }
+
+    // --- Connection URIs (`spanner:` scheme with query-parameter options) ---
+
+    const DB_PATH: &str = "projects/p/instances/i/databases/d";
+
+    fn set_uri(db: &mut SpannerDatabase, uri: &str) -> Result<()> {
+        db.set_option(OptionDatabase::Uri, OptionValue::String(uri.into()))
+    }
+
+    #[test]
+    fn a_bare_database_path_is_stored_verbatim() {
+        // The pre-URI form keeps working exactly as before, even with URI-ish characters in it.
+        let mut db = new_database();
+        set_uri(&mut db, DB_PATH).unwrap();
+        assert_eq!(db.database.as_deref(), Some(DB_PATH));
+        assert_eq!(db.endpoint, None);
+        assert!(!db.emulator);
+        // Not a recognised scheme → not parsed as a URI, stored as-is (and rejected only later, by
+        // Spanner itself).
+        let odd = "projects/p/instances/i/databases/d?x=y";
+        set_uri(&mut db, odd).unwrap();
+        assert_eq!(db.database.as_deref(), Some(odd));
+    }
+
+    #[test]
+    fn a_scheme_uri_sets_the_database_path() {
+        // All the tolerated path spellings: no slash, one slash, and an empty `//` authority.
+        for uri in [
+            format!("spanner:{DB_PATH}"),
+            format!("spanner:/{DB_PATH}"),
+            format!("spanner:///{DB_PATH}"),
+            format!("Spanner:///{DB_PATH}"), // schemes are case-insensitive
+        ] {
+            let mut db = new_database();
+            set_uri(&mut db, &uri).unwrap();
+            assert_eq!(db.database.as_deref(), Some(DB_PATH), "uri: {uri}");
+            assert_eq!(db.endpoint, None, "uri: {uri}");
+        }
+    }
+
+    #[test]
+    fn a_cloudspanner_scheme_is_not_recognised() {
+        // Only `spanner:` is a connection-URI scheme; `cloudspanner:` (the JDBC convention) is
+        // deliberately not supported. Like any other unknown scheme it is not parsed as a URI —
+        // the value is stored verbatim (and rejected only later, by Spanner itself).
+        let mut db = new_database();
+        let uri = format!("cloudspanner:///{DB_PATH}?spanner.emulator=true");
+        set_uri(&mut db, &uri).unwrap();
+        assert_eq!(db.database.as_deref(), Some(uri.as_str()));
+        assert_eq!(db.endpoint, None);
+        assert!(!db.emulator);
+    }
+
+    #[test]
+    fn a_host_authority_becomes_the_endpoint() {
+        // `spanner://host:port/projects/...` — the authority is the gRPC endpoint, taken verbatim
+        // (exactly as if passed as the `spanner.endpoint` option).
+        let mut db = new_database();
+        set_uri(&mut db, &format!("spanner://emu-host:9010/{DB_PATH}")).unwrap();
+        assert_eq!(db.database.as_deref(), Some(DB_PATH));
+        assert_eq!(db.endpoint.as_deref(), Some("emu-host:9010"));
+    }
+
+    #[test]
+    fn query_parameters_set_database_options() {
+        let mut db = new_database();
+        set_uri(
+            &mut db,
+            &format!(
+                "spanner:///{DB_PATH}?spanner.endpoint=http://localhost:9010\
+                 &spanner.emulator=true"
+            ),
+        )
+        .unwrap();
+        assert_eq!(db.database.as_deref(), Some(DB_PATH));
+        assert_eq!(db.endpoint.as_deref(), Some("http://localhost:9010"));
+        assert!(db.emulator);
+    }
+
+    #[test]
+    fn every_database_level_option_is_accepted_as_a_query_parameter() {
+        let mut db = new_database();
+        set_uri(
+            &mut db,
+            &format!(
+                "spanner:///{DB_PATH}\
+                 ?spanner.keyfile=/path/key.json\
+                 &spanner.keyfile_json=%7B%22type%22%3A%22service_account%22%7D\
+                 &spanner.impersonate.target_principal=target%40p.iam.gserviceaccount.com\
+                 &spanner.impersonate.delegates=a%40p.iam.gserviceaccount.com,b%40p.iam.gserviceaccount.com\
+                 &spanner.impersonate.scopes=https://www.googleapis.com/auth/cloud-platform\
+                 &spanner.impersonate.lifetime=900"
+            ),
+        )
+        .unwrap();
+        assert_eq!(db.keyfile.as_deref(), Some("/path/key.json"));
+        assert_eq!(
+            db.keyfile_json.as_deref(),
+            Some("{\"type\":\"service_account\"}")
+        );
+        assert_eq!(
+            db.impersonate_target_principal.as_deref(),
+            Some("target@p.iam.gserviceaccount.com")
+        );
+        assert_eq!(
+            db.impersonate_delegates,
+            vec![
+                "a@p.iam.gserviceaccount.com".to_string(),
+                "b@p.iam.gserviceaccount.com".to_string()
+            ]
+        );
+        assert_eq!(
+            db.impersonate_scopes,
+            vec!["https://www.googleapis.com/auth/cloud-platform".to_string()]
+        );
+        assert_eq!(db.impersonate_lifetime_secs, Some(900));
+    }
+
+    #[test]
+    fn an_explicit_option_set_after_the_uri_wins() {
+        let mut db = new_database();
+        set_uri(
+            &mut db,
+            &format!("spanner:///{DB_PATH}?spanner.endpoint=http://from-uri:9010"),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other(OPTION_ENDPOINT.into()),
+            OptionValue::String("http://explicit:9010".into()),
+        )
+        .unwrap();
+        assert_eq!(db.endpoint.as_deref(), Some("http://explicit:9010"));
+    }
+
+    #[test]
+    fn a_uri_set_after_an_explicit_option_overwrites_only_what_it_carries() {
+        let mut db = new_database();
+        db.set_option(
+            OptionDatabase::Other(OPTION_ENDPOINT.into()),
+            OptionValue::String("http://explicit:9010".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other(OPTION_EMULATOR.into()),
+            OptionValue::String("true".into()),
+        )
+        .unwrap();
+        // The URI names an endpoint but says nothing about the emulator flag: the endpoint is
+        // overwritten, the emulator flag survives.
+        set_uri(
+            &mut db,
+            &format!("spanner:///{DB_PATH}?spanner.endpoint=http://from-uri:9010"),
+        )
+        .unwrap();
+        assert_eq!(db.endpoint.as_deref(), Some("http://from-uri:9010"));
+        assert!(db.emulator);
+        // A URI with no query parameters at all leaves both untouched.
+        set_uri(&mut db, "spanner:///projects/p2/instances/i2/databases/d2").unwrap();
+        assert_eq!(
+            db.database.as_deref(),
+            Some("projects/p2/instances/i2/databases/d2")
+        );
+        assert_eq!(db.endpoint.as_deref(), Some("http://from-uri:9010"));
+        assert!(db.emulator);
+    }
+
+    #[test]
+    fn a_query_parameter_beats_the_host_authority() {
+        // Both name an endpoint; the query parameter applies after the authority, so it wins.
+        let mut db = new_database();
+        set_uri(
+            &mut db,
+            &format!("spanner://authority:9010/{DB_PATH}?spanner.endpoint=http://param:9010"),
+        )
+        .unwrap();
+        assert_eq!(db.endpoint.as_deref(), Some("http://param:9010"));
+    }
+
+    #[test]
+    fn an_unknown_query_parameter_is_rejected_by_name() {
+        let mut db = new_database();
+        let error = set_uri(
+            &mut db,
+            &format!("spanner:///{DB_PATH}?spanner.databoost=1"),
+        )
+        .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("spanner.databoost"));
+        // The database-path aliases are not query parameters either — the URI path is the one way
+        // to name the database.
+        for alias in ["uri", OPTION_DATABASE] {
+            let error = set_uri(&mut db, &format!("spanner:///{DB_PATH}?{alias}=x")).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+            assert!(error.message.contains(alias));
+        }
+    }
+
+    #[test]
+    fn a_rejected_uri_leaves_the_configuration_untouched() {
+        let mut db = new_database();
+        set_uri(&mut db, DB_PATH).unwrap();
+        db.set_option(
+            OptionDatabase::Other(OPTION_ENDPOINT.into()),
+            OptionValue::String("http://kept:9010".into()),
+        )
+        .unwrap();
+        for bad in [
+            "spanner:///projects/p2/instances/i2/databases/d2?bogus.key=1".to_string(),
+            // A bad *value* for a known key must also leave everything untouched (it is validated
+            // against a scratch instance before any field is mutated).
+            "spanner:///projects/p2/instances/i2/databases/d2?spanner.emulator=maybe".to_string(),
+            "spanner://host:9010/projects/p2/instances/i2/databases/d2?spanner.keyfile=%G1"
+                .to_string(),
+        ] {
+            let error = set_uri(&mut db, &bad).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "uri: {bad}");
+            assert_eq!(db.database.as_deref(), Some(DB_PATH), "uri: {bad}");
+            assert_eq!(
+                db.endpoint.as_deref(),
+                Some("http://kept:9010"),
+                "uri: {bad}"
+            );
+            assert!(!db.emulator, "uri: {bad}");
+        }
+    }
+
+    #[test]
+    fn malformed_percent_encoding_is_rejected() {
+        for bad in ["%G1", "%1", "%", "a%+5b"] {
+            let error = percent_decode(bad).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "input: {bad}");
+            assert!(error.message.contains("percent-encoding"), "input: {bad}");
+        }
+        // Percent-decoding is RFC 3986: `+` stays a literal plus (form-encoding would corrupt e.g.
+        // base64 in an inline keyfile JSON).
+        assert_eq!(percent_decode("a+b%20c%3D1").unwrap(), "a+b c=1");
+        // A decoded byte sequence that is not UTF-8 is rejected, not lossily replaced.
+        let error = percent_decode("%FF%FE").unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("UTF-8"));
+    }
+
+    #[test]
+    fn a_uri_with_a_bad_database_path_is_rejected() {
+        let mut db = new_database();
+        for bad in [
+            "spanner:",
+            "spanner:///",
+            "spanner:///projects/p",
+            "spanner:///projects//instances/i/databases/d",
+            "spanner:///databases/d/instances/i/projects/p",
+        ] {
+            let error = set_uri(&mut db, bad).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "uri: {bad}");
+            assert!(error.message.contains("database path"), "uri: {bad}");
+        }
+        // The classic trap: two slashes make `projects` a host authority. The error says so.
+        let error = set_uri(&mut db, &format!("spanner://{DB_PATH}")).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("host authority"));
+        assert!(error.message.contains("spanner:///projects/"));
+    }
+
+    #[test]
+    fn a_uri_fragment_is_rejected() {
+        let mut db = new_database();
+        let error = set_uri(&mut db, &format!("spanner:///{DB_PATH}#frag")).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("#fragment"));
+    }
+
+    #[test]
+    fn get_option_uri_returns_the_database_path_after_a_uri() {
+        // Documented: `get_option("uri")` reports the stored database path, not the original URI;
+        // the expanded options round-trip under their own keys.
+        let mut db = new_database();
+        set_uri(
+            &mut db,
+            &format!(
+                "spanner:///{DB_PATH}?spanner.endpoint=http://localhost:9010&spanner.emulator=yes"
+            ),
+        )
+        .unwrap();
+        assert_eq!(db.get_option_string(OptionDatabase::Uri).unwrap(), DB_PATH);
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(OPTION_DATABASE.into()))
+                .unwrap(),
+            DB_PATH
+        );
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(OPTION_ENDPOINT.into()))
+                .unwrap(),
+            "http://localhost:9010"
+        );
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(OPTION_EMULATOR.into()))
+                .unwrap(),
+            "true"
+        );
+    }
+
+    #[test]
+    fn the_database_alias_also_accepts_a_connection_uri() {
+        let mut db = new_database();
+        db.set_option(
+            OptionDatabase::Other(OPTION_DATABASE.into()),
+            OptionValue::String(format!("spanner:///{DB_PATH}?spanner.emulator=1")),
+        )
+        .unwrap();
+        assert_eq!(db.database.as_deref(), Some(DB_PATH));
+        assert!(db.emulator);
+    }
+
+    #[test]
+    fn uri_query_parameter_values_are_percent_decoded() {
+        let mut db = new_database();
+        set_uri(
+            &mut db,
+            &format!("spanner:///{DB_PATH}?spanner.endpoint=http%3A%2F%2Flocalhost%3A9010"),
+        )
+        .unwrap();
+        assert_eq!(db.endpoint.as_deref(), Some("http://localhost:9010"));
+        // Keys are decoded too, and empty `&&` segments are tolerated.
+        set_uri(
+            &mut db,
+            &format!("spanner:///{DB_PATH}?&spanner%2Eemulator=true&"),
+        )
+        .unwrap();
+        assert!(db.emulator);
     }
 }

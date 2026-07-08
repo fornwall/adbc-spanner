@@ -23,6 +23,19 @@
 //! projects/<project>/instances/<instance>/databases/<database>
 //! ```
 //!
+//! or as a **connection URI** with the `spanner:` scheme, whose query parameters are
+//! database-level driver options and whose optional `//host:port` authority becomes
+//! [`OPTION_ENDPOINT`]:
+//!
+//! ```text
+//! spanner:///projects/<p>/instances/<i>/databases/<d>?spanner.endpoint=http://localhost:9010&spanner.emulator=true
+//! ```
+//!
+//! A URI is expanded into the individual options at the moment it is set, so ordering is
+//! deterministic: an option set after the URI wins, and the URI overwrites only the fields it
+//! actually carries. Unknown query keys are rejected; values are percent-decoded (RFC 3986).
+//! `get_option("uri")` returns the stored database path, not the original URI.
+//!
 //! To talk to a Spanner emulator, either set the `SPANNER_EMULATOR_HOST` environment variable (the
 //! driver picks it up automatically and uses anonymous credentials) or set the [`OPTION_ENDPOINT`]
 //! and [`OPTION_EMULATOR`] options explicitly.
@@ -290,7 +303,9 @@ pub mod bench_support {
 }
 
 /// Driver-specific database option: the fully-qualified Spanner database path,
-/// `projects/<project>/instances/<instance>/databases/<database>`.
+/// `projects/<project>/instances/<instance>/databases/<database>`, or a `spanner:` **connection
+/// URI** carrying that path plus database-level options as query parameters (see the
+/// [crate-level Configuration docs](crate#configuration)).
 ///
 /// Equivalent to setting [`OptionDatabase::Uri`](adbc_core::options::OptionDatabase::Uri).
 pub const OPTION_DATABASE: &str = "spanner.database";
