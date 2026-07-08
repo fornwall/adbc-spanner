@@ -11,6 +11,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Cancel superseded PR runs (a rapid re-push cancels the in-flight run for the same
+# ref); pushes to main are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
