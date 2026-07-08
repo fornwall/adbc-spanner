@@ -321,7 +321,19 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   `execute_partitions` probes and `read_partition`'s initial fetch), fetch = each later chunk
   [inside the `spawn_prefetch` task, and each `next_bound_chunk` of a bound-query stream],
   update = DML/batch-DML/manual-commit/ingest-chunk paths; DDL and driver-internal metadata
-  queries stay unbounded, mirroring the tags scope).
+  queries stay unbounded, mirroring the tags scope), and retry tuning
+  (`spanner.retry.{max_attempts,max_elapsed_seconds}` at connection + statement level [statement
+  inherits, then overrides; `""` unsets — the staleness/timeout pattern; round-trip via
+  `get_option`/`get_option_int`/`get_option_double`] — `RetryConfig` in `src/retry.rs` bounds the
+  pinned client's gax retry policy by layering `RetryPolicyExt::{with_attempt_limit,with_time_limit}`
+  on a driver-local copy of the client's private `SpannerRetryPolicy` (so the
+  transport-error-on-idempotent retry is preserved, not dropped), applied via the builders'
+  `with_retry_policy` / `with_begin_retry_policy` / `with_commit_retry_policy` at the same sites the
+  request tags cover [`sql_builder`, `run_batch_txn`'s runner + `ExecuteBatchDml` batch, the ingest
+  write-only txn]; unset = the client's own unbounded policy, so it is purely opt-in. Bounds the
+  *per-attempt* retry loop, complementary to the *overall* RPC-timeout deadlines; custom *backoff*
+  via `with_backoff_policy` is a deliberate non-goal for now. The transaction-level abort retry
+  stays at the client default).
   (`get_statistics` computes exact `ROW_COUNT`/`NULL_COUNT`/`DISTINCT_COUNT` via one aggregate scan
   per table — see `src/statistics.rs`; `approximate=true` serves the same exact stats (exact values
   always satisfy an approximate request; Spanner has no cheaper source), with

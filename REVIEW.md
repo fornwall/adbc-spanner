@@ -645,8 +645,15 @@ already pass `--test-threads=1`.)
 transaction tags (`StatementBuilder::set_priority/set_request_tag`,
 `set_transaction_tag`); ~~request/attempt timeouts~~ **done** —
 `spanner.rpc.timeout_seconds.{query,update,fetch}` (overall per-operation deadlines mapped to
-ADBC `Timeout`; see `docs/options.md`), though per-attempt retry *tuning* (policies/backoff)
-remains open; PostgreSQL-dialect databases are
+ADBC `Timeout`; see `docs/options.md`); ~~per-attempt retry *tuning* (policies)~~ **done** —
+`spanner.retry.{max_attempts,max_elapsed_seconds}` (connection + statement level; bound the pinned
+client's gax retry policy via the builders' `with_retry_policy` / `with_begin_retry_policy` /
+`with_commit_retry_policy`, layering `RetryPolicyExt::{with_attempt_limit,with_time_limit}` on a
+driver-local copy of the client's `SpannerRetryPolicy` so the transport-on-idempotent retry is
+preserved — `src/retry.rs`; `RetryConfig` mirrors `RpcTimeouts`/`RequestConfig`). Custom *backoff*
+(the gax `BackoffPolicy` / `ExponentialBackoff`, settable via the same builders'
+`with_backoff_policy`) is a possible follow-up but was left out to keep the surface focused.
+PostgreSQL-dialect databases are
 unsupported *and undetected* — minimum viable is probing the dialect once and failing fast with a
 clear error; OAuth access-token auth (needs a small custom credentials impl — the auth crate has
 no static-token builder); query options (optimizer version), directed reads, commit stats,
