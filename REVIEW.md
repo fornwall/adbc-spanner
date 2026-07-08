@@ -650,8 +650,15 @@ polish: the four direction-specific copies of the type mapping (`bind_one` vs `b
 genuine 100-line duplication — fold via an element visitor, and add an "adding a type touches
 these N sites" checklist), three hand-rolled comment-skipping lexer walkers that could share one
 token iterator, ingest-mode strings matched in two places (make it an enum), positional column
-indices into INFORMATION_SCHEMA batches, `get_option_int` inconsistencies (database vs statement,
-and "not an integer" reported as `NotFound`), SQL-text helpers scattered across three modules.
+indices into INFORMATION_SCHEMA batches, ~~`get_option_int` inconsistencies (database vs statement,
+and "not an integer" reported as `NotFound`)~~ (**Fixed.** All three levels' `get_option_int`/
+`get_option_double` now delegate to `get_option_string` and parse via shared helpers in
+`src/options.rs` (`int_from_stored_string` / `double_from_stored_string`): unset/unknown options
+keep the string getter's `NotFound` unchanged, while a set-but-non-integer value is
+`InvalidArguments` naming the option and value — `NotFound` again means only "option unset". As a
+bonus, integer-valued options (`spanner.impersonate.lifetime`, `spanner.rows_per_batch`,
+`spanner.max_partitions`) are now gettable as ints at every level that stores them; covered by
+offline unit tests in `src/options.rs` and `src/driver.rs`), SQL-text helpers scattered across three modules.
 
 ---
 
