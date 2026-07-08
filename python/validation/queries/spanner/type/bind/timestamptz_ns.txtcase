@@ -1,3 +1,20 @@
+// Spanner override: idx PRIMARY KEY, native TIMESTAMP columns. The case's ns values sit
+// at the i64 nanosecond boundaries (~1677 / ~2262), which ARE inside Arrow's nanosecond
+// range, so the default (nanosecond) read path round-trips them; no option needed.
+
 // part: metadata
 
-skip = "case binds timestamps outside Arrow's nanosecond range (~1677-2262), which the driver's nanosecond TIMESTAMP read path cannot represent"
+[setup]
+drop = "test_timestamptz"
+
+// part: setup_query
+
+CREATE TABLE test_timestamptz (
+    idx INT64,
+    res TIMESTAMP,
+    res2 TIMESTAMP
+) PRIMARY KEY (idx)
+
+// part: bind_query
+
+INSERT INTO test_timestamptz (idx, res, res2) VALUES ($1, $2, $3)
