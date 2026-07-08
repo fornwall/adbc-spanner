@@ -1,3 +1,24 @@
+// Spanner override: idx PRIMARY KEY, native TIMESTAMP columns. The case includes
+// 9999-12-31 (outside Arrow's nanosecond range), so read under the microseconds mode
+// (spanner.max_timestamp_precision, PR #132) -> Timestamp(Microsecond, "UTC") over the
+// full 0001-9999 range, matching the case's tsu:UTC expected schema. Reverted after.
+
 // part: metadata
 
-skip = "case binds timestamps outside Arrow's nanosecond range (~1677-2262), which the driver's nanosecond TIMESTAMP read path cannot represent"
+[setup]
+drop = "test_timestamptz"
+
+[setup.connection.options]
+"spanner.max_timestamp_precision" = { apply = "microseconds", revert = "nanoseconds_error_on_overflow" }
+
+// part: setup_query
+
+CREATE TABLE test_timestamptz (
+    idx INT64,
+    res TIMESTAMP,
+    res2 TIMESTAMP
+) PRIMARY KEY (idx)
+
+// part: bind_query
+
+INSERT INTO test_timestamptz (idx, res, res2) VALUES ($1, $2, $3)

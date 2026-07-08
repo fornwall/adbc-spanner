@@ -1,3 +1,13 @@
-// part: metadata
+// Spanner override: FLOAT64 cannot be a primary key, so add a synthetic UUID key
+// (defaulted, so the bind INSERT only supplies res) and keep res a plain column.
 
-skip = "Spanner FLOAT64 columns cannot be primary keys, and the case's single-column bind table has no other key"
+// part: setup_query
+
+CREATE TABLE test_float64 (
+    res FLOAT64,
+    pk STRING(36) DEFAULT (GENERATE_UUID())
+) PRIMARY KEY (pk)
+
+// part: bind_query
+
+INSERT INTO test_float64 (res) VALUES ($1)

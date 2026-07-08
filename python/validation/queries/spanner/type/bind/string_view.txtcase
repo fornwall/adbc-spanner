@@ -1,3 +1,12 @@
-// part: metadata
+// Spanner override: mandatory PRIMARY KEY, native type name, and an explicit INSERT
+// column list. The driver binds Arrow Utf8View params (src/bind.rs) like Utf8.
 
-skip = "the driver does not bind Arrow Utf8View parameters"
+// part: setup_query
+
+CREATE TABLE test_string_view (
+    res STRING(MAX)
+) PRIMARY KEY (res)
+
+// part: bind_query
+
+INSERT INTO test_string_view (res) VALUES ($1)

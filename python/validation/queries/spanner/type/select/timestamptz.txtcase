@@ -1,3 +1,25 @@
+// Spanner override: idx PRIMARY KEY, native TIMESTAMP, GoogleSQL timestamp literals.
+// The case includes 9999-12-31 (outside Arrow's nanosecond range), so read it under
+// the microseconds mode from spanner.max_timestamp_precision (PR #132), which returns
+// Timestamp(Microsecond, "UTC") over Spanner's full 0001-9999 range — matching the
+// case's tsu:UTC expected schema. Reverted to the default after the case.
+
 // part: metadata
 
-skip = "case includes 9999-12-31, outside Arrow's nanosecond timestamp range (~1677-2262)"
+[setup]
+drop = "test_timestamptz"
+
+[setup.connection.options]
+"spanner.max_timestamp_precision" = { apply = "microseconds", revert = "nanoseconds_error_on_overflow" }
+
+// part: setup_query
+
+CREATE TABLE test_timestamptz (
+    idx INT64,
+    res TIMESTAMP
+) PRIMARY KEY (idx);
+INSERT INTO test_timestamptz (idx, res) VALUES (1, TIMESTAMP '2023-05-15 13:45:30+00');
+INSERT INTO test_timestamptz (idx, res) VALUES (2, TIMESTAMP '2000-01-01 00:00:00+00');
+INSERT INTO test_timestamptz (idx, res) VALUES (3, TIMESTAMP '1969-07-20 20:17:40+00');
+INSERT INTO test_timestamptz (idx, res) VALUES (4, TIMESTAMP '9999-12-31 23:59:59+00');
+INSERT INTO test_timestamptz (idx, res) VALUES (5, NULL);
