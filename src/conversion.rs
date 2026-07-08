@@ -554,7 +554,7 @@ pub(crate) fn build_schema(
         }
     }
 
-    let width = first_row.map(|r| r.raw_values().len()).unwrap_or(0);
+    let width = first_row.map_or(0, |r| r.raw_values().len());
     let fields: Vec<Field> = (0..width)
         .map(|i| Field::new(format!("col{i}"), DataType::Utf8, true))
         .collect();

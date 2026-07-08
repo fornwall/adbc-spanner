@@ -115,8 +115,7 @@ pub(crate) fn dense_union(
             populated
                 .iter()
                 .find(|(pid, _)| *pid == id)
-                .map(|(_, arr)| arr.clone())
-                .unwrap_or_else(|| new_empty_array(f.data_type()))
+                .map_or_else(|| new_empty_array(f.data_type()), |(_, arr)| arr.clone())
         })
         .collect();
     let union = UnionArray::try_new(

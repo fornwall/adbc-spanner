@@ -64,16 +64,16 @@ pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
     // `Error::status()` yields the structured gRPC status when present. We match on the code's
     // canonical name (e.g. "NOT_FOUND"), which is derived from the enum by the client itself — this
     // is not fragile string-parsing of a `Display` message.
-    let (status, vendor_code, details) = error
-        .status()
-        .map(|status| {
-            (
-                status_for_grpc_code(status.code.name()),
-                status.code as i32,
-                details_for_adbc(&status.details),
-            )
-        })
-        .unwrap_or((Status::Internal, 0, None));
+    let (status, vendor_code, details) =
+        error
+            .status()
+            .map_or((Status::Internal, 0, None), |status| {
+                (
+                    status_for_grpc_code(status.code.name()),
+                    status.code as i32,
+                    details_for_adbc(&status.details),
+                )
+            });
     let mut adbc = err(format!("Spanner error: {error}"), status);
     adbc.vendor_code = vendor_code;
     adbc.details = details;
@@ -266,8 +266,8 @@ mod tests {
 
     #[test]
     fn aborted_forwards_retry_info_detail() {
-        use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
         use google_cloud_gax::error::Error as GaxError;
+        use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
 
         let retry_info = serde_json::json!({
             "@type": "type.googleapis.com/google.rpc.RetryInfo",
@@ -296,8 +296,8 @@ mod tests {
 
     #[test]
     fn multiple_details_forward_in_order_under_typed_keys() {
-        use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
         use google_cloud_gax::error::Error as GaxError;
+        use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
 
         let gax = GaxError::service(
             RpcStatus::default()
@@ -338,8 +338,8 @@ mod tests {
 
     #[test]
     fn unrecognised_detail_keys_off_its_type_url() {
-        use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
         use google_cloud_gax::error::Error as GaxError;
+        use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
 
         // Not one of the well-known google.rpc detail types: lands in StatusDetails::Other and
         // takes its key from the Any type URL (final path segment, lowercased).
