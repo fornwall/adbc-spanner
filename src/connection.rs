@@ -59,6 +59,7 @@ use google_cloud_spanner::transaction::ReadWriteTransaction;
 
 use crate::bind::qualified_table;
 use crate::conversion::{TimestampPrecision, result_set_to_batch, stream_query};
+use crate::directed_read::DirectedRead;
 use crate::driver::Connected;
 use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
 use crate::request::RequestConfig;
@@ -238,6 +239,10 @@ pub struct SpannerConnection {
     /// for statements created on the connection, which may override the priority and request tag
     /// (the transaction tag is connection-level only).
     request: RequestConfig,
+    /// Directed-read replica selection for read-only queries (`spanner.directed_read`). Unset by
+    /// default (Spanner's own routing); becomes the default for statements created on the
+    /// connection, which may override it.
+    directed_read: DirectedRead,
     /// How `TIMESTAMP` columns map to Arrow (`spanner.max_timestamp_precision`): nanoseconds that
     /// error on out-of-range instants (the default) or microseconds covering Spanner's full range.
     /// Becomes the default for statements created on the connection, which may override it; also
@@ -270,6 +275,7 @@ impl SpannerConnection {
             isolation: IsolationLevel::Unspecified,
             read_staleness: ReadStaleness::default(),
             request: RequestConfig::default(),
+            directed_read: DirectedRead::default(),
             timestamp_precision: TimestampPrecision::default(),
             timeouts: RpcTimeouts::default(),
             retry: RetryConfig::default(),
@@ -681,6 +687,9 @@ impl Optionable for SpannerConnection {
             OptionConnection::Other(k) if k == crate::OPTION_TRANSACTION_TAG => {
                 self.request.set_transaction_tag(value)?;
             }
+            OptionConnection::Other(k) if k == crate::OPTION_DIRECTED_READ => {
+                self.directed_read.set(value)?;
+            }
             OptionConnection::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {
                 self.timestamp_precision = TimestampPrecision::parse_option(value)?;
             }
@@ -763,6 +772,16 @@ impl Optionable for SpannerConnection {
                 .ok_or_else(|| {
                     err(
                         format!("option {} is not set", crate::OPTION_TRANSACTION_TAG),
+                        Status::NotFound,
+                    )
+                }),
+            OptionConnection::Other(k) if k == crate::OPTION_DIRECTED_READ => self
+                .directed_read
+                .option_string()
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    err(
+                        format!("option {} is not set", crate::OPTION_DIRECTED_READ),
                         Status::NotFound,
                     )
                 }),
@@ -852,6 +871,7 @@ impl Connection for SpannerConnection {
             self.isolation.clone(),
             self.read_staleness.clone(),
             self.request.clone(),
+            self.directed_read.clone(),
             self.timestamp_precision,
             self.timeouts,
             self.retry,

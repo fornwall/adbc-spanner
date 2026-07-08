@@ -106,6 +106,7 @@ mod bind;
 mod connection;
 mod conversion;
 mod ddl;
+mod directed_read;
 mod driver;
 mod error;
 #[cfg(feature = "ffi")]
@@ -522,6 +523,33 @@ pub const OPTION_READ_TIMESTAMP: &str = "spanner.read.timestamp";
 /// [`RequestOptions.priority`](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions).
 pub const OPTION_REQUEST_PRIORITY: &str = "spanner.request.priority";
 
+/// Driver-specific connection **and** statement option: a
+/// [directed read](https://docs.cloud.google.com/spanner/docs/directed-reads) replica selection for
+/// read-only queries, steering where a read is served. The value is a small grammar:
+///
+/// ```text
+/// <mode> [ ":" <selection> ("," <selection>)* ] [ ";auto_failover_disabled" ]
+/// ```
+///
+/// - `<mode>` is `include` (an ordered preference list Spanner tries in turn) or `exclude`
+///   (replicas Spanner routes around), case-insensitive.
+/// - Each `<selection>` is `<location>`, `<location>:<type>` or `:<type>` (at least one of the two),
+///   where `<location>` is a region such as `us-east1` and `<type>` is `read_write`, `read_only` or
+///   `any` (case-insensitive; `any`/omitted matches every replica type).
+/// - The optional `;auto_failover_disabled` suffix (valid only with `include`) stops Spanner from
+///   falling back to a replica outside the list when the listed replicas are unavailable.
+///
+/// Examples: `include:us-east1`, `include:us-east1:read_only,us-east4:read_write`,
+/// `exclude:us-central1`, `include:us-east1;auto_failover_disabled`.
+///
+/// Directed reads apply to **read-only queries only** — Spanner rejects them on a read/write
+/// transaction — so the option is honoured on the driver's query paths (autocommit and manual mode
+/// alike, including parameterized/bound queries and `execute_partitions`) and ignored by DML/DDL.
+/// Unset by default (Spanner's own routing); set an empty string to unset. Malformed values fail
+/// with `InvalidArguments`. Set on a connection it becomes the default for statements it creates; a
+/// statement may override it. Round-trips through `get_option` (the raw, trimmed value).
+pub const OPTION_DIRECTED_READ: &str = "spanner.directed_read";
+
 /// Driver-specific connection **and** statement option: a free-form **request tag**, attached to
 /// every query/DML statement (and `ExecuteBatchDml` batch) the driver builds and surfaced in
 /// Spanner's query and transaction statistics for
@@ -671,6 +699,7 @@ mod options_doc_tests {
             crate::OPTION_READ_TIMESTAMP,
             crate::OPTION_REQUEST_PRIORITY,
             crate::OPTION_REQUEST_TAG,
+            crate::OPTION_DIRECTED_READ,
             crate::OPTION_TRANSACTION_TAG,
             crate::OPTION_MAX_TIMESTAMP_PRECISION,
             crate::OPTION_RPC_TIMEOUT_QUERY,

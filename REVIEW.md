@@ -727,8 +727,20 @@ convention) and is accepted as a `spanner:` connection-URI query parameter. Wire
 Python wrapper as an `access_token=` kwarg and documented in `README.md`, `python/README.md`,
 `docs/options.md`, and the `OPTION_ACCESS_TOKEN` rustdoc; offline unit tests cover the round-trip,
 the three mutual-exclusion conflicts, the emulator refusal, the bearer-header emission, and the
-no-leak rejection of a malformed token.); query options (optimizer version), directed reads, commit stats,
-`max_commit_delay`, `last_statement` optimization (free RPC saving for single-statement
+no-leak rejection of a malformed token.); query options (optimizer version), ~~directed reads~~
+(**Fixed.** `spanner.directed_read` at connection + statement level [statement inherits, then
+overrides; `""` unsets; round-trips through `get_option`] selects replicas for **read-only queries**
+via the grammar `<mode>[:<sel>,...][;auto_failover_disabled]` — `<mode>` is `include`/`exclude`, each
+`<sel>` is `<location>[:<type>]`/`:<type>` with `<type>` ∈ `read_write`/`read_only`/`any`. Parsed by
+`DirectedRead`/`parse` in the new `src/directed_read.rs` [offline unit tests: valid forms,
+case/whitespace, the auto-failover flag, malformed → `InvalidArguments`, the built client options,
+and clone-inheritance], built into the client `DirectedReadOptions`, and applied via
+`StatementBuilder::set_directed_read_options` on the read-only query paths only
+[`SpannerStatement::read_sql_builder` feeds `execute`, the bound-query path, `execute_partitions`, and
+the `execute_schema` PLAN probe]; DML/DDL keep the plain `sql_builder` since Spanner rejects directed
+reads on a read/write transaction. Documented in `README.md`, `python/README.md`, `docs/options.md`
+[grammar + examples], the `OPTION_DIRECTED_READ` rustdoc, and the CLAUDE.md feature list.), commit
+stats, `max_commit_delay`, `last_statement` optimization (free RPC saving for single-statement
 autocommit DML); ~~proto/enum columns (verify clean failure today)~~ (**Fixed.** They failed
 *silently*, not cleanly: `arrow_type` in `src/conversion.rs` mapped both `TypeCode::Proto` and
 `TypeCode::Enum` through the catch-all `_ => DataType::Utf8` arm, so a `PROTO` column surfaced its

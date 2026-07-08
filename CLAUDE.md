@@ -335,7 +335,17 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   `spanner.transaction.tag` connection-only; parsed/applied via `RequestConfig` in `src/request.rs`
   — every user statement builder goes through `SpannerStatement::sql_builder`, `run_batch_dml`
   tags the `ExecuteBatchDml` batch and the runner [commit priority + transaction tag; the client
-  has no batch-level priority setter], driver-internal metadata queries stay untagged), and RPC
+  has no batch-level priority setter], driver-internal metadata queries stay untagged), directed
+  reads (`spanner.directed_read` at connection + statement level [statement inherits, then overrides;
+  `""` unsets — the staleness pattern; round-trip via `get_option`] — a replica selection for
+  read-only queries parsed by `DirectedRead`/`parse` in `src/directed_read.rs` [unit-tested offline]
+  with the grammar `<mode>[:<sel>,...][;auto_failover_disabled]` where `<mode>` is `include`/`exclude`
+  and each `<sel>` is `<location>[:<type>]`/`:<type>` with `<type>` ∈ `read_write`/`read_only`/`any`;
+  built into the client `DirectedReadOptions` and applied via `StatementBuilder::set_directed_read_options`
+  only on the read-only query paths — `SpannerStatement::read_sql_builder` [= `sql_builder` + directed
+  reads] feeds the main `execute` query, the bound-query path, `execute_partitions`, and the
+  `execute_schema` PLAN probe; DML/DDL keep the plain `sql_builder` since Spanner rejects directed
+  reads on a read/write transaction), and RPC
   timeouts (`spanner.rpc.timeout_seconds.{query,update,fetch}` at connection + statement level
   [statement inherits, then overrides; `""` unsets, `0` disables; f64 seconds, finite +
   non-negative, round-trip via `get_option`/`get_option_double` — `RpcTimeouts` in
