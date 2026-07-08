@@ -351,17 +351,13 @@ impl Optionable for SpannerDatabase {
     }
 
     fn get_option_int(&self, key: Self::Option) -> Result<i64> {
-        Err(err(
-            format!("option {} is not an integer", option_name(&key)),
-            Status::NotFound,
-        ))
+        let what = format!("option {}", option_name(&key));
+        crate::options::int_from_stored_string(self.get_option_string(key), &what)
     }
 
     fn get_option_double(&self, key: Self::Option) -> Result<f64> {
-        Err(err(
-            format!("option {} is not a double", option_name(&key)),
-            Status::NotFound,
-        ))
+        let what = format!("option {}", option_name(&key));
+        crate::options::double_from_stored_string(self.get_option_string(key), &what)
     }
 }
 
@@ -579,6 +575,52 @@ mod tests {
             "http://localhost:9010"
         );
         assert!(db.emulator);
+    }
+
+    #[test]
+    fn typed_option_getters_distinguish_unset_from_non_integer() {
+        let mut db = new_database();
+
+        // Genuinely unset: NotFound ("option not set"), same as get_option_string.
+        let error = db
+            .get_option_int(OptionDatabase::Other(OPTION_ENDPOINT.into()))
+            .unwrap_err();
+        assert_eq!(error.status, Status::NotFound);
+        assert!(error.message.contains("is not set"), "{}", error.message);
+
+        // An integer-valued option is served by get_option_int (and as a double).
+        db.set_option(
+            OptionDatabase::Other(OPTION_IMPERSONATE_LIFETIME.into()),
+            OptionValue::String("900".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_option_int(OptionDatabase::Other(OPTION_IMPERSONATE_LIFETIME.into()))
+                .unwrap(),
+            900
+        );
+        assert_eq!(
+            db.get_option_double(OptionDatabase::Other(OPTION_IMPERSONATE_LIFETIME.into()))
+                .unwrap(),
+            900.0
+        );
+
+        // Set, but the value is not an integer: InvalidArguments, NOT NotFound (which must mean
+        // "option unset/unknown").
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("projects/p/instances/i/databases/d".into()),
+        )
+        .unwrap();
+        let error = db.get_option_int(OptionDatabase::Uri).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(
+            error.message.contains("is not an integer"),
+            "{}",
+            error.message
+        );
+        let error = db.get_option_double(OptionDatabase::Uri).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
     }
 
     #[test]

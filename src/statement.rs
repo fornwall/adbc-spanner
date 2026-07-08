@@ -764,27 +764,13 @@ impl Optionable for SpannerStatement {
     }
 
     fn get_option_int(&self, key: Self::Option) -> Result<i64> {
-        if let OptionStatement::Other(k) = &key {
-            if k == crate::OPTION_ROWS_PER_BATCH {
-                return Ok(self.rows_per_batch as i64);
-            }
-            if k == crate::OPTION_MAX_PARTITIONS {
-                if let Some(n) = self.max_partitions {
-                    return Ok(n);
-                }
-            }
-        }
-        Err(err(
-            format!("option {} is not set", key.as_ref()),
-            Status::NotFound,
-        ))
+        let what = format!("option {}", key.as_ref());
+        crate::options::int_from_stored_string(self.get_option_string(key), &what)
     }
 
     fn get_option_double(&self, key: Self::Option) -> Result<f64> {
-        Err(err(
-            format!("option {} is not set", key.as_ref()),
-            Status::NotFound,
-        ))
+        let what = format!("option {}", key.as_ref());
+        crate::options::double_from_stored_string(self.get_option_string(key), &what)
     }
 }
 
