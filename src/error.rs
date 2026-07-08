@@ -84,43 +84,37 @@ pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
 ///
 /// Returns `None` (rather than `Some(vec![])`) when nothing mapped, so an error without details
 /// keeps the `details: None` shape callers expect. See [`from_spanner`] for the key/value format
-/// contract. Serialization failures and details without a usable type name are skipped — a detail
-/// is diagnostic garnish, never worth failing (or panicking) the error path for.
+/// contract. A detail that fails to serialize, or whose ProtoJSON carries no usable `@type`, is
+/// skipped — a detail is diagnostic garnish, never worth failing (or panicking) the error path for.
 fn details_for_adbc(details: &[StatusDetails]) -> Option<Vec<(String, Vec<u8>)>> {
-    let mapped: Vec<(String, Vec<u8>)> = details
-        .iter()
-        .filter_map(|detail| Some((detail_key(detail)?, serde_json::to_vec(detail).ok()?)))
-        .collect();
+    let mapped: Vec<(String, Vec<u8>)> = details.iter().filter_map(map_detail).collect();
     (!mapped.is_empty()).then_some(mapped)
 }
 
-/// The ADBC detail key for one `google.rpc.Status` detail: the lowercased fully-qualified
-/// protobuf type name (e.g. `google.rpc.retryinfo`).
+/// Map one `google.rpc.Status` detail to its ADBC `(key, value)` pair, or `None` to skip it.
 ///
-/// The well-known `google.rpc` detail types get static keys; an unrecognised detail
-/// ([`StatusDetails::Other`]) derives its key from the `Any` type URL (the part after the final
-/// `/`, lowercased), or is skipped if the URL is missing.
-fn detail_key(detail: &StatusDetails) -> Option<String> {
-    let name = match detail {
-        StatusDetails::BadRequest(_) => "google.rpc.badrequest",
-        StatusDetails::DebugInfo(_) => "google.rpc.debuginfo",
-        StatusDetails::ErrorInfo(_) => "google.rpc.errorinfo",
-        StatusDetails::Help(_) => "google.rpc.help",
-        StatusDetails::LocalizedMessage(_) => "google.rpc.localizedmessage",
-        StatusDetails::PreconditionFailure(_) => "google.rpc.preconditionfailure",
-        StatusDetails::QuotaFailure(_) => "google.rpc.quotafailure",
-        StatusDetails::RequestInfo(_) => "google.rpc.requestinfo",
-        StatusDetails::ResourceInfo(_) => "google.rpc.resourceinfo",
-        StatusDetails::RetryInfo(_) => "google.rpc.retryinfo",
-        StatusDetails::Other(any) => {
-            let url = any.type_url()?;
-            return Some(url.rsplit('/').next().unwrap_or(url).to_ascii_lowercase());
-        }
-        // `StatusDetails` is #[non_exhaustive]; skip any detail kind added later rather than
-        // inventing a key for a type we cannot name.
-        _ => return None,
-    };
-    Some(name.to_string())
+/// Both halves derive from the detail's ProtoJSON form, so there is a single self-consistent path
+/// for every detail kind:
+///
+/// - **value** — the ProtoJSON encoding as UTF-8 bytes, self-describing via its `"@type"` field.
+/// - **key** — the lowercased fully-qualified protobuf type name, taken from that same `"@type"`
+///   (the path segment after the final `/`), e.g. `google.rpc.retryinfo`.
+///
+/// Deriving the key from the serialized `@type` — rather than matching each [`StatusDetails`]
+/// variant against a hand-maintained table — means the well-known `google.rpc` types and an
+/// unrecognised [`StatusDetails::Other`] share one code path, *and* any new `google.rpc.*` detail
+/// type added to the `#[non_exhaustive]` enum upstream is forwarded automatically instead of being
+/// silently dropped. A detail that fails to serialize, or whose ProtoJSON carries no `@type`
+/// string, is skipped.
+fn map_detail(detail: &StatusDetails) -> Option<(String, Vec<u8>)> {
+    let value = serde_json::to_value(detail).ok()?;
+    let type_url = value.get("@type")?.as_str()?;
+    let key = type_url
+        .rsplit('/')
+        .next()
+        .unwrap_or(type_url)
+        .to_ascii_lowercase();
+    Some((key, serde_json::to_vec(&value).ok()?))
 }
 
 /// Translate a Spanner *client/admin builder* construction error into an ADBC error.
