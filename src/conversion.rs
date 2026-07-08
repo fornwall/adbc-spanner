@@ -564,7 +564,9 @@ fn build_primitive<T: ArrowPrimitiveType>(
 /// SQL NULLs map to null slots. A present value that cannot be decoded as the column's type is an
 /// **error**, not a null — every typed arm goes through [`build_primitive`]/[`decode_error`], so a
 /// wire-format surprise cannot silently masquerade as a SQL NULL.
-fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Result<ArrayRef> {
+///
+/// `pub(crate)` (rather than private) only so `crate::bench_support` can expose it to `benches/`.
+pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Result<ArrayRef> {
     Ok(match data_type {
         DataType::Boolean => {
             let mut builder = BooleanBuilder::with_capacity(values.len());

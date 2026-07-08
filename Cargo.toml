@@ -65,6 +65,12 @@ ffi = ["dep:adbc_ffi"]
 # option-fuzzing entry point can take a derived-`Arbitrary` input type.
 fuzzing = ["dep:arbitrary"]
 
+[[bench]]
+# Criterion benchmarks over the Spanner-rows → Arrow conversion hot path (src/conversion.rs),
+# run offline (no network/emulator) via `cargo bench`.
+name = "conversion"
+harness = false
+
 [dependencies]
 # Two dependency families are pinned to git revisions (temporary). When reverting either to a
 # versioned crates.io release, follow the single revert checklist in CLAUDE.md "Temporary git
@@ -145,6 +151,9 @@ adbc_driver_manager = { git = "https://github.com/fornwall/arrow-adbc", rev = "7
 # Pinned to the same git revision as the google-cloud family above (see the note there).
 google-cloud-spanner-admin-instance-v1 = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
 google-cloud-spanner-admin-database-v1 = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
+# Benchmark harness for benches/conversion.rs. Slim feature set: `cargo_bench_support` is what
+# `cargo bench` needs; the default plotters/rayon extras are skipped.
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 # Names the gax error/status types so the error-mapping unit test can build a real gax error.
 # google-cloud-spanner re-exports this crate's `Error` at runtime, so this is a test-only dependency.
 # Same git pin as the google-cloud family above (see the note there).

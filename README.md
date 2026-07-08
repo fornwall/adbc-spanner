@@ -350,6 +350,18 @@ cargo +nightly fuzz run sql
 
 Fuzzing runs weekly (and on demand) in CI ([`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml)).
 
+### Benchmarks
+
+[Criterion](https://github.com/bheisler/criterion.rs) benchmarks in
+[`benches/conversion.rs`](benches/conversion.rs) cover the driver's hottest path — decoding Spanner
+wire values into Arrow arrays (`src/conversion.rs`). They run entirely offline against synthetic
+values (no network or emulator), one default-size streaming chunk (8192 rows) per benchmark:
+
+```sh
+cargo bench                 # full measurement
+cargo bench -- --test       # fast single-pass sanity run
+```
+
 ## Releasing
 
 Releases are cut with [`cargo-release`](https://github.com/crate-ci/cargo-release), configured under
