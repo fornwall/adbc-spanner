@@ -430,7 +430,12 @@ jobs:
           # consistency check that guards a vX.Y.Z release lives in the standalone
           # `version-gate` job (which the tag-only `python-publish` job depends on), so
           # a mismatched tag never reaches PyPI; here we only stamp the wheel version.
-          crate_version="$(grep -m1 '^version' ../Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          # Derive the version with `cargo metadata` (--no-deps: read only this manifest
+          # and resolve nothing, so the git-pinned dependencies are never fetched), the
+          # same robust parse the `version-gate` job uses — more reliable than a
+          # positional grep of Cargo.toml, since it parses the manifest the way cargo does.
+          crate_version="$(cargo metadata --no-deps --format-version 1 --manifest-path ../Cargo.toml \
+            | jq -r '.packages[] | select(.name == "adbc-spanner") | .version')"
           echo "__version__ = \"${crate_version}\"" > adbc_driver_spanner/_version.py
           echo "wheel version: ${crate_version}"
 

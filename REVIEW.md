@@ -788,7 +788,12 @@ step's Windows branch (already gated on `runner.os == Windows`) no longer copies
 `adbc_spanner.dll.lib` with `2>/dev/null || true`; it now asserts the import library exists and
 `exit 1`s with a `::error::` message if not, so a build regression that drops it fails the job loudly
 instead of shipping a `.zip` missing the import lib.); the
-wheel version parse greps `Cargo.toml` positionally — `cargo metadata | jq` is robust;
+~~the
+wheel version parse greps `Cargo.toml` positionally — `cargo metadata | jq` is robust~~ (**Fixed.** The
+`python-wheels` job's "Sync wheel version to the crate" step no longer greps `Cargo.toml` positionally;
+it now derives the crate version via `cargo metadata --no-deps --format-version 1 | jq -r '.packages[] |
+select(.name == "adbc-spanner") | .version'`, the same robust parse the tag-only `version-gate` job
+already uses, so both jobs read the version identically.);
 ~~`adbc-validation.yml` rebuilds arrow-adbc C++ + GoogleTest from source every run (cache it)~~
 (**Fixed.** `adbc-validation.yml` now caches the `adbc-validation/build` tree (the FetchContent-cloned
 + compiled arrow-adbc driver-manager/validation harness and GoogleTest, plus the harness objects) via
