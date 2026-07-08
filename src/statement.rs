@@ -96,6 +96,12 @@ pub struct SpannerStatement {
     /// and `replace`; the create/replace modes build the table from the ingest data's Arrow
     /// schema.
     ingest_mode: Option<IngestMode>,
+    /// Primary-key columns for a create-mode bulk ingest (`spanner.ingest.primary_key`). `None`
+    /// (the default) makes the create modes append a synthetic `adbc_ingest_key` UUID key; `Some`
+    /// keys on these existing ingest columns instead (in order), adding no synthetic column. Parsed
+    /// once in `set_option` (comma-separated, trimmed, empties dropped); `""` unsets. See
+    /// [`bind::create_table_sql`].
+    ingest_primary_key: Option<Vec<String>>,
     /// How bound columns pair with the query's `@name` parameters
     /// (`adbc.statement.bind_by_name`): `false` (the default) binds positionally, `true` forces
     /// strict by-name. See [`bind::resolve_parameter_names`].
@@ -164,6 +170,7 @@ impl SpannerStatement {
             target_db_schema: None,
             target_catalog: None,
             ingest_mode: None,
+            ingest_primary_key: None,
             bind_by_name: false,
             rows_per_batch: DEFAULT_ROWS_PER_BATCH,
             data_boost: false,
@@ -245,6 +252,7 @@ impl SpannerStatement {
             db_schema,
             &schema,
             if_not_exists,
+            self.ingest_primary_key.as_deref(),
         )?);
         Ok(Some(statements))
     }
@@ -879,6 +887,18 @@ impl Optionable for SpannerStatement {
                 // with a synthetic UUID primary key) in the create/replace modes.
                 self.ingest_mode = Some(ingest_mode_option(value)?);
             }
+            OptionStatement::Other(k) if k == crate::OPTION_INGEST_PRIMARY_KEY => {
+                // Comma-separated existing column names; `""` (or all-whitespace) unsets, back to the
+                // synthetic key. Column existence and Spanner key-type validity are checked when the
+                // CREATE TABLE is built (`bind::create_table_sql`) / by Spanner at DDL time.
+                let cols: Vec<String> = string_option(value)?
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
+                self.ingest_primary_key = (!cols.is_empty()).then_some(cols);
+            }
             OptionStatement::Other(k) if k == crate::OPTION_BIND_BY_NAME => {
                 self.bind_by_name =
                     crate::options::bool_option(value, "option adbc.statement.bind_by_name")?;
@@ -944,6 +964,10 @@ impl Optionable for SpannerStatement {
             OptionStatement::Temporary => Some(false.to_string()),
             // Reported in the spec's canonical `adbc.ingest.mode.*` spelling.
             OptionStatement::IngestMode => self.ingest_mode.map(String::from),
+            // The comma-joined key columns when set; unset (the synthetic key) reports NotFound.
+            OptionStatement::Other(k) if k == crate::OPTION_INGEST_PRIMARY_KEY => {
+                self.ingest_primary_key.as_ref().map(|cols| cols.join(","))
+            }
             // A plain boolean; reports "true"/"false" (the default is "false", positional).
             OptionStatement::Other(k) if k == crate::OPTION_BIND_BY_NAME => {
                 Some(self.bind_by_name.to_string())

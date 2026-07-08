@@ -445,6 +445,23 @@ pub const OPTION_MAX_PARTITIONS: &str = "spanner.max_partitions";
 /// Accepts a boolean. `get_option` reports `true`/`false`.
 pub const OPTION_BIND_BY_NAME: &str = "adbc.statement.bind_by_name";
 
+/// Driver-specific statement option: the **primary key** for a `create`/`create_append`/`replace`
+/// bulk ingest.
+///
+/// Spanner requires every table to have a primary key, but Arrow ingest data carries none, so by
+/// default the create modes append a hidden `adbc_ingest_key` UUID column and key on it. Set this
+/// option to one or more **existing** ingest columns (comma-separated for a composite key) to key on
+/// them instead — no synthetic column is added, and the column order given becomes the key order
+/// (which governs Spanner's physical row layout). Every named column must appear in the bound ingest
+/// data, else the create fails with `InvalidArguments`; Spanner additionally rejects key columns of
+/// unsupported types (e.g. `FLOAT64`, `JSON`, `ARRAY`). Only affects the table-creating modes —
+/// `append` ingests into an existing table whose own key governs.
+///
+/// A free-form string; `""` (or all-whitespace) unsets, back to the synthetic key. When set,
+/// `get_option` reports the comma-joined column list; when unset it reports `NotFound`, like the
+/// driver's other unset string options.
+pub const OPTION_INGEST_PRIMARY_KEY: &str = "spanner.ingest.primary_key";
+
 /// Driver-specific connection **and** statement option: the **read staleness** for read-only
 /// queries, as `"exact:<duration>"` or `"max:<duration>"`.
 ///
@@ -634,6 +651,7 @@ mod options_doc_tests {
             crate::OPTION_ROWS_PER_BATCH,
             crate::OPTION_DATA_BOOST,
             crate::OPTION_MAX_PARTITIONS,
+            crate::OPTION_INGEST_PRIMARY_KEY,
             crate::OPTION_READ_STALENESS,
             crate::OPTION_READ_TIMESTAMP,
             crate::OPTION_REQUEST_PRIORITY,
