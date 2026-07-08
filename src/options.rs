@@ -63,3 +63,80 @@ pub(crate) fn positive_usize(value: OptionValue, what: &str) -> Result<usize> {
         .filter(|&n| n > 0)
         .ok_or_else(|| invalid_argument(format!("{what} must be a positive integer")))
 }
+
+/// Reinterpret a `get_option_string` lookup as `get_option_int`.
+///
+/// Every gettable option in this driver has a canonical string form, so the typed getters at all
+/// three levels (database / connection / statement) delegate to `get_option_string` and parse the
+/// result here. The string lookup's error is propagated **unchanged** — per ADBC, `NotFound` means
+/// "option unset/unknown", never "wrong type" — while an option that IS set but whose value cannot
+/// be represented as an integer is reported as `InvalidArguments`.
+pub(crate) fn int_from_stored_string(stored: Result<String>, what: &str) -> Result<i64> {
+    let value = stored?;
+    value
+        .parse::<i64>()
+        .map_err(|_| invalid_argument(format!("{what} value {value:?} is not an integer")))
+}
+
+/// Reinterpret a `get_option_string` lookup as `get_option_double`; the same contract as
+/// [`int_from_stored_string`], parsing to `f64` (so integer-valued options are served as doubles).
+pub(crate) fn double_from_stored_string(stored: Result<String>, what: &str) -> Result<f64> {
+    let value = stored?;
+    value
+        .parse::<f64>()
+        .map_err(|_| invalid_argument(format!("{what} value {value:?} is not a double")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::err;
+    use adbc_core::error::Status;
+
+    #[test]
+    fn int_getter_parses_integer_valued_options() {
+        let get = |v: &str| int_from_stored_string(Ok(v.to_string()), "option o");
+        assert_eq!(get("8192").unwrap(), 8192);
+        assert_eq!(get("-5").unwrap(), -5);
+        assert_eq!(get("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn int_getter_reports_set_but_non_integer_values_as_invalid_arguments() {
+        // A value that exists but is not an integer must NOT be NotFound (that would read as
+        // "option unset"): it is an InvalidArguments error naming the option and the value.
+        for value in ["true", "max:10s", "1.5", "", "projects/p"] {
+            let error = int_from_stored_string(Ok(value.to_string()), "option o").unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "value {value:?}");
+            assert!(error.message.contains("option o"), "{}", error.message);
+            assert!(
+                error.message.contains(&format!("{value:?}")),
+                "{}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn typed_getters_propagate_the_string_lookup_error_unchanged() {
+        // Unset (NotFound) and unknown-key errors from get_option_string pass through as-is.
+        let unset = || err("option o is not set", Status::NotFound);
+        let error = int_from_stored_string(Err(unset()), "option o").unwrap_err();
+        assert_eq!(error.status, Status::NotFound);
+        assert_eq!(error.message, "option o is not set");
+        let error = double_from_stored_string(Err(unset()), "option o").unwrap_err();
+        assert_eq!(error.status, Status::NotFound);
+        assert_eq!(error.message, "option o is not set");
+    }
+
+    #[test]
+    fn double_getter_parses_and_rejects() {
+        let get = |v: &str| double_from_stored_string(Ok(v.to_string()), "option o");
+        assert_eq!(get("1.5").unwrap(), 1.5);
+        // Integer-valued options can always be represented as doubles.
+        assert_eq!(get("3600").unwrap(), 3600.0);
+        let error = get("true").unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("option o"), "{}", error.message);
+    }
+}

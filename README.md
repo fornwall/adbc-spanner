@@ -121,6 +121,8 @@ import adbc_driver_manager
 db = adbc_driver_manager.AdbcDatabase(
     driver="/path/to/libadbc_spanner.so",
     entrypoint="AdbcSpannerInit",
+    # or a connection URI carrying options as query parameters:
+    # "spanner:///projects/…/databases/…?spanner.endpoint=http://localhost:9010&spanner.emulator=true"
     uri="projects/my-project/instances/my-instance/databases/my-db",
 )
 ```
@@ -188,7 +190,7 @@ every option's exact type and allowed values, default, and `get_option` round-tr
 
 | Option                                       | Purpose                           |
 | -------------------------------------------- | --------------------------------- |
-| `uri` (`OptionDatabase::Uri`) / `spanner.database` | The Spanner database path (required); the two keys are equivalent. |
+| `uri` (`OptionDatabase::Uri`) / `spanner.database` | The Spanner database path, or a `spanner:` connection URI (see below); required. The two keys are equivalent. |
 | `spanner.endpoint`                           | Explicit gRPC endpoint (e.g. an emulator). |
 | `spanner.emulator`                           | Connect with anonymous credentials (emulator mode). |
 | `spanner.keyfile`                            | Path to a Google credential JSON file (dbt's `keyfile`). |
@@ -197,6 +199,23 @@ every option's exact type and allowed values, default, and `get_option` round-tr
 | `spanner.impersonate.delegates`              | Delegation chain for impersonation (comma-separated). |
 | `spanner.impersonate.scopes`                 | OAuth scopes for the impersonated token (comma-separated). |
 | `spanner.impersonate.lifetime`               | Lifetime of the impersonated token, in seconds. |
+
+Instead of a bare database path, `uri` / `spanner.database` also accept a **connection URI** with
+the `spanner:` scheme whose query parameters are the database-level options above:
+
+```text
+spanner:///projects/p/instances/i/databases/d?spanner.endpoint=http://localhost:9010&spanner.emulator=true
+spanner://localhost:9010/projects/p/instances/i/databases/d
+```
+
+The URI path is the database path; an optional `//host:port` authority becomes `spanner.endpoint`
+(write `spanner:///projects/…`, with three slashes, when no
+endpoint host is intended). Query parameters must be option names from the table above (unknown
+keys are rejected); values are percent-decoded per RFC 3986 (`+` is a literal plus, not a space).
+The URI is expanded into the individual options immediately when it is set, so precedence is
+plain last-writer-wins: an option set after the URI overrides it, and a URI set after an option
+overwrites only the fields the URI actually carries. `get_option("uri")` returns the stored
+database path, not the original URI.
 
 **Connection options** (via `set_option` on the connection):
 

@@ -35,8 +35,8 @@ holds configuration).
 
 | Option | Type / allowed values | Default | Round-trips | Description |
 | ------ | --------------------- | ------- | ----------- | ----------- |
-| `uri` | string: `projects/<p>/instances/<i>/databases/<d>` | — (required) | yes, when set | **Standard ADBC.** The fully-qualified Spanner database path. Equivalent to `spanner.database`; the two keys read and write the same value. Connecting without it fails with `InvalidState`. |
-| `spanner.database` | string: `projects/<p>/instances/<i>/databases/<d>` | — (required) | yes, when set | Driver-specific alias for `uri`. |
+| `uri` | string: `projects/<p>/instances/<i>/databases/<d>`, or a `spanner:` connection URI (see [Connection URIs](#connection-uris)) | — (required) | yes, when set (a connection URI reports the expanded database path, not the original URI) | **Standard ADBC.** The fully-qualified Spanner database path. Equivalent to `spanner.database`; the two keys read and write the same value. Connecting without it fails with `InvalidState`. |
+| `spanner.database` | as `uri` | — (required) | as `uri` | Driver-specific alias for `uri`. |
 | `spanner.endpoint` | string: gRPC endpoint URL, e.g. `http://localhost:9010` | unset (production Spanner service) | yes, when set | Explicit gRPC endpoint, e.g. a Spanner emulator. Takes precedence over the endpoint derived from `SPANNER_EMULATOR_HOST` (see [Environment](#environment)). |
 | `spanner.emulator` | boolean | `false` (forced `true` when `SPANNER_EMULATOR_HOST` is set non-empty) | yes, always (`true`/`false`) | Connect with **anonymous credentials** (emulator mode). Combining emulator mode with explicitly configured credentials (`spanner.keyfile`, `spanner.keyfile_json`, or `spanner.impersonate.target_principal`) is refused at connect time with `InvalidState` instead of silently ignoring them; ambient ADC does not conflict. |
 | `spanner.keyfile` | string: path to a credential JSON file | unset (Application Default Credentials) | yes, when set | Path to a Google credential JSON key file (dbt's `keyfile`). The credential flow is auto-detected from the JSON's `"type"` field: `service_account`, `authorized_user`, `impersonated_service_account`, or `external_account`. Overridden by `spanner.keyfile_json` if both are set. See [README § Authentication](../README.md#authentication). |
@@ -45,6 +45,26 @@ holds configuration).
 | `spanner.impersonate.delegates` | string: comma-separated service-account emails | unset (no delegation chain) | yes, when non-empty (normalised: entries trimmed, empties dropped, re-joined with `,`) | Delegation chain for impersonation; each account must hold the *Token Creator* role on the next, the last on the target principal. Only used when a target principal is set. |
 | `spanner.impersonate.scopes` | string: comma-separated OAuth 2.0 scopes | unset (the `cloud-platform` scope) | yes, when non-empty (normalised as above) | Scopes for the impersonated token. Only used when a target principal is set. |
 | `spanner.impersonate.lifetime` | non-negative seconds | `3600` (one hour) | yes, when explicitly set (the implicit default is **not** reported) | Lifetime of the impersonated access token, in seconds. Only used when a target principal is set. |
+
+### Connection URIs
+
+Instead of a bare database path, `uri` / `spanner.database` also accept a **connection URI** with
+the `spanner:` scheme (matched ASCII case-insensitively; any other scheme, including
+`cloudspanner:`, is not recognised and the value is stored verbatim as a database path):
+
+```text
+spanner:///projects/<p>/instances/<i>/databases/<d>?spanner.endpoint=http://localhost:9010&spanner.emulator=true
+spanner://localhost:9010/projects/<p>/instances/<i>/databases/<d>
+```
+
+The URI path is the database path; an optional `//host:port` authority becomes `spanner.endpoint`
+(write `spanner:///projects/…`, with three slashes, when no endpoint host is intended). Query
+parameters must be database-option names from the table above (unknown keys are rejected with
+`InvalidArguments`); values are percent-decoded per RFC 3986 (`+` is a literal plus, not a space).
+The URI is expanded into the individual options at the moment it is set, so precedence is
+last-writer-wins per option: a later `set_option` overrides what the URI carried, and the URI
+overwrites only the options it actually names. `get_option("uri")` reports the stored database
+path, not the original URI.
 
 ## Connection options
 
