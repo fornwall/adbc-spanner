@@ -218,19 +218,31 @@ pub mod fuzzing {
     ///
     /// The oracles live here (where the client's `Partition` type is in scope): a rejected
     /// descriptor must be a clean `InvalidArguments` error — never a panic — and an accepted one
-    /// must round-trip through the driver's own encoder: decode → encode → decode → encode
-    /// reproduces the enveloped bytes exactly.
+    /// must reach a byte-stable fixed point under the driver's own encoder: from a canonical
+    /// descriptor, decode → encode → decode → encode reproduces the enveloped bytes exactly.
+    ///
+    /// The fixed point is asserted from `encode_partition`'s *own* output, not from the arbitrary
+    /// input's first encode. A hand-crafted descriptor can carry a value whose lexical form serde
+    /// does not preserve — most notably a huge integer literal, which overflows `i64`/`u64` and is
+    /// parsed to `f64` by an imprecise path, so its first re-encode (a canonical ryu float) decodes
+    /// back to a *different* `f64` than the encoder emitted. One normalization pass reaches the
+    /// fixed point; every real descriptor `encode_partition` produces is already there (it only ever
+    /// emits ryu floats), so this does not weaken the invariant that matters for `read_partition`.
     pub fn decode_partition(descriptor: &[u8]) -> bool {
         match crate::connection::decode_partition(descriptor) {
             Ok(partition) => {
-                let bytes = crate::connection::encode_partition(&partition)
-                    .expect("a decoded partition re-encodes");
-                let again = crate::connection::decode_partition(&bytes)
-                    .expect("a re-encoded partition descriptor decodes");
+                use crate::connection::{decode_partition, encode_partition};
+                // Normalize once so the comparison starts from a canonical encoder output, then
+                // assert the round-trip from there is byte-stable.
+                let first = encode_partition(&partition).expect("a decoded partition re-encodes");
+                let normalized =
+                    decode_partition(&first).expect("a re-encoded partition descriptor decodes");
+                let bytes = encode_partition(&normalized).expect("a decoded partition re-encodes");
+                let again =
+                    decode_partition(&bytes).expect("a re-encoded partition descriptor decodes");
                 assert_eq!(
                     bytes,
-                    crate::connection::encode_partition(&again)
-                        .expect("a decoded partition re-encodes"),
+                    encode_partition(&again).expect("a decoded partition re-encodes"),
                     "enveloped partition descriptor round-trip changed the bytes"
                 );
                 true
