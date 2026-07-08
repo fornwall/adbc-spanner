@@ -27,12 +27,13 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Pinned so the corpus/behaviour is reproducible; bump deliberately. Pinned to the
-# fornwall/validation fork, which carries the two suite fixes (test_rows_affected DDL
-# override + bulk_ingest_synthetic_column) our overrides depend on, staged ahead of an
-# upstream (adbc-drivers/validation) submission.
-VALIDATION_REF="${ADBC_VALIDATION_REF:-7046e6d8256afd5c6b968d9e35f03bd8867278a4}"
-VALIDATION_REPO="${ADBC_VALIDATION_REPO:-fornwall/validation}"
+# Pinned so the corpus/behaviour is reproducible; bump deliberately. Points at the
+# upstream adbc-drivers/validation suite: the test_rows_affected DDL-override hook we
+# rely on landed upstream (#249), and the create-mode synthetic-column quirk is handled
+# by a driver-side test override (see tests/test_connection.py, adbc-drivers/validation#250)
+# rather than a shared-suite feature — so no fork is needed.
+VALIDATION_REF="${ADBC_VALIDATION_REF:-8f0de4199f651122df6c980827e43accb1fc6c88}"
+VALIDATION_REPO="${ADBC_VALIDATION_REPO:-adbc-drivers/validation}"
 PYTHON="${PYTHON:-python3}"
 EMULATOR_DATABASE="projects/test-project/instances/test-instance/databases/adbc-test"
 

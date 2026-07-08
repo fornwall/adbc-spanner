@@ -45,10 +45,11 @@ class SpannerQuirks(model.DriverQuirks):
         statement_get_parameter_schema=True,
         statement_prepare=True,
         statement_rows_affected=True,
-        # create-mode ingest adds a synthetic UUID primary key (Spanner requires
-        # one), which get_objects faithfully lists; the suite filters it out of the
-        # strict column-list assertions.
-        bulk_ingest_synthetic_column="adbc_ingest_key",
+        # NB: create-mode ingest adds a synthetic UUID primary key (Spanner requires
+        # one), which get_objects faithfully lists. The two strict column-list
+        # assertions that would trip over it are overridden to filter it out in
+        # test_connection.py (TestConnection subclass) rather than via a shared-suite
+        # feature flag — see adbc-drivers/validation#250.
         supported_xdbc_fields=[],
         # Spanner's default catalog and schema are both the empty string (GoogleSQL
         # INFORMATION_SCHEMA), which is what get_objects reports.

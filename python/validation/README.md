@@ -95,23 +95,27 @@ spec-conformant — `approximate=True` merely *allows* approximate/out-of-date v
 values always satisfy it (Spanner keeps no cheap pre-computed statistics, so there is nothing
 cheaper to serve); each row reports `statistic_is_approximate=false`.
 
-**Fork-pinned suite fixes (formerly strict xfails).** Three cases needed suite changes that are not
-yet in the upstream `adbc-drivers/validation` corpus; both are now landed on the
-[fornwall/validation](https://github.com/fornwall/validation) fork that `VALIDATION_REF` pins
-(`scripts/run-foundry-validation.sh`), staged ahead of an upstream submission. They are wired up in
-`SpannerQuirks` and now **pass**, so there are no strict xfails left. When `VALIDATION_REF` bumps to
-a suite that drops these changes (or renames the hooks), the matching quirks hookups below break —
-keep them in lockstep with the pin:
+**Spanner-specific test adaptations (formerly strict xfails).** Two cases needed adapting for
+Spanner. Neither requires a fork any more — `VALIDATION_REF` pins the plain upstream
+`adbc-drivers/validation` suite (`scripts/run-foundry-validation.sh`) — and both now **pass**, so
+there are no strict xfails left:
 
 - `test_get_objects_column_filter_table` / `_table_name` — tables created by `mode="create"` ingest
-  carry the synthetic `adbc_ingest_key` column, which `get_objects` faithfully lists; the cases'
-  strict column-list assertions expected only the data columns.
-  Suite fix: the `bulk_ingest_synthetic_column` `DriverFeatures` field the strict assertions filter
-  out; quirks hookup: `bulk_ingest_synthetic_column="adbc_ingest_key"`.
-- `test_rows_affected` — the suite hardcoded portable `CREATE TABLE (id INT)` with no override
-  hook; Spanner needs a `PRIMARY KEY` and `INT64`.
-  Suite fix: the DDL is routed through `query_override("TestStatement.test_rows_affected.create_table", …)`;
-  quirks hookup: that override rewrites `(id INT)` → `(id INT64) PRIMARY KEY (id)`.
+  carry the synthetic `adbc_ingest_key` primary-key column, which `get_objects` faithfully lists; the
+  cases' strict column-list assertions expected only the data columns.
+  Handled **in this repo**, not the shared suite: `tests/test_connection.py` subclasses the suite's
+  `TestConnection` and overrides just these two tests to drop `adbc_ingest_key` before the strict
+  assertions (`SYNTHETIC_INGEST_COLUMN`). The membership-based filter tests already pass and are
+  inherited unchanged. This is the driver-side alternative to a shared
+  `bulk_ingest_synthetic_column` feature flag — see the discussion on
+  [adbc-drivers/validation#250](https://github.com/adbc-drivers/validation/pull/250). If the suite
+  ever renames these two methods or reshapes their assertions, the overrides silently go stale — keep
+  them in lockstep with the pin.
+- `test_rows_affected` — the suite hardcoded portable `CREATE TABLE (id INT)`; Spanner needs a
+  `PRIMARY KEY` and `INT64`. The suite now routes that DDL through
+  `query_override("TestStatement.test_rows_affected.create_table", …)`
+  ([#249](https://github.com/adbc-drivers/validation/pull/249), merged upstream); quirks hookup: that
+  override rewrites `(id INT)` → `(id INT64, adbc_pk STRING(36) DEFAULT (GENERATE_UUID())) PRIMARY KEY (adbc_pk)`.
 
 Known remaining gaps (documented, not yet addressed):
 
