@@ -104,6 +104,9 @@ The driver accepts options at three levels, each with its own place in the DBAPI
 
 All values are passed as strings. Boolean options accept `"true"`/`"false"` (also
 `"1"`/`"0"`/`"yes"`/`"no"`, case-insensitive); integer options accept a numeric string.
+The authoritative driver-level reference — every option with its exact type, default, and
+round-trip behaviour — is
+[docs/options.md](https://github.com/fornwall/adbc-spanner/blob/main/docs/options.md).
 
 **Database options** (`connect()` kwargs or `db_kwargs=`):
 
@@ -112,8 +115,8 @@ All values are passed as strings. Boolean options accept `"true"`/`"false"` (als
 | `spanner.database`                           | `projects/<p>/instances/<i>/databases/<d>` | — (required)             | The Spanner database path (the `database=` kwarg). |
 | `spanner.endpoint`                           | host or URL, e.g. `http://localhost:9010` | production Spanner        | Explicit gRPC endpoint (e.g. an emulator). |
 | `spanner.emulator`                           | boolean                           | `false` (`true` when `SPANNER_EMULATOR_HOST` is set) | Connect with anonymous credentials (emulator mode). |
-| `spanner.keyfile`                            | file path                         | unset (ADC)                       | Path to a service-account JSON key file. |
-| `spanner.keyfile_json`                       | JSON string                       | unset (ADC)                       | Inline service-account JSON key; wins over `spanner.keyfile`. |
+| `spanner.keyfile`                            | file path                         | unset (ADC)                       | Path to a Google credential JSON file; the credential type is auto-detected from the JSON's `"type"` field. |
+| `spanner.keyfile_json`                       | JSON string                       | unset (ADC)                       | Inline credential JSON (same auto-detection); wins over `spanner.keyfile`. |
 | `spanner.impersonate.target_principal`       | service-account email             | unset (no impersonation)          | Service account to impersonate; setting it enables impersonation on top of the base credentials. |
 | `spanner.impersonate.delegates`              | comma-separated emails            | unset (no delegation)             | Delegation chain for impersonation. |
 | `spanner.impersonate.scopes`                 | comma-separated scopes            | `cloud-platform`                  | OAuth scopes for the impersonated token. |
