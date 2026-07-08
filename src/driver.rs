@@ -285,7 +285,8 @@ impl SpannerDatabase {
                         err(
                             format!(
                                 "failed to build Application Default Credentials to impersonate \
-                                 {target:?}: {e}"
+                                 {target:?}: {}",
+                                scrub_credential_error(&e)
                             ),
                             Status::InvalidArguments,
                         )
@@ -674,10 +675,42 @@ fn build_credentials_from_json(json: &str) -> Result<Credentials> {
 
     result.map_err(|e| {
         err(
-            format!("failed to build {credential_type} credentials: {e}"),
+            format!(
+                "failed to build {credential_type} credentials: {}",
+                scrub_credential_error(&e)
+            ),
             Status::InvalidArguments,
         )
     })
+}
+
+/// Reduce a `google-cloud-auth` credential-builder error to a fixed, secret-free category phrase.
+///
+/// The auth crate's own `Display` (and the `#[source]` chain behind it) is outside this crate's
+/// control: its `Parsing` / `Loading` variants wrap the underlying `serde_json` error produced while
+/// deserializing the credential JSON, which — depending on the failure mode, and on future versions
+/// of the crate — can echo fragments of the very JSON it was reading (potentially `private_key` or
+/// `refresh_token` material). So we never interpolate that `Display` into an ADBC error message.
+/// Instead we classify the failure with the crate's own public predicates and surface only one of a
+/// handful of fixed phrases, guaranteeing no key material can reach an error message regardless of
+/// what the auth crate puts in its `Display` now or later. The credential *type* and (on the keyfile
+/// path) the file *path* are still reported by the callers — those are user-supplied configuration,
+/// not secrets — upholding the driver's rule that keyfile JSON bodies never appear in error
+/// messages.
+fn scrub_credential_error(error: &google_cloud_auth::build_errors::Error) -> &'static str {
+    if error.is_missing_field() {
+        "a required field is missing or has the wrong type"
+    } else if error.is_parsing() {
+        "the credential JSON could not be parsed"
+    } else if error.is_unknown_type() {
+        "the credential type is unknown or invalid"
+    } else if error.is_not_supported() {
+        "the credential type is not supported for this use"
+    } else if error.is_loading() {
+        "the credentials could not be loaded"
+    } else {
+        "the credentials could not be built"
+    }
 }
 
 /// Wrap a base credential with service-account impersonation using the `google-cloud-auth`
@@ -706,7 +739,10 @@ fn build_impersonated_credentials(
     }
     builder.build().map_err(|e| {
         err(
-            format!("failed to build impersonated credentials for {target_principal:?}: {e}"),
+            format!(
+                "failed to build impersonated credentials for {target_principal:?}: {}",
+                scrub_credential_error(&e)
+            ),
             Status::InvalidArguments,
         )
     })
@@ -1045,6 +1081,59 @@ mod tests {
             error
                 .message
                 .contains("failed to build service_account credentials")
+        );
+    }
+
+    // A credential-build failure must never echo the credential JSON body into the ADBC error
+    // message: the auth crate's `Display` (which we no longer interpolate — see
+    // `scrub_credential_error`) can carry `serde_json`-derived fragments of the input, and the
+    // input holds the private key. Here a `service_account` key carries a recognizable fake secret
+    // but omits the required `client_email`, so `.build()` fails; the surfaced message must name the
+    // detected type and a safe category, and must not contain the secret material.
+    #[test]
+    fn credential_build_failure_never_leaks_key_material() {
+        const SECRET: &str = "SUPER-SECRET-PRIVATE-KEY-DO-NOT-LEAK-abc123";
+        let json = format!(
+            "{{\"type\":\"service_account\",\"private_key\":\"{SECRET}\",\"private_key_id\":42}}"
+        );
+        let error = build_credentials_from_json(&json).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        // The message names the detected credential type (safe, user-supplied config) ...
+        assert!(
+            error
+                .message
+                .contains("failed to build service_account credentials"),
+            "message should name the detected type: {}",
+            error.message
+        );
+        // ... but never the secret key material carried in the credential JSON body.
+        assert!(
+            !error.message.contains(SECRET),
+            "credential-build error leaked key material: {}",
+            error.message
+        );
+    }
+
+    // The scrubber turns a raw `google-cloud-auth` builder error into a fixed, secret-free phrase.
+    // We drive a real builder to produce a genuine `build_errors::Error` (its constructors are
+    // crate-private, so this is the only way to obtain one), then confirm the scrubbed phrase is a
+    // constant and carries none of the secret-bearing body the raw error was built from.
+    #[test]
+    fn scrub_credential_error_returns_fixed_phrase() {
+        const SECRET: &str = "leak-me-if-you-can-9f8e7d";
+        // A `service_account` body carrying a fake secret but missing the required `client_email`:
+        // `.build()` fails deserializing it, yielding a real `build_errors::Error`.
+        let raw = ServiceAccountCredentials::new(serde_json::json!({
+            "type": "service_account",
+            "private_key": SECRET,
+        }))
+        .build()
+        .unwrap_err();
+        let scrubbed = scrub_credential_error(&raw);
+        assert_eq!(scrubbed, "the credential JSON could not be parsed");
+        assert!(
+            !scrubbed.contains(SECRET),
+            "scrubbed phrase must be a fixed string, got: {scrubbed}"
         );
     }
 
