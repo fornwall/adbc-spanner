@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -29,6 +30,41 @@ def pytest_collection_modifyitems(
 def pytest_addoption(parser):
     adbc_drivers_validation.tests.conftest.pytest_addoption(parser)
     parser.addoption("--vendor-version", action="store", default="emulator")
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    # Fail loudly on a "green" run that exercised no real coverage.
+    #
+    # The suite reports Spanner's expected SQL-dialect divergences as per-case
+    # *skips* (each with a reason), and pytest exits 0 when every collected case is
+    # skipped. So an all-skip run is indistinguishable, by exit code alone, from a
+    # broken harness that silently skipped everything (e.g. the driver failing to
+    # load, or a fixture misconfiguration) — the exact "harness breakage looks like
+    # an expected dialect skip" hole that the gating workflow otherwise leaves open.
+    #
+    # When FOUNDRY_VALIDATION_REQUIRE_PASSES is set — the CI workflow sets it, so
+    # ad-hoc local `-k` runs (which may legitimately select only skipped cases) are
+    # unaffected — require that at least one collected case actually passed. This
+    # mirrors the env-gated fail-loud convention of the ADBC_TEST_REQUIRE_TARGET
+    # skip guard used by the Rust/Python integration suites.
+    if exitstatus != int(pytest.ExitCode.OK):
+        return
+    if not os.environ.get("FOUNDRY_VALIDATION_REQUIRE_PASSES"):
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    passed = len(reporter.stats.get("passed", [])) if reporter is not None else 0
+    if session.testscollected > 0 and passed == 0:
+        message = (
+            f"FOUNDRY_VALIDATION_REQUIRE_PASSES: collected {session.testscollected} "
+            "case(s) but none passed — every case skipped or errored. This usually "
+            "means the harness itself is broken (driver failed to load, connection "
+            "setup failed), not an expected Spanner SQL-dialect skip."
+        )
+        if reporter is not None:
+            reporter.write_line(message, red=True)
+        else:  # pragma: no cover - terminal reporter is a default plugin
+            print(message)
+        session.exitstatus = int(pytest.ExitCode.TESTS_FAILED)
 
 
 @pytest.fixture(scope="session")
