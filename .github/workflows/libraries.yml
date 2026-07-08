@@ -142,7 +142,14 @@ jobs:
           cp README.md LICENSE "$staging/"
           if [ "${{ runner.os }}" = "Windows" ]; then
             # Include the MSVC import library for consumers that link at build time.
-            cp "target/${{ matrix.target }}/release/adbc_spanner.dll.lib" "$staging/" 2>/dev/null || true
+            # It is a required part of the Windows artifact, so a missing one is a
+            # build regression that must fail the job loudly, not be swallowed.
+            implib="target/${{ matrix.target }}/release/adbc_spanner.dll.lib"
+            if [ ! -f "$implib" ]; then
+              echo "::error::expected Windows import library $implib is missing" >&2
+              exit 1
+            fi
+            cp "$implib" "$staging/"
             7z a "dist/${staging}.zip" "$staging"
           else
             tar -czf "dist/${staging}.tar.gz" "$staging"

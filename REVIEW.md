@@ -696,7 +696,11 @@ and a job-scoped `permissions: issues: write` to open a tracking issue (per-work
 `nightly-fuzz-failure` / `nightly-resilience-failure`), or, if one is already open, comment on it —
 idempotent, so a repeated failure never spams new issues. No third-party action added.);
 `foundry-validation` ends in `|| true`, making harness breakage indistinguishable from expected
-dialect failures; the Windows import-lib copy is `|| true`-optional (`libraries.yml:138`); the
+dialect failures; ~~the Windows import-lib copy is `|| true`-optional (`libraries.yml:138`)~~ (**Fixed.** The Package
+step's Windows branch (already gated on `runner.os == Windows`) no longer copies the
+`adbc_spanner.dll.lib` with `2>/dev/null || true`; it now asserts the import library exists and
+`exit 1`s with a `::error::` message if not, so a build regression that drops it fails the job loudly
+instead of shipping a `.zip` missing the import lib.); the
 wheel version parse greps `Cargo.toml` positionally — `cargo metadata | jq` is robust;
 ~~`adbc-validation.yml` rebuilds arrow-adbc C++ + GoogleTest from source every run (cache it)~~
 (**Fixed.** `adbc-validation.yml` now caches the `adbc-validation/build` tree (the FetchContent-cloned
