@@ -180,7 +180,7 @@ adbc_driver_manager = { git = "https://github.com/fornwall/arrow-adbc", rev = "7
 # Loads the built cdylib directly (bypassing the driver manager) so the raw-FFI lifecycle test
 # can drive double-release / error-struct-reuse paths the managed wrappers never hit. Already in
 # the dependency graph via adbc_driver_manager; same version range.
-libloading = "0.8"
+libloading = "0.9"
 # Admin clients, used by the emulator integration test to create the test instance and database.
 # Pinned to the same git revision as the google-cloud family above (see the note there).
 google-cloud-spanner-admin-instance-v1 = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
