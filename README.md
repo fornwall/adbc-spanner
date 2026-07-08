@@ -84,7 +84,8 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   `STRING(MAX)`, as `xdbc_type_name`).
 - Statistics: `get_statistics()` computes exact table/column counts with one aggregate scan per table
   — `ROW_COUNT`, and per column `NULL_COUNT` (plus `DISTINCT_COUNT` for groupable types). Spanner has
-  no cheap pre-computed statistics, so an `approximate` request returns nothing rather than scanning;
+  no cheap pre-computed statistics, so an `approximate` request gets the same exact scans (exact
+  values always satisfy an approximate request, and each row is flagged as not approximate);
   `get_statistic_names` is empty (Spanner has no custom named statistics).
 - `execute_schema()`: a query's result schema without running it (via `QueryMode::Plan`), so tools
   can introspect output columns — including a top-level `WITH` — with no data scan.

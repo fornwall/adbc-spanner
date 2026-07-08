@@ -278,8 +278,10 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   base credentials via `google-cloud-auth`'s `impersonated::Builder::from_source_credentials`,
   aligned with the BigQuery ADBC driver's `impersonate.*` group).
   (`get_statistics` computes exact `ROW_COUNT`/`NULL_COUNT`/`DISTINCT_COUNT` via one aggregate scan
-  per table — see `src/statistics.rs`; `approximate=true` returns nothing since Spanner has no cheap
-  stats. `get_statistic_names` returns an empty, correctly-typed result set.)
+  per table — see `src/statistics.rs`; `approximate=true` serves the same exact stats (exact values
+  always satisfy an approximate request; Spanner has no cheaper source), with
+  `statistic_is_approximate=false` on every row. `get_statistic_names` returns an empty,
+  correctly-typed result set.)
 - Partitioned execution (`execute_partitions`/`read_partition`): `execute_partitions` opens a batch
   read-only transaction (`DatabaseClient::batch_read_only_transaction`), calls `partition_query`, and
   serialises each `google_cloud_spanner::batch::Partition` (which carries its session + transaction

@@ -753,8 +753,10 @@ impl Connection for SpannerConnection {
     /// Table/column statistics, computed exactly from aggregate scans (`ROW_COUNT`, and per column
     /// `NULL_COUNT` and `DISTINCT_COUNT`). Name arguments are ADBC `LIKE` patterns.
     ///
-    /// Spanner keeps no cheap/pre-computed statistics, so an `approximate` request returns nothing
-    /// rather than triggering the expensive exact scans; pass `approximate = false` to compute them.
+    /// `approximate` makes no difference: Spanner keeps no cheap/pre-computed statistics, so both
+    /// modes run the same exact aggregate scans. That is spec-conformant — `approximate = true`
+    /// merely *allows* approximate values, and exact values always satisfy it (each returned row
+    /// reports `statistic_is_approximate = false`).
     fn get_statistics(
         &self,
         catalog: Option<&str>,
@@ -769,18 +771,17 @@ impl Connection for SpannerConnection {
         if catalog.is_some_and(|c| !like_match(c, "")) {
             return Ok(Box::new(RecordBatchIterator::new(Vec::new(), out_schema)));
         }
-        let schemas = if approximate {
-            Vec::new()
-        } else {
-            crate::statistics::collect_statistics(
-                &self.runtime,
-                &self.client,
-                &self.cancel,
-                &self.read_staleness,
-                db_schema,
-                table_name,
-            )?
-        };
+        // `approximate` is deliberately ignored: Spanner has no cheaper source of statistics, and
+        // exact values are always a conformant answer to an approximate request.
+        let _ = approximate;
+        let schemas = crate::statistics::collect_statistics(
+            &self.runtime,
+            &self.client,
+            &self.cancel,
+            &self.read_staleness,
+            db_schema,
+            table_name,
+        )?;
         let batch = crate::statistics::build(schemas, out_schema.clone())?;
         Ok(Box::new(RecordBatchIterator::new(
             vec![Ok(batch)],

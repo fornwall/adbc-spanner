@@ -6,7 +6,10 @@
 //!
 //! Spanner has no statistics catalog, but the count-style statistics can be computed exactly with a
 //! single aggregate scan per table: `ROW_COUNT` (table-level) plus per-column `NULL_COUNT` and
-//! `DISTINCT_COUNT`. All are integers, so they use the union's `int64` branch and are exact. (The
+//! `DISTINCT_COUNT`. All are integers, so they use the union's `int64` branch and are exact — the
+//! same exact scans serve both `approximate = false` (which *requires* exact values) and
+//! `approximate = true` (which merely *allows* approximate ones; exact values always satisfy it),
+//! and every row reports `statistic_is_approximate = false`. (The
 //! `MIN_VALUE`/`MAX_VALUE` statistics are not reported: the value union only has int64/uint64/
 //! float64/binary members, so they cannot represent Spanner's STRING/DATE/TIMESTAMP/NUMERIC types.)
 
