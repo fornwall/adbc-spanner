@@ -24,9 +24,11 @@ All levels parse option values with the same shared rules (`src/options.rs`):
 
 The *Round-trips* column below says what `get_option` (the string form; `AdbcDatabaseGetOption`
 etc.) returns for the option. Reading an option that is unset — and has no default to report —
-fails with `NotFound`. At the database and connection level only the string getter is implemented
-(`get_option_int` / `get_option_double` always fail); the statement level additionally serves
-`spanner.rows_per_batch` and `spanner.max_partitions` through `get_option_int`.
+fails with `NotFound`. The typed getters (`get_option_int` / `get_option_double`) reinterpret the
+same stored string, so they serve any set option whose value parses as that type — e.g.
+`spanner.rows_per_batch` and `spanner.max_partitions` through `get_option_int`, and the
+`spanner.rpc.timeout_seconds.*` options through `get_option_double` (integer-valued options are
+served as doubles too) — and fail with `InvalidArguments` for options whose value does not.
 
 ## Database options
 
@@ -79,6 +81,9 @@ path, not the original URI.
 | `spanner.request.priority` | `low`, `medium` or `high` (case-insensitive); `""` unsets | unset (service default, high) | yes, when set (the canonical lowercase form) | [Request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions) applied to every query/DML statement the driver builds, and the commit priority of every read/write transaction. Becomes the default for statements this connection creates (statements may override). |
 | `spanner.request.tag` | free-form string; `""` unsets | unset | yes, when set | [Request tag](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags) attached to every query/DML request the driver builds (surfaced in query/transaction statistics). Becomes the default for statements this connection creates (statements may override). Driver-internal metadata queries stay untagged. |
 | `spanner.transaction.tag` | free-form string; `""` unsets | unset | yes, when set | Transaction tag attached to every read/write transaction the driver builds (autocommit DML, the manual-mode commit, ingest commits). Connection level only. |
+| `spanner.rpc.timeout_seconds.query` | finite, non-negative seconds (fractions allowed); `0` disables; `""` unsets (see [RPC timeouts](#rpc-timeouts)) | unset (no deadline) | yes, when set (also via `get_option_double`) | Overall deadline on a query's **initial execution**: the `ExecuteStreamingSql` call plus the first chunk of the streamed result, the `execute_schema` / `execute_partitions` probes, and `read_partition`'s initial fetch. Expiry fails with `Timeout`. Becomes the default for statements this connection creates (statements may override). |
+| `spanner.rpc.timeout_seconds.update` | as `…query` | unset (no deadline) | yes, when set (also via `get_option_double`) | Overall deadline on each **write** operation: an autocommit DML / batch-DML transaction, the manual-mode commit, and each bulk-ingest commit chunk (covering any retries the client performs within it). A commit whose confirmation the driver stopped waiting for may still have landed server-side — the usual ambiguity of any timed-out commit. Same inheritance as `…query`. |
+| `spanner.rpc.timeout_seconds.fetch` | as `…query` | unset (no deadline) | yes, when set (also via `get_option_double`) | Overall deadline on **each subsequent chunk fetch** of a streamed result (after the first, which `…query` covers), enforced inside the background prefetch task so a stalled stream fails the consumer's next batch with `Timeout`. Same inheritance as `…query`. |
 
 Two standard connection options are **read-only**: `adbc.connection.catalog` and
 `adbc.connection.db_schema` (the "current" catalog/schema) both report `""` — a Spanner database
@@ -96,6 +101,9 @@ has a single, unnamed catalog and default schema — and cannot be set.
 | `spanner.max_timestamp_precision` | as the connection option; `""` resets to the **driver** default | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement timestamp-precision override (see [Timestamp precision](#timestamp-precision)). Note `""` resets to the driver default (`nanoseconds_error_on_overflow`), not to the connection's value. |
 | `spanner.request.priority` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement request-priority override. |
 | `spanner.request.tag` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement request-tag override. |
+| `spanner.rpc.timeout_seconds.query` | as the connection option; `0` disables; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement query-timeout override (see [RPC timeouts](#rpc-timeouts)). |
+| `spanner.rpc.timeout_seconds.update` | as the connection option; `0` disables; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement update-timeout override. |
+| `spanner.rpc.timeout_seconds.fetch` | as the connection option; `0` disables; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement fetch-timeout override. |
 | `adbc.statement.bind_by_name` | boolean | `false` (positional) | yes (`true`/`false`) | How bound Arrow columns pair with the query's `@name` parameters, following the ADBC SQLite reference driver's `bind_by_name` convention ([apache/arrow-adbc#3362](https://github.com/apache/arrow-adbc/issues/3362)). **`false`** (the default): strictly positional — the *i*-th bound column binds to the *i*-th distinct parameter in query order, column names ignored (the ADBC ordinal contract positional clients and validation suites rely on). **`true`**: strict by-name — each column binds to `@<its own name>` (order-independent); a bound column that names no query parameter fails with `InvalidArguments` naming the missing parameter. See [README § Status](../README.md#status). |
 | `adbc.ingest.target_table` | string: table name | unset | yes, when set | **Standard ADBC.** Bulk-ingest target table. Setting it clears any SQL query on the statement (query and ingest target are mutually exclusive on one handle). |
 | `adbc.ingest.target_db_schema` | string: named schema (`""` = Spanner's default, unnamed schema) | unset (default schema) | yes, when set | **Standard ADBC.** Named schema qualifying the ingest target table. |
@@ -176,6 +184,39 @@ the driver default (`nanoseconds_error_on_overflow`). `get_option` always report
 mode. The **bind** (write) direction is unaffected: Arrow timestamp parameters of any unit
 (`Second`/`Millisecond`/`Microsecond`/`Nanosecond`) are always accepted and bound at their full
 source precision.
+
+## RPC timeouts
+
+Without a deadline, a hung RPC blocks the (synchronous) ADBC call indefinitely, with `cancel` as
+the only escape. The `spanner.rpc.timeout_seconds.{query,update,fetch}` options — available at
+connection *and* statement level, named in parallel with the Flight SQL ADBC driver's
+`adbc.flight.sql.rpc.timeout_seconds.*` family — bound the driver's Spanner-facing operations:
+
+- **`query`** — the *initial execution* of a query: the `ExecuteStreamingSql` call plus the first
+  chunk of the streamed result (which settles the schema), the `execute_schema` /
+  `execute_partitions` probes, and `read_partition`'s initial fetch.
+- **`fetch`** — *each subsequent chunk fetch* of a streamed result, enforced inside the background
+  prefetch task, so a stream that stalls mid-result fails the consumer's next batch instead of
+  hanging. For a bound (parameterized) query over several rows it also covers executing each
+  per-row statement as the stream advances.
+- **`update`** — each *write* operation: an autocommit DML / batch-DML read/write transaction, the
+  manual-mode commit (including the commit performed when autocommit is re-enabled), and each
+  bulk-ingest commit chunk.
+
+Each value is a number of **seconds**, parsed as a double (fractions allowed) from a numeric
+string, integer or double value; it must be finite and non-negative — `NaN`, the infinities and
+negatives fail with `InvalidArguments`. `0` disables the timeout (same as unset, but it still
+round-trips); an empty string (`""`) unsets. A statement inherits the connection's values at
+creation and may override each independently. All three round-trip through `get_option` and
+`get_option_double`.
+
+Enforcement is an **overall deadline per operation** (a `tokio::time::timeout` around the whole
+driver-side operation, including any retries the client performs inside it), not a per-attempt
+gRPC timeout. An expired deadline fails with ADBC `Timeout` status. Note that a timed-out *commit*
+may still have landed server-side — the usual ambiguity of any commit whose confirmation was not
+awaited. DDL (an admin long-running operation) and driver-internal metadata queries
+(`get_objects`, schema probes, statistics scans) are deliberately not bounded, mirroring the
+request-tag/priority scope.
 
 ## Environment
 

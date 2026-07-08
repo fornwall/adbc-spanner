@@ -297,10 +297,12 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   count unchanged. The shared `ingest_into(table, mode)` helper (a small refactor of the former
   `ingest_create`) backs all three cases.
 - **Resilience suite misses some likely production failures** (`tests/resilience.rs`):
-  mid-stream disconnect after batches were consumed, latency/timeout toxics (nothing bounds the
-  wait — building the commit-fault test confirmed the client marks all data-plane RPCs idempotent
-  and retries transport faults with no attempt cap, so a commit under a persistent fault blocks
-  unboundedly; see the P3 timeout/retry-tuning feature), and truncated streams. (Faults during a
+  mid-stream disconnect after batches were consumed, latency/timeout toxics (by default nothing
+  bounds the wait — building the commit-fault test confirmed the client marks all data-plane RPCs
+  idempotent and retries transport faults with no attempt cap, so a commit under a persistent
+  fault blocks unboundedly; the `spanner.rpc.timeout_seconds.*` options now let callers bound
+  these operations, but the harness does not yet drive them under a toxic), and truncated
+  streams. (Faults during a
   manual-transaction commit are now covered by
   `commit_under_transport_fault_never_loses_the_write`.)
 - ~~**`statement.rs` has zero unit tests**; the option-coercion error paths (`rows_per_batch=0`,
@@ -631,8 +633,10 @@ trip unchanged).); `tests/resilience.rs` mutates process env in setup — safe o
 
 **Features** (all exposed by the pinned client unless noted): request priority / request tags /
 transaction tags (`StatementBuilder::set_priority/set_request_tag`,
-`set_transaction_tag`); request/attempt timeouts and retry tuning (today a hung network path
-blocks `block_on` indefinitely unless a second thread cancels); PostgreSQL-dialect databases are
+`set_transaction_tag`); ~~request/attempt timeouts~~ **done** —
+`spanner.rpc.timeout_seconds.{query,update,fetch}` (overall per-operation deadlines mapped to
+ADBC `Timeout`; see `docs/options.md`), though per-attempt retry *tuning* (policies/backoff)
+remains open; PostgreSQL-dialect databases are
 unsupported *and undetected* — minimum viable is probing the dialect once and failing fast with a
 clear error; OAuth access-token auth (needs a small custom credentials impl — the auth crate has
 no static-token builder); query options (optimizer version), directed reads, commit stats,

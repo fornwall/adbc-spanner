@@ -303,7 +303,17 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   `spanner.transaction.tag` connection-only; parsed/applied via `RequestConfig` in `src/request.rs`
   — every user statement builder goes through `SpannerStatement::sql_builder`, `run_batch_dml`
   tags the `ExecuteBatchDml` batch and the runner [commit priority + transaction tag; the client
-  has no batch-level priority setter], driver-internal metadata queries stay untagged).
+  has no batch-level priority setter], driver-internal metadata queries stay untagged), and RPC
+  timeouts (`spanner.rpc.timeout_seconds.{query,update,fetch}` at connection + statement level
+  [statement inherits, then overrides; `""` unsets, `0` disables; f64 seconds, finite +
+  non-negative, round-trip via `get_option`/`get_option_double` — `RpcTimeouts` in
+  `src/timeout.rs`, naming parallels Flight SQL's `adbc.flight.sql.rpc.timeout_seconds.*`] —
+  enforced as overall `tokio::time::timeout` deadlines (`timeout::with_timeout`) mapped to
+  `Status::Timeout`: query = initial execute + first chunk (plus the `execute_schema`/
+  `execute_partitions` probes and `read_partition`'s initial fetch), fetch = each later chunk
+  [inside the `spawn_prefetch` task, and each `next_bound_chunk` of a bound-query stream],
+  update = DML/batch-DML/manual-commit/ingest-chunk paths; DDL and driver-internal metadata
+  queries stay unbounded, mirroring the tags scope).
   (`get_statistics` computes exact `ROW_COUNT`/`NULL_COUNT`/`DISTINCT_COUNT` via one aggregate scan
   per table — see `src/statistics.rs`; `approximate=true` serves the same exact stats (exact values
   always satisfy an approximate request; Spanner has no cheaper source), with
