@@ -171,7 +171,8 @@ pub mod fuzzing {
         crate::bind::quote_ident(ident)
     }
     /// Resolve the column→parameter pairing for `sql` against a batch whose columns are named
-    /// `column_names` (built here as nullable `Int64`; the pairing never looks at types).
+    /// `column_names` (built here as nullable `Int64`; the pairing never looks at types), under
+    /// the default auto-detection mode (`adbc.statement.bind_by_name` unset).
     ///
     /// Returns the resolved names, or `None` on the documented count-mismatch rejection — after
     /// asserting the error is `InvalidArguments` (any other status, like any panic, is a bug).
@@ -183,7 +184,7 @@ pub mod fuzzing {
             .map(|name| Field::new(name, DataType::Int64, true))
             .collect();
         let batch = RecordBatch::new_empty(std::sync::Arc::new(Schema::new(fields)));
-        match crate::bind::resolve_parameter_names(sql, &batch) {
+        match crate::bind::resolve_parameter_names(sql, &batch, crate::bind::BindMode::Auto) {
             Ok(names) => Some(names),
             Err(e) => {
                 assert_eq!(
@@ -381,6 +382,24 @@ pub const OPTION_DATA_BOOST: &str = "spanner.data_boost_enabled";
 /// [`Statement::execute_partitions`](adbc_core::Statement::execute_partitions). This is a hint —
 /// Spanner may return fewer. Accepts a positive integer; unset lets Spanner choose.
 pub const OPTION_MAX_PARTITIONS: &str = "spanner.max_partitions";
+
+/// Statement option controlling how bound Arrow columns pair with the query's `@name` parameters,
+/// following the ADBC SQLite reference driver's `bind_by_name` convention
+/// ([apache/arrow-adbc#3362](https://github.com/apache/arrow-adbc/issues/3362)). Tri-state:
+///
+/// - **Unset** (the default): auto-detect. When **every** bound column's name matches one of the
+///   query's `@name` parameters, each column binds to `@<its own name>` (order-independent);
+///   otherwise the *i*-th column binds to the *i*-th distinct parameter in query order. This is
+///   the driver's historical behaviour — but note the pitfall the explicit modes close: a
+///   positional client whose column names all *coincidentally* match parameter names silently
+///   gets name-matched (possibly reordered) binding.
+/// - **`true`**: strict by-name. Every bound column must name a query parameter; an unmatched
+///   column fails with `InvalidArguments` naming the missing parameter.
+/// - **`false`**: strictly positional. Column names are ignored entirely.
+///
+/// Accepts a boolean; an empty string (`""`) resets to the unset default. `get_option` reports
+/// `true`/`false` when set and fails with `NotFound` when unset.
+pub const OPTION_BIND_BY_NAME: &str = "adbc.statement.bind_by_name";
 
 /// Driver-specific connection **and** statement option: the **read staleness** for read-only
 /// queries, as `"exact:<duration>"` or `"max:<duration>"`.

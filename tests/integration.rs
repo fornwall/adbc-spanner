@@ -3046,6 +3046,137 @@ fn execute_streams_in_batches() {
     drop.execute_update().expect("drop stream table");
 }
 
+/// The tri-state `adbc.statement.bind_by_name` option (the ADBC SQLite reference driver's
+/// convention): unset keeps the auto-detection heuristic, `false` forces positional binding even
+/// when every bound column name coincidentally matches a query parameter, and `true` forces
+/// strict by-name binding that rejects an unmatched column. Also covers the `get_option`
+/// round-trip (`true`/`false` when set, `NotFound` when unset or reset with `""`).
+#[test]
+fn bind_by_name_modes() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping bind_by_name_modes");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    let bind_by_name_key = || OptionStatement::Other(adbc_spanner::OPTION_BIND_BY_NAME.into());
+    // Two Int64 columns named after the query's parameters but in SWAPPED order: `b` (=10)
+    // first, `a` (=20) second — the coincidental-name-match input where the binding mode is
+    // observable in the result.
+    let batch = |names: [&str; 2]| {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(names[0], DataType::Int64, false),
+                Field::new(names[1], DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![10i64])),
+                Arc::new(Int64Array::from(vec![20i64])),
+            ],
+        )
+        .unwrap()
+    };
+    // Run `SELECT @a, @b` with `rows` bound under the given bind_by_name value (None = unset)
+    // and return the (@a, @b) values Spanner saw.
+    let query_pair = |connection: &mut SpannerConnection,
+                      rows: RecordBatch,
+                      mode: Option<&str>|
+     -> Result<(i64, i64), adbc_core::error::Error> {
+        let mut s = connection.new_statement().expect("new statement");
+        if let Some(value) = mode {
+            s.set_option(bind_by_name_key(), OptionValue::String(value.into()))
+                .expect("set bind_by_name");
+            assert_eq!(
+                s.get_option_string(bind_by_name_key())
+                    .expect("get bind_by_name"),
+                value,
+                "bind_by_name must round-trip through get_option"
+            );
+        } else {
+            assert!(
+                s.get_option_string(bind_by_name_key()).is_err(),
+                "unset bind_by_name must read as NotFound"
+            );
+        }
+        s.set_sql_query("SELECT @a AS a_value, @b AS b_value")
+            .unwrap();
+        s.bind(rows).expect("bind rows");
+        let reader = s.execute()?;
+        let batches = reader
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect bound query result");
+        assert_eq!(batches.len(), 1, "one bound row -> one result batch");
+        let ints = |i: usize| {
+            batches[0]
+                .column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        Ok((ints(0), ints(1)))
+    };
+
+    // Unset (default): every column names a parameter, so the heuristic binds BY NAME —
+    // order-independent, the swapped columns land on their namesakes.
+    assert_eq!(
+        query_pair(&mut connection, batch(["b", "a"]), None).expect("heuristic name binding"),
+        (20, 10),
+        "unset bind_by_name must name-match fully-matching columns"
+    );
+    // false: strictly positional — the very same batch now binds column 0 -> @a, column 1 -> @b,
+    // the coincidental name matches (and their order) ignored entirely.
+    assert_eq!(
+        query_pair(&mut connection, batch(["b", "a"]), Some("false")).expect("positional binding"),
+        (10, 20),
+        "bind_by_name=false must ignore coincidental name matches and bind positionally"
+    );
+    // true: strict by-name, same result as the heuristic for fully-matching columns.
+    assert_eq!(
+        query_pair(&mut connection, batch(["b", "a"]), Some("true")).expect("by-name binding"),
+        (20, 10),
+        "bind_by_name=true must bind matching columns by name"
+    );
+    // true with an unmatched column: a hard InvalidArguments error naming the parameter, instead
+    // of the heuristic's silent positional fallback.
+    let error = query_pair(&mut connection, batch(["a", "x"]), Some("true"))
+        .expect_err("bind_by_name=true must reject an unmatched column");
+    assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
+    assert!(
+        error.message.contains("could not find parameter \"x\""),
+        "error must name the missing parameter: {}",
+        error.message
+    );
+    // Unset with the same partial match: the heuristic falls back to positional binding.
+    assert_eq!(
+        query_pair(&mut connection, batch(["a", "x"]), None).expect("heuristic fallback"),
+        (10, 20),
+        "a partial name match under the default heuristic must bind positionally"
+    );
+    // Setting "" resets to the unset default: auto-detection again, and get_option is NotFound.
+    let mut reset = connection.new_statement().expect("new statement");
+    reset
+        .set_option(bind_by_name_key(), OptionValue::String("false".into()))
+        .expect("set bind_by_name=false");
+    reset
+        .set_option(bind_by_name_key(), OptionValue::String(String::new()))
+        .expect("reset bind_by_name");
+    assert!(
+        reset.get_option_string(bind_by_name_key()).is_err(),
+        "reset bind_by_name must read as NotFound again"
+    );
+}
+
 /// A parameterized query over **several bound rows** streams through the same bounded-chunk
 /// machinery as a plain query: each bound row's result is converted to Arrow in chunks of
 /// `spanner.rows_per_batch` (not materialised whole), and all rows execute inside one shared

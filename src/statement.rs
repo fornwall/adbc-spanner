@@ -91,6 +91,10 @@ pub struct SpannerStatement {
     /// and `replace`; the create/replace modes build the table from the ingest data's Arrow
     /// schema.
     ingest_mode: Option<IngestMode>,
+    /// How bound columns pair with the query's `@name` parameters
+    /// (`adbc.statement.bind_by_name`): unset auto-detects by-name vs positional, `true` forces
+    /// strict by-name, `false` forces positional. See [`bind::resolve_parameter_names`].
+    bind_mode: bind::BindMode,
     /// Rows converted into each streamed Arrow batch by `execute` (`spanner.rows_per_batch`).
     rows_per_batch: usize,
     /// Enable Data Boost for partitioned execution (`spanner.data_boost_enabled`).
@@ -138,6 +142,7 @@ impl SpannerStatement {
             target_db_schema: None,
             target_catalog: None,
             ingest_mode: None,
+            bind_mode: bind::BindMode::default(),
             rows_per_batch: DEFAULT_ROWS_PER_BATCH,
             data_boost: false,
             max_partitions: None,
@@ -169,7 +174,7 @@ impl SpannerStatement {
             }
             // Resolve the column→parameter mapping once per batch (it lexes `sql`), then reuse it
             // for every row instead of re-lexing the SQL per bound row.
-            let names = bind::resolve_parameter_names(sql, batch)?;
+            let names = bind::resolve_parameter_names(sql, batch, self.bind_mode)?;
             for row in 0..batch.num_rows() {
                 statements
                     .push(bind::bind_params(self.sql_builder(sql), &names, batch, row)?.build());
@@ -646,7 +651,7 @@ impl SpannerStatement {
         }
         if let Some(batch) = self.bound.first() {
             if batch.num_rows() > 0 {
-                let names = bind::resolve_parameter_names(sql, batch)?;
+                let names = bind::resolve_parameter_names(sql, batch, self.bind_mode)?;
                 builder = bind::bind_params(builder, &names, batch, 0)?;
             }
         }
@@ -686,6 +691,9 @@ impl Optionable for SpannerStatement {
                 // Append into an existing table, or create it (from the ingest data's Arrow schema,
                 // with a synthetic UUID primary key) in the create/replace modes.
                 self.ingest_mode = Some(ingest_mode_option(value)?);
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_BIND_BY_NAME => {
+                self.bind_mode = bind_by_name_option(value)?;
             }
             OptionStatement::Other(k) if k == crate::OPTION_ROWS_PER_BATCH => {
                 self.rows_per_batch = rows_per_batch_option(value)?;
@@ -728,6 +736,11 @@ impl Optionable for SpannerStatement {
             OptionStatement::Temporary => Some(false.to_string()),
             // Reported in the spec's canonical `adbc.ingest.mode.*` spelling.
             OptionStatement::IngestMode => self.ingest_mode.map(String::from),
+            // "true"/"false" when explicitly set; the unset default auto-detection reports the
+            // standard NotFound (there is no third string to round-trip).
+            OptionStatement::Other(k) if k == crate::OPTION_BIND_BY_NAME => {
+                self.bind_mode.option_string().map(str::to_string)
+            }
             OptionStatement::Other(k) if k == crate::OPTION_ROWS_PER_BATCH => {
                 Some(self.rows_per_batch.to_string())
             }
@@ -915,6 +928,7 @@ impl Statement for SpannerStatement {
         check_schema_query(&sql)?;
         let client = self.client.clone();
         let bound = self.bound.clone();
+        let bind_mode = self.bind_mode;
         // QueryMode::Plan analyses the query and returns its column metadata without scanning
         // any data, so dbt can introspect a model's output columns without wrapping it in a
         // `SELECT ... WHERE false` subquery.
@@ -926,7 +940,7 @@ impl Statement for SpannerStatement {
             // `@param` references resolve.
             if let Some(batch) = bound.first() {
                 if batch.num_rows() > 0 {
-                    let names = bind::resolve_parameter_names(&sql, batch)?;
+                    let names = bind::resolve_parameter_names(&sql, batch, bind_mode)?;
                     builder = bind::bind_params(builder, &names, batch, 0)?;
                 }
             }
@@ -1153,6 +1167,22 @@ fn check_ingest_temporary(value: OptionValue) -> Result<()> {
 /// integer (`0` = false, non-zero = true).
 fn bool_option(value: OptionValue) -> Result<bool> {
     crate::options::bool_option(value, "option")
+}
+
+/// Parse the tri-state `adbc.statement.bind_by_name` option into a [`bind::BindMode`]: a boolean
+/// (any of the shared bool spellings) selects strict by-name (`true`) or strictly positional
+/// (`false`) binding, and an empty string resets to the unset default — the auto-detection
+/// heuristic (matching how the other resettable statement options treat `""`).
+fn bind_by_name_option(value: OptionValue) -> Result<bind::BindMode> {
+    if matches!(&value, OptionValue::String(s) if s.is_empty()) {
+        return Ok(bind::BindMode::Auto);
+    }
+    let by_name = crate::options::bool_option(value, "option adbc.statement.bind_by_name")?;
+    Ok(if by_name {
+        bind::BindMode::ByName
+    } else {
+        bind::BindMode::Positional
+    })
 }
 
 /// Parse a positive `max_partitions` option, accepted as either an integer or a numeric string.
@@ -1402,6 +1432,49 @@ mod tests {
         // A non-string, non-int value kind is rejected outright.
         let error = bool_option(OptionValue::Double(1.0)).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
+    }
+
+    #[test]
+    fn bind_by_name_option_is_tri_state() {
+        use crate::bind::BindMode;
+        // A boolean (any shared spelling) selects the strict modes.
+        for truthy in ["true", "1", "yes"] {
+            assert_eq!(
+                bind_by_name_option(OptionValue::String(truthy.into())).unwrap(),
+                BindMode::ByName
+            );
+        }
+        for falsy in ["false", "0", "no"] {
+            assert_eq!(
+                bind_by_name_option(OptionValue::String(falsy.into())).unwrap(),
+                BindMode::Positional
+            );
+        }
+        assert_eq!(
+            bind_by_name_option(OptionValue::Int(1)).unwrap(),
+            BindMode::ByName
+        );
+        assert_eq!(
+            bind_by_name_option(OptionValue::Int(0)).unwrap(),
+            BindMode::Positional
+        );
+        // An empty string resets to the unset default (auto-detection) — which get_option reports
+        // as NotFound (no string form).
+        assert_eq!(
+            bind_by_name_option(OptionValue::String(String::new())).unwrap(),
+            BindMode::Auto
+        );
+        assert_eq!(BindMode::Auto.option_string(), None);
+        assert_eq!(BindMode::ByName.option_string(), Some("true"));
+        assert_eq!(BindMode::Positional.option_string(), Some("false"));
+        // Anything else is rejected, naming the option.
+        let error = bind_by_name_option(OptionValue::String("maybe".into())).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(
+            error.message.contains("adbc.statement.bind_by_name"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

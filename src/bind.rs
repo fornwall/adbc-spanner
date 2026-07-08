@@ -3,7 +3,10 @@
 //!
 //! ADBC supplies statement parameters (and bulk-ingest rows) as an Arrow [`RecordBatch`]: each
 //! column is one parameter, and each row is one set of bindings. Spanner uses **named** query
-//! parameters (`@name`), so a bind column named `id` binds to `@id` in the SQL. Bulk ingest does
+//! parameters (`@name`), so a bind column named `id` binds to `@id` in the SQL — how the
+//! column→parameter pairing is decided (by name, positionally, or auto-detected via the
+//! `adbc.statement.bind_by_name` option) is documented on [`BindMode`] and
+//! [`resolve_parameter_names`]. Bulk ingest does
 //! not go through SQL at all: each bound row becomes one insert [`Mutation`] (see
 //! [`insert_mutation`]), whose cells use the exact same Arrow→Spanner value mapping
 //! ([`cell_value`]) as parameter binding.
@@ -87,29 +90,91 @@ pub(crate) fn bind_params(
     Ok(builder)
 }
 
+/// How bound Arrow columns pair with the query's `@name` parameters — the tri-state
+/// [`OPTION_BIND_BY_NAME`](crate::OPTION_BIND_BY_NAME) (`adbc.statement.bind_by_name`) statement
+/// option, following the ADBC SQLite reference driver's `bind_by_name` convention
+/// (apache/arrow-adbc#3362).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum BindMode {
+    /// Option unset (the default): auto-detect — by name when **every** bound column names a
+    /// query parameter, else positionally. The historical heuristic; see
+    /// [`resolve_parameter_names`].
+    #[default]
+    Auto,
+    /// `adbc.statement.bind_by_name=true`: strict by-name. Every bound column must name a query
+    /// parameter; an unmatched column is an `InvalidArguments` error naming the missing parameter.
+    ByName,
+    /// `adbc.statement.bind_by_name=false`: strictly positional. Column names are ignored
+    /// entirely; the *i*-th column binds the *i*-th distinct parameter in query order.
+    Positional,
+}
+
+impl BindMode {
+    /// The value `get_option` reports for `adbc.statement.bind_by_name`: `"true"`/`"false"` when
+    /// explicitly set, `None` (→ the standard `NotFound` for an unset option) for the default
+    /// auto-detection.
+    pub(crate) fn option_string(self) -> Option<&'static str> {
+        match self {
+            BindMode::Auto => None,
+            BindMode::ByName => Some("true"),
+            BindMode::Positional => Some("false"),
+        }
+    }
+}
+
 /// Work out which parameter name each column of `batch` binds to for `sql`.
 ///
 /// ADBC's parameter model is a batch of columns matched to the query's parameters. This driver
-/// resolves the pairing two ways:
+/// resolves the pairing two ways, selected by `mode` (the `adbc.statement.bind_by_name` option):
 ///
-/// - **By name** (the historical behaviour): when every bound column's name is one of the query's
-///   `@name` parameters, each column binds to `@<its own name>`.
-/// - **Positionally** (the ADBC ordinal contract): otherwise the *i*-th column binds to the *i*-th
-///   distinct `@name` parameter in query order. This is what positional clients expect — most ADBC
-///   drivers (PostgreSQL, Snowflake, …) bind by position, and the Python DBAPI / validation suites
-///   pass parameters as `$1`/`?` with columns not named after the parameters.
+/// - **By name**: each column binds to `@<its own name>`, order-independent. With
+///   [`BindMode::ByName`] a column whose name is not one of the query's parameters is rejected
+///   here with `InvalidArguments` naming the missing parameter (a parameter no column names is
+///   simply left unbound, which Spanner rejects at execution time).
+/// - **Positionally** (the ADBC ordinal contract): the *i*-th column binds to the *i*-th
+///   distinct `@name` parameter in query order; the counts must line up. This is what positional
+///   clients expect — most ADBC drivers (PostgreSQL, Snowflake, …) bind by position, and the
+///   Python DBAPI / validation suites pass parameters as `$1`/`?` with columns not named after
+///   the parameters. [`BindMode::Positional`] ignores column names entirely.
+///
+/// With [`BindMode::Auto`] (option unset — the historical behaviour) the driver picks: by name
+/// when every bound column's name is one of the query's `@name` parameters, else positionally.
+/// Note the pitfall the explicit modes exist to close: under auto-detection a positional client
+/// whose column names all *coincidentally* match parameter names silently gets name-matched
+/// (possibly reordered) binding, and a by-name client with one misspelled column silently falls
+/// back to positional binding (or a count-mismatch error) instead of an unmatched-name error.
 ///
 /// Lexing the SQL to find its `@name` parameters is the expensive part, so callers resolve once per
 /// (sql, batch) and reuse the result across every row via [`bind_params`].
-pub(crate) fn resolve_parameter_names(sql: &str, batch: &RecordBatch) -> Result<Vec<String>> {
+pub(crate) fn resolve_parameter_names(
+    sql: &str,
+    batch: &RecordBatch,
+    mode: BindMode,
+) -> Result<Vec<String>> {
     let schema = batch.schema();
     let column_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     let params = named_parameters(sql);
     let param_set: std::collections::HashSet<&str> = params.iter().map(String::as_str).collect();
 
-    // Name mode: every bound column corresponds to a query parameter of the same name.
-    if !column_names.is_empty() && column_names.iter().all(|c| param_set.contains(c)) {
-        return Ok(column_names.iter().map(|c| (*c).to_string()).collect());
+    match mode {
+        // Strict name mode: every bound column must correspond to a query parameter.
+        BindMode::ByName => {
+            if let Some(missing) = column_names.iter().find(|c| !param_set.contains(*c)) {
+                return Err(invalid_argument(format!(
+                    "could not find parameter {missing:?}: adbc.statement.bind_by_name is true, \
+                     so every bound column must name one of the query's parameters (got {params:?})",
+                )));
+            }
+            return Ok(column_names.iter().map(|c| (*c).to_string()).collect());
+        }
+        // Auto-detected name mode: every bound column corresponds to a query parameter.
+        BindMode::Auto => {
+            if !column_names.is_empty() && column_names.iter().all(|c| param_set.contains(c)) {
+                return Ok(column_names.iter().map(|c| (*c).to_string()).collect());
+            }
+        }
+        // Strictly positional: column names are never consulted.
+        BindMode::Positional => {}
     }
 
     // Positional mode: i-th column -> i-th parameter. Counts must line up.
@@ -1096,7 +1161,7 @@ mod tests {
         // Every bound column names a query parameter -> bind by name, order-independent.
         let b = int_batch(&["b", "a"]);
         assert_eq!(
-            resolve_parameter_names("SELECT @a, @b", &b).unwrap(),
+            resolve_parameter_names("SELECT @a, @b", &b, BindMode::Auto).unwrap(),
             vec!["b", "a"],
         );
     }
@@ -1107,14 +1172,83 @@ mod tests {
         // produce) -> i-th column binds to the i-th parameter in query order.
         let b = int_batch(&["res", "other"]);
         assert_eq!(
-            resolve_parameter_names("INSERT INTO t VALUES (@p1, @p2)", &b).unwrap(),
+            resolve_parameter_names("INSERT INTO t VALUES (@p1, @p2)", &b, BindMode::Auto).unwrap(),
             vec!["p1", "p2"],
         );
         // A single unmatched column still binds to the single parameter.
         let one = int_batch(&["res"]);
         assert_eq!(
-            resolve_parameter_names("INSERT INTO t VALUES (@p1)", &one).unwrap(),
+            resolve_parameter_names("INSERT INTO t VALUES (@p1)", &one, BindMode::Auto).unwrap(),
             vec!["p1"],
+        );
+    }
+
+    #[test]
+    fn auto_mode_partial_name_match_falls_back_to_positional() {
+        // Only SOME columns name query parameters -> the heuristic (option unset) binds
+        // positionally, i-th column to i-th parameter — pinning the historical behaviour (the
+        // matching "a" column does NOT get name-bound).
+        let b = int_batch(&["a", "x"]);
+        assert_eq!(
+            resolve_parameter_names("SELECT @b, @a", &b, BindMode::Auto).unwrap(),
+            vec!["b", "a"],
+        );
+    }
+
+    #[test]
+    fn by_name_mode_binds_by_name_and_leaves_extra_params_unbound() {
+        // Strict by-name: order-independent, and a query parameter no column names (@c) is simply
+        // left unbound (Spanner rejects that at execution time, not here).
+        let b = int_batch(&["b", "a"]);
+        assert_eq!(
+            resolve_parameter_names("SELECT @a, @b, @c", &b, BindMode::ByName).unwrap(),
+            vec!["b", "a"],
+        );
+    }
+
+    #[test]
+    fn by_name_mode_rejects_an_unmatched_column_naming_the_parameter() {
+        // bind_by_name=true: a bound column with no matching query parameter is a hard
+        // InvalidArguments error naming the missing parameter — never a silent positional
+        // fallback (which is what BindMode::Auto would do with this input).
+        let b = int_batch(&["a", "x"]);
+        let err = resolve_parameter_names("SELECT @a, @b", &b, BindMode::ByName).unwrap_err();
+        assert_eq!(err.status, adbc_core::error::Status::InvalidArguments);
+        assert!(
+            err.message.contains("could not find parameter \"x\""),
+            "error must name the missing parameter: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn positional_mode_ignores_coincidental_name_matches() {
+        // Every column name matches a query parameter, so the Auto heuristic would silently bind
+        // by name (reordering the values!). bind_by_name=false must ignore the names entirely:
+        // column 0 binds @a, column 1 binds @b.
+        let b = int_batch(&["b", "a"]);
+        assert_eq!(
+            resolve_parameter_names("SELECT @a, @b", &b, BindMode::Positional).unwrap(),
+            vec!["a", "b"],
+        );
+        // Contrast: the unset default name-matches the very same input (see
+        // resolves_parameters_by_name_when_columns_match).
+        assert_eq!(
+            resolve_parameter_names("SELECT @a, @b", &b, BindMode::Auto).unwrap(),
+            vec!["b", "a"],
+        );
+    }
+
+    #[test]
+    fn positional_mode_still_requires_matching_counts() {
+        // Even a column that names a parameter cannot save a count mismatch under
+        // bind_by_name=false.
+        let b = int_batch(&["a"]);
+        let err = resolve_parameter_names("SELECT @a, @b", &b, BindMode::Positional).unwrap_err();
+        assert!(
+            err.message.contains("parameter count mismatch"),
+            "unexpected error: {}",
+            err.message
         );
     }
 
@@ -1132,7 +1266,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![2, 4])),
             ],
         );
-        let names = resolve_parameter_names("SELECT @a, @b", &b).unwrap();
+        let names = resolve_parameter_names("SELECT @a, @b", &b, BindMode::Auto).unwrap();
         assert_eq!(names, vec!["a", "b"]);
         for row in 0..b.num_rows() {
             assert!(bind_params(Statement::builder("SELECT @a, @b"), &names, &b, row).is_ok());
@@ -1142,7 +1276,7 @@ mod tests {
     #[test]
     fn positional_binding_rejects_count_mismatch() {
         let b = int_batch(&["x", "y"]);
-        let err = resolve_parameter_names("SELECT @p1", &b).unwrap_err();
+        let err = resolve_parameter_names("SELECT @p1", &b, BindMode::Auto).unwrap_err();
         assert!(
             err.message.contains("parameter count mismatch"),
             "unexpected error: {}",

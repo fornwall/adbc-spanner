@@ -263,7 +263,10 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   background task prefetching the next chunk ahead of the consumer), DML, DDL (via
   admin `UpdateDatabaseDdl`), manual transactions
   (buffer-and-commit), native Arrow types for DATE/TIMESTAMP/NUMERIC and native `List`/`Struct` for
-  ARRAY/STRUCT, parameter binding (by column name, else positionally; an `arrow.json`-tagged string
+  ARRAY/STRUCT, parameter binding (auto-detected: by column name when every bound column names a
+  query parameter, else positionally; the tri-state `adbc.statement.bind_by_name` statement option
+  [SQLite reference-driver convention] forces strict by-name [`true`, unmatched column →
+  `InvalidArguments`] or strictly positional [`false`, names ignored]; an `arrow.json`-tagged string
   column binds as a `JSON`-typed param — Spanner won't coerce STRING params into JSON columns — and
   ingest create modes map it to a `JSON` column) + bulk ingest (append and
   create/create_append/replace — the create modes build the table via admin DDL from the ingest
