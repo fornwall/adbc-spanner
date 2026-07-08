@@ -66,8 +66,12 @@ fn value_for(code: InfoCode) -> InfoValue {
         InfoCode::DriverVersion => InfoValue::Str(DRIVER_VERSION.to_string()),
         InfoCode::DriverArrowVersion => InfoValue::Str(ARROW_VERSION.to_string()),
         InfoCode::DriverAdbcVersion => InfoValue::Int(ADBC_VERSION_1_1_0),
-        // Recognised codes without a stable value (vendor product/Arrow versions, Substrait
-        // bounds), plus any future `#[non_exhaustive]` variant.
+        // Recognised codes without a stable value, emitted as null rather than a fabricated string.
+        // In particular `VendorVersion` (the Spanner *server* product version) is deliberately null:
+        // Spanner exposes no user-visible server version, so reporting anything here — least of all
+        // this driver's own version — would be misleading. Likewise `VendorArrowVersion` (the server
+        // runs no Arrow library) and the Substrait version bounds. Also covers any future
+        // `#[non_exhaustive]` variant.
         _ => InfoValue::Null,
     }
 }
@@ -238,6 +242,58 @@ mod tests {
             version.starts_with('v') && version.len() > 1,
             "expected a v-prefixed arrow version, got {version:?}"
         );
+    }
+
+    #[test]
+    fn vendor_version_is_null_not_the_driver_version() {
+        // The Spanner *server* has no user-visible product version, so `VendorVersion` must never be
+        // populated — least of all with this driver's own version. It is absent from the default set
+        // and, when requested explicitly, yields a row with a null string value.
+        assert!(!REPORTED.contains(&InfoCode::VendorVersion));
+        assert!(!REPORTED.contains(&InfoCode::VendorArrowVersion));
+
+        let batch = build(Some(
+            [InfoCode::VendorVersion, InfoCode::DriverVersion]
+                .into_iter()
+                .collect(),
+        ))
+        .unwrap();
+        assert_eq!(batch.num_rows(), 2);
+
+        let names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let union = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UnionArray>()
+            .unwrap();
+
+        let vendor_row = (0..names.len())
+            .find(|&i| names.value(i) == u32::from(&InfoCode::VendorVersion))
+            .unwrap();
+        let vendor_value = union.value(vendor_row);
+        let vendor_str = vendor_value
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("VendorVersion lands in the string branch");
+        assert!(
+            vendor_str.is_null(0),
+            "VendorVersion must be null, got {:?}",
+            vendor_str.value(0)
+        );
+
+        // The driver version, by contrast, is a real non-null string — so the null above is a
+        // deliberate absence, not a build that reports nothing at all.
+        let driver_row = (0..names.len())
+            .find(|&i| names.value(i) == u32::from(&InfoCode::DriverVersion))
+            .unwrap();
+        let driver_value = union.value(driver_row);
+        let driver_str = driver_value.as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(!driver_str.is_null(0));
+        assert_eq!(driver_str.value(0), DRIVER_VERSION);
     }
 
     #[test]
