@@ -510,6 +510,14 @@ fn query_and_dml_round_trip() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(ddl_rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    // Assert the stored value round-trips through the freshly-created table, not merely that a row
+    // exists: the `Note` column must read back as the exact string that was inserted.
+    let ddl_note = ddl_rows[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(ddl_note.value(0), "hello");
 
     // Drop the scratch table like every other section, so re-runs against a persistent
     // `SPANNER_GCP_DATABASE` don't accumulate leftovers.
@@ -1214,6 +1222,26 @@ fn query_and_dml_round_trip() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(created.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    // Assert the replaced values, not just the count: `replace` drops + recreates, so the table
+    // holds exactly one copy of `create_rows()` — (10,"x"),(20,"y") — rather than the duplicated
+    // four rows an `append` would have left behind.
+    let created_ids = created[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let created_labels = created[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        (0..created[0].num_rows())
+            .map(|i| (created_ids.value(i), created_labels.value(i)))
+            .collect::<Vec<_>>(),
+        vec![(10, "x"), (20, "y")],
+        "replace-mode ingest must leave exactly the replacement rows"
+    );
     // `create` mode on an already-existing table is the ADBC-contractual error path: the driver
     // emits a `CREATE TABLE` (no `IF NOT EXISTS`), Spanner rejects it because `AdbcCreate` still
     // exists, and the driver remaps the DDL failure onto `AlreadyExists` — naming the table — so
