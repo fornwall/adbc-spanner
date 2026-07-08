@@ -23,12 +23,14 @@
 //! Spanner `TIMESTAMP` has **nanosecond** precision (up to nine fractional digits), so a
 //! `Timestamp` parameter is bound at its full source precision: a `Nanosecond` input formats up to
 //! nine fractional digits, `Microsecond` six, `Millisecond` three, `Second` none — nothing is
-//! truncated. The driver's read path is symmetric: it maps Spanner `TIMESTAMP` to Arrow
+//! truncated. The driver's default read path is symmetric: it maps Spanner `TIMESTAMP` to Arrow
 //! `Timestamp(Nanosecond, "UTC")` and parses values back at full nanosecond precision (see
 //! [`crate::conversion::parse_timestamp_nanos`]), so nanoseconds bound here round-trip
 //! full-precision. (Arrow's nanosecond `i64` only spans ~1677-09-21 to 2262-04-11, so a Spanner
-//! timestamp outside that range cannot be read back and surfaces as an error rather than a silent
-//! truncation.)
+//! timestamp outside that range cannot be read back at nanosecond precision and surfaces as an
+//! error rather than a silent truncation; set
+//! [`spanner.max_timestamp_precision=microseconds`](crate::OPTION_MAX_TIMESTAMP_PRECISION) to read
+//! the full 0001–9999 range at microsecond precision instead.)
 //!
 //! Spanner encodes `DATE` / `TIMESTAMP` / `NUMERIC` values on the wire as strings, and query
 //! parameters are sent untyped (Spanner infers the type from the SQL). So these three are formatted

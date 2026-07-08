@@ -75,6 +75,7 @@ path, not the original URI.
 | `adbc.connection.transaction.isolation_level` | one of `adbc.connection.transaction.isolation.default`, `…isolation.serializable`, `…isolation.repeatable_read` | `adbc.connection.transaction.isolation.default` (the database default) | yes, always (the canonical spec string) | **Standard ADBC.** Isolation level for read/write (DML) transactions. `serializable` and `repeatable_read` map to Spanner's isolation levels; `default` leaves the database default. The other spec levels (`read_uncommitted`, `read_committed`, `snapshot`, `linearizable`) are rejected with `NotImplemented`; unknown strings with `InvalidArguments`. |
 | `spanner.read.staleness` | `exact:<duration>` or `max:<duration>` (see [Stale reads](#stale-reads)); `""` unsets | unset (strong read) | yes, when set (the raw, trimmed value) | Stale-read bound for read-only queries. Becomes the default for statements this connection creates (statements may override). Mutually exclusive with `spanner.read.timestamp`. |
 | `spanner.read.timestamp` | RFC 3339 timestamp, optionally prefixed `read:` or `min:` (see [Stale reads](#stale-reads)); `""` unsets | unset (strong read) | yes, when set (the raw, trimmed value) | Absolute read timestamp for read-only queries. Same inheritance and mutual exclusion as `spanner.read.staleness`. |
+| `spanner.max_timestamp_precision` | `nanoseconds_error_on_overflow` or `microseconds` (see [Timestamp precision](#timestamp-precision)); `""` resets to the default | `nanoseconds_error_on_overflow` | yes, always (the effective mode) | How `TIMESTAMP` columns map to Arrow: `Timestamp(Nanosecond, "UTC")` with a loud error on instants outside ~1677–2262 (the default), or `Timestamp(Microsecond, "UTC")` covering Spanner's full 0001–9999 range (sub-microsecond digits truncate toward negative infinity). Becomes the default for statements this connection creates (statements may override); also governs `get_table_schema` and `read_partition`, which have no statement. |
 | `spanner.request.priority` | `low`, `medium` or `high` (case-insensitive); `""` unsets | unset (service default, high) | yes, when set (the canonical lowercase form) | [Request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions) applied to every query/DML statement the driver builds, and the commit priority of every read/write transaction. Becomes the default for statements this connection creates (statements may override). |
 | `spanner.request.tag` | free-form string; `""` unsets | unset | yes, when set | [Request tag](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags) attached to every query/DML request the driver builds (surfaced in query/transaction statistics). Becomes the default for statements this connection creates (statements may override). Driver-internal metadata queries stay untagged. |
 | `spanner.transaction.tag` | free-form string; `""` unsets | unset | yes, when set | Transaction tag attached to every read/write transaction the driver builds (autocommit DML, the manual-mode commit, ingest commits). Connection level only. |
@@ -92,6 +93,7 @@ has a single, unnamed catalog and default schema — and cannot be set.
 | `spanner.max_partitions` | positive integer | unset (Spanner chooses) | yes, when set (also via `get_option_int`) | Hint for the maximum number of partitions returned by `execute_partitions`; Spanner may return fewer. |
 | `spanner.read.staleness` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement stale-read override. Set `""` to clear a bound inherited from the connection (i.e. force a strong read). Mutually exclusive with `spanner.read.timestamp`. |
 | `spanner.read.timestamp` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement read-timestamp override; same semantics as above. |
+| `spanner.max_timestamp_precision` | as the connection option; `""` resets to the **driver** default | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement timestamp-precision override (see [Timestamp precision](#timestamp-precision)). Note `""` resets to the driver default (`nanoseconds_error_on_overflow`), not to the connection's value. |
 | `spanner.request.priority` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement request-priority override. |
 | `spanner.request.tag` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement request-tag override. |
 | `adbc.statement.bind_by_name` | boolean | `false` (positional) | yes (`true`/`false`) | How bound Arrow columns pair with the query's `@name` parameters, following the ADBC SQLite reference driver's `bind_by_name` convention ([apache/arrow-adbc#3362](https://github.com/apache/arrow-adbc/issues/3362)). **`false`** (the default): strictly positional — the *i*-th bound column binds to the *i*-th distinct parameter in query order, column names ignored (the ADBC ordinal contract positional clients and validation suites rely on). **`true`**: strict by-name — each column binds to `@<its own name>` (order-independent); a bound column that names no query parameter fails with `InvalidArguments` naming the missing parameter. See [README § Status](../README.md#status). |
@@ -131,6 +133,49 @@ with `""`). Because Spanner accepts the bounded-staleness kinds (`max:` / `min:`
 single-use transactions, contexts that need a multi-use read-only transaction (a bound query over
 several parameter rows, `execute_partitions`) pin them to their most-stale legal equivalent
 (`max:<d>` → exact staleness `<d>`, `min:<t>` → read timestamp `<t>`).
+
+## Timestamp precision
+
+Spanner `TIMESTAMP` values span 0001-01-01 to 9999-12-31 at nanosecond precision. Arrow's
+`Timestamp(Nanosecond)` stores an `i64` count of nanoseconds since the Unix epoch, which spans only
+~1677-09-21 to 2262-04-11 — so the two ranges cannot both be honoured at nanosecond precision.
+`spanner.max_timestamp_precision` — available at connection *and* statement level — picks how the
+driver resolves the mismatch:
+
+- **`nanoseconds_error_on_overflow`** (the default) — `TIMESTAMP` maps to
+  `Timestamp(Nanosecond, "UTC")`, preserving the full nanosecond precision Spanner delivers on the
+  wire. Reading a well-formed instant outside the representable ~1677–2262 window is a **loud
+  `InvalidArguments` error** naming the column, the offending value, and this option as the escape
+  hatch.
+- **`microseconds`** — `TIMESTAMP` maps to `Timestamp(Microsecond, "UTC")`, whose `i64` covers
+  Spanner's **entire** 0001–9999 range (and far beyond). Any sub-microsecond digits a value carries
+  are **truncated toward negative infinity** (a floor on the timeline, also for pre-epoch instants:
+  `…56.789012345Z` → `…56.789012`, and one nanosecond *before* the epoch becomes microsecond `-1`,
+  not `0`). This is lossy for values with real nanosecond precision — that loss is the price of the
+  full range.
+
+Exactly these two values exist **by design**. A third mode that keeps nanoseconds and silently
+wraps or clamps out-of-range values (as some drivers offer under a plain `nanoseconds` value) is
+deliberately not offered: a wrapped timestamp is a plausible-looking, wrong instant —
+indistinguishable from real data, i.e. silent corruption. Every supported mode is either lossless
+or explicit about what it loses (documented microsecond truncation), and anything else fails
+loudly. The option is modeled on the Snowflake ADBC driver's `max_timestamp_precision`
+([apache/arrow-adbc#2917](https://github.com/apache/arrow-adbc/issues/2917)), minus its
+silent-wraparound value.
+
+The selected mode applies uniformly to **every** surface that produces timestamp data or
+timestamp-typed schemas: `execute` (plain, parameterized and multi-row bound queries, including
+the streamed batches after the first), DML `THEN RETURN` rows, `execute_schema` (the PLAN probe)
+and the `execute_partitions` schema — so the advertised schema always carries the same unit as the
+data — plus `get_table_schema` and `read_partition` at the connection level. `read_partition`
+decodes under the **reading** connection's mode: set it to the same value as the producing
+statement so the descriptor's schema matches what is streamed.
+
+A statement inherits the connection's mode at creation and may override it; setting `""` resets to
+the driver default (`nanoseconds_error_on_overflow`). `get_option` always reports the effective
+mode. The **bind** (write) direction is unaffected: Arrow timestamp parameters of any unit
+(`Second`/`Millisecond`/`Microsecond`/`Nanosecond`) are always accepted and bound at their full
+source precision.
 
 ## Environment
 

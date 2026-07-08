@@ -241,6 +241,7 @@ database path, not the original URI.
 | `adbc.connection.transaction.isolation_level` | Isolation level for read/write transactions. |
 | `spanner.read.staleness`                     | Stale-read bound (`exact:`/`max:` + duration) for read-only queries; inherited by the connection's statements. |
 | `spanner.read.timestamp`                     | Absolute read timestamp (RFC 3339) for read-only queries; mutually exclusive with `spanner.read.staleness`. |
+| `spanner.max_timestamp_precision`            | How `TIMESTAMP` maps to Arrow: `nanoseconds_error_on_overflow` (default) or `microseconds` (full 0001–9999 range) — see [Type mapping](#type-mapping); inherited by the connection's statements. |
 | `spanner.request.priority`                   | [Request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions) (`low`/`medium`/`high`) for queries, DML and commits; inherited by the connection's statements. |
 | `spanner.request.tag`                        | [Request tag](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags) attached to every query/DML request; inherited by the connection's statements. |
 | `spanner.transaction.tag`                    | Transaction tag attached to every read/write transaction the driver builds. Connection-level only. |
@@ -254,6 +255,7 @@ database path, not the original URI.
 | `spanner.max_partitions`                     | Hint for the maximum partition count from `execute_partitions`. |
 | `spanner.read.staleness`                     | Per-statement stale-read override. |
 | `spanner.read.timestamp`                     | Per-statement read-timestamp override. |
+| `spanner.max_timestamp_precision`            | Per-statement timestamp-precision override (`""` resets to the driver default). |
 | `spanner.request.priority`                   | Per-statement request-priority override. |
 | `spanner.request.tag`                        | Per-statement request-tag override. |
 | `adbc.ingest.target_table`                   | Bulk-ingest target table. |
@@ -306,7 +308,7 @@ authenticates as that target. The option group mirrors the BigQuery ADBC driver'
 | `FLOAT64`                                   | `Float64`                         |
 | `FLOAT32`                                   | `Float32`                         |
 | `DATE`                                      | `Date32`                          |
-| `TIMESTAMP`                                 | `Timestamp(Nanosecond, "UTC")`    |
+| `TIMESTAMP`                                 | `Timestamp(Nanosecond, "UTC")` (default) or `Timestamp(Microsecond, "UTC")` — see below |
 | `NUMERIC`                                   | `Decimal128(38, 9)`               |
 | `BYTES`                                     | `Binary`                          |
 | `STRING` / `UUID` / `INTERVAL` / `ENUM` / `PROTO` | `Utf8`                      |
@@ -333,11 +335,16 @@ carrying `arrow.json` binds as a Spanner `JSON`-typed parameter (a list of tagge
 Bulk-ingest create modes likewise create a `JSON` column for a tagged field. So JSON values
 round-trip: what `execute` reads from a `JSON` column can be bound straight back into one.
 
-`TIMESTAMP` is read at full nanosecond precision (matching the bind/write path). Arrow stores
-`Timestamp(Nanosecond)` as an `i64` count of nanoseconds since the Unix epoch, which spans only
-~1677-09-21 to 2262-04-11 — a narrower window than Spanner's year 1–9999 range. A Spanner timestamp
-outside that window cannot be represented, so reading one surfaces an `InvalidArguments` error naming
-the offending value rather than silently truncating or wrapping it.
+`TIMESTAMP` is read at full nanosecond precision by default (matching the bind/write path). Arrow
+stores `Timestamp(Nanosecond)` as an `i64` count of nanoseconds since the Unix epoch, which spans
+only ~1677-09-21 to 2262-04-11 — a narrower window than Spanner's year 1–9999 range. A Spanner
+timestamp outside that window cannot be represented, so reading one surfaces an `InvalidArguments`
+error naming the column and the offending value rather than silently truncating or wrapping it. To
+read tables holding such timestamps, set `spanner.max_timestamp_precision=microseconds` (connection
+or statement level): `TIMESTAMP` then maps to `Timestamp(Microsecond, "UTC")`, which covers
+Spanner's entire range, at the cost of truncating any sub-microsecond digits toward negative
+infinity. Those are the only two modes — there is deliberately no silently-wrapping nanosecond mode
+— see [docs/options.md § Timestamp precision](docs/options.md#timestamp-precision).
 
 > **Note:** native `STRUCT` mapping needs `Type::struct_type()`, which is on `google-cloud-rust`
 > `main` but not yet in a crates.io release. Until it ships, `Cargo.toml` pins the `google-cloud-*`

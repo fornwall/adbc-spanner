@@ -18,8 +18,8 @@ scripts/run-foundry-validation.sh -k ingest  # extra args are forwarded to pytes
 
 The script builds the driver, installs the (pinned) validation package, bootstraps the emulator
 instance/database, and runs pytest. The `Foundry validation` workflow runs it as a **gating CI
-job** on pushes to main and pull requests (plus *workflow_dispatch*): every case passes, skips
-with a reason, or is a strict xfail pinned to a pending upstream suite fix (see below).
+job** on pushes to main and pull requests (plus *workflow_dispatch*): every case passes or skips
+with a reason — there are **no expected failures**.
 
 ## Layout
 
@@ -83,24 +83,23 @@ spec-conformant — `approximate=True` merely *allows* approximate/out-of-date v
 values always satisfy it (Spanner keeps no cheap pre-computed statistics, so there is nothing
 cheaper to serve); each row reports `statistic_is_approximate=false`.
 
-**Strict xfails pending upstream suite fixes** (`_PENDING_UPSTREAM_XFAILS` in `tests/conftest.py`):
-three cases are unpassable with the suite at the current `VALIDATION_REF` pin, and the fixes are
-staged as fork-internal PRs on [fornwall/validation](https://github.com/fornwall/validation) ahead
-of an upstream (adbc-drivers/validation) submission. They are marked `xfail(strict=True)`, so once
-a fixed suite is pinned each xfail *must* be removed — in the same commit as the pin bump and its
-matching `SpannerQuirks` hookup — or the run fails:
+**Fork-pinned suite fixes (formerly strict xfails).** Three cases needed suite changes that are not
+yet in the upstream `adbc-drivers/validation` corpus; both are now landed on the
+[fornwall/validation](https://github.com/fornwall/validation) fork that `VALIDATION_REF` pins
+(`scripts/run-foundry-validation.sh`), staged ahead of an upstream submission. They are wired up in
+`SpannerQuirks` and now **pass**, so there are no strict xfails left. When `VALIDATION_REF` bumps to
+a suite that drops these changes (or renames the hooks), the matching quirks hookups below break —
+keep them in lockstep with the pin:
 
 - `test_get_objects_column_filter_table` / `_table_name` — tables created by `mode="create"` ingest
   carry the synthetic `adbc_ingest_key` column, which `get_objects` faithfully lists; the cases'
-  strict column-list assertions expect only the data columns.
-  Fix: [fornwall/validation#2](https://github.com/fornwall/validation/pull/2) (a
-  `bulk_ingest_synthetic_columns` `DriverFeatures` field the strict assertions filter out); quirks
-  hookup on pin bump: `bulk_ingest_synthetic_columns=["adbc_ingest_key"]`.
-- `test_rows_affected` — the suite hardcodes portable `CREATE TABLE (id INT)` with no override
+  strict column-list assertions expected only the data columns.
+  Suite fix: the `bulk_ingest_synthetic_column` `DriverFeatures` field the strict assertions filter
+  out; quirks hookup: `bulk_ingest_synthetic_column="adbc_ingest_key"`.
+- `test_rows_affected` — the suite hardcoded portable `CREATE TABLE (id INT)` with no override
   hook; Spanner needs a `PRIMARY KEY` and `INT64`.
-  Fix: [fornwall/validation#1](https://github.com/fornwall/validation/pull/1) (routes the DDL
-  through `query_override`); quirks hookup on pin bump: a
-  `"TestStatement.test_rows_affected"` → `CREATE TABLE ... (id INT64) PRIMARY KEY (id)` override.
+  Suite fix: the DDL is routed through `query_override("TestStatement.test_rows_affected.create_table", …)`;
+  quirks hookup: that override rewrites `(id INT)` → `(id INT64) PRIMARY KEY (id)`.
 
 Known remaining gaps (documented, not yet addressed):
 

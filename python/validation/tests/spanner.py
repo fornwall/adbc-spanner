@@ -45,6 +45,10 @@ class SpannerQuirks(model.DriverQuirks):
         statement_get_parameter_schema=True,
         statement_prepare=True,
         statement_rows_affected=True,
+        # create-mode ingest adds a synthetic UUID primary key (Spanner requires
+        # one), which get_objects faithfully lists; the suite filters it out of the
+        # strict column-list assertions.
+        bulk_ingest_synthetic_column="adbc_ingest_key",
         supported_xdbc_fields=[],
         # Spanner's default catalog and schema are both the empty string (GoogleSQL
         # INFORMATION_SCHEMA), which is what get_objects reports.
@@ -72,6 +76,16 @@ class SpannerQuirks(model.DriverQuirks):
         # primary key and native type names.
         if context == "TestStatement.sample_table":
             return "CREATE TABLE `sample_table` (id INT64, value STRING(MAX)) PRIMARY KEY (id)"
+        if context == "TestStatement.test_rows_affected.create_table":
+            # The suite's default is `CREATE TABLE <quoted_name> (id INT)`; Spanner needs
+            # a native type and a mandatory primary key. `id` can't be the key: the test
+            # runs `UPDATE ... SET id = id + 1`, which Spanner rejects on a key column, so
+            # add a synthetic UUID key (defaulted, so the test's `INSERT (id)` still works).
+            return default.replace(
+                "(id INT)",
+                "(id INT64, adbc_pk STRING(36) DEFAULT (GENERATE_UUID()))"
+                " PRIMARY KEY (adbc_pk)",
+            )
         return super().query_override(context, default)
 
     def quote_one_identifier(self, identifier: str) -> str:

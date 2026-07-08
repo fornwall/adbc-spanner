@@ -1,0 +1,1 @@
+{"partition":{"inner":{"Query":{"session":"projects/p/instances/i/databases/d/sessions/s","sql":"SELECT 1","partitionToken":"dG9rZW4="}}},"v":1}

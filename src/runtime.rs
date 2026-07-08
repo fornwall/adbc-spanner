@@ -37,6 +37,16 @@ pub(crate) type SharedRuntime = Arc<Runtime>;
 #[derive(Clone)]
 pub(crate) struct CancelSignal(Arc<CancelInner>);
 
+impl std::fmt::Debug for CancelSignal {
+    // `CancelInner` holds a `Notify`, which is not `Debug`; the latched flag is the only meaningful
+    // state to surface.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancelSignal")
+            .field("cancelled", &self.0.cancelled.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
 struct CancelInner {
     /// Latched cancellation state; `true` from `signal()` until the next `reset()`.
     cancelled: AtomicBool,

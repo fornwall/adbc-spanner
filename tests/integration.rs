@@ -1774,6 +1774,48 @@ fn query_and_dml_round_trip() {
         vec!["Singers".to_string()],
         "types reported by get_table_types must round-trip as get_objects filters"
     );
+
+    // --- Depth-boundary rule: a table_type filter matching nothing must still return the
+    // catalog + db_schema skeleton, with each schema's db_schema_tables an EMPTY list — never
+    // NULL, which is reserved for levels strictly below the requested depth. (The adbc-drivers
+    // validation suite caught DuckDB shipping NULL here; see duckdb/duckdb PR #21018.)
+    let no_such_type = connection
+        .get_objects(
+            ObjectDepth::Tables,
+            None,
+            None,
+            None,
+            Some(vec!["NO SUCH TYPE"]),
+            None,
+        )
+        .expect("get_objects with a table_type filter matching nothing")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect type-filtered objects");
+    let nb = &no_such_type[0];
+    assert_eq!(nb.num_rows(), 1, "single catalog");
+    let nb_schemas = nb.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+    assert!(
+        nb_schemas.is_valid(0),
+        "catalog_db_schemas must not be NULL at Tables depth"
+    );
+    let nb_schemas = nb_schemas.value(0);
+    let nb_schemas = nb_schemas.as_any().downcast_ref::<StructArray>().unwrap();
+    assert!(
+        !nb_schemas.is_empty(),
+        "the db_schema skeleton must survive a table_type filter matching nothing"
+    );
+    let nb_tables = nb_schemas
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    for i in 0..nb_tables.len() {
+        assert!(
+            nb_tables.is_valid(i),
+            "db_schema_tables must be EMPTY, not NULL, when the filter matches nothing"
+        );
+        assert_eq!(nb_tables.value(i).len(), 0, "no tables may match");
+    }
 }
 
 /// A bulk ingest big enough to cross the driver's per-chunk byte budget (~4 MiB) is split into
@@ -1893,6 +1935,163 @@ fn bulk_ingest_chunks_past_the_byte_budget() {
         .set_sql_query("DROP TABLE AdbcChunked")
         .unwrap();
     drop_chunked.execute_update().expect("drop chunked table");
+}
+
+/// `spanner.max_timestamp_precision`: a stored TIMESTAMP outside Arrow's nanosecond range
+/// (year 9999) errors loudly in the default mode — naming the column, the value and the escape
+/// hatch — and reads back exactly in `microseconds` mode, where `execute_schema` advertises the
+/// same `Timestamp(Microsecond, "UTC")` unit as the data path. Also covers connection-level
+/// inheritance, per-statement override, and `""` reset.
+#[test]
+fn timestamp_precision_modes_round_trip() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping timestamp_precision_modes_round_trip");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    let mut ddl = connection.new_statement().expect("new statement");
+    ddl.set_sql_query(
+        "DROP TABLE IF EXISTS AdbcTsPrecision; \
+         CREATE TABLE AdbcTsPrecision (Id INT64, T TIMESTAMP) PRIMARY KEY (Id)",
+    )
+    .unwrap();
+    ddl.execute_update().expect("create timestamp table");
+
+    // Year 9999 is far outside the ~1677–2262 Arrow nanosecond window; the sub-microsecond digits
+    // exercise the documented truncation. Year 1500 covers the pre-1677 side.
+    let mut ins = connection.new_statement().expect("new statement");
+    ins.set_sql_query(
+        "INSERT INTO AdbcTsPrecision (Id, T) VALUES \
+         (1, TIMESTAMP '9999-01-01T00:00:00.123456789Z'), \
+         (2, TIMESTAMP '1500-06-15T12:34:56.789012Z'), \
+         (3, NULL)",
+    )
+    .unwrap();
+    assert_eq!(ins.execute_update().expect("insert timestamps"), Some(3));
+
+    let micros_ty = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+
+    // Default mode: reading the out-of-range instant is a loud error pointing at the option.
+    let mut q = connection.new_statement().expect("new statement");
+    q.set_sql_query("SELECT T FROM AdbcTsPrecision WHERE Id = 1")
+        .unwrap();
+    // The failure may surface on `execute` (the first chunk settles the schema eagerly) or on the
+    // first batch pulled from the reader; either way the message must be diagnosable.
+    let msg = match q.execute() {
+        Err(e) => e.message,
+        Ok(reader) => match reader.collect::<Result<Vec<_>, _>>() {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("year-9999 TIMESTAMP must not decode as nanoseconds"),
+        },
+    };
+    assert!(
+        msg.contains("\"T\"")
+            && msg.contains("9999-01-01")
+            && msg.contains("spanner.max_timestamp_precision"),
+        "error should name the column, the value and the escape hatch: {msg}"
+    );
+
+    // Connection-level microseconds mode: statements inherit it, the option round-trips, and the
+    // full range reads back (with sub-microsecond digits truncated toward negative infinity).
+    connection
+        .set_option(
+            OptionConnection::Other("spanner.max_timestamp_precision".into()),
+            OptionValue::String("microseconds".into()),
+        )
+        .expect("set connection timestamp precision");
+    assert_eq!(
+        connection
+            .get_option_string(OptionConnection::Other(
+                "spanner.max_timestamp_precision".into()
+            ))
+            .unwrap(),
+        "microseconds"
+    );
+
+    let mut q = connection.new_statement().expect("new statement");
+    assert_eq!(
+        q.get_option_string(OptionStatement::Other(
+            "spanner.max_timestamp_precision".into()
+        ))
+        .unwrap(),
+        "microseconds",
+        "statement inherits the connection's mode"
+    );
+    q.set_sql_query("SELECT T FROM AdbcTsPrecision ORDER BY Id")
+        .unwrap();
+
+    // The advertised (PLAN-probe) schema must carry the same unit as the data the reader streams.
+    let planned = q.execute_schema().expect("execute_schema in micros mode");
+    assert_eq!(planned.field(0).data_type(), &micros_ty);
+
+    let reader = q.execute().expect("query in micros mode");
+    assert_eq!(reader.schema().field(0).data_type(), &micros_ty);
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect micros batches");
+    let ts = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .unwrap();
+    assert_eq!(ts.value(0), 253_370_764_800_123_456); // .123456789 truncated to .123456
+    assert_eq!(ts.value(1), -14_817_468_303_210_988); // 1500-06-15T12:34:56.789012Z
+    assert!(ts.is_null(2));
+
+    // The table-metadata surface honours the connection's mode too.
+    let table_schema = connection
+        .get_table_schema(None, None, "AdbcTsPrecision")
+        .expect("get_table_schema");
+    assert_eq!(
+        table_schema
+            .field_with_name("T")
+            .expect("T column")
+            .data_type(),
+        &micros_ty
+    );
+
+    // A statement-level `""` resets to the driver default (nanoseconds), overriding the
+    // connection's mode — and the out-of-range value errors again.
+    let mut q = connection.new_statement().expect("new statement");
+    q.set_option(
+        OptionStatement::Other("spanner.max_timestamp_precision".into()),
+        OptionValue::String(String::new()),
+    )
+    .expect("reset statement precision");
+    assert_eq!(
+        q.get_option_string(OptionStatement::Other(
+            "spanner.max_timestamp_precision".into()
+        ))
+        .unwrap(),
+        "nanoseconds_error_on_overflow"
+    );
+    q.set_sql_query("SELECT T FROM AdbcTsPrecision WHERE Id = 1")
+        .unwrap();
+    let planned = q.execute_schema().expect("execute_schema in default mode");
+    assert_eq!(
+        planned.field(0).data_type(),
+        &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+    );
+    let failed = match q.execute() {
+        Err(_) => true,
+        Ok(reader) => reader.collect::<Result<Vec<_>, _>>().is_err(),
+    };
+    assert!(failed, "statement-level reset must restore the loud error");
+
+    let mut drop_ts = connection.new_statement().expect("new statement");
+    drop_ts.set_sql_query("DROP TABLE AdbcTsPrecision").unwrap();
+    drop_ts.execute_update().expect("drop timestamp table");
 }
 
 /// Flatten a collected `get_objects` result into the table names it contains, across all
@@ -3771,7 +3970,9 @@ fn execute_partitions_round_trip() {
     let mut seen: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
     for token in &partitioned.partitions {
         let reader = connection.read_partition(token).expect("read_partition");
-        assert_eq!(reader.schema().field(0).name(), "Id");
+        // Every partition's reader must agree with the schema `execute_partitions` reported up
+        // front — a consumer routes each descriptor by that schema, so drift would be a bug.
+        assert_eq!(*reader.schema(), partitioned.schema);
         for batch in reader {
             let batch = batch.expect("partition batch");
             let ids = batch
@@ -4502,4 +4703,286 @@ fn request_priority_and_tags() {
     let mut drop = connection.new_statement().expect("new statement");
     drop.set_sql_query("DROP TABLE AdbcReqOpts").unwrap();
     drop.execute_update().expect("drop reqopts table");
+}
+
+/// One expected column of the schema-fidelity projection: a GoogleSQL expression producing a value
+/// of a mapped Spanner type, and the exact Arrow [`Field`] every schema path must map it to.
+struct SchemaFidelityCase {
+    /// Column alias in the projection (also the expected Arrow field name).
+    name: &'static str,
+    /// GoogleSQL expression of the column's type.
+    expr: &'static str,
+    /// The fully-typed Arrow field (name, data type, nullability, extension metadata).
+    field: Field,
+}
+
+/// The table of (type, SQL expression) pairs covering **every** mapped Spanner type: all the
+/// scalars, `ARRAY` of each scalar, and `ARRAY<STRUCT<..>>` including a nested `STRUCT` and a
+/// nested `ARRAY`. Top-level (non-array) `STRUCT` columns are excluded because real Cloud Spanner
+/// rejects returning structs except inside arrays ("Spanner does not yet support returning STRUCT
+/// except as arrays-of-structs"), so `ARRAY(SELECT AS STRUCT ...)` is the only portable spelling —
+/// it still exercises the whole recursive `STRUCT` mapping, one array level down.
+fn schema_fidelity_cases() -> Vec<SchemaFidelityCase> {
+    let json_metadata = || {
+        std::collections::HashMap::from([
+            ("ARROW:extension:name".to_string(), "arrow.json".to_string()),
+            ("ARROW:extension:metadata".to_string(), String::new()),
+        ])
+    };
+    let timestamp = || DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
+    let list = |item: Field| DataType::List(Arc::new(item));
+    let item = |data_type: DataType| Field::new("item", data_type, true);
+    let case = |name: &'static str, expr: &'static str, data_type: DataType| SchemaFidelityCase {
+        name,
+        expr,
+        field: Field::new(name, data_type, true),
+    };
+    vec![
+        case("BoolCol", "TRUE", DataType::Boolean),
+        case("Int64Col", "1", DataType::Int64),
+        case("Float64Col", "1.5", DataType::Float64),
+        case("Float32Col", "CAST(1.25 AS FLOAT32)", DataType::Float32),
+        case("StringCol", "'x'", DataType::Utf8),
+        case("BytesCol", "b'xyz'", DataType::Binary),
+        case("DateCol", "DATE '2024-01-15'", DataType::Date32),
+        case(
+            "TsCol",
+            "TIMESTAMP '2024-01-15T12:34:56.789012Z'",
+            timestamp(),
+        ),
+        case("NumCol", "NUMERIC '1.5'", DataType::Decimal128(38, 9)),
+        SchemaFidelityCase {
+            name: "JsonCol",
+            expr: r#"JSON '{"a":1}'"#,
+            field: Field::new("JsonCol", DataType::Utf8, true).with_metadata(json_metadata()),
+        },
+        case("ArrBool", "[TRUE, FALSE]", list(item(DataType::Boolean))),
+        case("ArrInt64", "[1, 2, 3]", list(item(DataType::Int64))),
+        case("ArrFloat64", "[1.5, 2.5]", list(item(DataType::Float64))),
+        case(
+            "ArrFloat32",
+            "[CAST(1.25 AS FLOAT32)]",
+            list(item(DataType::Float32)),
+        ),
+        case("ArrStr", "['a', 'b']", list(item(DataType::Utf8))),
+        case("ArrBytes", "[b'x']", list(item(DataType::Binary))),
+        case(
+            "ArrDate",
+            "[DATE '2024-01-15']",
+            list(item(DataType::Date32)),
+        ),
+        case(
+            "ArrTs",
+            "[TIMESTAMP '2024-01-15T12:34:56Z']",
+            list(item(timestamp())),
+        ),
+        case(
+            "ArrNum",
+            "[NUMERIC '2.5']",
+            list(item(DataType::Decimal128(38, 9))),
+        ),
+        SchemaFidelityCase {
+            name: "ArrJson",
+            expr: r#"[JSON '1', JSON '{"b":2}']"#,
+            field: Field::new(
+                "ArrJson",
+                list(item(DataType::Utf8).with_metadata(json_metadata())),
+                true,
+            ),
+        },
+        case(
+            "ArrStruct",
+            "ARRAY(SELECT AS STRUCT 1 AS id, 'a' AS tag)",
+            list(item(DataType::Struct(
+                vec![
+                    Field::new("id", DataType::Int64, true),
+                    Field::new("tag", DataType::Utf8, true),
+                ]
+                .into(),
+            ))),
+        ),
+        // A nested STRUCT and a nested ARRAY inside the array-of-structs element, so the recursive
+        // struct-field mapping (struct-in-struct, list-in-struct) is covered on every schema path.
+        case(
+            "ArrNestedStruct",
+            "ARRAY(SELECT AS STRUCT \
+                 STRUCT(DATE '2024-01-15' AS d, [1, 2] AS xs) AS child, 2.5 AS ratio)",
+            list(item(DataType::Struct(
+                vec![
+                    Field::new(
+                        "child",
+                        DataType::Struct(
+                            vec![
+                                Field::new("d", DataType::Date32, true),
+                                Field::new("xs", list(item(DataType::Int64)), true),
+                            ]
+                            .into(),
+                        ),
+                        true,
+                    ),
+                    Field::new("ratio", DataType::Float64, true),
+                ]
+                .into(),
+            ))),
+        ),
+    ]
+}
+
+/// Zero-row / metadata schema fidelity across every mapped Spanner type (the Snowflake ADBC
+/// driver's recurring "schema rot" bug class: zero-row and metadata paths deriving a schema
+/// differently from the data path).
+///
+/// The driver has two schema sources that could drift: the `QueryMode::Plan` probe behind
+/// `execute_schema`, and the result-set-metadata schema the streaming readers build
+/// (`build_schema` in `src/conversion.rs`, whose all-`Utf8` fallback kicks in if metadata were
+/// ever absent). For one projection covering the full type table this asserts:
+///
+/// 1. `execute` on a **zero-row** result yields the same fully-typed schema as the identical
+///    projection **with** rows — and both match the expected Arrow field exactly (name, type,
+///    nullability, `arrow.json` extension metadata), so the two paths can't "agree" by both
+///    degrading to the Utf8 fallback;
+/// 2. `execute_schema` (the PLAN probe) reports that same schema, for the with-rows and the
+///    zero-row statement alike;
+/// 3. the bound-parameter path (`BoundQueryBatchReader`, several bound rows in one multi-use
+///    read-only snapshot) reports that same schema even when every bound row matches nothing.
+#[test]
+fn zero_row_schema_fidelity() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping zero_row_schema_fidelity");
+        return;
+    };
+    ensure_database_once(&target);
+    // No serial guard: this test only runs read-only queries over literals (no DDL/DML, no
+    // tables), and read-only transactions do not block schema changes.
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    let cases = schema_fidelity_cases();
+    let select_list = cases
+        .iter()
+        .map(|c| format!("{} AS {}", c.expr, c.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // The identical projection over a one-row and a zero-row source.
+    let with_rows_sql = format!("SELECT {select_list} FROM UNNEST([1]) AS r");
+    let zero_rows_sql = format!("SELECT {select_list} FROM UNNEST(ARRAY<INT64>[]) AS r");
+
+    // Per-column comparison (rather than whole-schema equality) so a divergence names the exact
+    // column and path. Field equality covers name, data type (recursively), nullability and the
+    // extension metadata.
+    let assert_expected_schema = |actual: &Schema, path: &str| {
+        assert_eq!(
+            actual.fields().len(),
+            cases.len(),
+            "{path}: column count diverges"
+        );
+        for (actual_field, case) in actual.fields().iter().zip(&cases) {
+            assert_eq!(
+                actual_field.as_ref(),
+                &case.field,
+                "{path}: column {} diverges from the expected Arrow field",
+                case.name
+            );
+        }
+    };
+
+    // (1a) The data path, with rows: the reader schema and every batch's schema are fully typed.
+    let mut with_rows = connection.new_statement().expect("new statement");
+    with_rows.set_sql_query(&with_rows_sql).unwrap();
+    let reader = with_rows.execute().expect("execute with-rows projection");
+    assert_expected_schema(&reader.schema(), "execute (with rows) reader schema");
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect with-rows batches");
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    for batch in &batches {
+        assert_expected_schema(&batch.schema(), "execute (with rows) batch schema");
+    }
+
+    // (1b) The data path, zero rows: no rows come back, but the stream's schema (and the schema of
+    // any empty batch it yields) is still fully typed — never the all-Utf8 fallback.
+    let mut zero_rows = connection.new_statement().expect("new statement");
+    zero_rows.set_sql_query(&zero_rows_sql).unwrap();
+    let reader = zero_rows.execute().expect("execute zero-row projection");
+    assert_expected_schema(&reader.schema(), "execute (zero rows) reader schema");
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect zero-row batches");
+    assert_eq!(
+        batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        0,
+        "the zero-row projection must return no rows"
+    );
+    for batch in &batches {
+        assert_expected_schema(&batch.schema(), "execute (zero rows) empty-batch schema");
+    }
+
+    // (2) The metadata path: execute_schema's PLAN probe agrees with the data path, for the
+    // with-rows and the zero-row statement alike.
+    let mut plan = connection.new_statement().expect("new statement");
+    plan.set_sql_query(&with_rows_sql).unwrap();
+    let schema = plan.execute_schema().expect("execute_schema (with rows)");
+    assert_expected_schema(&schema, "execute_schema (with rows)");
+    plan.set_sql_query(&zero_rows_sql).unwrap();
+    let schema = plan.execute_schema().expect("execute_schema (zero rows)");
+    assert_expected_schema(&schema, "execute_schema (zero rows)");
+
+    // (3) The bound-parameter path: several bound rows stream through BoundQueryBatchReader (one
+    // shared read-only snapshot, one execution per bound row). With no bound row matching
+    // anything, the schema must still come out fully typed from the first (empty) result set's
+    // metadata.
+    let bound_sql = format!("SELECT {select_list} FROM UNNEST([1]) AS n WHERE n = @N");
+    let bind_values = |values: Vec<i64>| {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("N", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(values))],
+        )
+        .unwrap()
+    };
+
+    let mut bound_zero = connection.new_statement().expect("new statement");
+    bound_zero.set_sql_query(&bound_sql).unwrap();
+    bound_zero
+        .bind(bind_values(vec![5, 6, 7]))
+        .expect("bind three non-matching rows");
+    let reader = bound_zero.execute().expect("bound zero-row query");
+    assert_expected_schema(&reader.schema(), "bound query (zero rows) reader schema");
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect bound zero-row batches");
+    assert_eq!(
+        batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        0,
+        "no bound row matches, so the bound query must return no rows"
+    );
+    for batch in &batches {
+        assert_expected_schema(
+            &batch.schema(),
+            "bound query (zero rows) empty-batch schema",
+        );
+    }
+
+    // The same bound statement with matching rows produces the identical schema, so the zero-row
+    // bound path cannot have drifted from the with-rows bound path either.
+    let mut bound_hits = connection.new_statement().expect("new statement");
+    bound_hits.set_sql_query(&bound_sql).unwrap();
+    bound_hits
+        .bind(bind_values(vec![1, 1]))
+        .expect("bind two matching rows");
+    let reader = bound_hits.execute().expect("bound with-rows query");
+    assert_expected_schema(&reader.schema(), "bound query (with rows) reader schema");
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect bound with-rows batches");
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    for batch in &batches {
+        assert_expected_schema(&batch.schema(), "bound query (with rows) batch schema");
+    }
 }
