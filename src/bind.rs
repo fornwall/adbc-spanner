@@ -652,15 +652,22 @@ fn spanner_field_type(field: &Field) -> Result<String> {
 
 /// Build a `CREATE TABLE` statement for bulk ingest from the data's Arrow `schema`.
 ///
-/// Every data column maps to its Spanner type via [`spanner_field_type`], and a hidden
-/// [`INGEST_KEY_COLUMN`] UUID key is appended as the primary key (Spanner requires one). Pass
-/// `if_not_exists` for `create_append` mode. `db_schema` (the `adbc.ingest.target_db_schema` option)
-/// optionally qualifies the created table with a named schema.
+/// Every data column maps to its Spanner type via [`spanner_field_type`]. Spanner requires a primary
+/// key; `primary_key` chooses it:
+/// - `None` (the default): a hidden [`INGEST_KEY_COLUMN`] UUID column is appended and keyed on.
+/// - `Some(cols)` (the `spanner.ingest.primary_key` option): those **existing** data columns become
+///   the key, in the given order, and no synthetic column is added. Every name must appear in
+///   `schema`, else this fails with `InvalidArguments`. (Spanner separately rejects key columns of
+///   unsupported types at DDL time.)
+///
+/// Pass `if_not_exists` for `create_append` mode. `db_schema` (the `adbc.ingest.target_db_schema`
+/// option) optionally qualifies the created table with a named schema.
 pub(crate) fn create_table_sql(
     table: &str,
     db_schema: Option<&str>,
     schema: &arrow_schema::Schema,
     if_not_exists: bool,
+    primary_key: Option<&[String]>,
 ) -> Result<String> {
     let mut columns: Vec<String> = Vec::with_capacity(schema.fields().len() + 1);
     for field in schema.fields() {
@@ -670,16 +677,32 @@ pub(crate) fn create_table_sql(
             spanner_field_type(field)?
         ));
     }
-    columns.push(format!(
-        "{} STRING(36) DEFAULT (GENERATE_UUID())",
-        quote_ident(INGEST_KEY_COLUMN)
-    ));
+    let key = match primary_key {
+        Some(cols) => {
+            for col in cols {
+                if !schema.fields().iter().any(|f| f.name() == col) {
+                    return Err(invalid_argument(format!(
+                        "spanner.ingest.primary_key column {col:?} is not present in the ingest \
+                         data; the primary key must reference existing columns"
+                    )));
+                }
+            }
+            cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>()
+        }
+        None => {
+            columns.push(format!(
+                "{} STRING(36) DEFAULT (GENERATE_UUID())",
+                quote_ident(INGEST_KEY_COLUMN)
+            ));
+            vec![quote_ident(INGEST_KEY_COLUMN)]
+        }
+    };
     let guard = if if_not_exists { "IF NOT EXISTS " } else { "" };
     Ok(format!(
         "CREATE TABLE {guard}{} ({}) PRIMARY KEY ({})",
         qualified_table(db_schema, table),
         columns.join(", "),
-        quote_ident(INGEST_KEY_COLUMN),
+        key.join(", "),
     ))
 }
 
@@ -830,7 +853,7 @@ mod tests {
             ),
             Field::new("plain", DataType::Utf8, true),
         ]);
-        let sql = create_table_sql("t", None, &schema, false).unwrap();
+        let sql = create_table_sql("t", None, &schema, false, None).unwrap();
         assert!(
             sql.contains("`doc` JSON, `docs` ARRAY<JSON>, `plain` STRING(MAX)"),
             "unexpected DDL: {sql}"
@@ -864,22 +887,52 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
         ]);
         assert_eq!(
-            create_table_sql("my_table", None, &schema, false).unwrap(),
+            create_table_sql("my_table", None, &schema, false, None).unwrap(),
             "CREATE TABLE `my_table` (`idx` INT64, `name` STRING(MAX), \
              `adbc_ingest_key` STRING(36) DEFAULT (GENERATE_UUID())) \
              PRIMARY KEY (`adbc_ingest_key`)"
         );
         assert!(
-            create_table_sql("t", None, &schema, true)
+            create_table_sql("t", None, &schema, true, None)
                 .unwrap()
                 .starts_with("CREATE TABLE IF NOT EXISTS `t`")
         );
         // A named target schema (`adbc.ingest.target_db_schema`) qualifies the created table.
         assert!(
-            create_table_sql("t", Some("app"), &schema, false)
+            create_table_sql("t", Some("app"), &schema, false, None)
                 .unwrap()
                 .starts_with("CREATE TABLE `app`.`t`")
         );
+    }
+
+    #[test]
+    fn create_table_sql_uses_existing_columns_as_primary_key() {
+        let schema = Schema::new(vec![
+            Field::new("idx", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        // A single existing column becomes the key; no synthetic column is added.
+        assert_eq!(
+            create_table_sql("t", None, &schema, false, Some(&["idx".to_string()])).unwrap(),
+            "CREATE TABLE `t` (`idx` INT64, `name` STRING(MAX)) PRIMARY KEY (`idx`)"
+        );
+        // A composite key preserves the given column order (which drives Spanner's row layout).
+        assert_eq!(
+            create_table_sql(
+                "t",
+                None,
+                &schema,
+                false,
+                Some(&["name".to_string(), "idx".to_string()])
+            )
+            .unwrap(),
+            "CREATE TABLE `t` (`idx` INT64, `name` STRING(MAX)) PRIMARY KEY (`name`, `idx`)"
+        );
+        // A key column absent from the ingest data is rejected up front.
+        let err = create_table_sql("t", None, &schema, false, Some(&["missing".to_string()]))
+            .unwrap_err();
+        assert_eq!(err.status, adbc_core::error::Status::InvalidArguments);
+        assert!(err.message.contains("missing"));
     }
 
     #[test]

@@ -285,7 +285,11 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   ingest create modes map it to a `JSON` column) + bulk ingest (append and
   create/create_append/replace — the create modes build the table via admin DDL from the ingest
   data's Arrow schema with a synthetic `adbc_ingest_key` UUID primary key, since Spanner requires
-  one; the rows themselves ship as native **insert mutations** — `bind::insert_mutation`, reusing
+  one — or, when `spanner.ingest.primary_key` [statement option; comma-separated existing columns,
+  `""` unsets, round-trips via `get_option`] is set, key on those existing columns in the given
+  order and add no synthetic column [`bind::create_table_sql`; a named column absent from the ingest
+  schema → `InvalidArguments`, and it is ignored by `append`]; the rows themselves ship as native
+  **insert mutations** — `bind::insert_mutation`, reusing
   the same `cell_value` Arrow→Spanner mapping as parameter binding — not per-row `INSERT` DML, so
   nothing is SQL-parsed/planned per row but `INSERT` semantics are kept (duplicate PK →
   `AlreadyExists` naming the target table; `create` mode onto an existing table likewise remaps to

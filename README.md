@@ -118,7 +118,10 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   The three create modes build the table from the ingest data's Arrow schema, adding a synthetic
   `adbc_ingest_key` `STRING` primary key populated with a UUID per row, because Spanner requires
   every table to have a primary key and the ingest data carries none. That column is a real column,
-  so it shows up in a later `SELECT *` from the table.
+  so it shows up in a later `SELECT *` from the table. To key on your own data instead, set
+  `spanner.ingest.primary_key` to one or more existing ingest columns (comma-separated for a
+  composite key, in key order) — those become the primary key and no synthetic column is added; a
+  named column absent from the data fails with `InvalidArguments`.
 - Metadata: `get_table_types()`, `get_table_schema()`, and `get_objects()` (catalog/schema/table/
   column introspection from `INFORMATION_SCHEMA`; columns report the Spanner-native type, e.g.
   `STRING(MAX)`, as `xdbc_type_name`).

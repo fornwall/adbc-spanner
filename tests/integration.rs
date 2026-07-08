@@ -1311,6 +1311,111 @@ fn query_and_dml_round_trip() {
         .execute_update()
         .expect("drop create_append table");
 
+    // Create-mode ingest keyed on an existing column (`spanner.ingest.primary_key`): the table is
+    // built with that column as the primary key and NO synthetic `adbc_ingest_key` is added.
+    let mut drop_pk = connection.new_statement().expect("new statement");
+    drop_pk
+        .set_sql_query("DROP TABLE IF EXISTS AdbcIngestPk")
+        .unwrap();
+    drop_pk
+        .execute_update()
+        .expect("pre-drop primary-key table");
+    let pk_ingest = |connection: &mut SpannerConnection, key: &str, mode: &str| {
+        let mut s = connection.new_statement().expect("new statement");
+        s.set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcIngestPk".into()),
+        )
+        .unwrap();
+        s.set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_INGEST_PRIMARY_KEY.into()),
+            OptionValue::String(key.into()),
+        )
+        .unwrap();
+        s.set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String(mode.into()),
+        )
+        .unwrap();
+        // The option round-trips through get_option as the comma-joined column list.
+        assert_eq!(
+            s.get_option_string(OptionStatement::Other(
+                adbc_spanner::OPTION_INGEST_PRIMARY_KEY.into()
+            ))
+            .unwrap(),
+            key
+        );
+        s.bind(create_rows()).expect("bind primary-key ingest rows");
+        s.execute_update()
+    };
+    assert_eq!(
+        pk_ingest(&mut connection, "Id", "create").expect("create keyed on Id"),
+        Some(2)
+    );
+    assert_eq!(count_rows(&mut connection, "AdbcIngestPk"), 2);
+    // The created table's columns are exactly the data columns — no synthetic key was appended.
+    let pk_schema = connection
+        .get_table_schema(None, None, "AdbcIngestPk")
+        .expect("get_table_schema for the keyed ingest table");
+    let pk_cols: Vec<&str> = pk_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    assert_eq!(
+        pk_cols,
+        vec!["Id", "Label"],
+        "keying on an existing column must not add a synthetic column: {pk_cols:?}"
+    );
+    // Re-ingesting a row whose key duplicates an existing one is an insert-mutation conflict →
+    // AlreadyExists (the same PK semantics as the synthetic key), proving `Id` really is the key.
+    let dup_err = pk_ingest(&mut connection, "Id", "append")
+        .expect_err("appending duplicate primary keys must fail");
+    assert_eq!(
+        dup_err.status,
+        adbc_core::error::Status::AlreadyExists,
+        "duplicate primary key must be AlreadyExists, got: {dup_err:?}"
+    );
+    let mut drop_pk_done = connection.new_statement().expect("new statement");
+    drop_pk_done
+        .set_sql_query("DROP TABLE AdbcIngestPk")
+        .unwrap();
+    drop_pk_done
+        .execute_update()
+        .expect("drop primary-key table");
+    // A primary_key naming a column absent from the ingest data fails up front with
+    // InvalidArguments — before any DDL is sent to Spanner.
+    let mut bad_pk = connection.new_statement().expect("new statement");
+    bad_pk
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcIngestBadPk".into()),
+        )
+        .unwrap();
+    bad_pk
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_INGEST_PRIMARY_KEY.into()),
+            OptionValue::String("NoSuchColumn".into()),
+        )
+        .unwrap();
+    bad_pk
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("create".into()),
+        )
+        .unwrap();
+    bad_pk
+        .bind(create_rows())
+        .expect("bind bad-primary-key rows");
+    let bad_pk_err = bad_pk
+        .execute_update()
+        .expect_err("primary_key referencing a missing column must fail");
+    assert_eq!(
+        bad_pk_err.status,
+        adbc_core::error::Status::InvalidArguments,
+        "a primary_key column absent from the data must be InvalidArguments, got: {bad_pk_err:?}"
+    );
+
     // Parameterized query: bind @Id and read the matching row back.
     let param = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, false)])),
