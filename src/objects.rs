@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use adbc_core::error::{Result, Status};
 use adbc_core::options::ObjectDepth;
@@ -29,6 +30,7 @@ use crate::conversion::result_set_to_batch;
 use crate::error::{err, from_spanner};
 use crate::nested::{arrow_err, field, list_item, list_of, list_of_nullable, struct_fields};
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
+use crate::timeout::with_timeout;
 
 /// A column of a table, as returned by `get_objects`.
 pub(crate) struct Column {
@@ -80,6 +82,7 @@ pub(crate) fn collect_objects(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
     cancel: &CancelSignal,
+    timeout: Option<Duration>,
     depth: ObjectDepth,
     db_schema: Option<&str>,
     table_name: Option<&str>,
@@ -176,28 +179,35 @@ pub(crate) fn collect_objects(
         constraint_batch,
         key_column_batch,
         referential_batch,
-    ) = block_on_cancellable(runtime, cancel, async move {
-        // All the metadata queries run concurrently, sharing ONE multi-use read-only
-        // transaction so they observe a single snapshot (the previous serial implementation
-        // used one single-use transaction per query, with no cross-query consistency).
-        // INFORMATION_SCHEMA queries are allowed in read-only transactions, and the client
-        // supports concurrent statements on one transaction: `execute_query` takes `&self`,
-        // and the inline-begin state machine serialises the implicit `BeginTransaction`
-        // among concurrent first statements (later ones wait for the begun transaction id).
-        let txn = client
-            .read_only_transaction()
-            .build()
-            .await
-            .map_err(from_spanner)?;
-        try_join!(
-            query_txn(&txn, schemata_stmt),
-            query_txn_opt(&txn, tables_stmt),
-            query_txn_opt(&txn, columns_stmt),
-            query_txn_opt(&txn, constraints_stmt),
-            query_txn_opt(&txn, key_columns_stmt),
-            query_txn_opt(&txn, referential_stmt),
-        )
-    })?;
+    ) = block_on_cancellable(
+        runtime,
+        cancel,
+        // The whole `get_objects` metadata fetch is one query-side operation, bounded by the
+        // connection's query timeout (`spanner.rpc.timeout_seconds.query`); unset leaves it
+        // unbounded.
+        with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async move {
+            // All the metadata queries run concurrently, sharing ONE multi-use read-only
+            // transaction so they observe a single snapshot (the previous serial implementation
+            // used one single-use transaction per query, with no cross-query consistency).
+            // INFORMATION_SCHEMA queries are allowed in read-only transactions, and the client
+            // supports concurrent statements on one transaction: `execute_query` takes `&self`,
+            // and the inline-begin state machine serialises the implicit `BeginTransaction`
+            // among concurrent first statements (later ones wait for the begun transaction id).
+            let txn = client
+                .read_only_transaction()
+                .build()
+                .await
+                .map_err(from_spanner)?;
+            try_join!(
+                query_txn(&txn, schemata_stmt),
+                query_txn_opt(&txn, tables_stmt),
+                query_txn_opt(&txn, columns_stmt),
+                query_txn_opt(&txn, constraints_stmt),
+                query_txn_opt(&txn, key_columns_stmt),
+                query_txn_opt(&txn, referential_stmt),
+            )
+        }),
+    )?;
 
     let schema_names = str_col(&schema_batch, 0)?;
 

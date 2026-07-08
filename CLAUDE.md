@@ -321,10 +321,14 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   `src/timeout.rs`, naming parallels Flight SQL's `adbc.flight.sql.rpc.timeout_seconds.*`] —
   enforced as overall `tokio::time::timeout` deadlines (`timeout::with_timeout`) mapped to
   `Status::Timeout`: query = initial execute + first chunk (plus the `execute_schema`/
-  `execute_partitions` probes and `read_partition`'s initial fetch), fetch = each later chunk
-  [inside the `spawn_prefetch` task, and each `next_bound_chunk` of a bound-query stream],
-  update = DML/batch-DML/manual-commit/ingest-chunk paths; DDL and driver-internal metadata
-  queries stay unbounded, mirroring the tags scope), and retry tuning
+  `execute_partitions` probes and `read_partition`'s initial fetch) **and the driver-internal
+  metadata reads** (`get_objects`/`collect_objects`, `get_statistics`/`collect_statistics` — both
+  its discovery fetch and aggregate-scan phases, `get_table_schema`, the ingest `table_exists`
+  probe), fetch = each later chunk [inside the `spawn_prefetch` task, and each `next_bound_chunk`
+  of a bound-query stream], update = DML/batch-DML/manual-commit/ingest-chunk paths **and DDL**
+  (`run_ddl`'s admin `UpdateDatabaseDdl` call plus its LRO poll loop). So no driver-side network
+  path is left unbounded; unlike the tags/priority options (which leave metadata queries
+  untagged), the timeouts do bound them), and retry tuning
   (`spanner.retry.{max_attempts,max_elapsed_seconds}` at connection + statement level [statement
   inherits, then overrides; `""` unsets — the staleness/timeout pattern; round-trip via
   `get_option`/`get_option_int`/`get_option_double`] — `RetryConfig` in `src/retry.rs` bounds the

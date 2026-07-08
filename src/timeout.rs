@@ -15,8 +15,9 @@
 //!   ([`spawn_prefetch`](crate::runtime::spawn_prefetch)) so a stalled stream fails the consumer's
 //!   next batch instead of hanging the prefetcher.
 //! - [`OPTION_RPC_TIMEOUT_UPDATE`](crate::OPTION_RPC_TIMEOUT_UPDATE) — the **write paths**: DML /
-//!   batch-DML read/write transactions (including the manual-mode commit) and each bulk-ingest
-//!   commit chunk.
+//!   batch-DML read/write transactions (including the manual-mode commit), each bulk-ingest commit
+//!   chunk, and DDL — the admin `UpdateDatabaseDdl` call **and** its long-running-operation poll
+//!   loop, which otherwise polls without any bound.
 //!
 //! Each value is a number of **seconds**, parsed as `f64` (fractions allowed); it must be finite
 //! and non-negative — `NaN`, the infinities and negatives are rejected with `InvalidArguments`,

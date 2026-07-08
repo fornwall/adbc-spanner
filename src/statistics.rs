@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use adbc_core::error::{Error, Result, Status};
 use arrow_array::{
@@ -33,6 +34,7 @@ use crate::error::{err, from_spanner};
 use crate::nested::{arrow_err, dense_union, field, list_item, list_of, struct_fields};
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
 use crate::staleness::ReadStaleness;
+use crate::timeout::with_timeout;
 
 /// The `int64` branch of the `statistic_value` union (see `STATISTIC_VALUE_SCHEMA`).
 const INT64_BRANCH: i8 = 0;
@@ -66,28 +68,36 @@ pub(crate) fn collect_statistics(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
     cancel: &CancelSignal,
+    timeout: Option<Duration>,
     read_staleness: &ReadStaleness,
     db_schema: Option<&str>,
     table_name: Option<&str>,
 ) -> Result<Vec<SchemaStatistics>> {
+    // A metadata read, so the connection's query timeout bounds each network phase — the
+    // INFORMATION_SCHEMA discovery fetch here, and the aggregate scans below — with `Status::Timeout`
+    // on expiry; unset (the default) leaves them unbounded.
     let (table_batch, column_batch) = {
         let client = client.clone();
-        block_on_cancellable(runtime, cancel, async move {
-            let tables = query_batch(
-                &client,
-                "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
-                 WHERE TABLE_TYPE = 'BASE TABLE'",
-            )
-            .await?;
-            let columns = query_batch(
-                &client,
-                "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, SPANNER_TYPE \
-                 FROM INFORMATION_SCHEMA.COLUMNS \
-                 ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION",
-            )
-            .await?;
-            Ok::<_, Error>((tables, columns))
-        })?
+        block_on_cancellable(
+            runtime,
+            cancel,
+            with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async move {
+                let tables = query_batch(
+                    &client,
+                    "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
+                     WHERE TABLE_TYPE = 'BASE TABLE'",
+                )
+                .await?;
+                let columns = query_batch(
+                    &client,
+                    "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, SPANNER_TYPE \
+                     FROM INFORMATION_SCHEMA.COLUMNS \
+                     ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION",
+                )
+                .await?;
+                Ok::<_, Error>((tables, columns))
+            }),
+        )?
     };
 
     let (ts, tn) = (str_col(&table_batch, 0)?, str_col(&table_batch, 1)?);
@@ -141,37 +151,43 @@ pub(crate) fn collect_statistics(
     // index and slot it back into deterministic order. The whole stream is driven inside a single
     // `block_on_cancellable`, so a `cancel` still interrupts an in-flight batch of scans, and any
     // scan error propagates out (via `?`) as an overall `Err`.
-    let batches: Vec<RecordBatch> = block_on_cancellable(runtime, cancel, async {
-        let mut slots: Vec<Option<RecordBatch>> = (0..prepared.len()).map(|_| None).collect();
-        let mut scans = stream::iter(prepared.iter().enumerate().map(|(idx, p)| {
-            let client = client.clone();
-            let sql = p.sql.clone();
-            // The aggregate scans the user table, so honour the connection's read staleness.
-            let bound = bound.clone();
-            async move {
-                let transaction = crate::staleness::single_use(&client, bound);
-                let result_set = transaction
-                    .execute_query(SpannerSql::builder(sql).build())
-                    .await
-                    .map_err(from_spanner)?;
-                // The aggregate scan returns only INT64 counts, never a TIMESTAMP column, so the
-                // default timestamp precision is fine here.
-                let (_schema, batch) = result_set_to_batch(
-                    result_set,
-                    crate::conversion::TimestampPrecision::default(),
-                )
-                .await?;
-                Ok::<_, Error>((idx, batch))
+    // The whole concurrent scan phase is one query-side operation, bounded by the same query
+    // timeout (so a stalled aggregate scan cannot hang the collector unboundedly).
+    let batches: Vec<RecordBatch> = block_on_cancellable(
+        runtime,
+        cancel,
+        with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async {
+            let mut slots: Vec<Option<RecordBatch>> = (0..prepared.len()).map(|_| None).collect();
+            let mut scans = stream::iter(prepared.iter().enumerate().map(|(idx, p)| {
+                let client = client.clone();
+                let sql = p.sql.clone();
+                // The aggregate scans the user table, so honour the connection's read staleness.
+                let bound = bound.clone();
+                async move {
+                    let transaction = crate::staleness::single_use(&client, bound);
+                    let result_set = transaction
+                        .execute_query(SpannerSql::builder(sql).build())
+                        .await
+                        .map_err(from_spanner)?;
+                    // The aggregate scan returns only INT64 counts, never a TIMESTAMP column, so the
+                    // default timestamp precision is fine here.
+                    let (_schema, batch) = result_set_to_batch(
+                        result_set,
+                        crate::conversion::TimestampPrecision::default(),
+                    )
+                    .await?;
+                    Ok::<_, Error>((idx, batch))
+                }
+            }))
+            .buffer_unordered(STATISTICS_SCAN_CONCURRENCY);
+            while let Some(result) = scans.next().await {
+                let (idx, batch) = result?;
+                slots[idx] = Some(batch);
             }
-        }))
-        .buffer_unordered(STATISTICS_SCAN_CONCURRENCY);
-        while let Some(result) = scans.next().await {
-            let (idx, batch) = result?;
-            slots[idx] = Some(batch);
-        }
-        // Every prepared table produced exactly one batch (the loop consumed the whole stream).
-        Ok::<_, Error>(slots.into_iter().map(|b| b.unwrap()).collect())
-    })?;
+            // Every prepared table produced exactly one batch (the loop consumed the whole stream).
+            Ok::<_, Error>(slots.into_iter().map(|b| b.unwrap()).collect())
+        }),
+    )?;
 
     // Parse each batch and re-group by schema, in the original deterministic order.
     let mut schemas: Vec<SchemaStatistics> = Vec::new();

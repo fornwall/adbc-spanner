@@ -509,23 +509,25 @@ pub const OPTION_REQUEST_TAG: &str = "spanner.request.tag";
 /// rejected), accepted as a numeric string, an integer, or a double; it round-trips through
 /// `get_option` and `get_option_double`. `0` disables the timeout; an empty string unsets it.
 /// Unset (the default) means no deadline. Set on a connection it becomes the default for
-/// statements it creates; a statement may override it. DDL and driver-internal metadata queries
-/// are not bounded. Naming parallels the Flight SQL ADBC driver's
+/// statements it creates; a statement may override it. It also bounds the driver-internal metadata
+/// **read** queries (`get_objects`, `get_statistics`, `get_table_schema`, the ingest table-exists
+/// probe), which are executions of a query. Naming parallels the Flight SQL ADBC driver's
 /// `adbc.flight.sql.rpc.timeout_seconds.*` options; the full semantics are in
 /// [docs/options.md](https://github.com/fornwall/adbc-spanner/blob/main/docs/options.md#rpc-timeouts).
 pub const OPTION_RPC_TIMEOUT_QUERY: &str = "spanner.rpc.timeout_seconds.query";
 
 /// Driver-specific connection **and** statement option: the **update timeout**, in seconds — an
 /// overall deadline on each write operation: an autocommit DML / batch-DML read/write transaction,
-/// the manual-mode commit (including re-enabling autocommit, which commits the buffer), and each
-/// bulk-ingest commit chunk. The deadline covers the whole driver-side operation, including any
-/// retries the client performs within it. An expired deadline fails with
-/// [`Status::Timeout`](adbc_core::error::Status::Timeout) — note Spanner may still have committed
-/// a transaction whose confirmation the driver stopped waiting for, the usual ambiguity of any
-/// timed-out commit.
+/// the manual-mode commit (including re-enabling autocommit, which commits the buffer), each
+/// bulk-ingest commit chunk, and a DDL change — the admin `UpdateDatabaseDdl` call **and** its
+/// long-running-operation poll loop (which otherwise polls without any bound). The deadline covers
+/// the whole driver-side operation, including any retries the client performs within it. An expired
+/// deadline fails with [`Status::Timeout`](adbc_core::error::Status::Timeout) — note Spanner may
+/// still have committed a transaction whose confirmation the driver stopped waiting for, the usual
+/// ambiguity of any timed-out commit.
 ///
 /// Value syntax, validation, `0`/`""` handling, round-trip and inheritance are as
-/// [`OPTION_RPC_TIMEOUT_QUERY`]. DDL (an admin long-running operation) is not bounded.
+/// [`OPTION_RPC_TIMEOUT_QUERY`].
 pub const OPTION_RPC_TIMEOUT_UPDATE: &str = "spanner.rpc.timeout_seconds.update";
 
 /// Driver-specific connection **and** statement option: the **fetch timeout**, in seconds — an

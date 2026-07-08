@@ -65,16 +65,18 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   See [troubleshooting with tags](https://cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags).
   Driver-internal metadata queries (`get_objects`, schema probes, …) are not tagged/prioritised.
 - RPC timeouts: `spanner.rpc.timeout_seconds.query` (a query's initial execution, through the first
-  chunk of its streamed result), `spanner.rpc.timeout_seconds.fetch` (each subsequent chunk fetch,
-  enforced inside the background prefetch task) and `spanner.rpc.timeout_seconds.update` (DML /
-  batch DML, the manual-mode commit, each bulk-ingest commit chunk) — settable on a connection
-  (where they become the default for its statements) or per statement, named in parallel with the
-  Flight SQL driver's `adbc.flight.sql.rpc.timeout_seconds.*`. Values are seconds (fractions
-  allowed; must be finite and non-negative; `0` disables, `""` unsets; round-trip via `get_option`
-  and `get_option_double`). Each is an overall deadline on the driver-side operation (including the
-  client's internal retries); expiry fails with ADBC `Timeout` status. Unset means no deadline —
-  the pre-existing behaviour, where only `cancel` can interrupt a hung call. DDL and driver-internal
-  metadata queries are not bounded.
+  chunk of its streamed result — also the driver-internal metadata reads: `get_objects`,
+  `get_statistics`, `get_table_schema`, the ingest table-exists probe),
+  `spanner.rpc.timeout_seconds.fetch` (each subsequent chunk fetch, enforced inside the background
+  prefetch task) and `spanner.rpc.timeout_seconds.update` (DML / batch DML, the manual-mode commit,
+  each bulk-ingest commit chunk, and DDL — the admin `UpdateDatabaseDdl` call **and** its
+  long-running-operation poll loop) — settable on a connection (where they become the default for
+  its statements) or per statement, named in parallel with the Flight SQL driver's
+  `adbc.flight.sql.rpc.timeout_seconds.*`. Values are seconds (fractions allowed; must be finite and
+  non-negative; `0` disables, `""` unsets; round-trip via `get_option` and `get_option_double`).
+  Each is an overall deadline on the driver-side operation (including the client's internal
+  retries); expiry fails with ADBC `Timeout` status. Unset means no deadline — the pre-existing
+  behaviour, where only `cancel` can interrupt a hung call.
 - Retry tuning: `spanner.retry.max_attempts` (a positive integer; `1` disables retrying) and
   `spanner.retry.max_elapsed_seconds` (finite, strictly positive) bound the Spanner client's
   *per-attempt* retry loop — settable on a connection (where they become the default for its
@@ -280,8 +282,8 @@ database path, not the original URI.
 | `spanner.request.priority`                   | [Request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions) (`low`/`medium`/`high`) for queries, DML and commits; inherited by the connection's statements. |
 | `spanner.request.tag`                        | [Request tag](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags) attached to every query/DML request; inherited by the connection's statements. |
 | `spanner.transaction.tag`                    | Transaction tag attached to every read/write transaction the driver builds. Connection-level only. |
-| `spanner.rpc.timeout_seconds.query`          | Deadline (seconds) on a query's initial execution; inherited by the connection's statements. |
-| `spanner.rpc.timeout_seconds.update`         | Deadline (seconds) on DML / batch-DML / commit / ingest-chunk operations; inherited by the connection's statements. |
+| `spanner.rpc.timeout_seconds.query`          | Deadline (seconds) on a query's initial execution and the driver-internal metadata reads (`get_objects` / `get_statistics` / `get_table_schema`); inherited by the connection's statements. |
+| `spanner.rpc.timeout_seconds.update`         | Deadline (seconds) on DML / batch-DML / commit / ingest-chunk / DDL operations; inherited by the connection's statements. |
 | `spanner.rpc.timeout_seconds.fetch`          | Deadline (seconds) on each subsequent chunk fetch of a streamed result; inherited by the connection's statements. |
 | `spanner.retry.max_attempts`                 | Cap on the client's retry attempts (first try + retries; `1` disables retrying); inherited by the connection's statements. |
 | `spanner.retry.max_elapsed_seconds`          | Cap on the client's total retry wall-clock time (seconds); combines with `max_attempts`; inherited by the connection's statements. |
