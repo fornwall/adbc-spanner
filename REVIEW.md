@@ -550,9 +550,22 @@ options without a target do not trip the guard, so the plain emulator path — t
 path — is unchanged. Offline unit tests in `src/driver.rs`
 (`emulator_mode_with_an_explicit_keyfile_is_refused` and siblings) cover keyfile / keyfile_json /
 impersonation-target refusal plus the ambient-ADC negative case; documented in README's
-Authentication list and the `OPTION_EMULATOR` rustdoc.) Credential-building errors interpolate the auth crate's `Display`
+Authentication list and the `OPTION_EMULATOR` rustdoc.) ~~Credential-building errors interpolate the auth crate's `Display`
 output, which is outside this crate's control (`driver.rs:436-473`); scrub or verify it never
-embeds key material.
+embeds key material.~~ (**Fixed.** The three credential-build sites in `src/driver.rs`
+(`build_credentials_from_json`, the ADC-source and impersonated builders) no longer interpolate the
+`google-cloud-auth` builder error's `Display` — whose `Parsing`/`Loading` variants wrap a
+`serde_json` error that can echo fragments of the credential JSON body it was deserializing (private
+key / refresh token). A new `scrub_credential_error` classifies the error with the auth crate's own
+public `is_missing_field`/`is_parsing`/`is_unknown_type`/`is_not_supported`/`is_loading` predicates
+and surfaces only one of a handful of fixed, secret-free phrases, so no key material can reach an
+ADBC error message regardless of what the auth crate puts in its `Display` now or after a dependency
+bump; the credential *type* and (keyfile path) *path* — user-supplied config, not secrets — are
+still reported. Offline unit tests in `src/driver.rs`
+(`credential_build_failure_never_leaks_key_material` drives a failing `service_account` build whose
+body carries a recognizable fake secret and asserts it is absent from the message;
+`scrub_credential_error_returns_fixed_phrase` pins the scrubbed phrase against a real builder
+error).)
 
 **Conformance.** ~~`adbc.ingest.temporary="false"` (the default value) is rejected instead of
 no-op'd~~ (**Fixed.** `set_option("adbc.ingest.temporary", …)` now accepts any falsy spelling of
