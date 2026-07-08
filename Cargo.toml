@@ -124,6 +124,12 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Only pulled in by the `fuzzing` feature: derives `Arbitrary` for the option-fuzz input type.
 arbitrary = { version = "1", features = ["derive"], optional = true }
+# Names the gax `error::rpc::StatusDetails` type so `from_spanner` (src/error.rs) can forward
+# `google.rpc.Status` details (RetryInfo on ABORTED, ErrorInfo, ...) into the ADBC error's
+# `details`. Already in the dependency graph — google-cloud-spanner re-exports this crate's
+# `Error` — so this adds no new code, it only names the types. Same git pin as the
+# google-cloud family above (see the note there).
+google-cloud-gax = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
 
 # Lints applied in local dev too (CI additionally runs `clippy -D warnings`).
 [lints.rust]
@@ -166,10 +172,6 @@ google-cloud-spanner-admin-database-v1 = { git = "https://github.com/fornwall/go
 # Benchmark harness for benches/conversion.rs. Slim feature set: `cargo_bench_support` is what
 # `cargo bench` needs; the default plotters/rayon extras are skipped.
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
-# Names the gax error/status types so the error-mapping unit test can build a real gax error.
-# google-cloud-spanner re-exports this crate's `Error` at runtime, so this is a test-only dependency.
-# Same git pin as the google-cloud family above (see the note there).
-google-cloud-gax = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
 # In-process mock `google.spanner.v1.Spanner` gRPC server (mockall + tonic), used by
 # tests/mock_spanner.rs to inject *logical* gRPC faults (ABORTED, mid-stream UNAVAILABLE, a hung
 # stream) fully offline — the complement of the Toxiproxy transport-fault harness (see

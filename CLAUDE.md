@@ -51,8 +51,13 @@ SpannerDriver ──▶ SpannerDatabase ──▶ SpannerConnection ──▶ Sp
   driver and shared via `Arc` into every database/connection/statement.
 - `src/ffi.rs` — `adbc_ffi::export_driver!(AdbcSpannerInit, SpannerDriver)`; the C entrypoint of the
   shared library. Gated behind the default `ffi` feature.
-- `src/error.rs` — helpers to build `adbc_core` errors; `from_spanner` is generic over `Display`
-  because the client surfaces several distinct gax error types.
+- `src/error.rs` — helpers to build `adbc_core` errors. `from_spanner` takes the concrete
+  `google_cloud_spanner::Error`: it maps the gRPC code onto the closest ADBC status, keeps the
+  numeric code in `vendor_code`, and forwards any `google.rpc.Status` details (RetryInfo on
+  ABORTED, ErrorInfo, BadRequest, …) into `Error.details` — key = lowercased proto type name
+  (`google.rpc.retryinfo`), value = the detail's ProtoJSON bytes (no `-bin` suffix; the pinned
+  client's detail types have no binary-proto encoding). `from_builder` stays generic over
+  `Display` for the status-less client-builder errors.
 
 Key design points:
 
@@ -108,7 +113,7 @@ same directory (the fork tracks close to the 0.23.0 release).
 and **each is independently a crates.io publish blocker** — the crate cannot be published until
 *both* are reverted to versioned releases:
 
-1. The whole `google-cloud-*` family (spanner, auth, lro, both admin crates + the test-only `gax`)
+1. The whole `google-cloud-*` family (spanner, auth, lro, both admin crates + `gax`)
    is pinned to a `google-cloud-rust` git revision, because native `STRUCT` mapping needs
    `Type::struct_type()`, which is on `main` but not yet in a crates.io release.
 2. `adbc_core` and `adbc_ffi` (and the dev-dependency `adbc_driver_manager`) are pinned to a
@@ -131,10 +136,11 @@ always share ONE rev; the seven `google-cloud-rust` crates likewise share ONE re
 touch *every* location for that family in lockstep:
 
 - `Cargo.toml` `[dependencies]` — arrow-adbc: `adbc_core`, `adbc_ffi`; google-cloud:
-  `google-cloud-spanner`, `google-cloud-auth`, `google-cloud-lro`.
+  `google-cloud-spanner`, `google-cloud-auth`, `google-cloud-lro`, `google-cloud-gax` (the last
+  names `rpc::StatusDetails` so `from_spanner` can forward `google.rpc.Status` details).
 - `Cargo.toml` `[dev-dependencies]` — arrow-adbc: `adbc_driver_manager`; google-cloud:
   `google-cloud-spanner-admin-instance-v1`, `google-cloud-spanner-admin-database-v1`,
-  `google-cloud-gax`, `spanner-grpc-mock` (the mock-server harness of `tests/mock_spanner.rs`;
+  `spanner-grpc-mock` (the mock-server harness of `tests/mock_spanner.rs`;
   note it is `publish = false` upstream and will never be on crates.io — when the family reverts
   to versioned releases this one stays a git pin, so check whether `cargo publish` tolerates a
   version-less git dev-dependency before flipping `publish` back on). (There is no `[patch]`

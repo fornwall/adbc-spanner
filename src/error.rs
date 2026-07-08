@@ -1,6 +1,7 @@
 //! Helpers for producing [`adbc_core`] errors and translating Spanner client errors.
 
 use adbc_core::error::{Error, Status};
+use google_cloud_gax::error::rpc::StatusDetails;
 
 /// Build an ADBC error with the given message and status.
 pub(crate) fn err(message: impl Into<String>, status: Status) -> Error {
@@ -36,17 +37,84 @@ pub(crate) fn invalid_argument(message: impl Into<String>) -> Error {
 /// `vendor_code`, so callers can recover exactly what failed (e.g. a retry loop looking for
 /// `ABORTED` = 10) even where several codes share one ADBC status. Errors without a status
 /// (transport/serialization/etc.) fall back to [`Status::Internal`] with `vendor_code` 0.
+///
+/// # Structured error details
+///
+/// A `google.rpc.Status` may also carry structured *details* — most importantly
+/// `google.rpc.RetryInfo` on `ABORTED`, where Spanner recommends how long to back off before
+/// retrying the aborted transaction. Each detail is forwarded into the ADBC error's `details`
+/// vector as a `(key, value)` pair:
+///
+/// - **key** — the lowercased fully-qualified protobuf type name of the detail message, e.g.
+///   `google.rpc.retryinfo`, `google.rpc.errorinfo`, `google.rpc.badrequest`, `google.rpc.help`.
+///   This follows the Flight SQL / gRPC metadata key style; there is no `-bin` suffix because the
+///   value is UTF-8 text, not binary protobuf (`-bin` marks binary values in that convention).
+/// - **value** — the detail's **ProtoJSON** encoding as UTF-8 bytes, self-describing via its
+///   `"@type"` field — i.e. the canonical JSON form of the `google.protobuf.Any` that carried the
+///   detail on the wire, e.g. `{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"0.010s"}`.
+///   ProtoJSON (rather than binary protobuf) because the preview client decodes details into
+///   serde-modelled types whose only supported wire encoding is ProtoJSON; the format is a stable,
+///   documented protobuf encoding that any JSON parser can consume.
+///
+/// Together with `vendor_code` this completes the retry story: a retry loop detects an exhausted
+/// abort via `vendor_code == 10` (`ABORTED`) and, when present, honours the server-recommended
+/// delay in the `google.rpc.retryinfo` detail's `retryDelay`. Errors without a gRPC status, and
+/// statuses without details, leave `details` as `None` (never `Some(vec![])`).
 pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
     // `Error::status()` yields the structured gRPC status when present. We match on the code's
     // canonical name (e.g. "NOT_FOUND"), which is derived from the enum by the client itself — this
     // is not fragile string-parsing of a `Display` message.
-    let (status, vendor_code) = error
+    let (status, vendor_code, details) = error
         .status()
-        .map(|status| (status_for_grpc_code(status.code.name()), status.code as i32))
-        .unwrap_or((Status::Internal, 0));
+        .map(|status| {
+            (
+                status_for_grpc_code(status.code.name()),
+                status.code as i32,
+                details_for_adbc(&status.details),
+            )
+        })
+        .unwrap_or((Status::Internal, 0, None));
     let mut adbc = err(format!("Spanner error: {error}"), status);
     adbc.vendor_code = vendor_code;
+    adbc.details = details;
     adbc
+}
+
+/// Map a gRPC status' `google.rpc.Status` details onto ADBC error details.
+///
+/// Returns `None` (rather than `Some(vec![])`) when nothing mapped, so an error without details
+/// keeps the `details: None` shape callers expect. See [`from_spanner`] for the key/value format
+/// contract. A detail that fails to serialize, or whose ProtoJSON carries no usable `@type`, is
+/// skipped — a detail is diagnostic garnish, never worth failing (or panicking) the error path for.
+fn details_for_adbc(details: &[StatusDetails]) -> Option<Vec<(String, Vec<u8>)>> {
+    let mapped: Vec<(String, Vec<u8>)> = details.iter().filter_map(map_detail).collect();
+    (!mapped.is_empty()).then_some(mapped)
+}
+
+/// Map one `google.rpc.Status` detail to its ADBC `(key, value)` pair, or `None` to skip it.
+///
+/// Both halves derive from the detail's ProtoJSON form, so there is a single self-consistent path
+/// for every detail kind:
+///
+/// - **value** — the ProtoJSON encoding as UTF-8 bytes, self-describing via its `"@type"` field.
+/// - **key** — the lowercased fully-qualified protobuf type name, taken from that same `"@type"`
+///   (the path segment after the final `/`), e.g. `google.rpc.retryinfo`.
+///
+/// Deriving the key from the serialized `@type` — rather than matching each [`StatusDetails`]
+/// variant against a hand-maintained table — means the well-known `google.rpc` types and an
+/// unrecognised [`StatusDetails::Other`] share one code path, *and* any new `google.rpc.*` detail
+/// type added to the `#[non_exhaustive]` enum upstream is forwarded automatically instead of being
+/// silently dropped. A detail that fails to serialize, or whose ProtoJSON carries no `@type`
+/// string, is skipped.
+fn map_detail(detail: &StatusDetails) -> Option<(String, Vec<u8>)> {
+    let value = serde_json::to_value(detail).ok()?;
+    let type_url = value.get("@type")?.as_str()?;
+    let key = type_url
+        .rsplit('/')
+        .next()
+        .unwrap_or(type_url)
+        .to_ascii_lowercase();
+    Some((key, serde_json::to_vec(&value).ok()?))
 }
 
 /// Translate a Spanner *client/admin builder* construction error into an ADBC error.
@@ -159,6 +227,8 @@ mod tests {
         // The numeric gRPC code survives in vendor_code (NOT_FOUND = 5).
         assert_eq!(adbc.vendor_code, Code::NotFound as i32);
         assert_eq!(adbc.vendor_code, 5);
+        // A status without details keeps details = None, not Some(vec![]).
+        assert_eq!(adbc.details, None);
     }
 
     #[test]
@@ -184,5 +254,110 @@ mod tests {
         let adbc = from_spanner(GaxError::deser("no structured status here"));
         assert_eq!(adbc.status, Status::Internal);
         assert_eq!(adbc.vendor_code, 0);
+        // Non-service errors (transport, deserialization, ...) carry no details.
+        assert_eq!(adbc.details, None);
+    }
+
+    /// Build a `StatusDetails` from its ProtoJSON (`Any`) encoding — the same wire shape the
+    /// client itself deserializes, and the shape our mapped detail values re-serialize to.
+    fn detail_from_json(value: serde_json::Value) -> StatusDetails {
+        serde_json::from_value(value).expect("valid StatusDetails ProtoJSON")
+    }
+
+    #[test]
+    fn aborted_forwards_retry_info_detail() {
+        use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
+        use google_cloud_gax::error::Error as GaxError;
+
+        let retry_info = serde_json::json!({
+            "@type": "type.googleapis.com/google.rpc.RetryInfo",
+            "retryDelay": "1s",
+        });
+        let gax = GaxError::service(
+            RpcStatus::default()
+                .set_code(Code::Aborted)
+                .set_message("Transaction was aborted")
+                .set_details([detail_from_json(retry_info.clone())]),
+        );
+        let adbc = from_spanner(gax);
+        assert_eq!(adbc.status, Status::IO);
+        assert_eq!(adbc.vendor_code, Code::Aborted as i32);
+
+        let details = adbc.details.expect("RetryInfo detail forwarded");
+        assert_eq!(details.len(), 1);
+        let (key, value) = &details[0];
+        assert_eq!(key, "google.rpc.retryinfo");
+        // The value is the detail's ProtoJSON bytes, self-describing via "@type": a retry loop
+        // can parse it with any JSON parser and honour the recommended delay.
+        let parsed: serde_json::Value = serde_json::from_slice(value).expect("UTF-8 JSON value");
+        assert_eq!(parsed, retry_info);
+        assert_eq!(parsed["retryDelay"], "1s");
+    }
+
+    #[test]
+    fn multiple_details_forward_in_order_under_typed_keys() {
+        use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
+        use google_cloud_gax::error::Error as GaxError;
+
+        let gax = GaxError::service(
+            RpcStatus::default()
+                .set_code(Code::InvalidArgument)
+                .set_message("Bad query")
+                .set_details([
+                    detail_from_json(serde_json::json!({
+                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        "reason": "TEST_REASON",
+                        "domain": "spanner.googleapis.com",
+                    })),
+                    detail_from_json(serde_json::json!({
+                        "@type": "type.googleapis.com/google.rpc.BadRequest",
+                        "fieldViolations": [{"field": "sql", "description": "syntax error"}],
+                    })),
+                    detail_from_json(serde_json::json!({
+                        "@type": "type.googleapis.com/google.rpc.Help",
+                        "links": [{"description": "docs", "url": "https://example.invalid"}],
+                    })),
+                ]),
+        );
+        let adbc = from_spanner(gax);
+        let details = adbc.details.expect("details forwarded");
+        let keys: Vec<&str> = details.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "google.rpc.errorinfo",
+                "google.rpc.badrequest",
+                "google.rpc.help"
+            ]
+        );
+        // Spot-check one payload round-trips its fields.
+        let error_info: serde_json::Value = serde_json::from_slice(&details[0].1).unwrap();
+        assert_eq!(error_info["reason"], "TEST_REASON");
+        assert_eq!(error_info["domain"], "spanner.googleapis.com");
+    }
+
+    #[test]
+    fn unrecognised_detail_keys_off_its_type_url() {
+        use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
+        use google_cloud_gax::error::Error as GaxError;
+
+        // Not one of the well-known google.rpc detail types: lands in StatusDetails::Other and
+        // takes its key from the Any type URL (final path segment, lowercased).
+        let custom = serde_json::json!({
+            "@type": "type.googleapis.com/mycompany.CustomDetail",
+            "foo": "bar",
+        });
+        let gax = GaxError::service(
+            RpcStatus::default()
+                .set_code(Code::Internal)
+                .set_message("boom")
+                .set_details([detail_from_json(custom.clone())]),
+        );
+        let adbc = from_spanner(gax);
+        let details = adbc.details.expect("custom detail forwarded");
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].0, "mycompany.customdetail");
+        let parsed: serde_json::Value = serde_json::from_slice(&details[0].1).unwrap();
+        assert_eq!(parsed, custom);
     }
 }
