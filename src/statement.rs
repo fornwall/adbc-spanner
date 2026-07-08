@@ -945,11 +945,13 @@ impl Statement for SpannerStatement {
     ///
     /// # Security
     ///
-    /// Each returned descriptor is **opaque but executable**: it is serde-JSON of the client's
-    /// `Partition`, carrying the SQL text (inside its `ExecuteSqlRequest`) plus the session and
-    /// transaction identity. Anyone who can hand a descriptor to `Connection::read_partition` can
-    /// run arbitrary SQL with that connection's credentials — the blob is not authenticated. Treat
-    /// descriptors as executable request blobs, not opaque data:
+    /// Each returned descriptor is **opaque but executable**: a versioned JSON envelope
+    /// (`{"v":1,"partition":…}`) around the serde form of the client's `Partition`, carrying the
+    /// SQL text (inside its `ExecuteSqlRequest`) plus the session and transaction identity. Anyone
+    /// who can hand a descriptor to `Connection::read_partition` can run arbitrary SQL with that
+    /// connection's credentials — the version envelope guards against format drift between driver
+    /// versions, it does **not** authenticate the blob. Treat descriptors as executable request
+    /// blobs, not opaque data:
     /// transport them only over trusted channels and never accept one from an untrusted source.
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
         // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
@@ -1007,13 +1009,7 @@ impl Statement for SpannerStatement {
                 } else {
                     partition
                 };
-                let token = serde_json::to_vec(&partition).map_err(|e| {
-                    err(
-                        format!("failed to serialize partition descriptor: {e}"),
-                        Status::Internal,
-                    )
-                })?;
-                tokens.push(token);
+                tokens.push(crate::connection::encode_partition(&partition)?);
             }
             Ok::<_, Error>((schema, tokens))
         })?;

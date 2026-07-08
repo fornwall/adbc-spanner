@@ -3634,7 +3634,9 @@ fn execute_partitions_round_trip() {
     let mut seen: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
     for token in &partitioned.partitions {
         let reader = connection.read_partition(token).expect("read_partition");
-        assert_eq!(reader.schema().field(0).name(), "Id");
+        // Every partition's reader must agree with the schema `execute_partitions` reported up
+        // front — a consumer routes each descriptor by that schema, so drift would be a bug.
+        assert_eq!(*reader.schema(), partitioned.schema);
         for batch in reader {
             let batch = batch.expect("partition batch");
             let ids = batch

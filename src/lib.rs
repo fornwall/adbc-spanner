@@ -199,21 +199,22 @@ pub mod fuzzing {
     ///
     /// The oracles live here (where the client's `Partition` type is in scope): a rejected
     /// descriptor must be a clean `InvalidArguments` error — never a panic — and an accepted one
-    /// must survive a serialize → decode → serialize round trip unchanged (compared as
-    /// `serde_json::Value`, so map key order is irrelevant).
+    /// must round-trip through the driver's own encoder with the **enveloped** form as the fixed
+    /// point: decode → encode yields the versioned envelope (so an accepted legacy *bare*
+    /// descriptor re-encodes to the envelope, by design — that is the compatibility upgrade, not
+    /// a round-trip violation), and from there decode → encode must reproduce the bytes exactly.
     pub fn decode_partition(descriptor: &[u8]) -> bool {
         match crate::connection::decode_partition(descriptor) {
             Ok(partition) => {
-                let value =
-                    serde_json::to_value(&partition).expect("a decoded partition re-serializes");
-                let bytes =
-                    serde_json::to_vec(&value).expect("a serde_json::Value always serializes");
+                let bytes = crate::connection::encode_partition(&partition)
+                    .expect("a decoded partition re-encodes");
                 let again = crate::connection::decode_partition(&bytes)
-                    .expect("a re-serialized partition descriptor decodes");
+                    .expect("a re-encoded partition descriptor decodes");
                 assert_eq!(
-                    value,
-                    serde_json::to_value(&again).expect("a decoded partition re-serializes"),
-                    "partition descriptor round-trip changed the value"
+                    bytes,
+                    crate::connection::encode_partition(&again)
+                        .expect("a decoded partition re-encodes"),
+                    "enveloped partition descriptor round-trip changed the bytes"
                 );
                 true
             }
@@ -224,7 +225,8 @@ pub mod fuzzing {
                     "decode_partition must reject with InvalidArguments: {e:?}"
                 );
                 assert!(
-                    e.message.contains("invalid partition descriptor"),
+                    e.message.contains("invalid partition descriptor")
+                        || e.message.contains("not supported by this driver"),
                     "unexpected rejection message: {}",
                     e.message
                 );
@@ -283,6 +285,37 @@ pub mod fuzzing {
             // (unsupported key, wrong value type, non-boolean text) are expected, not panics.
             let _ = database.set_option(OptionDatabase::Other(key.clone()), value);
             let _ = database.get_option_string(OptionDatabase::Other(key));
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// Run the partition-descriptor oracle over the checked-in fuzz seed corpus
+        /// (`fuzz/seeds/partition/`), so a corpus/oracle mismatch fails `cargo test
+        /// --features fuzzing` locally instead of only surfacing in a fuzz run. The two
+        /// well-formed seeds (legacy bare + enveloped) must be accepted; the bad-version seed
+        /// must be rejected — both verdicts include the oracle's internal round-trip and
+        /// clean-rejection assertions.
+        #[test]
+        fn partition_seed_corpus_satisfies_the_oracle() {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/seeds/partition");
+            let mut verdicts = std::collections::BTreeMap::new();
+            for entry in std::fs::read_dir(dir).expect("seed corpus directory exists") {
+                let path = entry.unwrap().path();
+                let bytes = std::fs::read(&path).unwrap();
+                let name = path.file_name().unwrap().to_str().unwrap().to_string();
+                verdicts.insert(name, super::decode_partition(&bytes));
+            }
+            let expected: std::collections::BTreeMap<String, bool> = [
+                ("enveloped-bad-version", false),
+                ("enveloped-query-descriptor", true),
+                ("query-descriptor", true),
+                ("read-descriptor", true),
+            ]
+            .into_iter()
+            .map(|(name, accepted)| (name.to_string(), accepted))
+            .collect();
+            assert_eq!(verdicts, expected);
         }
     }
 }
