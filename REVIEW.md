@@ -612,8 +612,12 @@ also flagged by the CI review, which notes `cargo doc` runs without `--all-featu
 docs.rs)~~ (**Fixed.** `ci.yml` now has a dedicated `cargo test --doc --all-features` step after
 the unit tests, and the docs step runs `cargo doc --no-deps --all-features` to match docs.rs);
 keyfile/impersonation auth is offline-unit-tested only, never exercised end-to-end;
-weak assertions (`AdbcDdl` note value unchecked, `replace`-ingest values unchecked, only row
-counts); ~~untested small surfaces: `rollback()` without a transaction, `get_statistic_names`,
+~~weak assertions (`AdbcDdl` note value unchecked, `replace`-ingest values unchecked, only row
+counts)~~ (**Fixed.** The `AdbcDdl` round-trip now downcasts the read-back `Note` column and asserts
+it equals the inserted `"hello"`, not just that one row came back; the create-mode ingest test now
+reads the `Id`/`Label` columns back after `replace` and asserts the exact `[(10,"x"),(20,"y")]`
+rows, distinguishing a real `replace` (one copy) from the duplicated four rows an `append` would
+leave — both in `tests/integration.rs`); ~~untested small surfaces: `rollback()` without a transaction, `get_statistic_names`,
 `read_partition` with a garbage descriptor (also a natural fuzz target), `Connection::cancel`~~
 (**Fixed.** All four are covered. `rollback()` in autocommit mode asserts `InvalidState`, and in
 manual mode with nothing buffered it is a no-op that keeps the connection in manual mode
