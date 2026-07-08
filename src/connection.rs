@@ -57,7 +57,7 @@ use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
 use crate::bind::qualified_table;
-use crate::conversion::{result_set_to_batch, stream_query};
+use crate::conversion::{result_set_to_batch, stream_query, TimestampPrecision};
 use crate::driver::Connected;
 use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
 use crate::request::RequestConfig;
@@ -234,6 +234,11 @@ pub struct SpannerConnection {
     /// for statements created on the connection, which may override the priority and request tag
     /// (the transaction tag is connection-level only).
     request: RequestConfig,
+    /// How `TIMESTAMP` columns map to Arrow (`spanner.max_timestamp_precision`): nanoseconds that
+    /// error on out-of-range instants (the default) or microseconds covering Spanner's full range.
+    /// Becomes the default for statements created on the connection, which may override it; also
+    /// applied to `get_table_schema` and `read_partition` (which have no statement).
+    timestamp_precision: TimestampPrecision,
     txn: SharedTxn,
     /// Cancellation signal for this connection's in-flight metadata/commit operations
     /// (see [`Connection::cancel`]).
@@ -251,6 +256,7 @@ impl SpannerConnection {
             isolation: IsolationLevel::Unspecified,
             read_staleness: ReadStaleness::default(),
             request: RequestConfig::default(),
+            timestamp_precision: TimestampPrecision::default(),
             txn: Arc::new(Mutex::new(TxnState::new())),
             cancel: CancelSignal::new(),
         }
@@ -469,7 +475,9 @@ pub(crate) fn table_exists(
             .execute_query(statement)
             .await
             .map_err(from_spanner)?;
-        let (_schema, batch) = result_set_to_batch(result_set).await?;
+        // A TABLE_NAME probe returns only strings, so the timestamp precision is irrelevant.
+        let (_schema, batch) =
+            result_set_to_batch(result_set, TimestampPrecision::default()).await?;
         Ok::<bool, Error>(batch.num_rows() > 0)
     })
 }
@@ -482,7 +490,9 @@ pub(crate) async fn query_batch(client: &DatabaseClient, sql: &str) -> Result<Re
         .execute_query(SpannerSql::builder(sql).build())
         .await
         .map_err(from_spanner)?;
-    let (_schema, batch) = result_set_to_batch(result_set).await?;
+    // The INFORMATION_SCHEMA collectors read only string/int columns, never TIMESTAMPs, so the
+    // default timestamp precision is fine here.
+    let (_schema, batch) = result_set_to_batch(result_set, TimestampPrecision::default()).await?;
     Ok(batch)
 }
 
@@ -625,6 +635,9 @@ impl Optionable for SpannerConnection {
             OptionConnection::Other(k) if k == crate::OPTION_TRANSACTION_TAG => {
                 self.request.set_transaction_tag(value)?;
             }
+            OptionConnection::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {
+                self.timestamp_precision = TimestampPrecision::parse_option(value)?;
+            }
             other => {
                 return Err(not_implemented(&format!(
                     "unsupported Spanner connection option: {}",
@@ -692,6 +705,10 @@ impl Optionable for SpannerConnection {
                         Status::NotFound,
                     )
                 }),
+            // Always set (there is a default mode), so the effective value is always reported.
+            OptionConnection::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {
+                Ok(self.timestamp_precision.as_str().to_string())
+            }
             // A Spanner database has a single, unnamed catalog and (default) schema — both the empty
             // string in INFORMATION_SCHEMA, which is what `get_objects` reports — so the "current"
             // catalog/schema are reported as "". (They can't be switched; setting them is unsupported.)
@@ -731,6 +748,7 @@ impl Connection for SpannerConnection {
             self.isolation.clone(),
             self.read_staleness.clone(),
             self.request.clone(),
+            self.timestamp_precision,
             self.txn.clone(),
         ))
     }
@@ -814,13 +832,16 @@ impl Connection for SpannerConnection {
         let sql = format!("SELECT * FROM {table} LIMIT 0");
         let client = self.client.clone();
         let bound = self.read_staleness.timestamp_bound()?;
+        // The reported schema honours the connection's timestamp precision, so it matches what a
+        // query on this connection would actually stream.
+        let precision = self.timestamp_precision;
         let result = block_on_cancellable(&self.runtime, &self.cancel, async move {
             let transaction = crate::staleness::single_use(&client, bound);
             let result_set = transaction
                 .execute_query(SpannerSql::builder(sql).build())
                 .await
                 .map_err(from_spanner)?;
-            result_set_to_batch(result_set).await
+            result_set_to_batch(result_set, precision).await
         });
         match result {
             Ok((schema, _batch)) => Ok((*schema).clone()),
@@ -976,10 +997,20 @@ impl Connection for SpannerConnection {
         let runtime = self.runtime.clone();
         let cancel = self.cancel.clone();
         // Stream the partition's rows to Arrow exactly like `Statement::execute`. The connection has
-        // no per-statement batch-size option, so the default chunk size is used.
+        // no per-statement batch-size option, so the default chunk size is used; the timestamp
+        // precision is the **reading** connection's `spanner.max_timestamp_precision` (set it to the
+        // same mode as the producing statement so the descriptor's advertised schema matches).
+        let precision = self.timestamp_precision;
         let reader = block_on_cancellable(&self.runtime, &self.cancel, async move {
             let result_set = partition.execute(&client).await.map_err(from_spanner)?;
-            stream_query(runtime, cancel, result_set, DEFAULT_ROWS_PER_BATCH).await
+            stream_query(
+                runtime,
+                cancel,
+                result_set,
+                DEFAULT_ROWS_PER_BATCH,
+                precision,
+            )
+            .await
         })?;
         Ok(Box::new(reader))
     }

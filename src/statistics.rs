@@ -154,7 +154,13 @@ pub(crate) fn collect_statistics(
                     .execute_query(SpannerSql::builder(sql).build())
                     .await
                     .map_err(from_spanner)?;
-                let (_schema, batch) = result_set_to_batch(result_set).await?;
+                // The aggregate scan returns only INT64 counts, never a TIMESTAMP column, so the
+                // default timestamp precision is fine here.
+                let (_schema, batch) = result_set_to_batch(
+                    result_set,
+                    crate::conversion::TimestampPrecision::default(),
+                )
+                .await?;
                 Ok::<_, Error>((idx, batch))
             }
         }))

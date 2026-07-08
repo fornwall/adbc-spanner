@@ -442,6 +442,32 @@ pub const OPTION_REQUEST_TAG: &str = "spanner.request.tag";
 /// no per-statement override).
 pub const OPTION_TRANSACTION_TAG: &str = "spanner.transaction.tag";
 
+/// Driver-specific connection **and** statement option: the maximum precision at which Spanner
+/// `TIMESTAMP` columns are read into Arrow. Two values:
+///
+/// - `nanoseconds_error_on_overflow` (the default) — `TIMESTAMP` maps to
+///   `Timestamp(Nanosecond, "UTC")`, preserving the wire value's full nanosecond precision. Arrow
+///   stores nanoseconds as an `i64`, which spans only ~1677-09-21 to 2262-04-11 — narrower than
+///   Spanner's 0001–9999 range — so reading a well-formed instant outside that window is a loud
+///   `InvalidArguments` error naming the column and the offending value.
+/// - `microseconds` — `TIMESTAMP` maps to `Timestamp(Microsecond, "UTC")`, which covers Spanner's
+///   **entire** 0001–9999 range: the escape hatch for tables holding timestamps the nanosecond
+///   representation cannot hold (mirroring the Snowflake ADBC driver's
+///   `adbc.snowflake.sql.client_option.max_timestamp_precision`). Spanner timestamps carry up to
+///   nanosecond precision on the wire, so any sub-microsecond digits are **truncated toward
+///   negative infinity** in this mode.
+///
+/// There is deliberately no silently-wrapping nanosecond mode: a wrapped out-of-range timestamp is
+/// indistinguishable from real data. The mode applies uniformly to every surface that produces
+/// timestamps or timestamp-typed schemas: `execute` (including parameterized/bound queries),
+/// `execute_schema` and the `execute_partitions` schema probe, `read_partition` (which uses the
+/// **reading connection's** setting), DML `THEN RETURN` rows, and `get_table_schema`.
+///
+/// Set on a connection it becomes the default for statements it creates; a statement may override
+/// it. Set an empty string to reset to the default. Round-trips through `get_option` (the
+/// effective mode is always reported).
+pub const OPTION_MAX_TIMESTAMP_PRECISION: &str = "spanner.max_timestamp_precision";
+
 /// The vendor name reported by [`Connection::get_info`](adbc_core::Connection::get_info).
 pub const VENDOR_NAME: &str = "Google Cloud Spanner";
 
@@ -478,6 +504,7 @@ mod options_doc_tests {
             crate::OPTION_REQUEST_PRIORITY,
             crate::OPTION_REQUEST_TAG,
             crate::OPTION_TRANSACTION_TAG,
+            crate::OPTION_MAX_TIMESTAMP_PRECISION,
             // Standard ADBC (spec) options the driver handles.
             constants::ADBC_OPTION_URI,
             constants::ADBC_CONNECTION_OPTION_AUTOCOMMIT,

@@ -15,7 +15,7 @@
 //! | `FLOAT64`                                   | `Float64`                         |
 //! | `FLOAT32`                                   | `Float32`                         |
 //! | `DATE`                                      | `Date32`                          |
-//! | `TIMESTAMP`                                 | `Timestamp(Nanosecond, "UTC")`    |
+//! | `TIMESTAMP`                                 | `Timestamp(Nanosecond, "UTC")` (default) or `Timestamp(Microsecond, "UTC")` |
 //! | `NUMERIC`                                   | `Decimal128(38, 9)`               |
 //! | `BYTES`                                     | `Binary`                          |
 //! | `STRING`/`UUID`/`INTERVAL`/`ENUM`/`PROTO`   | `Utf8`                            |
@@ -32,18 +32,25 @@
 //! consumers that understand the extension recognize the logical JSON type. The extension lives on
 //! the [`Field`], not the [`DataType`]; for `ARRAY<JSON>` it sits on the list's child (`item`)
 //! field. The other Utf8-backed codes stay plain, untagged `Utf8`.
+//!
+//! The `TIMESTAMP` mapping is selected by [`TimestampPrecision`] (the
+//! `spanner.max_timestamp_precision` option): the default keeps the wire's full nanosecond
+//! precision but errors on instants outside Arrow's nanosecond range (~1677–2262), while
+//! `microseconds` covers Spanner's whole 0001–9999 range at microsecond precision, truncating
+//! sub-microsecond digits toward negative infinity.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use adbc_core::error::{Result, Status};
+use adbc_core::options::OptionValue;
 use arrow_array::builder::{BinaryBuilder, BooleanBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_array::types::{
     ArrowPrimitiveType, Date32Type, Decimal128Type, Float32Type, Float64Type, Int64Type,
 };
 use arrow_array::{
     ArrayRef, ListArray, PrimitiveArray, RecordBatch, RecordBatchReader, StructArray,
-    TimestampNanosecondArray,
+    TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
@@ -74,16 +81,81 @@ const ARROW_EXTENSION_METADATA: &str = "ARROW:extension:metadata";
 /// Canonical Arrow extension name for JSON stored as a Utf8 (string) column.
 const ARROW_JSON_EXTENSION: &str = "arrow.json";
 
+/// How Spanner `TIMESTAMP` columns map to Arrow — the value of the
+/// [`spanner.max_timestamp_precision`](crate::OPTION_MAX_TIMESTAMP_PRECISION) connection/statement
+/// option.
+///
+/// Spanner timestamps span 0001-01-01 to 9999-12-31 at nanosecond precision; Arrow's
+/// `Timestamp(Nanosecond)` `i64` spans only ~1677-09-21 to 2262-04-11. The two variants are the
+/// two lossless-or-loud ways out of that mismatch. There is deliberately **no** mode that keeps
+/// nanoseconds and silently wraps out-of-range values (as some drivers offer): a wrapped timestamp
+/// is indistinguishable from real data, i.e. silent corruption.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TimestampPrecision {
+    /// `Timestamp(Nanosecond, "UTC")`, preserving the wire value's full nanosecond precision. A
+    /// well-formed instant outside the representable range is a loud error (naming the column and
+    /// value), never a wrapped or null result. The default.
+    #[default]
+    NanosecondsErrorOnOverflow,
+    /// `Timestamp(Microsecond, "UTC")`, covering Spanner's whole 0001–9999 range. Sub-microsecond
+    /// wire digits are **truncated toward negative infinity** (`…12:34:56.789012345Z` becomes
+    /// `…12:34:56.789012`).
+    Microseconds,
+}
+
+impl TimestampPrecision {
+    /// Option value selecting [`Self::NanosecondsErrorOnOverflow`].
+    pub(crate) const NANOSECONDS_ERROR_ON_OVERFLOW: &'static str = "nanoseconds_error_on_overflow";
+    /// Option value selecting [`Self::Microseconds`].
+    pub(crate) const MICROSECONDS: &'static str = "microseconds";
+
+    /// Parse the `spanner.max_timestamp_precision` option value. The empty string resets to the
+    /// default (the staleness-option unset convention); anything else unknown is rejected.
+    pub(crate) fn parse_option(value: OptionValue) -> Result<Self> {
+        let what = format!("option {}", crate::OPTION_MAX_TIMESTAMP_PRECISION);
+        let s = crate::options::string_option(value, &what)?;
+        match s.trim() {
+            "" => Ok(Self::default()),
+            Self::NANOSECONDS_ERROR_ON_OVERFLOW => Ok(Self::NanosecondsErrorOnOverflow),
+            Self::MICROSECONDS => Ok(Self::Microseconds),
+            other => Err(invalid_argument(format!(
+                "{what} expects {:?} or {:?} (or \"\" to reset to the default), got {other:?}",
+                Self::NANOSECONDS_ERROR_ON_OVERFLOW,
+                Self::MICROSECONDS,
+            ))),
+        }
+    }
+
+    /// The canonical option-value string, for `get_option` round-tripping.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NanosecondsErrorOnOverflow => Self::NANOSECONDS_ERROR_ON_OVERFLOW,
+            Self::Microseconds => Self::MICROSECONDS,
+        }
+    }
+
+    /// The Arrow [`TimeUnit`] `TIMESTAMP` columns map to under this mode.
+    fn time_unit(self) -> TimeUnit {
+        match self {
+            Self::NanosecondsErrorOnOverflow => TimeUnit::Nanosecond,
+            Self::Microseconds => TimeUnit::Microsecond,
+        }
+    }
+}
+
 /// Drain a Spanner [`ResultSet`] and materialise it as a single Arrow [`RecordBatch`] together with
 /// its schema.
-pub(crate) async fn result_set_to_batch(mut rs: ResultSet) -> Result<(SchemaRef, RecordBatch)> {
+pub(crate) async fn result_set_to_batch(
+    mut rs: ResultSet,
+    precision: TimestampPrecision,
+) -> Result<(SchemaRef, RecordBatch)> {
     let mut rows: Vec<Row> = Vec::new();
     while let Some(row) = rs.next().await {
         rows.push(row.map_err(from_spanner)?);
     }
     // Metadata (including the row type) is delivered with the first partial result set and retained
     // by the ResultSet, so it is available here even for empty results.
-    rows_to_batch(rs.metadata(), &rows)
+    rows_to_batch(rs.metadata(), &rows, precision)
 }
 
 /// Materialise already-drained Spanner rows (plus their result-set metadata) as a single Arrow
@@ -93,8 +165,9 @@ pub(crate) async fn result_set_to_batch(mut rs: ResultSet) -> Result<(SchemaRef,
 pub(crate) fn rows_to_batch(
     metadata: Option<&ResultSetMetadata>,
     rows: &[Row],
+    precision: TimestampPrecision,
 ) -> Result<(SchemaRef, RecordBatch)> {
-    let schema = build_schema(metadata, rows.first());
+    let schema = build_schema(metadata, rows.first(), precision);
     let batch = build_batch(schema.clone(), rows)?;
     Ok((schema, batch))
 }
@@ -176,9 +249,10 @@ pub(crate) async fn stream_query(
     cancel: CancelSignal,
     mut rs: ResultSet,
     batch_size: usize,
+    precision: TimestampPrecision,
 ) -> Result<SpannerBatchReader> {
     let first = pull_chunk(&mut rs, batch_size).await?;
-    let schema = build_schema(rs.metadata(), first.first());
+    let schema = build_schema(rs.metadata(), first.first(), precision);
     let source = ResultSetChunks {
         result_set: rs,
         batch_size,
@@ -305,6 +379,7 @@ pub(crate) async fn stream_bound_query(
     transaction: MultiUseReadOnlyTransaction,
     statements: Vec<SpannerSql>,
     batch_size: usize,
+    precision: TimestampPrecision,
 ) -> Result<BoundQueryBatchReader> {
     let mut statements = statements.into_iter();
     let mut result_set = match statements.next() {
@@ -320,7 +395,7 @@ pub(crate) async fn stream_bound_query(
     let (first, schema) = match result_set.as_mut() {
         Some(rs) => {
             let rows = pull_chunk(rs, batch_size).await?;
-            let schema = build_schema(rs.metadata(), rows.first());
+            let schema = build_schema(rs.metadata(), rows.first(), precision);
             (Some(rows), schema)
         }
         None => (None, Arc::new(Schema::empty())),
@@ -435,6 +510,7 @@ impl RecordBatchReader for BoundQueryBatchReader {
 pub(crate) fn build_schema(
     metadata: Option<&ResultSetMetadata>,
     first_row: Option<&Row>,
+    precision: TimestampPrecision,
 ) -> SchemaRef {
     if let Some(md) = metadata {
         let names = md.column_names();
@@ -444,7 +520,7 @@ pub(crate) fn build_schema(
                 .iter()
                 .enumerate()
                 .map(|(i, name)| match types.get(i) {
-                    Some(ty) => arrow_field(name, ty, true),
+                    Some(ty) => arrow_field(name, ty, true, precision),
                     None => Field::new(name, DataType::Utf8, true),
                 })
                 .collect();
@@ -466,8 +542,13 @@ pub(crate) fn build_schema(
 /// it as logical JSON, so consumers that understand the extension (pyarrow, DuckDB, polars) can
 /// recognize it while others still read plain strings. Only `TypeCode::Json` is tagged — the other
 /// Utf8-backed codes (`STRING`, `UUID`, `INTERVAL`, `ENUM`, `PROTO`) stay untagged.
-fn arrow_field(name: impl Into<String>, ty: &Type, nullable: bool) -> Field {
-    let field = Field::new(name, arrow_type(ty), nullable);
+fn arrow_field(
+    name: impl Into<String>,
+    ty: &Type,
+    nullable: bool,
+    precision: TimestampPrecision,
+) -> Field {
+    let field = Field::new(name, arrow_type(ty, precision), nullable);
     if ty.code() == TypeCode::Json {
         field.with_metadata(json_extension_metadata())
     } else {
@@ -504,8 +585,10 @@ fn json_extension_metadata() -> HashMap<String, String> {
     ])
 }
 
-/// Map a Spanner column [`Type`] to an Arrow [`DataType`].
-fn arrow_type(ty: &Type) -> DataType {
+/// Map a Spanner column [`Type`] to an Arrow [`DataType`]. `precision` selects the `TIMESTAMP`
+/// unit (see [`TimestampPrecision`]) and is threaded recursively, so a `TIMESTAMP` nested in an
+/// `ARRAY`/`STRUCT` maps the same as a top-level column.
+fn arrow_type(ty: &Type, precision: TimestampPrecision) -> DataType {
     match ty.code() {
         TypeCode::Bool => DataType::Boolean,
         TypeCode::Int64 => DataType::Int64,
@@ -513,16 +596,18 @@ fn arrow_type(ty: &Type) -> DataType {
         TypeCode::Float32 => DataType::Float32,
         TypeCode::Bytes => DataType::Binary,
         TypeCode::Date => DataType::Date32,
-        TypeCode::Timestamp => DataType::Timestamp(TimeUnit::Nanosecond, Some(TIMESTAMP_TZ.into())),
+        TypeCode::Timestamp => {
+            DataType::Timestamp(precision.time_unit(), Some(TIMESTAMP_TZ.into()))
+        }
         TypeCode::Numeric => DataType::Decimal128(NUMERIC_PRECISION, NUMERIC_SCALE),
-        TypeCode::Struct => struct_arrow_type(ty),
+        TypeCode::Struct => struct_arrow_type(ty, precision),
         TypeCode::Array => match ty.array_element_type() {
             // ARRAY<T> → Arrow List<T> (recursively; T may itself be a STRUCT). The element field is
             // built via `arrow_field`, so an `ARRAY<JSON>` carries the `arrow.json` extension on the
             // list's child (`item`) field, not the top-level List. Spanner does not allow arrays of
             // arrays; fall back to JSON text for anything unexpected.
             Some(element) if !matches!(element.code(), TypeCode::Array | TypeCode::Unspecified) => {
-                DataType::List(Arc::new(arrow_field(LIST_ITEM, &element, true)))
+                DataType::List(Arc::new(arrow_field(LIST_ITEM, &element, true, precision)))
             }
             _ => DataType::Utf8,
         },
@@ -533,15 +618,18 @@ fn arrow_type(ty: &Type) -> DataType {
 
 /// Map a Spanner `STRUCT` type to an Arrow `Struct`, using the field names and types from the
 /// result metadata. Falls back to `Utf8` if the struct type is somehow unavailable.
-fn struct_arrow_type(ty: &Type) -> DataType {
+fn struct_arrow_type(ty: &Type, precision: TimestampPrecision) -> DataType {
     match ty.struct_type() {
-        Some(st) => DataType::Struct(struct_fields(st)),
+        Some(st) => DataType::Struct(struct_fields(st, precision)),
         None => DataType::Utf8,
     }
 }
 
 /// Build the Arrow child fields for a Spanner struct type (names verbatim, including empties/dups).
-fn struct_fields(st: &google_cloud_spanner::model::StructType) -> Fields {
+fn struct_fields(
+    st: &google_cloud_spanner::model::StructType,
+    precision: TimestampPrecision,
+) -> Fields {
     st.fields
         .iter()
         .map(|f| {
@@ -551,7 +639,7 @@ fn struct_fields(st: &google_cloud_spanner::model::StructType) -> Fields {
                 .cloned()
                 .map(Type::from)
                 .unwrap_or_default();
-            arrow_field(&f.name, &field_type, true)
+            arrow_field(&f.name, &field_type, true, precision)
         })
         .collect()
 }
@@ -571,7 +659,7 @@ fn build_batch(schema: SchemaRef, rows: &[Row]) -> Result<RecordBatch> {
         .fields()
         .iter()
         .zip(&columns)
-        .map(|(field, values)| build_array(field.data_type(), values))
+        .map(|(field, values)| build_column(field, values))
         .collect::<Result<_>>()?;
 
     RecordBatch::try_new(schema, arrays).map_err(|e| {
@@ -579,6 +667,16 @@ fn build_batch(schema: SchemaRef, rows: &[Row]) -> Result<RecordBatch> {
             format!("failed to build record batch: {e}"),
             Status::Internal,
         )
+    })
+}
+
+/// Build one result column via [`build_array`], prefixing any error with the column's name.
+/// `build_array` only sees the type and the offending value; in a wide result the failing
+/// *column* is what the caller needs to identify (e.g. an out-of-range `TIMESTAMP`).
+fn build_column(field: &FieldRef, values: &[Option<&Value>]) -> Result<ArrayRef> {
+    build_array(field.data_type(), values).map_err(|mut e| {
+        e.message = format!("column {:?}: {}", field.name(), e.message);
+        e
     })
 }
 
@@ -670,13 +768,34 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
                             if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
                                 invalid_argument(format!(
                                     "TIMESTAMP value {s:?} is outside the range representable as \
-                                     an Arrow Timestamp(Nanosecond) (~1677-09-21 to 2262-04-11)"
+                                     an Arrow Timestamp(Nanosecond) (~1677-09-21 to 2262-04-11); \
+                                     set {}={} to read it at microsecond precision instead",
+                                    crate::OPTION_MAX_TIMESTAMP_PRECISION,
+                                    TimestampPrecision::MICROSECONDS,
                                 ))
                             } else {
                                 decode_error("TIMESTAMP", v)
                             }
                         })?)
                     }
+                }
+            }
+            Arc::new(builder.finish().with_timezone_opt(tz.clone()))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            // The `microseconds` mode of `spanner.max_timestamp_precision`. Every instant Spanner
+            // can store (0001-01-01 to 9999-12-31) fits an i64 of epoch microseconds, so this arm
+            // has no out-of-range case; sub-microsecond wire digits are truncated toward negative
+            // infinity (see `parse_timestamp_micros`). Undecodable strings still error loudly.
+            let mut builder = TimestampMicrosecondArray::builder(values.len());
+            for &value in values {
+                match present(value) {
+                    None => builder.append_null(),
+                    Some(v) => builder.append_value(
+                        v.try_as_string()
+                            .and_then(parse_timestamp_micros)
+                            .ok_or_else(|| decode_error("TIMESTAMP", v))?,
+                    ),
                 }
             }
             Arc::new(builder.finish().with_timezone_opt(tz.clone()))
@@ -847,6 +966,22 @@ pub(crate) fn parse_timestamp_nanos(s: &str) -> Option<i64> {
         .and_then(|dt| dt.timestamp_nanos_opt())
 }
 
+/// Parse a Spanner `TIMESTAMP` (RFC 3339) into microseconds since the Unix epoch (Arrow
+/// `Timestamp(Microsecond)`), **truncating** any sub-microsecond digits **toward negative
+/// infinity**: chrono splits an instant into floor seconds plus a non-negative sub-second part,
+/// so the integer division of the sub-second nanoseconds is a floor on the timeline (e.g.
+/// `1969-12-31T23:59:59.9999999Z` → `-1` µs, not `0`).
+///
+/// Returns `None` for a malformed string. Every instant Spanner can store (0001-01-01 to
+/// 9999-12-31) is representable — i64 microseconds span ~±292,000 years — so the checked
+/// arithmetic only guards against hypothetical far-out-of-range inputs, never real Spanner data.
+pub(crate) fn parse_timestamp_micros(s: &str) -> Option<i64> {
+    let dt = chrono::DateTime::parse_from_rfc3339(s).ok()?;
+    dt.timestamp()
+        .checked_mul(1_000_000)?
+        .checked_add(i64::from(dt.timestamp_subsec_micros()))
+}
+
 /// Parse a Spanner `NUMERIC` (decimal string) into an unscaled `i128` at scale 9 (Arrow
 /// `Decimal128(38, 9)`). Returns `None` on malformed input or i128 overflow.
 pub(crate) fn parse_numeric_i128(s: &str) -> Option<i128> {
@@ -915,7 +1050,12 @@ mod tests {
 
     #[test]
     fn json_column_is_tagged_arrow_json() {
-        let field = arrow_field("payload", &google_cloud_spanner::types::json(), true);
+        let field = arrow_field(
+            "payload",
+            &google_cloud_spanner::types::json(),
+            true,
+            TimestampPrecision::default(),
+        );
         // Storage type stays Utf8; only the field metadata marks it as logical JSON.
         assert_eq!(field.data_type(), &DataType::Utf8);
         assert_eq!(extension_name(&field), Some(ARROW_JSON_EXTENSION));
@@ -932,7 +1072,12 @@ mod tests {
     #[test]
     fn string_column_is_not_tagged() {
         // Guards against over-tagging: plain STRING must stay untagged Utf8.
-        let field = arrow_field("name", &google_cloud_spanner::types::string(), true);
+        let field = arrow_field(
+            "name",
+            &google_cloud_spanner::types::string(),
+            true,
+            TimestampPrecision::default(),
+        );
         assert_eq!(field.data_type(), &DataType::Utf8);
         assert_eq!(extension_name(&field), None);
         assert!(field.metadata().is_empty());
@@ -941,7 +1086,12 @@ mod tests {
     #[test]
     fn array_of_json_tags_the_item_field() {
         let element = google_cloud_spanner::types::json();
-        let field = arrow_field("tags", &google_cloud_spanner::types::array(element), true);
+        let field = arrow_field(
+            "tags",
+            &google_cloud_spanner::types::array(element),
+            true,
+            TimestampPrecision::default(),
+        );
         // Top-level List field carries no extension; its child (`item`) field does.
         assert_eq!(extension_name(&field), None);
         let DataType::List(item) = field.data_type() else {
@@ -1299,6 +1449,215 @@ mod tests {
             .unwrap();
         assert_eq!(ids.value(2), 7);
         assert!(names.is_null(2)); // NULL field stays a null slot
+    }
+
+    /// The option values of `spanner.max_timestamp_precision` parse to the two modes; the empty
+    /// string resets to the default; anything else is rejected loudly.
+    #[test]
+    fn timestamp_precision_option_parses_and_round_trips() {
+        let parse = |s: &str| TimestampPrecision::parse_option(OptionValue::String(s.to_string()));
+        assert_eq!(
+            parse("nanoseconds_error_on_overflow").unwrap(),
+            TimestampPrecision::NanosecondsErrorOnOverflow
+        );
+        assert_eq!(
+            parse("microseconds").unwrap(),
+            TimestampPrecision::Microseconds
+        );
+        // "" unsets — i.e. resets to the default mode (the staleness-option convention).
+        assert_eq!(parse("").unwrap(), TimestampPrecision::default());
+        assert_eq!(
+            parse(" microseconds ").unwrap(),
+            TimestampPrecision::Microseconds
+        ); // trimmed
+        assert_eq!(
+            TimestampPrecision::default(),
+            TimestampPrecision::NanosecondsErrorOnOverflow
+        );
+        // Round-trip strings match what parse accepts.
+        for mode in [
+            TimestampPrecision::NanosecondsErrorOnOverflow,
+            TimestampPrecision::Microseconds,
+        ] {
+            assert_eq!(parse(mode.as_str()).unwrap(), mode);
+        }
+        // Snowflake's silent-wraparound `nanoseconds` value is deliberately not offered: wrapped
+        // timestamps are silent data corruption. It must be rejected, not quietly accepted.
+        for bad in ["nanoseconds", "millis", "seconds", "true"] {
+            let error = parse(bad).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "value {bad:?}");
+            assert!(
+                error.message.contains("spanner.max_timestamp_precision")
+                    && error.message.contains(bad),
+                "{}",
+                error.message
+            );
+        }
+        // Non-string option values are rejected.
+        assert_eq!(
+            TimestampPrecision::parse_option(OptionValue::Int(1))
+                .unwrap_err()
+                .status,
+            Status::InvalidArguments
+        );
+    }
+
+    /// The schema mapping and the data path must agree on the `TIMESTAMP` unit in **both** modes —
+    /// the array a reader builds must have exactly the `DataType` the schema (query results,
+    /// `execute_schema`, the PLAN probe, `get_table_schema` — all of which go through
+    /// `arrow_field`) advertises, including for a `TIMESTAMP` nested inside an `ARRAY`.
+    #[test]
+    fn timestamp_schema_unit_matches_data_path_in_both_modes() {
+        use google_cloud_spanner::value::ToValue;
+        for (mode, unit) in [
+            (
+                TimestampPrecision::NanosecondsErrorOnOverflow,
+                TimeUnit::Nanosecond,
+            ),
+            (TimestampPrecision::Microseconds, TimeUnit::Microsecond),
+        ] {
+            let expected = DataType::Timestamp(unit, Some(TIMESTAMP_TZ.into()));
+            let field = arrow_field("t", &google_cloud_spanner::types::timestamp(), true, mode);
+            assert_eq!(field.data_type(), &expected, "{mode:?}");
+
+            // The data path produces an array of exactly the advertised type.
+            let v = "2024-01-15T12:34:56.789012Z".to_value();
+            let array = build_array(field.data_type(), &[Some(&v)]).unwrap();
+            assert_eq!(array.data_type(), &expected, "{mode:?}");
+
+            // Nested: ARRAY<TIMESTAMP> carries the same unit on the item field.
+            let list_field = arrow_field(
+                "ts",
+                &google_cloud_spanner::types::array(google_cloud_spanner::types::timestamp()),
+                true,
+                mode,
+            );
+            let DataType::List(item) = list_field.data_type() else {
+                panic!("expected a List, got {:?}", list_field.data_type());
+            };
+            assert_eq!(item.data_type(), &expected, "{mode:?}");
+        }
+    }
+
+    /// `parse_timestamp_micros` covers Spanner's whole 0001–9999 range and truncates
+    /// sub-microsecond digits toward negative infinity (a floor on the timeline, also for
+    /// pre-epoch instants).
+    #[test]
+    fn timestamps_to_epoch_micros_truncate_toward_negative_infinity() {
+        assert_eq!(parse_timestamp_micros("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_timestamp_micros("2024-01-15T12:34:56.789012Z"),
+            Some(1_705_322_096_789_012)
+        );
+        // Sub-microsecond digits truncate: 789012345 ns → 789012 µs.
+        assert_eq!(
+            parse_timestamp_micros("2024-01-15T12:34:56.789012345Z"),
+            Some(1_705_322_096_789_012)
+        );
+        // ... and toward negative infinity, not toward zero: 1 ns before the epoch is µs -1.
+        assert_eq!(
+            parse_timestamp_micros("1969-12-31T23:59:59.999999999Z"),
+            Some(-1)
+        );
+        assert_eq!(
+            parse_timestamp_micros("1970-01-01T00:00:00.000000999Z"),
+            Some(0)
+        );
+        // Spanner's extremes — far outside the Arrow *nanosecond* range — are representable.
+        let year_1500 = parse_timestamp_micros("1500-06-15T12:34:56.789012Z").unwrap();
+        // Under floor semantics the sub-second part stays exactly 789012 µs, pre-epoch included.
+        assert_eq!(year_1500.rem_euclid(1_000_000), 789_012);
+        assert_eq!(
+            parse_timestamp_micros("0001-01-01T00:00:00Z"),
+            Some(-62_135_596_800_000_000)
+        );
+        assert_eq!(
+            parse_timestamp_micros("9999-12-31T23:59:59.999999999Z"),
+            Some(253_402_300_799_999_999)
+        );
+        assert_eq!(parse_timestamp_micros("nope"), None);
+    }
+
+    /// The `microseconds` mode reads values the default mode must reject (year 1500 / 9999),
+    /// truncates sub-microsecond precision, and keeps the strict-decode and null semantics.
+    #[test]
+    fn microsecond_mode_reads_full_range_and_default_mode_errors() {
+        use arrow_array::Array;
+        use google_cloud_spanner::value::ToValue;
+        let micros_ty = DataType::Timestamp(TimeUnit::Microsecond, Some(TIMESTAMP_TZ.into()));
+        let nanos_ty = DataType::Timestamp(TimeUnit::Nanosecond, Some(TIMESTAMP_TZ.into()));
+        let null = None::<&str>.to_value();
+        let year_1500 = "1500-06-15T12:34:56.789012Z".to_value();
+        let year_9999 = "9999-01-01T00:00:00Z".to_value();
+        let sub_micro = "2024-01-15T12:34:56.789012345Z".to_value();
+
+        // Microseconds: everything decodes; sub-microsecond digits truncate; nulls survive.
+        let array = build_array(
+            &micros_ty,
+            &[
+                Some(&year_1500),
+                Some(&year_9999),
+                Some(&sub_micro),
+                Some(&null),
+                None,
+            ],
+        )
+        .unwrap();
+        let ts = array
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(
+            ts.value(0),
+            parse_timestamp_micros("1500-06-15T12:34:56.789012Z").unwrap()
+        );
+        assert_eq!(
+            ts.value(1),
+            parse_timestamp_micros("9999-01-01T00:00:00Z").unwrap()
+        );
+        assert_eq!(ts.value(2), 1_705_322_096_789_012);
+        assert!(ts.is_null(3));
+        assert!(ts.is_null(4));
+
+        // A malformed string is still a loud decode error in microseconds mode, never a null.
+        let malformed = "2024-13-45T99:99:99Z".to_value();
+        let err = build_array(&micros_ty, &[Some(&malformed)]).unwrap_err();
+        assert_eq!(err.status, Status::InvalidData);
+
+        // The default (nanoseconds) mode must reject the same out-of-range instants loudly,
+        // pointing at the escape hatch.
+        for value in [&year_1500, &year_9999] {
+            let err = build_array(&nanos_ty, &[Some(value)]).unwrap_err();
+            assert_eq!(err.status, Status::InvalidArguments);
+            assert!(
+                err.message.contains("spanner.max_timestamp_precision")
+                    && err.message.contains("microseconds"),
+                "{}",
+                err.message
+            );
+        }
+    }
+
+    /// A conversion error surfacing through a record batch names the failing **column** as well
+    /// as the offending value, so a wide result stays diagnosable.
+    #[test]
+    fn conversion_errors_name_the_column() {
+        use google_cloud_spanner::value::ToValue;
+        let field: FieldRef = Arc::new(Field::new(
+            "CreatedAt",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(TIMESTAMP_TZ.into())),
+            true,
+        ));
+        let out_of_range = "9999-01-01T00:00:00Z".to_value();
+        let err = build_column(&field, &[Some(&out_of_range)]).unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(
+            err.message.contains("\"CreatedAt\"")
+                && err.message.contains("9999-01-01T00:00:00Z")
+                && err.message.contains("spanner.max_timestamp_precision"),
+            "{}",
+            err.message
+        );
     }
 
     /// `INT64` arrives as a JSON string, so every `i64` — including magnitudes above 2^53 that an
