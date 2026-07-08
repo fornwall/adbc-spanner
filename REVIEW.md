@@ -747,9 +747,20 @@ option/metadata constants and the `bench_support`/`fuzzing` helper modules — w
 documented, so the lint gates future additions without needing any new docs, and
 `clippy --all-targets --all-features -- -D warnings` plus `cargo doc --no-deps --all-features` stay
 clean); assorted maintainability
-polish: the four direction-specific copies of the type mapping (`bind_one` vs `bind_list` is a
+polish: ~~the four direction-specific copies of the type mapping (`bind_one` vs `bind_list` is a
 genuine 100-line duplication — fold via an element visitor, and add an "adding a type touches
-these N sites" checklist), ~~three hand-rolled comment-skipping lexer walkers that could share one
+these N sites" checklist)~~ (**Fixed.** The scalar bind path (`cell_value`) and the array-element
+path (`list_cell_value`) in `src/bind.rs` now funnel through one `scalar_binder` — a `fn`-pointer
+per-element visitor keyed on `DataType` that reads element `i` of an array into a Spanner `Value`
+(nulls preserved), so a scalar type's Arrow→Spanner mapping lives in exactly one match and the two
+paths can no longer drift; the parallel per-type arms and the `list_primitive`/`list_string`/
+`list_binary`/`list_try`/`string_value`/`string_array_value` collectors were removed, and JSON
+typing/array wrapping now sit only at the two call sites. A doc "checklist" above `scalar_binder`
+enumerates the sites to touch when adding a type — the visitor itself, `spanner_column_type`,
+`spanner_field_type`, the `conversion.rs` read path, and the module-level supported-types doc.
+Behaviour-preserving for every existing input [all 43 `bind.rs` unit tests pass unchanged], with the
+one intended consequence of closing the drift: `ARRAY<Date64>` elements, which the scalar path
+already accepted but the old array arm silently rejected, now bind too), ~~three hand-rolled comment-skipping lexer walkers that could share one
 token iterator~~ (**Fixed.** `split_statements`, `is_dml_returning` (both `src/ddl.rs`) and
 `named_parameters` (`src/bind.rs`) each hand-rolled the same GoogleSQL whitespace/comment/quote walk;
 they now share one `Lexer` (`src/ddl.rs::lex`) that tokenizes into `Lexeme::{Word, Quoted, Comment,

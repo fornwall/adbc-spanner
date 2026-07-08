@@ -50,11 +50,11 @@
 use adbc_core::error::Result;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    ArrowPrimitiveType, Date32Type, Date64Type, Decimal128Type, Float32Type, Float64Type, Int8Type,
-    Int16Type, Int32Type, Int64Type, TimestampMicrosecondType, TimestampMillisecondType,
+    Date32Type, Date64Type, Decimal128Type, Float32Type, Float64Type, Int8Type, Int16Type,
+    Int32Type, Int64Type, TimestampMicrosecondType, TimestampMillisecondType,
     TimestampNanosecondType, TimestampSecondType,
 };
-use arrow_array::{Array, ArrayRef, OffsetSizeTrait, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, TimeUnit};
 use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Utc};
 use google_cloud_spanner::mutation::Mutation;
@@ -204,119 +204,166 @@ fn cell_value(
     column: &dyn Array,
     row: usize,
 ) -> Result<(Value, Option<Type>)> {
-    let is_null = column.is_null(row);
-    let json = is_json_field(field);
-    Ok(match column.data_type() {
-        DataType::Int64 => {
-            let a = column.as_primitive::<Int64Type>();
-            (scalar_value(is_null, || a.value(row)), None)
+    let data_type = column.data_type();
+    match data_type {
+        // ARRAY<...> values: an Arrow `List`/`LargeList` column maps to a Spanner array. Each
+        // element runs through the same [`scalar_binder`] mapping as a scalar bind (see
+        // [`list_cell_value`]); nested arrays and STRUCT elements are out of scope and rejected
+        // there.
+        DataType::List(item) => {
+            let elem = (!column.is_null(row)).then(|| column.as_list::<i32>().value(row));
+            list_cell_value(name, item, elem)
         }
+        DataType::LargeList(item) => {
+            let elem = (!column.is_null(row)).then(|| column.as_list::<i64>().value(row));
+            list_cell_value(name, item, elem)
+        }
+        // Every scalar type funnels through the one [`scalar_binder`] mapping.
+        _ => {
+            let bind = scalar_binder(data_type).ok_or_else(|| {
+                invalid_argument(format!(
+                    "cannot bind parameter {name:?}: unsupported Arrow type {data_type:?}"
+                ))
+            })?;
+            let value = bind(name, data_type, column, row)?;
+            // JSON is the only type needing an explicit param type; `is_json_field` is true only
+            // for `arrow.json`-tagged string columns, so this is `None` for every other type.
+            Ok((value, is_json_field(field).then(types::json)))
+        }
+    }
+}
+
+/// The per-element Arrow→Spanner scalar encoder returned by [`scalar_binder`]: given the parameter
+/// `name` (for error messages), the element's Arrow [`DataType`] (equal to the array's own type —
+/// consulted for the `Timestamp` unit / `Decimal128` scale), the array, and an element index, it
+/// produces that element's Spanner [`Value`]. A plain `fn` (the arms capture nothing), so
+/// dispatching once per cell and reusing the result across an array's elements costs no allocation.
+type ScalarBinder = fn(&str, &DataType, &dyn Array, usize) -> Result<Value>;
+
+/// The **single** Arrow→Spanner scalar-value mapping — the one place a scalar type's encoding
+/// lives.
+///
+/// Returns the [`ScalarBinder`] for a scalar Arrow `data_type` (reading element `i` of an array of
+/// that type into a Spanner scalar [`Value`], nulls preserved), or `None` if the type has no
+/// Spanner mapping. Both binding paths funnel through it — [`cell_value`] for a scalar `@param`,
+/// and [`list_cell_value`] for every element of an `ARRAY<...>` — so the two can no longer drift,
+/// and a scalar type is accepted as parameter *and* array element in one stroke.
+///
+/// **Adding a new Arrow scalar type touches these sites** (keep them in lockstep):
+///   1. **here** (`scalar_binder`) — the Arrow→Spanner *value* mapping, shared by the scalar and
+///      array-element binds;
+///   2. [`spanner_column_type`] — the Arrow→Spanner *column* type for the ingest `CREATE TABLE`;
+///   3. [`spanner_field_type`] — only if the type needs field-aware handling (as `arrow.json` does);
+///   4. the read path in [`crate::conversion`] — the reverse Spanner→Arrow mapping, so values
+///      round-trip;
+///   5. the module-level doc list of supported types (top of this file).
+///
+/// (A new *container* kind — beyond `List`/`LargeList` — is instead added to [`cell_value`].)
+fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
+    let bind: ScalarBinder = match data_type {
+        DataType::Int64 => |_, _, a, i| {
+            Ok(scalar_value(a.is_null(i), || {
+                a.as_primitive::<Int64Type>().value(i)
+            }))
+        },
         // Spanner's only integer type is INT64, so narrower Arrow ints widen to it.
-        DataType::Int32 => {
-            let a = column.as_primitive::<Int32Type>();
-            (scalar_value(is_null, || i64::from(a.value(row))), None)
-        }
-        DataType::Int16 => {
-            let a = column.as_primitive::<Int16Type>();
-            (scalar_value(is_null, || i64::from(a.value(row))), None)
-        }
-        DataType::Int8 => {
-            let a = column.as_primitive::<Int8Type>();
-            (scalar_value(is_null, || i64::from(a.value(row))), None)
-        }
-        DataType::Float64 => {
-            let a = column.as_primitive::<Float64Type>();
-            (scalar_value(is_null, || a.value(row)), None)
-        }
-        DataType::Float32 => {
-            let a = column.as_primitive::<Float32Type>();
-            (scalar_value(is_null, || a.value(row)), None)
-        }
+        DataType::Int32 => |_, _, a, i| {
+            Ok(scalar_value(a.is_null(i), || {
+                i64::from(a.as_primitive::<Int32Type>().value(i))
+            }))
+        },
+        DataType::Int16 => |_, _, a, i| {
+            Ok(scalar_value(a.is_null(i), || {
+                i64::from(a.as_primitive::<Int16Type>().value(i))
+            }))
+        },
+        DataType::Int8 => |_, _, a, i| {
+            Ok(scalar_value(a.is_null(i), || {
+                i64::from(a.as_primitive::<Int8Type>().value(i))
+            }))
+        },
+        DataType::Float64 => |_, _, a, i| {
+            Ok(scalar_value(a.is_null(i), || {
+                a.as_primitive::<Float64Type>().value(i)
+            }))
+        },
+        // f32 widens losslessly to Spanner FLOAT64.
+        DataType::Float32 => |_, _, a, i| {
+            Ok(scalar_value(a.is_null(i), || {
+                f64::from(a.as_primitive::<Float32Type>().value(i))
+            }))
+        },
         DataType::Boolean => {
-            let a = column.as_boolean();
-            (scalar_value(is_null, || a.value(row)), None)
+            |_, _, a, i| Ok(scalar_value(a.is_null(i), || a.as_boolean().value(i)))
         }
-        // `Utf8`/`LargeUtf8` differ only in offset width; both map to Spanner STRING. LargeUtf8
-        // is what Arrow-native producers commonly emit (e.g. `pyarrow.Table.from_pandas`).
+        // `Utf8`/`LargeUtf8` differ only in offset width; both map to Spanner STRING (LargeUtf8 is
+        // what Arrow-native producers commonly emit, e.g. `pyarrow.Table.from_pandas`). JSON typing
+        // is applied by the caller, not here.
         DataType::Utf8 => {
-            let a = column.as_string::<i32>();
-            string_value(json, (!is_null).then(|| a.value(row)))
+            |_, _, a, i| Ok(scalar_value(a.is_null(i), || a.as_string::<i32>().value(i)))
         }
         DataType::LargeUtf8 => {
-            let a = column.as_string::<i64>();
-            string_value(json, (!is_null).then(|| a.value(row)))
+            |_, _, a, i| Ok(scalar_value(a.is_null(i), || a.as_string::<i64>().value(i)))
         }
         // `Utf8View`/`BinaryView` are the German-string layouts newer Arrow producers (polars,
         // pyarrow 16+ with view types) emit by default; same Spanner mapping as their offset kin.
         DataType::Utf8View => {
-            let a = column.as_string_view();
-            string_value(json, (!is_null).then(|| a.value(row)))
+            |_, _, a, i| Ok(scalar_value(a.is_null(i), || a.as_string_view().value(i)))
         }
-        DataType::Binary => {
-            let a = column.as_binary::<i32>();
-            (scalar_value(is_null, || a.value(row).to_vec()), None)
-        }
-        DataType::LargeBinary => {
-            let a = column.as_binary::<i64>();
-            (scalar_value(is_null, || a.value(row).to_vec()), None)
-        }
-        DataType::BinaryView => {
-            let a = column.as_binary_view();
-            (scalar_value(is_null, || a.value(row).to_vec()), None)
-        }
-        DataType::Date32 => {
-            let a = column.as_primitive::<Date32Type>();
-            (
-                try_scalar_value(is_null, || date_string(name, a.value(row)))?,
-                None,
-            )
-        }
+        DataType::Binary => |_, _, a, i| {
+            Ok(scalar_value(a.is_null(i), || {
+                a.as_binary::<i32>().value(i).to_vec()
+            }))
+        },
+        DataType::LargeBinary => |_, _, a, i| {
+            Ok(scalar_value(a.is_null(i), || {
+                a.as_binary::<i64>().value(i).to_vec()
+            }))
+        },
+        DataType::BinaryView => |_, _, a, i| {
+            Ok(scalar_value(a.is_null(i), || {
+                a.as_binary_view().value(i).to_vec()
+            }))
+        },
+        DataType::Date32 => |name, _, a, i| {
+            try_scalar_value(a.is_null(i), || {
+                date_string(name, a.as_primitive::<Date32Type>().value(i))
+            })
+        },
         // `Date64` is milliseconds since the Unix epoch, constrained by Arrow to whole days.
-        DataType::Date64 => {
-            let a = column.as_primitive::<Date64Type>();
-            (
-                try_scalar_value(is_null, || {
-                    date_string(name, date64_days(name, a.value(row))?)
-                })?,
-                None,
-            )
-        }
-        // Spanner `TIMESTAMP` is UTC with nanosecond precision, so every Arrow timestamp unit
-        // is accepted; `timestamp_value` reads the raw i64 from the unit's typed array and
+        DataType::Date64 => |name, _, a, i| {
+            try_scalar_value(a.is_null(i), || {
+                date_string(
+                    name,
+                    date64_days(name, a.as_primitive::<Date64Type>().value(i))?,
+                )
+            })
+        },
+        // Spanner `TIMESTAMP` is UTC with nanosecond precision, so every Arrow timestamp unit is
+        // accepted; `timestamp_value` reads the raw i64 from the unit's typed array and
         // `timestamp_string` formats the Spanner value at the unit's full precision.
-        DataType::Timestamp(unit, _) => (
-            try_scalar_value(is_null, || {
-                timestamp_string(name, unit, timestamp_value(column, unit, row))
-            })?,
-            None,
-        ),
-        DataType::Decimal128(_precision, scale) => {
-            let a = column.as_primitive::<Decimal128Type>();
+        DataType::Timestamp(_, _) => |name, dt, a, i| {
+            let DataType::Timestamp(unit, _) = dt else {
+                unreachable!("scalar_binder dispatched a Timestamp arm on {dt:?}")
+            };
+            try_scalar_value(a.is_null(i), || {
+                timestamp_string(name, unit, timestamp_value(a, unit, i))
+            })
+        },
+        DataType::Decimal128(_, _) => |name, dt, a, i| {
+            let DataType::Decimal128(_, scale) = dt else {
+                unreachable!("scalar_binder dispatched a Decimal128 arm on {dt:?}")
+            };
             // Format the full i128 directly; no narrower decimal type in the way. The scale is
             // validated even for a null so a bad schema fails loudly on every row.
             let scale = numeric_scale(name, *scale)?;
-            (
-                scalar_value(is_null, || numeric_string(a.value(row), scale)),
-                None,
-            )
-        }
-        // ARRAY<...> values: an Arrow `List`/`LargeList` column maps to a Spanner array. The
-        // element type mirrors the scalar arms above (see [`list_cell_value`]); nested arrays and
-        // STRUCT elements are out of scope and rejected there.
-        DataType::List(item) => {
-            let elem = (!is_null).then(|| column.as_list::<i32>().value(row));
-            list_cell_value(name, item, elem)?
-        }
-        DataType::LargeList(item) => {
-            let elem = (!is_null).then(|| column.as_list::<i64>().value(row));
-            list_cell_value(name, item, elem)?
-        }
-        other => {
-            return Err(invalid_argument(format!(
-                "cannot bind parameter {name:?}: unsupported Arrow type {other:?}"
-            )));
-        }
-    })
+            Ok(scalar_value(a.is_null(i), || {
+                numeric_string(a.as_primitive::<Decimal128Type>().value(i), scale)
+            }))
+        },
+        _ => return None,
+    };
+    Some(bind)
 }
 
 /// The Spanner SQL `NULL` wire value.
@@ -342,178 +389,40 @@ fn try_scalar_value<T: ToValue>(is_null: bool, value: impl FnOnce() -> Result<T>
     })
 }
 
-/// Convert a string cell (or a null) — typed as Spanner `JSON` when the column carries the
-/// `arrow.json` extension (`json`), else as plain, untyped `STRING` (see the module doc).
-fn string_value(json: bool, value: Option<&str>) -> (Value, Option<Type>) {
-    (value.to_value(), json.then(types::json))
-}
-
 /// Convert an Arrow `List`/`LargeList` cell to a Spanner `ARRAY<...>` wire [`Value`].
 ///
-/// `item` is the list's element field (its data type drives the mapping; an `arrow.json` extension
-/// tag on it makes a string element type as `ARRAY<JSON>`); `elem` is the child slice for this
-/// row, or `None` when the whole cell is null (→ a typed null array). The element-type mapping
-/// mirrors the scalar arms of [`cell_value`] (narrower ints widen to `INT64`, floats to `FLOAT64`,
+/// `item` is the list's element field: its data type selects the [`scalar_binder`] mapping (an
+/// `arrow.json` tag on a string element types the whole array as `ARRAY<JSON>`), and `elem` is the
+/// child slice for this row, or `None` when the whole cell is null (→ a typed null array). Every
+/// element runs through the same `scalar_binder` as a scalar bind, so the element mapping cannot
+/// drift from the scalar one (narrower ints widen to `INT64`, floats to `FLOAT64`,
 /// `DATE`/`TIMESTAMP`/`NUMERIC` format to their Spanner string forms), and each element keeps its
-/// own null. Spanner has no `ARRAY<ARRAY<…>>`, and `ARRAY<STRUCT>` is out of scope, so
-/// `List`/`LargeList`/`Struct` (and any otherwise-unsupported) element types are rejected.
+/// own null. The element type is validated up front, so an unsupported element — including a
+/// nested `ARRAY<ARRAY<…>>` or `ARRAY<STRUCT>` (both out of scope for Spanner) — is rejected even
+/// for an empty or null array.
 fn list_cell_value(
     name: &str,
     item: &Field,
     elem: Option<ArrayRef>,
 ) -> Result<(Value, Option<Type>)> {
-    let json = is_json_field(item);
-    Ok(match item.data_type() {
-        DataType::Int64 => (list_primitive::<Int64Type, _>(elem, |v| v).to_value(), None),
-        // Narrower Arrow ints widen to Spanner INT64, exactly like the scalar arms.
-        DataType::Int32 => (
-            list_primitive::<Int32Type, _>(elem, i64::from).to_value(),
-            None,
-        ),
-        DataType::Int16 => (
-            list_primitive::<Int16Type, _>(elem, i64::from).to_value(),
-            None,
-        ),
-        DataType::Int8 => (
-            list_primitive::<Int8Type, _>(elem, i64::from).to_value(),
-            None,
-        ),
-        DataType::Float64 => (
-            list_primitive::<Float64Type, _>(elem, |v| v).to_value(),
-            None,
-        ),
-        DataType::Float32 => (
-            list_primitive::<Float32Type, _>(elem, f64::from).to_value(),
-            None,
-        ),
-        DataType::Boolean => {
-            let v: Option<Vec<Option<bool>>> = elem.map(|a| {
-                let a = a.as_boolean();
-                (0..a.len())
-                    .map(|i| (!a.is_null(i)).then(|| a.value(i)))
-                    .collect()
-            });
-            (v.to_value(), None)
-        }
-        DataType::Utf8 => string_array_value(json, list_string::<i32>(elem)),
-        DataType::LargeUtf8 => string_array_value(json, list_string::<i64>(elem)),
-        DataType::Utf8View => {
-            let v = elem.map(|a| {
-                let a = a.as_string_view();
-                (0..a.len())
-                    .map(|i| (!a.is_null(i)).then(|| a.value(i).to_string()))
-                    .collect()
-            });
-            string_array_value(json, v)
-        }
-        DataType::Binary => (list_binary::<i32>(elem).to_value(), None),
-        DataType::LargeBinary => (list_binary::<i64>(elem).to_value(), None),
-        DataType::BinaryView => {
-            let v: Option<Vec<Option<Vec<u8>>>> = elem.map(|a| {
-                let a = a.as_binary_view();
-                (0..a.len())
-                    .map(|i| (!a.is_null(i)).then(|| a.value(i).to_vec()))
-                    .collect()
-            });
-            (v.to_value(), None)
-        }
-        // DATE / TIMESTAMP / NUMERIC map to strings that Spanner coerces from the array element's
-        // SQL / column context, same as their scalar arms.
-        DataType::Date32 => {
-            let v = list_try(elem, |a| {
-                let a = a.as_primitive::<Date32Type>();
-                (0..a.len())
-                    .map(|i| {
-                        (!a.is_null(i))
-                            .then(|| date_string(name, a.value(i)))
-                            .transpose()
-                    })
-                    .collect()
-            })?;
-            (v.to_value(), None)
-        }
-        DataType::Timestamp(unit, _) => {
-            let v = list_try(elem, |a| {
-                (0..a.len())
-                    .map(|i| {
-                        (!a.is_null(i))
-                            .then(|| {
-                                timestamp_string(name, unit, timestamp_value(a.as_ref(), unit, i))
-                            })
-                            .transpose()
-                    })
-                    .collect()
-            })?;
-            (v.to_value(), None)
-        }
-        DataType::Decimal128(_precision, scale) => {
-            let scale = numeric_scale(name, *scale)?;
-            let v: Option<Vec<Option<String>>> = elem.map(|a| {
-                let a = a.as_primitive::<Decimal128Type>();
-                (0..a.len())
-                    .map(|i| (!a.is_null(i)).then(|| numeric_string(a.value(i), scale)))
-                    .collect()
-            });
-            (v.to_value(), None)
-        }
-        other => {
-            return Err(invalid_argument(format!(
-                "cannot bind ARRAY parameter {name:?}: unsupported element type {other:?}"
-            )));
-        }
-    })
-}
-
-/// Type a collected string array as Spanner `ARRAY<JSON>` when the list's element carries the
-/// `arrow.json` extension (`json`), else as untyped `ARRAY<STRING>`. `None` is a null array; each
-/// `Option<String>` keeps its own element null.
-fn string_array_value(json: bool, values: Option<Vec<Option<String>>>) -> (Value, Option<Type>) {
-    (values.to_value(), json.then(|| types::array(types::json())))
-}
-
-/// Collect a primitive Arrow child slice into `Vec<Option<E>>`, mapping each element through `f`
-/// and preserving per-element nulls. Returns `None` for a null array (`elem` is `None`).
-fn list_primitive<P, E>(
-    elem: Option<ArrayRef>,
-    f: impl Fn(P::Native) -> E,
-) -> Option<Vec<Option<E>>>
-where
-    P: ArrowPrimitiveType,
-{
-    elem.map(|a| {
-        let a = a.as_primitive::<P>();
-        (0..a.len())
-            .map(|i| (!a.is_null(i)).then(|| f(a.value(i))))
-            .collect()
-    })
-}
-
-/// Collect a `Utf8`/`LargeUtf8` child slice into `Vec<Option<String>>`, preserving per-element nulls.
-fn list_string<O: OffsetSizeTrait>(elem: Option<ArrayRef>) -> Option<Vec<Option<String>>> {
-    elem.map(|a| {
-        let a = a.as_string::<O>();
-        (0..a.len())
-            .map(|i| (!a.is_null(i)).then(|| a.value(i).to_string()))
-            .collect()
-    })
-}
-
-/// Collect a `Binary`/`LargeBinary` child slice into `Vec<Option<Vec<u8>>>`, per-element nulls kept.
-fn list_binary<O: OffsetSizeTrait>(elem: Option<ArrayRef>) -> Option<Vec<Option<Vec<u8>>>> {
-    elem.map(|a| {
-        let a = a.as_binary::<O>();
-        (0..a.len())
-            .map(|i| (!a.is_null(i)).then(|| a.value(i).to_vec()))
-            .collect()
-    })
-}
-
-/// Like [`Option::map`] but the mapping is fallible (used for the string-formatted element types).
-fn list_try<E>(
-    elem: Option<ArrayRef>,
-    f: impl FnOnce(ArrayRef) -> Result<Vec<Option<E>>>,
-) -> Result<Option<Vec<Option<E>>>> {
-    elem.map(f).transpose()
+    let item_type = item.data_type();
+    let bind = scalar_binder(item_type).ok_or_else(|| {
+        invalid_argument(format!(
+            "cannot bind ARRAY parameter {name:?}: unsupported element type {item_type:?}"
+        ))
+    })?;
+    let value = match elem {
+        // A null cell is a null array; each present element keeps its own null via `scalar_binder`.
+        None => null_value(),
+        Some(a) => (0..a.len())
+            .map(|i| bind(name, item_type, a.as_ref(), i))
+            .collect::<Result<Vec<Value>>>()?
+            .to_value(),
+    };
+    Ok((
+        value,
+        is_json_field(item).then(|| types::array(types::json())),
+    ))
 }
 
 /// Convert an Arrow `Date64` value (milliseconds since the Unix epoch, at a whole-day boundary
@@ -1496,43 +1405,37 @@ mod tests {
     // ------------------------------------------------------------------------------------------
 
     #[test]
-    fn list_primitive_widens_and_keeps_element_nulls() {
-        // Int32 elements widen to i64; a middle element null is preserved; a null cell -> None
-        // (a Spanner null array).
+    fn array_elements_widen_and_keep_nulls_through_scalar_binder() {
+        // The array path routes every element through the same `scalar_binder` as a scalar bind:
+        // Int32 elements widen to Spanner INT64 (`StringValue("<digits>")`), a middle element null
+        // stays `NullValue`, and a whole-cell null becomes a `NullValue` (a Spanner null array).
+        // Asserted on the built statement's wire rendering, since a bound array's per-element wire
+        // encoding is its only external view.
         let arr = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
             Some(vec![Some(1i32), None, Some(3)]),
             None,
         ]);
-        assert_eq!(
-            list_primitive::<Int32Type, _>(Some(arr.value(0)), i64::from),
-            Some(vec![Some(1i64), None, Some(3)])
+        let b = batch(
+            vec![Field::new("tags", arr.data_type().clone(), true)],
+            vec![Arc::new(arr)],
         );
-        assert_eq!(list_primitive::<Int32Type, i64>(None, i64::from), None);
-    }
-
-    #[test]
-    fn list_string_and_binary_keep_element_nulls() {
-        use arrow_array::builder::{BinaryBuilder, ListBuilder, StringBuilder};
-
-        let mut sb = ListBuilder::new(StringBuilder::new());
-        sb.values().append_value("a");
-        sb.values().append_null();
-        sb.append(true);
-        let strings = sb.finish();
-        assert_eq!(
-            list_string::<i32>(Some(strings.value(0))),
-            Some(vec![Some("a".to_string()), None])
+        let populated = bound_params_debug(&b, 0);
+        for needle in [r#"StringValue("1")"#, "NullValue", r#"StringValue("3")"#] {
+            assert!(
+                populated.contains(needle),
+                "row 0 missing {needle}: {populated}"
+            );
+        }
+        // Widening really happened — no i32-specific `NumberValue` slipped through.
+        assert!(
+            !populated.contains("NumberValue"),
+            "Int32 array element must widen to INT64: {populated}"
         );
-        assert_eq!(list_string::<i32>(None), None);
-
-        let mut bb = ListBuilder::new(BinaryBuilder::new());
-        bb.values().append_value(b"xy");
-        bb.values().append_null();
-        bb.append(true);
-        let bins = bb.finish();
-        assert_eq!(
-            list_binary::<i32>(Some(bins.value(0))),
-            Some(vec![Some(b"xy".to_vec()), None])
+        // A null array cell is a bare NullValue (no ListValue wrapper).
+        let null_array = bound_params_debug(&b, 1);
+        assert!(
+            null_array.contains("NullValue") && !null_array.contains("ListValue"),
+            "null array cell must be a NullValue: {null_array}"
         );
     }
 
@@ -1783,37 +1686,6 @@ mod tests {
         assert!(
             !row0.contains("skip"),
             "row 0 was read from the unsliced buffer: {row0}"
-        );
-    }
-
-    #[test]
-    fn list_helpers_read_sliced_list_arrays_at_their_offset() {
-        use arrow_array::builder::{ListBuilder, StringBuilder};
-
-        // Slicing the ListArray itself (not just a containing batch) and collecting the cell the
-        // way `bind_one` does (`.value(row)` on the sliced view) yields the sliced row's
-        // elements, asserted structurally rather than via `Debug`.
-        let ints = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
-            Some(vec![Some(1i64)]),
-            Some(vec![Some(2), None]),
-        ]);
-        let sliced = ints.slice(1, 1);
-        assert_eq!(
-            list_primitive::<Int64Type, _>(Some(sliced.value(0)), |v| v),
-            Some(vec![Some(2i64), None])
-        );
-
-        let mut sb = ListBuilder::new(StringBuilder::new());
-        sb.values().append_value("skip");
-        sb.append(true);
-        sb.values().append_value("keep");
-        sb.values().append_null();
-        sb.append(true);
-        let strings = sb.finish();
-        let sliced = strings.slice(1, 1);
-        assert_eq!(
-            list_string::<i32>(Some(sliced.value(0))),
-            Some(vec![Some("keep".to_string()), None])
         );
     }
 }
