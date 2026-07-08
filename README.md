@@ -189,23 +189,23 @@ fn main() -> adbc_core::error::Result<()> {
 
 Options exist at three levels — **database**, **connection** and **statement** — matching the ADBC
 object they are set on. Driver-specific options use the bare `spanner.*` prefix; the standard
-`adbc.*` (spec) options the driver honours are listed alongside them. Boolean options accept
-`true`/`false` (also `1`/`0`/`yes`/`no`, case-insensitive, or an integer); integer options accept
-an integer or a numeric string. Every settable option round-trips through `get_option`.
+`adbc.*` (spec) options the driver honours are listed alongside them. The tables below are a quick
+index only: **[docs/options.md](docs/options.md) is the complete, authoritative reference**, with
+every option's exact type and allowed values, default, and `get_option` round-trip behaviour.
 
 **Database options** (via `new_database_with_opts` or `set_option` on the database):
 
-| Option                                       | Value                             | Default                           | Description                       |
-| -------------------------------------------- | --------------------------------- | --------------------------------- | --------------------------------- |
-| `uri` (`OptionDatabase::Uri`) / `spanner.database` | `projects/<p>/instances/<i>/databases/<d>`, or a `spanner:` connection URI (see below) | — (required)     | The Spanner database path; the two keys are equivalent. |
-| `spanner.endpoint`                           | host or URL, e.g. `http://localhost:9010` | production Spanner        | Explicit gRPC endpoint (e.g. an emulator). |
-| `spanner.emulator`                           | boolean                           | `false` (`true` when `SPANNER_EMULATOR_HOST` is set) | Connect with anonymous credentials (emulator mode). |
-| `spanner.keyfile`                            | file path                         | unset (ADC)                       | Path to a service-account JSON key file (dbt's `keyfile`). |
-| `spanner.keyfile_json`                       | JSON string                       | unset (ADC)                       | Inline service-account JSON key (dbt's `keyfile_json`); wins over `spanner.keyfile`. |
-| `spanner.impersonate.target_principal`       | service-account email             | unset (no impersonation)          | Service account to impersonate; setting it enables impersonation on top of the base credentials. |
-| `spanner.impersonate.delegates`              | comma-separated emails            | unset (no delegation)             | Delegation chain for impersonation. |
-| `spanner.impersonate.scopes`                 | comma-separated scopes            | `cloud-platform`                  | OAuth scopes for the impersonated token. |
-| `spanner.impersonate.lifetime`               | non-negative integer (seconds)    | `3600`                            | Lifetime of the impersonated token. |
+| Option                                       | Purpose                           |
+| -------------------------------------------- | --------------------------------- |
+| `uri` (`OptionDatabase::Uri`) / `spanner.database` | The Spanner database path, or a `spanner:` connection URI (see below); required. The two keys are equivalent. |
+| `spanner.endpoint`                           | Explicit gRPC endpoint (e.g. an emulator). |
+| `spanner.emulator`                           | Connect with anonymous credentials (emulator mode). |
+| `spanner.keyfile`                            | Path to a Google credential JSON file (dbt's `keyfile`). |
+| `spanner.keyfile_json`                       | Inline credential JSON (dbt's `keyfile_json`); wins over `spanner.keyfile`. |
+| `spanner.impersonate.target_principal`       | Service account to impersonate; setting it enables impersonation. |
+| `spanner.impersonate.delegates`              | Delegation chain for impersonation (comma-separated). |
+| `spanner.impersonate.scopes`                 | OAuth scopes for the impersonated token (comma-separated). |
+| `spanner.impersonate.lifetime`               | Lifetime of the impersonated token, in seconds. |
 
 Instead of a bare database path, `uri` / `spanner.database` also accept a **connection URI** with
 the `spanner:` scheme whose query parameters are the database-level options above:
@@ -226,36 +226,36 @@ database path, not the original URI.
 
 **Connection options** (via `set_option` on the connection):
 
-| Option                                       | Value                             | Default                           | Description                       |
-| -------------------------------------------- | --------------------------------- | --------------------------------- | --------------------------------- |
-| `adbc.connection.autocommit`                 | boolean                           | `true`                            | `false` enters manual transaction mode: DML is buffered and applied atomically on `commit` (see [Status](#status)). |
-| `adbc.connection.readonly`                   | boolean                           | `false`                           | Reject all writes on the connection — DML, DDL and ingest fail with `InvalidState`; queries still run. Snapshotted into each statement at creation. |
-| `adbc.connection.transaction.isolation_level` | `adbc.connection.transaction.isolation.` + `default` / `serializable` / `repeatable_read` | `…isolation.default` | Isolation level for read/write transactions. The other spec levels are rejected with `NotImplemented`. |
-| `spanner.read.staleness`                     | `exact:<duration>` or `max:<duration>` (`<duration>`: number + optional `s`/`ms`/`us`/`ns`/`m`/`h`, `s` default) | unset (strong read) | Stale-read bound for read-only queries; becomes the default for statements the connection creates. Mutually exclusive with `spanner.read.timestamp`; set to `""` to unset. |
-| `spanner.read.timestamp`                     | RFC 3339 timestamp, optionally prefixed `read:` (exact, default) or `min:` (bounded) | unset (strong read) | Absolute read timestamp for read-only queries; same inheritance and mutual exclusion as above. |
-| `spanner.request.priority`                   | `low` / `medium` / `high` (case-insensitive) | unset (service default, high) | [Request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions) for every query/DML statement, and the commit priority of every read/write transaction; becomes the default for statements the connection creates. Set to `""` to unset. |
-| `spanner.request.tag`                        | free-form string                  | unset                             | [Request tag](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags) attached to every query/DML request; becomes the default for statements the connection creates. Set to `""` to unset. |
-| `spanner.transaction.tag`                    | free-form string                  | unset                             | Transaction tag attached to every read/write transaction the driver builds (autocommit DML, manual-mode commit, ingest commits). Connection-level only. Set to `""` to unset. |
+| Option                                       | Purpose                           |
+| -------------------------------------------- | --------------------------------- |
+| `adbc.connection.autocommit`                 | `false` enters manual transaction mode: DML is buffered and applied atomically on `commit` (see [Status](#status)). |
+| `adbc.connection.readonly`                   | Reject all writes on the connection (queries still run). The flag is live: toggling it immediately affects existing statements. |
+| `adbc.connection.transaction.isolation_level` | Isolation level for read/write transactions. |
+| `spanner.read.staleness`                     | Stale-read bound (`exact:`/`max:` + duration) for read-only queries; inherited by the connection's statements. |
+| `spanner.read.timestamp`                     | Absolute read timestamp (RFC 3339) for read-only queries; mutually exclusive with `spanner.read.staleness`. |
+| `spanner.request.priority`                   | [Request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions) (`low`/`medium`/`high`) for queries, DML and commits; inherited by the connection's statements. |
+| `spanner.request.tag`                        | [Request tag](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags) attached to every query/DML request; inherited by the connection's statements. |
+| `spanner.transaction.tag`                    | Transaction tag attached to every read/write transaction the driver builds. Connection-level only. |
 
 **Statement options** (via `set_option` on the statement):
 
-| Option                                       | Value                             | Default                           | Description                       |
-| -------------------------------------------- | --------------------------------- | --------------------------------- | --------------------------------- |
-| `spanner.rows_per_batch`                     | positive integer                  | `8192`                            | Rows converted into each Arrow `RecordBatch` streamed by `execute`. Larger batches trade memory for fewer conversions. |
-| `spanner.data_boost_enabled`                 | boolean                           | `false`                           | Run `execute_partitions` partitions on [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview); baked into each partition descriptor. |
-| `spanner.max_partitions`                     | positive integer                  | unset (Spanner chooses)           | Hint for the maximum partition count from `execute_partitions`; Spanner may return fewer. |
-| `spanner.read.staleness`                     | as the connection option          | inherited from the connection     | Per-statement stale-read override. |
-| `spanner.read.timestamp`                     | as the connection option          | inherited from the connection     | Per-statement read-timestamp override. |
-| `spanner.request.priority`                   | as the connection option          | inherited from the connection     | Per-statement request-priority override. |
-| `spanner.request.tag`                        | as the connection option          | inherited from the connection     | Per-statement request-tag override. |
-| `adbc.ingest.target_table`                   | table name                        | unset                             | Bulk-ingest target table; setting it clears any SQL query on the statement (they are mutually exclusive). |
-| `adbc.ingest.target_db_schema`               | schema name                       | unset (default schema)            | Named schema qualifying the ingest target table (`""` selects Spanner's default, unnamed schema). |
-| `adbc.ingest.target_catalog`                 | `""` only                         | unset                             | Spanner has a single, unnamed catalog, so only the empty catalog is accepted. |
-| `adbc.ingest.temporary`                      | `false` only                      | `false`                           | Spanner has no temporary tables; the spec default `false` is accepted as a no-op, `true` is rejected with `NotImplemented`. |
-| `adbc.ingest.mode`                           | `adbc.ingest.mode.append` / `…create` / `…create_append` / `…replace` (short forms `append`/`create`/`create_append`/`replace` also accepted) | append | Bulk-ingest mode (see [Status](#status) for what each mode does). |
+| Option                                       | Purpose                           |
+| -------------------------------------------- | --------------------------------- |
+| `spanner.rows_per_batch`                     | Rows per Arrow `RecordBatch` streamed by `execute` (default 8192). |
+| `spanner.data_boost_enabled`                 | Run `execute_partitions` partitions on [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview). |
+| `spanner.max_partitions`                     | Hint for the maximum partition count from `execute_partitions`. |
+| `spanner.read.staleness`                     | Per-statement stale-read override. |
+| `spanner.read.timestamp`                     | Per-statement read-timestamp override. |
+| `spanner.request.priority`                   | Per-statement request-priority override. |
+| `spanner.request.tag`                        | Per-statement request-tag override. |
+| `adbc.ingest.target_table`                   | Bulk-ingest target table. |
+| `adbc.ingest.target_db_schema`               | Named schema qualifying the ingest target table. |
+| `adbc.ingest.target_catalog`                 | Only the empty catalog is accepted (Spanner has a single, unnamed catalog). |
+| `adbc.ingest.temporary`                      | Spanner has no temporary tables; only the spec default `false` is accepted. |
+| `adbc.ingest.mode`                           | Bulk-ingest mode: append / create / create_append / replace (see [Status](#status)). |
 
-The read-only "current" catalog/schema connection options (`adbc.connection.current_catalog`,
-`adbc.connection.current_db_schema`) report `""` — Spanner has a single, unnamed catalog and
+The read-only "current" catalog/schema connection options (`adbc.connection.catalog`,
+`adbc.connection.db_schema`) report `""` — Spanner has a single, unnamed catalog and
 default schema — and cannot be set.
 
 ### Authentication

@@ -15,6 +15,10 @@
 //!
 //! ## Configuration
 //!
+//! The complete reference of every option at every level — with exact types, defaults, and
+//! `get_option` round-trip behaviour — is
+//! [docs/options.md](https://github.com/fornwall/adbc-spanner/blob/main/docs/options.md).
+//!
 //! A database is configured through ADBC options. The Spanner database path is required and can be
 //! supplied either through the standard [`OptionDatabase::Uri`](adbc_core::options::OptionDatabase::Uri)
 //! option or the driver-specific [`OPTION_DATABASE`] key:
@@ -446,3 +450,54 @@ pub const DRIVER_NAME: &str = "adbc-spanner";
 
 /// The version of this driver.
 pub const DRIVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Drift guard: every option key the driver handles must be documented in `docs/options.md`.
+#[cfg(test)]
+mod options_doc_tests {
+    #[test]
+    fn every_handled_option_key_is_documented() {
+        use adbc_core::constants;
+
+        let doc = include_str!("../docs/options.md");
+        let keys: &[&str] = &[
+            // Driver-specific options (this crate's OPTION_* constants).
+            crate::OPTION_DATABASE,
+            crate::OPTION_ENDPOINT,
+            crate::OPTION_EMULATOR,
+            crate::OPTION_KEYFILE,
+            crate::OPTION_KEYFILE_JSON,
+            crate::OPTION_IMPERSONATE_TARGET_PRINCIPAL,
+            crate::OPTION_IMPERSONATE_DELEGATES,
+            crate::OPTION_IMPERSONATE_SCOPES,
+            crate::OPTION_IMPERSONATE_LIFETIME,
+            crate::OPTION_ROWS_PER_BATCH,
+            crate::OPTION_DATA_BOOST,
+            crate::OPTION_MAX_PARTITIONS,
+            crate::OPTION_READ_STALENESS,
+            crate::OPTION_READ_TIMESTAMP,
+            crate::OPTION_REQUEST_PRIORITY,
+            crate::OPTION_REQUEST_TAG,
+            crate::OPTION_TRANSACTION_TAG,
+            // Standard ADBC (spec) options the driver handles.
+            constants::ADBC_OPTION_URI,
+            constants::ADBC_CONNECTION_OPTION_AUTOCOMMIT,
+            constants::ADBC_CONNECTION_OPTION_READ_ONLY,
+            constants::ADBC_CONNECTION_OPTION_ISOLATION_LEVEL,
+            constants::ADBC_CONNECTION_OPTION_CURRENT_CATALOG,
+            constants::ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA,
+            constants::ADBC_INGEST_OPTION_TARGET_TABLE,
+            constants::ADBC_INGEST_OPTION_TARGET_DB_SCHEMA,
+            constants::ADBC_INGEST_OPTION_TARGET_CATALOG,
+            constants::ADBC_INGEST_OPTION_TEMPORARY,
+            constants::ADBC_INGEST_OPTION_MODE,
+        ];
+        for key in keys {
+            // Require the backticked form so a bare substring (e.g. "uri" inside another
+            // word) cannot satisfy the check by accident.
+            assert!(
+                doc.contains(&format!("`{key}`")),
+                "option key `{key}` is handled by the driver but missing from docs/options.md"
+            );
+        }
+    }
+}
