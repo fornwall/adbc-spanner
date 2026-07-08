@@ -199,10 +199,8 @@ pub mod fuzzing {
     ///
     /// The oracles live here (where the client's `Partition` type is in scope): a rejected
     /// descriptor must be a clean `InvalidArguments` error — never a panic — and an accepted one
-    /// must round-trip through the driver's own encoder with the **enveloped** form as the fixed
-    /// point: decode → encode yields the versioned envelope (so an accepted legacy *bare*
-    /// descriptor re-encodes to the envelope, by design — that is the compatibility upgrade, not
-    /// a round-trip violation), and from there decode → encode must reproduce the bytes exactly.
+    /// must round-trip through the driver's own encoder: decode → encode → decode → encode
+    /// reproduces the enveloped bytes exactly.
     pub fn decode_partition(descriptor: &[u8]) -> bool {
         match crate::connection::decode_partition(descriptor) {
             Ok(partition) => {
@@ -292,10 +290,9 @@ pub mod fuzzing {
     mod tests {
         /// Run the partition-descriptor oracle over the checked-in fuzz seed corpus
         /// (`fuzz/seeds/partition/`), so a corpus/oracle mismatch fails `cargo test
-        /// --features fuzzing` locally instead of only surfacing in a fuzz run. The two
-        /// well-formed seeds (legacy bare + enveloped) must be accepted; the bad-version seed
-        /// must be rejected — both verdicts include the oracle's internal round-trip and
-        /// clean-rejection assertions.
+        /// --features fuzzing` locally instead of only surfacing in a fuzz run. The enveloped
+        /// seed must be accepted; the bad-version seed must be rejected — both verdicts include
+        /// the oracle's internal round-trip and clean-rejection assertions.
         #[test]
         fn partition_seed_corpus_satisfies_the_oracle() {
             let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/seeds/partition");
@@ -309,8 +306,6 @@ pub mod fuzzing {
             let expected: std::collections::BTreeMap<String, bool> = [
                 ("enveloped-bad-version", false),
                 ("enveloped-query-descriptor", true),
-                ("query-descriptor", true),
-                ("read-descriptor", true),
             ]
             .into_iter()
             .map(|(name, accepted)| (name.to_string(), accepted))

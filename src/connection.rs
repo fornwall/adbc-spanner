@@ -999,7 +999,7 @@ pub(crate) const PARTITION_DESCRIPTOR_VERSION: u64 = 1;
 
 /// Encode a [`Partition`] into an opaque ADBC partition descriptor: the versioned JSON envelope
 /// `{"v":1,"partition":<serde form of the client's Partition>}`. The inverse of
-/// [`decode_partition`], which also still accepts the pre-envelope bare form.
+/// [`decode_partition`].
 pub(crate) fn encode_partition(partition: &Partition) -> Result<Vec<u8>> {
     let internal = |e: serde_json::Error| {
         err(
@@ -1013,38 +1013,32 @@ pub(crate) fn encode_partition(partition: &Partition) -> Result<Vec<u8>> {
 }
 
 /// Decode an opaque partition descriptor produced by `Statement::execute_partitions` — the
-/// versioned JSON envelope written by [`encode_partition`], or (for compatibility with
-/// descriptors produced by driver versions before the envelope existed) the bare serde-JSON of
-/// the client's [`Partition`], distinguished by the presence of the `"v"` key (the bare form's
-/// only top-level key is `"inner"`). An unsupported envelope version and anything that does not
-/// decode (empty input, non-JSON bytes, or valid JSON of the wrong shape) are
-/// [`Status::InvalidArguments`] errors, never a panic. A pure function so the rejection paths are
-/// unit-testable without a connection.
+/// versioned JSON envelope written by [`encode_partition`] (`{"v":1,"partition":…}`). A missing
+/// or unsupported version, and anything that does not decode (empty input, non-JSON bytes, or
+/// valid JSON of the wrong shape) are [`Status::InvalidArguments`] errors, never a panic. A pure
+/// function so the rejection paths are unit-testable without a connection.
 pub(crate) fn decode_partition(descriptor: &[u8]) -> Result<Partition> {
     let invalid =
         |e: serde_json::Error| invalid_argument(format!("invalid partition descriptor: {e}"));
     let value: serde_json::Value = serde_json::from_slice(descriptor).map_err(invalid)?;
-    let payload = match value.get("v") {
-        Some(v) => {
-            // The versioned envelope. Check the version before touching the payload, so a
-            // future-format descriptor fails on the version — not on its (unknown) payload shape.
-            let v = v.as_u64().ok_or_else(|| {
-                invalid_argument(format!(
-                    "invalid partition descriptor: version {v} is not an unsigned integer"
-                ))
-            })?;
-            if v != PARTITION_DESCRIPTOR_VERSION {
-                return Err(invalid_argument(format!(
-                    "partition descriptor version {v} not supported by this driver"
-                )));
-            }
-            value.get("partition").cloned().ok_or_else(|| {
-                invalid_argument("invalid partition descriptor: missing \"partition\" field")
-            })?
-        }
-        // The pre-envelope bare form.
-        None => value,
-    };
+    // Check the version before touching the payload, so a future-format descriptor fails on the
+    // version — not on its (unknown) payload shape.
+    let v = value.get("v").ok_or_else(|| {
+        invalid_argument("invalid partition descriptor: missing \"v\" version field")
+    })?;
+    let v = v.as_u64().ok_or_else(|| {
+        invalid_argument(format!(
+            "invalid partition descriptor: version {v} is not an unsigned integer"
+        ))
+    })?;
+    if v != PARTITION_DESCRIPTOR_VERSION {
+        return Err(invalid_argument(format!(
+            "partition descriptor version {v} not supported by this driver"
+        )));
+    }
+    let payload = value.get("partition").cloned().ok_or_else(|| {
+        invalid_argument("invalid partition descriptor: missing \"partition\" field")
+    })?;
     serde_json::from_value(payload).map_err(invalid)
 }
 
@@ -1164,15 +1158,12 @@ mod tests {
         }
     }
 
-    /// `encode_partition` writes the versioned envelope, and `decode_partition` accepts both the
-    /// envelope and the pre-envelope bare form — with the envelope as the round-trip fixed point:
-    /// a legacy bare descriptor re-encodes to the enveloped form, which then round-trips
-    /// byte-for-byte.
+    /// `encode_partition` writes the versioned envelope, and decode → encode is a byte-for-byte
+    /// fixed point.
     #[test]
     fn partition_descriptor_envelope_round_trips() {
-        // The pre-envelope bare form: serde-JSON of the client's `Partition` itself.
-        let legacy: &[u8] = br#"{"inner":{"Query":{"sql":"SELECT 1"}}}"#;
-        let partition = decode_partition(legacy).expect("legacy bare descriptor decodes");
+        let descriptor: &[u8] = br#"{"v":1,"partition":{"inner":{"Query":{"sql":"SELECT 1"}}}}"#;
+        let partition = decode_partition(descriptor).expect("enveloped descriptor decodes");
 
         let encoded = encode_partition(&partition).expect("encode");
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -1185,6 +1176,21 @@ mod tests {
         // The enveloped form is canonical: decode → encode reproduces it exactly.
         let again = decode_partition(&encoded).expect("enveloped descriptor decodes");
         assert_eq!(encode_partition(&again).expect("re-encode"), encoded);
+    }
+
+    /// A pre-envelope bare descriptor (no `"v"` key) is now rejected — the driver has never had
+    /// users, so there are no legacy descriptors to accept, and a descriptor carries a live
+    /// session/transaction identity that could not outlive a driver upgrade anyway.
+    #[test]
+    fn bare_partition_descriptor_is_rejected() {
+        let bare: &[u8] = br#"{"inner":{"Query":{"sql":"SELECT 1"}}}"#;
+        let error = decode_partition(bare).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(
+            error.message.contains("missing \"v\" version field"),
+            "unexpected message: {}",
+            error.message
+        );
     }
 
     /// An envelope with an unknown version must be rejected up front with a clean
