@@ -734,7 +734,15 @@ round-tripping via `get_option`] — `QueryOptionsConfig` in `src/query_options.
 on the query statement builder via `SpannerStatement::sql_builder`; offline unit tests cover the
 round-trip/unset, non-string rejection, and clone inheritance
 [`query_options::tests`].); directed reads, commit stats,
-`max_commit_delay`, `last_statement` optimization (free RPC saving for single-statement
+~~`max_commit_delay`~~ (**Fixed.** Added the `spanner.max_commit_delay` connection **and** statement
+option — a duration in `0..=500ms` (staleness grammar, `""` unsets, round-trips via `get_option`),
+stored on `RequestConfig` in `src/request.rs` and applied via the client's `set_max_commit_delay`
+at the read/write **commit** sites `RequestConfig` already threads through: autocommit DML, the
+`ExecuteBatchDml` batch runner, the manual-mode commit, and the ingest write-only txn
+(`apply_to_runner` / `apply_to_write_only`). Parsing/round-trip/cap covered by the offline unit
+tests `parses_max_commit_delay_with_units_and_enforces_the_500ms_cap` and
+`max_commit_delay_round_trips_and_unsets`; documented in `README.md`, `python/README.md`,
+`docs/options.md`, and the `OPTION_MAX_COMMIT_DELAY` rustdoc.), `last_statement` optimization (free RPC saving for single-statement
 autocommit DML); ~~proto/enum columns (verify clean failure today)~~ (**Fixed.** They failed
 *silently*, not cleanly: `arrow_type` in `src/conversion.rs` mapped both `TypeCode::Proto` and
 `TypeCode::Enum` through the catch-all `_ => DataType::Utf8` arm, so a `PROTO` column surfaced its

@@ -630,6 +630,21 @@ pub const OPTION_RETRY_MAX_ELAPSED_SECONDS: &str = "spanner.retry.max_elapsed_se
 /// no per-statement override).
 pub const OPTION_TRANSACTION_TAG: &str = "spanner.transaction.tag";
 
+/// Driver-specific connection **and** statement option: the **maximum commit delay** Spanner may
+/// add to a read/write commit so it can batch the commit with others — a throughput-for-latency
+/// trade-off (see Spanner's
+/// [`TransactionOptions.max_commit_delay`](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions)).
+/// Applied at every read/write commit the driver builds: autocommit DML, the `ExecuteBatchDml`
+/// batch runner, the manual-mode commit, and the bulk-ingest write-only transaction.
+///
+/// The value is a duration using the same grammar as [`OPTION_READ_STALENESS`] (a number, default
+/// unit seconds, with optional `s`/`ms`/`us`/`ns`/`m`/`h` suffix — e.g. `100ms`, `0.2s`); it must
+/// fall within Spanner's `0..=500ms` range (values outside it, and malformed values, are rejected
+/// with [`Status::InvalidArguments`](adbc_core::error::Status::InvalidArguments)). `0` means no
+/// delay; an empty string unsets it. Round-trips through `get_option`. Set on a connection it
+/// becomes the default for statements it creates; a statement may override it.
+pub const OPTION_MAX_COMMIT_DELAY: &str = "spanner.max_commit_delay";
+
 /// Driver-specific connection **and** statement option: the maximum precision at which Spanner
 /// `TIMESTAMP` columns are read into Arrow. Two values:
 ///
@@ -695,6 +710,7 @@ mod options_doc_tests {
             crate::OPTION_QUERY_OPTIMIZER_VERSION,
             crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE,
             crate::OPTION_TRANSACTION_TAG,
+            crate::OPTION_MAX_COMMIT_DELAY,
             crate::OPTION_MAX_TIMESTAMP_PRECISION,
             crate::OPTION_RPC_TIMEOUT_QUERY,
             crate::OPTION_RPC_TIMEOUT_UPDATE,

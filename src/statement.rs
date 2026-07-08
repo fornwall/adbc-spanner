@@ -935,6 +935,9 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) if k == crate::OPTION_REQUEST_TAG => {
                 self.request.set_request_tag(value)?;
             }
+            OptionStatement::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => {
+                self.request.set_max_commit_delay(value)?;
+            }
             OptionStatement::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_VERSION => {
                 self.query_options.set_optimizer_version(value)?;
             }
@@ -1010,6 +1013,9 @@ impl Optionable for SpannerStatement {
             }
             OptionStatement::Other(k) if k == crate::OPTION_REQUEST_TAG => {
                 self.request.request_tag_string().map(str::to_string)
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => {
+                self.request.max_commit_delay_string().map(str::to_string)
             }
             OptionStatement::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_VERSION => self
                 .query_options
