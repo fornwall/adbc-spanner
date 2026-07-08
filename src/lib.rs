@@ -105,7 +105,6 @@
 mod bind;
 mod connection;
 mod conversion;
-mod ddl;
 mod directed_read;
 mod driver;
 mod error;
@@ -116,9 +115,11 @@ mod info;
 mod nested;
 mod objects;
 mod options;
+mod query_options;
 mod request;
 mod retry;
 mod runtime;
+mod sql;
 mod staleness;
 mod statement;
 mod statistics;
@@ -136,15 +137,15 @@ pub use statement::SpannerStatement;
 pub mod fuzzing {
     /// Split a `;`-separated SQL batch into individual statements (quote/comment aware).
     pub fn split_statements(sql: &str) -> Vec<String> {
-        crate::ddl::split_statements(sql)
+        crate::sql::split_statements(sql)
     }
     /// Whether the SQL begins with a DDL statement.
     pub fn is_ddl(sql: &str) -> bool {
-        crate::ddl::is_ddl(sql)
+        crate::sql::is_ddl(sql)
     }
     /// Whether the SQL contains a top-level `THEN RETURN` clause.
     pub fn is_dml_returning(sql: &str) -> bool {
-        crate::ddl::is_dml_returning(sql)
+        crate::sql::is_dml_returning(sql)
     }
     /// Parse a Spanner `DATE` string into Arrow `Date32` days.
     pub fn parse_date_days(s: &str) -> Option<i32> {
@@ -165,23 +166,23 @@ pub mod fuzzing {
     /// The first SQL keyword, uppercased — skipping whitespace, comments, and `@{…}` statement
     /// hints.
     pub fn first_keyword(sql: &str) -> Option<String> {
-        crate::ddl::first_keyword(sql)
+        crate::sql::first_keyword(sql)
     }
     /// Whether the SQL begins with a DML statement (`INSERT`/`UPDATE`/`DELETE`).
     pub fn is_dml(sql: &str) -> bool {
-        crate::ddl::is_dml(sql)
+        crate::sql::is_dml(sql)
     }
     /// Strip trailing top-level `;` terminators from a single-statement query.
     pub fn strip_trailing_terminators(sql: &str) -> String {
-        crate::ddl::strip_trailing_terminators(sql)
+        crate::sql::strip_trailing_terminators(sql)
     }
     /// The distinct `@name` bind parameters of a query, in first-appearance order.
     pub fn named_parameters(sql: &str) -> Vec<String> {
-        crate::bind::named_parameters(sql)
+        crate::sql::named_parameters(sql)
     }
     /// Backtick-quote a Spanner identifier (GoogleSQL backslash escaping).
     pub fn quote_ident(ident: &str) -> String {
-        crate::bind::quote_ident(ident)
+        crate::sql::quote_ident(ident)
     }
     /// Resolve the column→parameter pairing for `sql` against a batch whose columns are named
     /// `column_names` (built here as nullable `Int64`; the pairing never looks at types), under the
@@ -218,19 +219,31 @@ pub mod fuzzing {
     ///
     /// The oracles live here (where the client's `Partition` type is in scope): a rejected
     /// descriptor must be a clean `InvalidArguments` error — never a panic — and an accepted one
-    /// must round-trip through the driver's own encoder: decode → encode → decode → encode
-    /// reproduces the enveloped bytes exactly.
+    /// must reach a byte-stable fixed point under the driver's own encoder: from a canonical
+    /// descriptor, decode → encode → decode → encode reproduces the enveloped bytes exactly.
+    ///
+    /// The fixed point is asserted from `encode_partition`'s *own* output, not from the arbitrary
+    /// input's first encode. A hand-crafted descriptor can carry a value whose lexical form serde
+    /// does not preserve — most notably a huge integer literal, which overflows `i64`/`u64` and is
+    /// parsed to `f64` by an imprecise path, so its first re-encode (a canonical ryu float) decodes
+    /// back to a *different* `f64` than the encoder emitted. One normalization pass reaches the
+    /// fixed point; every real descriptor `encode_partition` produces is already there (it only ever
+    /// emits ryu floats), so this does not weaken the invariant that matters for `read_partition`.
     pub fn decode_partition(descriptor: &[u8]) -> bool {
         match crate::connection::decode_partition(descriptor) {
             Ok(partition) => {
-                let bytes = crate::connection::encode_partition(&partition)
-                    .expect("a decoded partition re-encodes");
-                let again = crate::connection::decode_partition(&bytes)
-                    .expect("a re-encoded partition descriptor decodes");
+                use crate::connection::{decode_partition, encode_partition};
+                // Normalize once so the comparison starts from a canonical encoder output, then
+                // assert the round-trip from there is byte-stable.
+                let first = encode_partition(&partition).expect("a decoded partition re-encodes");
+                let normalized =
+                    decode_partition(&first).expect("a re-encoded partition descriptor decodes");
+                let bytes = encode_partition(&normalized).expect("a decoded partition re-encodes");
+                let again =
+                    decode_partition(&bytes).expect("a re-encoded partition descriptor decodes");
                 assert_eq!(
                     bytes,
-                    crate::connection::encode_partition(&again)
-                        .expect("a decoded partition re-encodes"),
+                    encode_partition(&again).expect("a decoded partition re-encodes"),
                     "enveloped partition descriptor round-trip changed the bytes"
                 );
                 true
@@ -558,6 +571,26 @@ pub const OPTION_DIRECTED_READ: &str = "spanner.directed_read";
 /// statements it creates; a statement may override it.
 pub const OPTION_REQUEST_TAG: &str = "spanner.request.tag";
 
+/// Driver-specific connection **and** statement option: the query **optimizer version** Spanner
+/// uses to plan queries — a version string such as `"6"` or `"latest"`. Applied as a
+/// [`QueryOptions`](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/ExecuteSqlRequest#queryoptions)
+/// on every query statement the driver builds. The value is opaque (passed to Spanner unchanged);
+/// unset (the default) leaves the database/service default optimizer. Set an empty string to unset.
+/// Set on a connection it becomes the default for statements it creates; a statement may override
+/// it. See Spanner's
+/// [query optimizer versions](https://docs.cloud.google.com/spanner/docs/query-optimizer/manage-query-optimizer).
+pub const OPTION_QUERY_OPTIMIZER_VERSION: &str = "spanner.query.optimizer_version";
+
+/// Driver-specific connection **and** statement option: the query **optimizer statistics package**
+/// Spanner plans against — a named statistics package. Applied as a
+/// [`QueryOptions`](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/ExecuteSqlRequest#queryoptions)
+/// on every query statement the driver builds. The value is opaque (passed to Spanner unchanged);
+/// unset (the default) leaves the database default. Value handling and connection→statement
+/// inheritance are as [`OPTION_QUERY_OPTIMIZER_VERSION`]. See Spanner's
+/// [optimizer statistics packages](https://docs.cloud.google.com/spanner/docs/query-optimizer/statistics-packages).
+pub const OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE: &str =
+    "spanner.query.optimizer_statistics_package";
+
 /// Driver-specific connection **and** statement option: the **query timeout**, in seconds — an
 /// overall deadline on the *initial execution* of a query: the `ExecuteStreamingSql` call plus the
 /// first chunk of a streamed result, the `execute_schema` / `execute_partitions` probes, and the
@@ -637,6 +670,21 @@ pub const OPTION_RETRY_MAX_ELAPSED_SECONDS: &str = "spanner.retry.max_elapsed_se
 /// no per-statement override).
 pub const OPTION_TRANSACTION_TAG: &str = "spanner.transaction.tag";
 
+/// Driver-specific connection **and** statement option: the **maximum commit delay** Spanner may
+/// add to a read/write commit so it can batch the commit with others — a throughput-for-latency
+/// trade-off (see Spanner's
+/// [`TransactionOptions.max_commit_delay`](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions)).
+/// Applied at every read/write commit the driver builds: autocommit DML, the `ExecuteBatchDml`
+/// batch runner, the manual-mode commit, and the bulk-ingest write-only transaction.
+///
+/// The value is a duration using the same grammar as [`OPTION_READ_STALENESS`] (a number, default
+/// unit seconds, with optional `s`/`ms`/`us`/`ns`/`m`/`h` suffix — e.g. `100ms`, `0.2s`); it must
+/// fall within Spanner's `0..=500ms` range (values outside it, and malformed values, are rejected
+/// with [`Status::InvalidArguments`](adbc_core::error::Status::InvalidArguments)). `0` means no
+/// delay; an empty string unsets it. Round-trips through `get_option`. Set on a connection it
+/// becomes the default for statements it creates; a statement may override it.
+pub const OPTION_MAX_COMMIT_DELAY: &str = "spanner.max_commit_delay";
+
 /// Driver-specific connection **and** statement option: the maximum precision at which Spanner
 /// `TIMESTAMP` columns are read into Arrow. Two values:
 ///
@@ -700,7 +748,10 @@ mod options_doc_tests {
             crate::OPTION_REQUEST_PRIORITY,
             crate::OPTION_REQUEST_TAG,
             crate::OPTION_DIRECTED_READ,
+            crate::OPTION_QUERY_OPTIMIZER_VERSION,
+            crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE,
             crate::OPTION_TRANSACTION_TAG,
+            crate::OPTION_MAX_COMMIT_DELAY,
             crate::OPTION_MAX_TIMESTAMP_PRECISION,
             crate::OPTION_RPC_TIMEOUT_QUERY,
             crate::OPTION_RPC_TIMEOUT_UPDATE,

@@ -39,6 +39,7 @@ use crate::directed_read::DirectedRead;
 use crate::error::{
     err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
 };
+use crate::query_options::QueryOptionsConfig;
 use crate::request::RequestConfig;
 use crate::retry::RetryConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
@@ -127,6 +128,11 @@ pub struct SpannerStatement {
     /// creation time and overridable per statement. Applied to this statement's read-only query
     /// paths only (Spanner rejects it on writes). Unset by default (Spanner's own routing).
     directed_read: DirectedRead,
+    /// Query optimizer options (`spanner.query.optimizer_version` /
+    /// `spanner.query.optimizer_statistics_package`), inherited from the connection at creation time
+    /// and overridable per statement. Applied to every query statement builder this statement
+    /// produces (via [`Self::sql_builder`]).
+    query_options: QueryOptionsConfig,
     /// How `TIMESTAMP` columns map to Arrow (`spanner.max_timestamp_precision`), inherited from
     /// the connection at creation time and overridable per statement. Applied uniformly to every
     /// result path of this statement: `execute` (plain and bound queries), DML `THEN RETURN`
@@ -157,6 +163,7 @@ impl SpannerStatement {
         read_staleness: ReadStaleness,
         request: RequestConfig,
         directed_read: DirectedRead,
+        query_options: QueryOptionsConfig,
         timestamp_precision: TimestampPrecision,
         timeouts: RpcTimeouts,
         retry: RetryConfig,
@@ -184,6 +191,7 @@ impl SpannerStatement {
             read_staleness,
             request,
             directed_read,
+            query_options,
             timestamp_precision,
             timeouts,
             retry,
@@ -198,12 +206,15 @@ impl SpannerStatement {
     }
 
     /// A Spanner statement builder for `sql` with this statement's request priority / request tag
-    /// (`spanner.request.priority` / `spanner.request.tag`) and retry policy
-    /// (`spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds`) applied. Every query/DML
-    /// statement the driver builds goes through here so the options apply uniformly.
+    /// (`spanner.request.priority` / `spanner.request.tag`), query optimizer options
+    /// (`spanner.query.optimizer_version` / `spanner.query.optimizer_statistics_package`) and retry
+    /// policy (`spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds`) applied. Every
+    /// query/DML statement the driver builds goes through here so the options apply uniformly.
     fn sql_builder(&self, sql: &str) -> StatementBuilder {
-        self.retry
-            .apply_to_statement(self.request.apply_to_statement(SpannerSql::builder(sql)))
+        self.retry.apply_to_statement(
+            self.query_options
+                .apply_to_statement(self.request.apply_to_statement(SpannerSql::builder(sql))),
+        )
     }
 
     /// A Spanner statement builder for a **read-only query** `sql`: [`sql_builder`](Self::sql_builder)
@@ -266,7 +277,7 @@ impl SpannerStatement {
         if drop_first {
             statements.push(format!(
                 "DROP TABLE IF EXISTS {}",
-                bind::qualified_table(db_schema, table)
+                crate::sql::qualified_table(db_schema, table)
             ));
         }
         statements.push(bind::create_table_sql(
@@ -353,7 +364,7 @@ impl SpannerStatement {
         if !self.bound.is_empty() {
             self.build_bound_statements(sql, false)
         } else {
-            Ok(crate::ddl::split_statements(sql)
+            Ok(crate::sql::split_statements(sql)
                 .into_iter()
                 .map(|s| self.sql_builder(&s).build())
                 .collect())
@@ -679,7 +690,7 @@ impl SpannerStatement {
     /// `commit`, and `ExecuteBatchDml` — the commit path — rejects `THEN RETURN` outright, so the
     /// returned rows would be silently unobtainable. It is rejected up front instead.
     fn run_dml(&self, sql: &str) -> Result<DmlOutcome> {
-        if !crate::ddl::is_dml_returning(sql) {
+        if !crate::sql::is_dml_returning(sql) {
             let statements = self.build_dml_statements(sql)?;
             return Ok(DmlOutcome::Plain(self.run_or_buffer(statements)?));
         }
@@ -691,7 +702,7 @@ impl SpannerStatement {
             ));
         }
         let statements = if self.bound.is_empty() {
-            let parts = crate::ddl::split_statements(sql);
+            let parts = crate::sql::split_statements(sql);
             if parts.len() > 1 {
                 return Err(not_implemented(
                     "THEN RETURN in a multi-statement (`;`-separated) DML batch",
@@ -949,6 +960,15 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) if k == crate::OPTION_DIRECTED_READ => {
                 self.directed_read.set(value)?;
             }
+            OptionStatement::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => {
+                self.request.set_max_commit_delay(value)?;
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_VERSION => {
+                self.query_options.set_optimizer_version(value)?;
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
+                self.query_options.set_optimizer_statistics_package(value)?;
+            }
             OptionStatement::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {
                 // `""` resets to the driver default (nanoseconds), not to the connection's value —
                 // the same unset semantics as the staleness options.
@@ -1021,6 +1041,18 @@ impl Optionable for SpannerStatement {
             }
             OptionStatement::Other(k) if k == crate::OPTION_DIRECTED_READ => {
                 self.directed_read.option_string().map(str::to_string)
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => {
+                self.request.max_commit_delay_string().map(str::to_string)
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_VERSION => self
+                .query_options
+                .optimizer_version_string()
+                .map(str::to_string),
+            OptionStatement::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
+                self.query_options
+                    .optimizer_statistics_package_string()
+                    .map(str::to_string)
             }
             // The effective mode: inherited from the connection at creation unless overridden.
             OptionStatement::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {
@@ -1104,8 +1136,8 @@ impl Statement for SpannerStatement {
         }
         self.check_bound_has_destination()?;
         let sql = self.sql()?;
-        if crate::ddl::is_ddl(&sql) {
-            self.run_ddl(crate::ddl::split_statements(&sql))?;
+        if crate::sql::is_ddl(&sql) {
+            self.run_ddl(crate::sql::split_statements(&sql))?;
             // DDL has no result set — return an empty reader with an empty schema.
             return Ok(Self::empty_reader());
         }
@@ -1115,7 +1147,7 @@ impl Statement for SpannerStatement {
         // single-use transaction below, which Spanner rejects for DML. This mirrors `execute_update`.
         // DML with a `THEN RETURN` clause returns its rows; plain DML yields an empty result (the
         // query interface has nowhere to report the affected-row count, so it is discarded).
-        if crate::ddl::is_dml(&sql) {
+        if crate::sql::is_dml(&sql) {
             if self.is_read_only() {
                 return Err(invalid_state(
                     "cannot execute DML: the connection is read-only",
@@ -1139,7 +1171,7 @@ impl Statement for SpannerStatement {
         // clients and conformance suites routinely append one (e.g. `SELECT current_date;;;`). The
         // DDL and DML paths above go through `split_statements`, which already drops empty trailing
         // segments, so this stripping is scoped to the query path and never splits a `;`-batch.
-        let sql = crate::ddl::strip_trailing_terminators(&sql);
+        let sql = crate::sql::strip_trailing_terminators(&sql);
         // Parameterized query: run once per bound row.
         if !self.bound.is_empty() {
             let reader = self.execute_bound_query(&sql)?;
@@ -1201,8 +1233,8 @@ impl Statement for SpannerStatement {
         self.check_bound_has_destination()?;
 
         let sql = self.sql()?;
-        if crate::ddl::is_ddl(&sql) {
-            self.run_ddl(crate::ddl::split_statements(&sql))?;
+        if crate::sql::is_ddl(&sql) {
+            self.run_ddl(crate::sql::split_statements(&sql))?;
             // DDL does not report an affected-row count (and is never transactional in Spanner, so
             // it always runs immediately rather than buffering).
             return Ok(None);
@@ -1284,7 +1316,7 @@ impl Statement for SpannerStatement {
         // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
         self.cancel.reset();
         let sql = self.sql()?;
-        if crate::ddl::is_ddl(&sql) {
+        if crate::sql::is_ddl(&sql) {
             return Err(invalid_state(
                 "execute_partitions is only valid for queries",
             ));
@@ -1375,7 +1407,7 @@ impl Statement for SpannerStatement {
         // introspect them beforehand, so each parameter is typed as `Null` — Arrow's convention for
         // an unknown/any type — with the parameter name preserved.
         let sql = self.sql()?;
-        let fields: Vec<Field> = bind::named_parameters(&sql)
+        let fields: Vec<Field> = crate::sql::named_parameters(&sql)
             .into_iter()
             .map(|name| Field::new(name, DataType::Null, true))
             .collect();
@@ -1431,10 +1463,10 @@ fn string_option(value: OptionValue) -> Result<String> {
 /// transaction mode is the problem. Catch DDL and DML up front with a clear message instead. (This
 /// also covers `THEN RETURN` DML — it does produce rows, but Spanner cannot plan it read-only.)
 fn check_schema_query(sql: &str) -> Result<()> {
-    if crate::ddl::is_ddl(sql) {
+    if crate::sql::is_ddl(sql) {
         return Err(invalid_state("execute_schema is only valid for queries"));
     }
-    if crate::ddl::is_dml(sql) {
+    if crate::sql::is_dml(sql) {
         return Err(invalid_argument(
             "execute_schema only supports queries: DML (INSERT/UPDATE/DELETE) cannot be planned \
              in a read-only schema probe; run it via execute or execute_update instead",

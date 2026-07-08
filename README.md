@@ -70,6 +70,15 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   `<location>`, `<location>:<type>` or `:<type>` (`<type>` is `read_write`/`read_only`/`any`), plus an
   optional `;auto_failover_disabled` on `include`. E.g. `include:us-east1:read_only,us-east4`. Applies
   to queries only (Spanner rejects directed reads on writes); see [docs/options.md](docs/options.md#directed-reads).
+- Commit batching: `spanner.max_commit_delay` sets the [maximum commit delay](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions)
+  Spanner may add to a read/write commit so it can batch it with others (trading a little latency for
+  throughput). It applies at every read/write commit the driver builds — autocommit DML, the
+  `ExecuteBatchDml` batch runner, the manual-mode commit, and the bulk-ingest write-only transaction
+  — and is settable on a connection (where it becomes the default for its statements) or per
+  statement. The value is a duration in `0..=500ms` (the staleness duration grammar: a number with
+  an optional `s`/`ms`/`us`/`ns`/`m`/`h` suffix, e.g. `100ms`, `0.2s`); values above 500ms or
+  malformed ones are rejected with `InvalidArguments`, `""` unsets, and it round-trips via
+  `get_option`.
 - RPC timeouts: `spanner.rpc.timeout_seconds.query` (a query's initial execution, through the first
   chunk of its streamed result — also the driver-internal metadata reads: `get_objects`,
   `get_statistics`, `get_table_schema`, the ingest table-exists probe),
@@ -292,7 +301,10 @@ database path, not the original URI.
 | `spanner.request.priority`                   | [Request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions) (`low`/`medium`/`high`) for queries, DML and commits; inherited by the connection's statements. |
 | `spanner.request.tag`                        | [Request tag](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags) attached to every query/DML request; inherited by the connection's statements. |
 | `spanner.directed_read`                      | [Directed read](https://docs.cloud.google.com/spanner/docs/directed-reads) replica selection (`include`/`exclude` + `location:type`) for read-only queries; inherited by the connection's statements. |
+| `spanner.query.optimizer_version`            | [Query optimizer version](https://docs.cloud.google.com/spanner/docs/query-optimizer/manage-query-optimizer) (e.g. `"6"`/`"latest"`) applied to every query; inherited by the connection's statements. |
+| `spanner.query.optimizer_statistics_package` | [Optimizer statistics package](https://docs.cloud.google.com/spanner/docs/query-optimizer/statistics-packages) applied to every query; inherited by the connection's statements. |
 | `spanner.transaction.tag`                    | Transaction tag attached to every read/write transaction the driver builds. Connection-level only. |
+| `spanner.max_commit_delay`                   | [Maximum commit delay](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions) (a duration in `0..=500ms`) Spanner may add to a read/write commit to batch it with others; applies to autocommit DML, batch DML, the manual-mode commit and bulk ingest; inherited by the connection's statements. |
 | `spanner.rpc.timeout_seconds.query`          | Deadline (seconds) on a query's initial execution and the driver-internal metadata reads (`get_objects` / `get_statistics` / `get_table_schema`); inherited by the connection's statements. |
 | `spanner.rpc.timeout_seconds.update`         | Deadline (seconds) on DML / batch-DML / commit / ingest-chunk / DDL operations; inherited by the connection's statements. |
 | `spanner.rpc.timeout_seconds.fetch`          | Deadline (seconds) on each subsequent chunk fetch of a streamed result; inherited by the connection's statements. |
@@ -312,6 +324,9 @@ database path, not the original URI.
 | `spanner.request.priority`                   | Per-statement request-priority override. |
 | `spanner.request.tag`                        | Per-statement request-tag override. |
 | `spanner.directed_read`                      | Per-statement directed-read override (applies to read-only queries). |
+| `spanner.max_commit_delay`                   | Per-statement max-commit-delay override. |
+| `spanner.query.optimizer_version`            | Per-statement optimizer-version override. |
+| `spanner.query.optimizer_statistics_package` | Per-statement optimizer-statistics-package override. |
 | `spanner.rpc.timeout_seconds.query`          | Per-statement query-timeout override. |
 | `spanner.rpc.timeout_seconds.update`         | Per-statement update-timeout override. |
 | `spanner.rpc.timeout_seconds.fetch`          | Per-statement fetch-timeout override. |

@@ -64,6 +64,7 @@ use google_cloud_spanner::value::{ToValue, Value};
 
 use crate::conversion::is_json_field;
 use crate::error::invalid_argument;
+use crate::sql::{named_parameters, qualified_table, quote_ident};
 
 /// Bind the columns of `batch` at `row` to the query parameters named by `names`.
 ///
@@ -526,81 +527,6 @@ fn numeric_string(unscaled: i128, scale: u32) -> String {
     )
 }
 
-/// Extract the distinct named parameters (`@name`) referenced by `sql`, in order of first
-/// appearance.
-///
-/// Skips `@name` occurrences inside string / bytes literals and quoted identifiers — including
-/// triple-quoted (`'''…'''`/`"""…"""`) and raw (`r'…'`, `rb'…'`, …) forms — and comments
-/// (`-- …`, `# …`, `/* … */`), and does not treat statement hints (`@{…}`) or system variables
-/// (`@@var`) as parameters. The lexical scan is delegated to the shared [`crate::ddl::lex`]
-/// tokenizer (the same rules as [`crate::ddl::split_statements`]), so a `@name` marker is only a
-/// parameter when the `@` character stands as its own token — never inside a literal, comment or
-/// hint body. Used by `get_parameter_schema` when no parameter data has been bound yet.
-pub(crate) fn named_parameters(sql: &str) -> Vec<String> {
-    use crate::ddl::Lexeme;
-    let mut params: Vec<String> = Vec::new();
-    let mut lexemes = crate::ddl::lex(sql).peekable();
-    while let Some(lexeme) = lexemes.next() {
-        // Only a bare `@` token can introduce a parameter; `@` inside a literal/comment/hint body
-        // is folded into that lexeme and never reaches here.
-        if lexeme != Lexeme::Other('@') {
-            continue;
-        }
-        // `.copied()` releases the peek borrow so the matched arm can advance `lexemes`.
-        match lexemes.peek().copied() {
-            // `@@var` (system variable) or `@{…}` (statement hint): not a bind parameter — consume
-            // the second marker character and keep scanning (a hint body is lexed normally).
-            Some(Lexeme::Other('@')) | Some(Lexeme::Other('{')) => {
-                lexemes.next();
-            }
-            // `@name`: a bind parameter. The name is the adjacent identifier run, which must start
-            // with a letter or underscore — a word run may also start with a digit (`@1` is not a
-            // parameter).
-            Some(Lexeme::Word(name))
-                if name.starts_with(|ch: char| ch == '_' || ch.is_ascii_alphabetic()) =>
-            {
-                lexemes.next();
-                if !params.iter().any(|p| p == name) {
-                    params.push(name.to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-    params
-}
-
-/// Backtick-quote a Spanner identifier. Keeps reserved words (`create`, `index`, …) and
-/// otherwise-unsafe names valid, and closes the identifier-injection vector when a caller's
-/// table/column names reach the generated SQL.
-///
-/// GoogleSQL quoted identifiers use **backslash escape sequences** (`\\``, `\\\\`) — not the
-/// backtick doubling of other dialects, which Spanner would reject as a syntax error. (Real
-/// Spanner object names cannot contain backticks or backslashes, so an escaped name will fail
-/// server-side with a clear "invalid name" error rather than mangling the surrounding SQL.)
-pub(crate) fn quote_ident(ident: &str) -> String {
-    let mut out = String::with_capacity(ident.len() + 2);
-    out.push('`');
-    for c in ident.chars() {
-        if c == '`' || c == '\\' {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out.push('`');
-    out
-}
-
-/// Backtick-quote a table name, optionally qualified by a (named) schema, with proper GoogleSQL
-/// identifier escaping (see [`quote_ident`]) so a hostile or mistyped name cannot leak into the
-/// surrounding SQL. An empty schema (Spanner's default, unnamed schema) qualifies to the bare table.
-pub(crate) fn qualified_table(db_schema: Option<&str>, table_name: &str) -> String {
-    match db_schema.filter(|s| !s.is_empty()) {
-        Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(table_name)),
-        None => quote_ident(table_name),
-    }
-}
-
 /// Synthetic primary-key column added to tables created by bulk ingest (see [`create_table_sql`]).
 /// Spanner requires a primary key, but Arrow ingest data carries none, so we add a hidden
 /// UUID-defaulted key. Spanner forbids leading-underscore identifiers, hence the `adbc_`-prefixed
@@ -1006,26 +932,6 @@ mod tests {
         assert_eq!(mutation_table(Some("app"), "Users"), "app.Users");
     }
 
-    #[test]
-    fn qualifies_table_names() {
-        assert_eq!(qualified_table(None, "Users"), "`Users`");
-        assert_eq!(qualified_table(Some(""), "Users"), "`Users`");
-        assert_eq!(qualified_table(Some("app"), "Users"), "`app`.`Users`");
-        // Caller-supplied names are escaped, so a backtick cannot leak into the surrounding SQL.
-        assert_eq!(qualified_table(None, "a`b"), r"`a\`b`");
-        assert_eq!(qualified_table(Some("s`x"), r"t\y"), r"`s\`x`.`t\\y`");
-    }
-
-    #[test]
-    fn quotes_identifiers_with_googlesql_escapes() {
-        assert_eq!(quote_ident("plain"), "`plain`");
-        assert_eq!(quote_ident("create"), "`create`");
-        assert_eq!(quote_ident("a`b"), r"`a\`b`");
-        assert_eq!(quote_ident(r"a\b"), r"`a\\b`");
-        assert_eq!(quote_ident(r"a\`b"), r"`a\\\`b`");
-        assert_eq!(quote_ident("spaced name"), "`spaced name`");
-    }
-
     fn batch(fields: Vec<Field>, columns: Vec<arrow_array::ArrayRef>) -> RecordBatch {
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
     }
@@ -1401,46 +1307,6 @@ mod tests {
             vec![Arc::new(strings.finish()), Arc::new(bytes.finish())],
         );
         assert!(bind_row(Statement::builder("SELECT @s, @b"), &b, 0).is_ok());
-    }
-
-    #[test]
-    fn extracts_named_parameters() {
-        // Basic references, in order, with a later reuse deduped.
-        assert_eq!(
-            named_parameters("SELECT @a, @b FROM t WHERE @a > 0"),
-            vec!["a", "b"]
-        );
-        // No parameters.
-        assert_eq!(named_parameters("SELECT 1"), Vec::<String>::new());
-        // `@` inside string literals and comments is not a parameter.
-        assert_eq!(named_parameters("SELECT '@x', @y -- @z\n"), vec!["y"]);
-        assert_eq!(named_parameters("SELECT @y /* @z */, @w"), vec!["y", "w"]);
-        assert_eq!(named_parameters("SELECT `@col`, @p"), vec!["p"]);
-        // Statement hints (`@{…}`) and system variables (`@@var`) are not parameters.
-        assert_eq!(
-            named_parameters("SELECT @{JOIN_METHOD=HASH_JOIN} * FROM t WHERE id = @id"),
-            vec!["id"]
-        );
-        assert_eq!(named_parameters("SELECT @@rows"), Vec::<String>::new());
-        // First-seen order is preserved across repeats.
-        assert_eq!(named_parameters("@b @a @a @b @c"), vec!["b", "a", "c"]);
-    }
-
-    #[test]
-    fn named_parameters_skip_raw_and_triple_quoted_strings() {
-        // In a raw string the backslash is not an escape: the literal ends at the first quote and
-        // scanning resumes correctly after it. (The old lexer consumed `\'` as escaped, stayed in
-        // string mode, and swallowed the parameters that followed.)
-        assert_eq!(named_parameters(r"SELECT r'\', @p"), vec!["p"]);
-        assert_eq!(named_parameters(r"SELECT rb'@x\', @p"), vec!["p"]);
-        // `@name` inside a triple-quoted string is not a parameter; one after it is.
-        assert_eq!(named_parameters("SELECT '''@x''', @y"), vec!["y"]);
-        assert_eq!(named_parameters(r#"SELECT """it's @x""", @y"#), vec!["y"]);
-        // An empty literal is not the start of a triple-quoted string.
-        assert_eq!(named_parameters("SELECT '', @z"), vec!["z"]);
-        // A non-adjacent or non-prefix word does not make the literal raw: `\'` stays an escape,
-        // so the literal runs to the *third* quote and @a is inside it.
-        assert_eq!(named_parameters(r"SELECT xr'\' @a ', @b"), vec!["b"]);
     }
 
     #[test]

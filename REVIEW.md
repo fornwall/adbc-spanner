@@ -727,7 +727,13 @@ convention) and is accepted as a `spanner:` connection-URI query parameter. Wire
 Python wrapper as an `access_token=` kwarg and documented in `README.md`, `python/README.md`,
 `docs/options.md`, and the `OPTION_ACCESS_TOKEN` rustdoc; offline unit tests cover the round-trip,
 the three mutual-exclusion conflicts, the emulator refusal, the bearer-header emission, and the
-no-leak rejection of a malformed token.); query options (optimizer version), ~~directed reads~~
+no-leak rejection of a malformed token.); ~~query options (optimizer version)~~ (**Fixed.**
+`spanner.query.optimizer_version` and `spanner.query.optimizer_statistics_package`, connection +
+statement level [statement inherits, then overrides; `""` unsets; opaque pass-through strings
+round-tripping via `get_option`] — `QueryOptionsConfig` in `src/query_options.rs` sets `QueryOptions`
+on the query statement builder via `SpannerStatement::sql_builder`; offline unit tests cover the
+round-trip/unset, non-string rejection, and clone inheritance
+[`query_options::tests`].); ~~directed reads~~
 (**Fixed.** `spanner.directed_read` at connection + statement level [statement inherits, then
 overrides; `""` unsets; round-trips through `get_option`] selects replicas for **read-only queries**
 via the grammar `<mode>[:<sel>,...][;auto_failover_disabled]` — `<mode>` is `include`/`exclude`, each
@@ -739,8 +745,16 @@ and clone-inheritance], built into the client `DirectedReadOptions`, and applied
 [`SpannerStatement::read_sql_builder` feeds `execute`, the bound-query path, `execute_partitions`, and
 the `execute_schema` PLAN probe]; DML/DDL keep the plain `sql_builder` since Spanner rejects directed
 reads on a read/write transaction. Documented in `README.md`, `python/README.md`, `docs/options.md`
-[grammar + examples], the `OPTION_DIRECTED_READ` rustdoc, and the CLAUDE.md feature list.), commit
-stats, `max_commit_delay`, `last_statement` optimization (free RPC saving for single-statement
+[grammar + examples], the `OPTION_DIRECTED_READ` rustdoc, and the CLAUDE.md feature list.), commit stats,
+~~`max_commit_delay`~~ (**Fixed.** Added the `spanner.max_commit_delay` connection **and** statement
+option — a duration in `0..=500ms` (staleness grammar, `""` unsets, round-trips via `get_option`),
+stored on `RequestConfig` in `src/request.rs` and applied via the client's `set_max_commit_delay`
+at the read/write **commit** sites `RequestConfig` already threads through: autocommit DML, the
+`ExecuteBatchDml` batch runner, the manual-mode commit, and the ingest write-only txn
+(`apply_to_runner` / `apply_to_write_only`). Parsing/round-trip/cap covered by the offline unit
+tests `parses_max_commit_delay_with_units_and_enforces_the_500ms_cap` and
+`max_commit_delay_round_trips_and_unsets`; documented in `README.md`, `python/README.md`,
+`docs/options.md`, and the `OPTION_MAX_COMMIT_DELAY` rustdoc.), `last_statement` optimization (free RPC saving for single-statement
 autocommit DML); ~~proto/enum columns (verify clean failure today)~~ (**Fixed.** They failed
 *silently*, not cleanly: `arrow_type` in `src/conversion.rs` mapped both `TypeCode::Proto` and
 `TypeCode::Enum` through the catch-all `_ => DataType::Utf8` arm, so a `PROTO` column surfaced its
@@ -800,7 +814,12 @@ step's Windows branch (already gated on `runner.os == Windows`) no longer copies
 `adbc_spanner.dll.lib` with `2>/dev/null || true`; it now asserts the import library exists and
 `exit 1`s with a `::error::` message if not, so a build regression that drops it fails the job loudly
 instead of shipping a `.zip` missing the import lib.); the
-wheel version parse greps `Cargo.toml` positionally — `cargo metadata | jq` is robust;
+~~the
+wheel version parse greps `Cargo.toml` positionally — `cargo metadata | jq` is robust~~ (**Fixed.** The
+`python-wheels` job's "Sync wheel version to the crate" step no longer greps `Cargo.toml` positionally;
+it now derives the crate version via `cargo metadata --no-deps --format-version 1 | jq -r '.packages[] |
+select(.name == "adbc-spanner") | .version'`, the same robust parse the tag-only `version-gate` job
+already uses, so both jobs read the version identically.);
 ~~`adbc-validation.yml` rebuilds arrow-adbc C++ + GoogleTest from source every run (cache it)~~
 (**Fixed.** `adbc-validation.yml` now caches the `adbc-validation/build` tree (the FetchContent-cloned
 + compiled arrow-adbc driver-manager/validation harness and GoogleTest, plus the harness objects) via
@@ -885,7 +904,18 @@ keep the string getter's `NotFound` unchanged, while a set-but-non-integer value
 `InvalidArguments` naming the option and value — `NotFound` again means only "option unset". As a
 bonus, integer-valued options (`spanner.impersonate.lifetime`, `spanner.rows_per_batch`,
 `spanner.max_partitions`) are now gettable as ints at every level that stores them; covered by
-offline unit tests in `src/options.rs` and `src/driver.rs`), SQL-text helpers scattered across three modules.
+offline unit tests in `src/options.rs` and `src/driver.rs`), ~~SQL-text helpers scattered across
+three modules~~ (**Fixed.** The GoogleSQL-lexer module `src/ddl.rs` was renamed to `src/sql.rs` — the
+single home for the driver's SQL-text concerns — and the three pure SQL-text helpers that lived in
+`src/bind.rs` (`quote_ident`, `qualified_table`, `named_parameters`, the last of which already
+delegated to the lexer) moved there next to `lex`/`split_statements`/`first_keyword`/
+`strip_trailing_terminators`/`is_dml_returning`, with their unit tests. A pure, behavior-preserving
+structural move — only relocation + re-export + call-site path updates (`crate::ddl::` → `crate::sql::`,
+`bind::` → `crate::sql::` at the few callers, plus the `fuzzing` re-exports); no logic changed, verified
+by the unchanged unit tests (all 233 lib tests pass, `clippy -D warnings` and `fmt --check` clean).
+`like_match` stays in `src/connection.rs` with its catalog-filter feature, and the Arrow-batch-aware
+`resolve_parameter_names` / mutation-form `mutation_table` stay in `src/bind.rs`, as those are not pure
+SQL-text helpers.)
 
 ---
 
