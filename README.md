@@ -134,7 +134,12 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   (e.g. `google.rpc.retryinfo`, `google.rpc.errorinfo`) and whose value is the detail's ProtoJSON
   encoding as UTF-8 bytes (self-describing via `"@type"`; no `-bin` key suffix since the value is
   text, not binary protobuf). Most useful: on `ABORTED`, Spanner's `RetryInfo` detail carries the
-  server-recommended `retryDelay` to wait before retrying the transaction.
+  server-recommended `retryDelay` to wait before retrying the transaction. Note this per-detail,
+  type-name-keyed ProtoJSON layout deliberately diverges from the Flight SQL ADBC driver, which
+  emits a single `grpc-status-details-bin` detail holding the whole `google.rpc.Status` as binary
+  protobuf — so a consumer written to Flight SQL's convention won't interoperate. The reason is that
+  the pinned preview client decodes details into serde-modelled types whose only supported encoding
+  is ProtoJSON, with no binary-protobuf path.
 
 Not supported (returns `NotImplemented`, by nature of Spanner): **Substrait** — Spanner executes
 GoogleSQL/PostgreSQL text and has no Substrait support.
