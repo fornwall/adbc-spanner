@@ -127,14 +127,18 @@ revert a family to versioned crates.io releases. Current pinned revs:
 - `fornwall/arrow-adbc`: `786e7f3488eb71b200ece775b027a647cf42db9e`
 
 **Invariant:** the three arrow-adbc crates (`adbc_core`, `adbc_ffi`, `adbc_driver_manager`) must
-always share ONE rev; the six `google-cloud-*` crates likewise share ONE rev. When reverting, touch
-*every* location for that family in lockstep:
+always share ONE rev; the seven `google-cloud-rust` crates likewise share ONE rev. When reverting,
+touch *every* location for that family in lockstep:
 
 - `Cargo.toml` `[dependencies]` — arrow-adbc: `adbc_core`, `adbc_ffi`; google-cloud:
   `google-cloud-spanner`, `google-cloud-auth`, `google-cloud-lro`.
 - `Cargo.toml` `[dev-dependencies]` — arrow-adbc: `adbc_driver_manager`; google-cloud:
   `google-cloud-spanner-admin-instance-v1`, `google-cloud-spanner-admin-database-v1`,
-  `google-cloud-gax`. (There is no `[patch]` section.)
+  `google-cloud-gax`, `spanner-grpc-mock` (the mock-server harness of `tests/mock_spanner.rs`;
+  note it is `publish = false` upstream and will never be on crates.io — when the family reverts
+  to versioned releases this one stays a git pin, so check whether `cargo publish` tolerates a
+  version-less git dev-dependency before flipping `publish` back on). (There is no `[patch]`
+  section.)
 - `deny.toml` `allow-git` — drop the repo URL for each family once it no longer has any git dep.
 - `README.md` — the quickstart `adbc_core = { git = … rev = "786e7f3…" }` block and the surrounding
   "not on crates.io" / *Type mapping* notes that name the pins.
