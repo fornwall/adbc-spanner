@@ -685,6 +685,34 @@ pub const OPTION_TRANSACTION_TAG: &str = "spanner.transaction.tag";
 /// becomes the default for statements it creates; a statement may override it.
 pub const OPTION_MAX_COMMIT_DELAY: &str = "spanner.max_commit_delay";
 
+/// Driver-specific connection **and** statement option: whether to request Spanner return **commit
+/// statistics** for the read/write commits the driver builds (see Spanner's
+/// [commit statistics](https://docs.cloud.google.com/spanner/docs/commit-statistics)). A boolean,
+/// `false` by default; accepted as a bool-ish string (`true`/`false`/`1`/`0`/`yes`/`no`) or an
+/// integer, and an empty string unsets it (back to `false`). Round-trips through `get_option` (the
+/// effective boolean is always reported).
+///
+/// When enabled it is applied at every read/write commit the driver builds — autocommit DML, the
+/// `ExecuteBatchDml` batch runner, the manual-mode commit, and the bulk-ingest write-only
+/// transaction — and the returned **mutation count** of the most recent such commit is captured and
+/// read back via [`OPTION_COMMIT_STATS_MUTATION_COUNT`] (autocommit DML / bulk ingest report on the
+/// statement; the manual-mode commit reports on the connection). Set on a connection it becomes the
+/// default for statements it creates; a statement may override it.
+pub const OPTION_COMMIT_STATS: &str = "spanner.commit_stats";
+
+/// Driver-specific **read-only** connection and statement option: the **mutation count** from the
+/// most recent commit run with [`OPTION_COMMIT_STATS`] enabled, as reported by Spanner's commit
+/// statistics.
+///
+/// Readable via `get_option` / `get_option_int`. It is [`Status::NotFound`](adbc_core::error::Status::NotFound)
+/// until a commit that requested (and received) commit stats has run on this object — so enable
+/// [`OPTION_COMMIT_STATS`] first, run a write, then read this back on the same statement (for
+/// autocommit DML / bulk ingest) or the same connection (for a manual-mode commit). Setting it is
+/// rejected ([`Status::NotImplemented`](adbc_core::error::Status::NotImplemented)); it is a result,
+/// not a configuration knob. When several commits run (e.g. a chunked bulk ingest) it reports the
+/// most recent one's count.
+pub const OPTION_COMMIT_STATS_MUTATION_COUNT: &str = "spanner.commit_stats.mutation_count";
+
 /// Driver-specific connection **and** statement option: the maximum precision at which Spanner
 /// `TIMESTAMP` columns are read into Arrow. Two values:
 ///
@@ -752,6 +780,8 @@ mod options_doc_tests {
             crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE,
             crate::OPTION_TRANSACTION_TAG,
             crate::OPTION_MAX_COMMIT_DELAY,
+            crate::OPTION_COMMIT_STATS,
+            crate::OPTION_COMMIT_STATS_MUTATION_COUNT,
             crate::OPTION_MAX_TIMESTAMP_PRECISION,
             crate::OPTION_RPC_TIMEOUT_QUERY,
             crate::OPTION_RPC_TIMEOUT_UPDATE,

@@ -745,8 +745,24 @@ and clone-inheritance], built into the client `DirectedReadOptions`, and applied
 [`SpannerStatement::read_sql_builder` feeds `execute`, the bound-query path, `execute_partitions`, and
 the `execute_schema` PLAN probe]; DML/DDL keep the plain `sql_builder` since Spanner rejects directed
 reads on a read/write transaction. Documented in `README.md`, `python/README.md`, `docs/options.md`
-[grammar + examples], the `OPTION_DIRECTED_READ` rustdoc, and the CLAUDE.md feature list.), commit stats,
-~~`max_commit_delay`~~ (**Fixed.** Added the `spanner.max_commit_delay` connection **and** statement
+[grammar + examples], the `OPTION_DIRECTED_READ` rustdoc, and the CLAUDE.md feature list.), ~~commit stats~~
+(**Fixed.** Added the `spanner.commit_stats` boolean connection **and** statement option (default
+`false`; a bool-ish string/int via `options::bool_option`, `""`/false unsets, round-trips as
+`"true"`/`"false"` via `get_option`) — stored on `RequestConfig` in `src/request.rs`, applying the
+client's `set_return_commit_stats(true)` at the same four read/write commit sites `max_commit_delay`
+covers (`apply_to_runner`: autocommit DML, the `ExecuteBatchDml` batch runner, `THEN RETURN` DML,
+the manual-mode commit; `apply_to_write_only`: the bulk-ingest write-only txn). The returned
+**mutation count** is captured out of the commit response (`run_batch_txn`, `write_mutation_chunk`,
+`execute_returning_dml`) into a new per-object `CommitStats` cell (an `Arc<Mutex<Option<i64>>>`;
+statement-owned for autocommit DML / bulk ingest, connection-owned for the manual-mode commit —
+deliberately **not** inherited, since the count belongs to whichever object ran the commit) and read
+back via `get_option`/`get_option_int` on the read-only key `spanner.commit_stats.mutation_count`
+(`OPTION_COMMIT_STATS_MUTATION_COUNT` — `NotFound` until a commit with stats has run; setting it →
+`NotImplemented`). Offline unit tests cover the flag round-trip/unset/reject and the sink's
+record/most-recent/ignore-`None`/clone-sharing semantics (`request::tests`), plus a self-skipping
+`tests/integration.rs` case; documented in `README.md`, `python/README.md`, `docs/options.md`, the
+`OPTION_COMMIT_STATS` / `OPTION_COMMIT_STATS_MUTATION_COUNT` rustdoc, and the CLAUDE.md feature
+list.), ~~`max_commit_delay`~~ (**Fixed.** Added the `spanner.max_commit_delay` connection **and** statement
 option — a duration in `0..=500ms` (staleness grammar, `""` unsets, round-trips via `get_option`),
 stored on `RequestConfig` in `src/request.rs` and applied via the client's `set_max_commit_delay`
 at the read/write **commit** sites `RequestConfig` already threads through: autocommit DML, the

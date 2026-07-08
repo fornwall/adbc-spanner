@@ -62,7 +62,7 @@ use crate::directed_read::DirectedRead;
 use crate::driver::Connected;
 use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
 use crate::query_options::QueryOptionsConfig;
-use crate::request::RequestConfig;
+use crate::request::{CommitStats, RequestConfig};
 use crate::retry::RetryConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
 use crate::sql::qualified_table;
@@ -263,6 +263,11 @@ pub struct SpannerConnection {
     /// connection, which may override each knob. The connection itself applies it to its commit
     /// paths (autocommit DML, the manual-mode commit, ingest commits).
     retry: RetryConfig,
+    /// Mutation count captured from the connection's most recent manual-mode commit that requested
+    /// commit statistics (`spanner.commit_stats`), read back via
+    /// `spanner.commit_stats.mutation_count`. Connection-owned (not shared with statements): the
+    /// manual-mode commit runs on the connection, so its stats belong here.
+    commit_stats: CommitStats,
     txn: SharedTxn,
     /// Cancellation signal for this connection's in-flight metadata/commit operations
     /// (see [`Connection::cancel`]).
@@ -285,6 +290,7 @@ impl SpannerConnection {
             timestamp_precision: TimestampPrecision::default(),
             timeouts: RpcTimeouts::default(),
             retry: RetryConfig::default(),
+            commit_stats: CommitStats::default(),
             txn: Arc::new(Mutex::new(TxnState::new())),
             cancel: CancelSignal::new(),
         }
@@ -307,6 +313,7 @@ impl SpannerConnection {
             self.request.clone(),
             self.retry,
             self.timeouts.update_timeout(),
+            &self.commit_stats,
             statements,
             mutations,
         )?;
@@ -399,6 +406,7 @@ pub(crate) fn run_batch_dml(
     request: RequestConfig,
     retry: RetryConfig,
     timeout: Option<Duration>,
+    commit_stats: &CommitStats,
     statements: Vec<SpannerSql>,
 ) -> Result<i64> {
     run_batch_txn(
@@ -409,6 +417,7 @@ pub(crate) fn run_batch_dml(
         request,
         retry,
         timeout,
+        commit_stats,
         statements,
         Vec::new(),
     )
@@ -436,6 +445,7 @@ pub(crate) fn run_batch_txn(
     request: RequestConfig,
     retry: RetryConfig,
     timeout: Option<Duration>,
+    commit_stats: &CommitStats,
     statements: Vec<SpannerSql>,
     mutations: Vec<Mutation>,
 ) -> Result<i64> {
@@ -475,13 +485,22 @@ pub(crate) fn run_batch_txn(
             })
             .await
             .map_err(from_spanner)?;
-        Ok::<i64, Error>(outcome.result)
+        // The commit stats (if any — only when `spanner.commit_stats` requested them) ride on the
+        // commit response; capture the mutation count so the caller can record it into its cell.
+        let mutation_count = outcome
+            .commit_response
+            .commit_stats
+            .as_ref()
+            .map(|stats| stats.mutation_count);
+        Ok::<(i64, Option<i64>), Error>((outcome.result, mutation_count))
     };
-    block_on_cancellable(
+    let (count, mutation_count) = block_on_cancellable(
         runtime,
         cancel,
         with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_UPDATE, transaction),
-    )
+    )?;
+    commit_stats.record(mutation_count);
+    Ok(count)
 }
 
 /// Validate a lookup's `catalog` argument. Spanner has a single, unnamed (`""`) catalog, so `None`
@@ -699,6 +718,9 @@ impl Optionable for SpannerConnection {
             OptionConnection::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => {
                 self.request.set_max_commit_delay(value)?;
             }
+            OptionConnection::Other(k) if k == crate::OPTION_COMMIT_STATS => {
+                self.request.set_commit_stats(value)?;
+            }
             OptionConnection::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_VERSION => {
                 self.query_options.set_optimizer_version(value)?;
             }
@@ -807,6 +829,25 @@ impl Optionable for SpannerConnection {
                 .ok_or_else(|| {
                     err(
                         format!("option {} is not set", crate::OPTION_MAX_COMMIT_DELAY),
+                        Status::NotFound,
+                    )
+                }),
+            // A plain boolean; always reports the effective value ("true"/"false", default "false").
+            OptionConnection::Other(k) if k == crate::OPTION_COMMIT_STATS => {
+                Ok(self.request.commit_stats_string().to_string())
+            }
+            // The captured mutation count from the connection's most recent manual-mode commit that
+            // requested commit stats; NotFound until such a commit has run.
+            OptionConnection::Other(k) if k == crate::OPTION_COMMIT_STATS_MUTATION_COUNT => self
+                .commit_stats
+                .mutation_count()
+                .map(|n| n.to_string())
+                .ok_or_else(|| {
+                    err(
+                        format!(
+                            "option {} is not set",
+                            crate::OPTION_COMMIT_STATS_MUTATION_COUNT
+                        ),
                         Status::NotFound,
                     )
                 }),

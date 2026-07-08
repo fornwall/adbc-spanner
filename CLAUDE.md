@@ -355,7 +355,18 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   `set_max_commit_delay` [a `google_cloud_wkt::Duration`] at the same read/write **commit** sites
   the runner / write-only builders cover: autocommit DML, the `ExecuteBatchDml` batch runner, the
   manual-mode commit, and the ingest write-only txn — i.e. `RequestConfig::{apply_to_runner,
-  apply_to_write_only}`), query
+  apply_to_write_only}`), commit
+  stats (`spanner.commit_stats` at connection + statement level [statement inherits, then overrides;
+  a boolean via `options::bool_option`, `""`/false unsets, default false; round-trips as
+  `"true"`/`"false"` via `get_option`] — stored on `RequestConfig`, applies
+  `set_return_commit_stats(true)` at the same four `apply_to_{runner,write_only}` commit sites as
+  `max_commit_delay`; the returned mutation count is recorded into a per-object `CommitStats` cell
+  [`src/request.rs`, an `Arc<Mutex<Option<i64>>>`; statement-owned for autocommit DML / bulk ingest,
+  connection-owned for the manual-mode commit — **not** inherited] and read back via
+  `get_option`/`get_option_int` on the read-only key `spanner.commit_stats.mutation_count`
+  [`OPTION_COMMIT_STATS_MUTATION_COUNT`, NotFound until a commit with stats has run, setting it →
+  NotImplemented]; `run_batch_txn`, `write_mutation_chunk` and `execute_returning_dml` thread the
+  count out of the commit response), query
   optimizer options (`spanner.query.optimizer_version` and
   `spanner.query.optimizer_statistics_package` at connection + statement level [statement inherits,
   then overrides; `""` unsets — the staleness pattern; opaque pass-through strings, round-trip via
