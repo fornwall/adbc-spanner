@@ -2,8 +2,10 @@
 //!
 //! The ADBC `get_objects` result is a deeply nested structure:
 //! `catalog → list<db_schema → list<table → list<column>>>`. We populate it from Spanner's
-//! `INFORMATION_SCHEMA` (a Spanner database is a single, unnamed catalog). Levels below the
-//! requested [`ObjectDepth`] are left null via [`new_null_array`].
+//! `INFORMATION_SCHEMA` (a Spanner database is a single, unnamed catalog). Levels strictly below
+//! the requested [`ObjectDepth`] are left null via [`new_null_array`]; a list at or above the
+//! requested depth is always a valid (possibly **empty**) list — per the ADBC spec, a filter that
+//! matches nothing must still yield the parent skeleton with empty lists, never NULL.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -821,6 +823,43 @@ mod tests {
         assert_eq!(is_nullable.value(1), "YES");
     }
 
+    /// The `catalog_db_schemas` list column of the (single-row) result batch.
+    fn schemas_list(batch: &RecordBatch) -> ListArray {
+        batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .clone()
+    }
+
+    /// The `db_schema_tables` list of the catalog's (valid) `catalog_db_schemas` entry.
+    fn tables_list(schemas: &ListArray) -> ListArray {
+        let schemas = schemas.value(0);
+        let schemas = schemas.as_any().downcast_ref::<StructArray>().unwrap();
+        schemas
+            .column_by_name("db_schema_tables")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .clone()
+    }
+
+    /// The named list child (`table_columns` / `table_constraints`) of the first schema's
+    /// (valid) `db_schema_tables` entry.
+    fn table_child_list(schemas: &ListArray, name: &str) -> ListArray {
+        let tables = tables_list(schemas).value(0);
+        let tables = tables.as_any().downcast_ref::<StructArray>().unwrap();
+        tables
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .clone()
+    }
+
     #[test]
     fn build_catalogs_depth_leaves_schemas_null() {
         let batch = build(ObjectDepth::Catalogs, sample()).unwrap();
@@ -847,6 +886,120 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(name.value(0), "");
+    }
+
+    /// ADBC depth rule: NULL is reserved for list levels strictly BELOW the requested depth. A
+    /// filter matching nothing must still yield the parent skeleton with EMPTY — valid,
+    /// zero-length — lists at (and above) the requested depth. DuckDB shipped this wrong (its
+    /// `get_objects` returned NULL where the spec requires an empty list) and the adbc-drivers
+    /// validation suite caught it (duckdb/duckdb PR #21018); these tests pin our behaviour at
+    /// every depth boundary.
+    #[test]
+    fn schema_filter_matching_nothing_yields_empty_schemas_list_not_null() {
+        // A db_schema filter that excludes every schema: `collect_objects` hands `build` an
+        // empty Vec. At every depth that requests schemas, the single catalog row must carry an
+        // empty catalog_db_schemas list, not NULL.
+        for depth in [
+            ObjectDepth::Schemas,
+            ObjectDepth::Tables,
+            ObjectDepth::Columns,
+            ObjectDepth::All,
+        ] {
+            let batch = build(depth, Vec::new()).unwrap();
+            assert_eq!(batch.num_rows(), 1, "single catalog at {depth:?}");
+            let schemas = schemas_list(&batch);
+            assert!(
+                schemas.is_valid(0),
+                "catalog_db_schemas must not be NULL at {depth:?}"
+            );
+            assert_eq!(
+                schemas.value(0).len(),
+                0,
+                "catalog_db_schemas must be empty at {depth:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn table_filter_matching_nothing_keeps_schema_skeleton_with_empty_table_lists() {
+        // The DuckDB corner: a table_name/table_type filter that excludes every table must still
+        // return the catalog + db_schema skeleton, with each schema's db_schema_tables an EMPTY
+        // list (tables are at/above the requested depth), never NULL.
+        for depth in [ObjectDepth::Tables, ObjectDepth::Columns, ObjectDepth::All] {
+            let schemas = vec![DbSchema {
+                name: "".to_string(),
+                tables: Vec::new(),
+            }];
+            let batch = build(depth, schemas).unwrap();
+            let schemas = schemas_list(&batch);
+            assert!(schemas.is_valid(0));
+            assert_eq!(
+                schemas.value(0).len(),
+                1,
+                "schema skeleton kept at {depth:?}"
+            );
+            let tables = tables_list(&schemas);
+            assert!(
+                tables.is_valid(0),
+                "db_schema_tables must not be NULL at {depth:?}"
+            );
+            assert_eq!(
+                tables.value(0).len(),
+                0,
+                "db_schema_tables must be empty at {depth:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn column_filter_matching_nothing_yields_empty_column_and_constraint_lists() {
+        // A column_name filter that excludes every column (constraints are populated at the same
+        // depth and can likewise come out empty): the table row must carry EMPTY table_columns /
+        // table_constraints lists at Columns/All depth, never NULL.
+        for depth in [ObjectDepth::Columns, ObjectDepth::All] {
+            let schemas = vec![DbSchema {
+                name: "".to_string(),
+                tables: vec![Table {
+                    name: "Users".to_string(),
+                    table_type: "BASE TABLE".to_string(),
+                    columns: Vec::new(),
+                    constraints: Vec::new(),
+                }],
+            }];
+            let batch = build(depth, schemas).unwrap();
+            let schemas = schemas_list(&batch);
+            for name in ["table_columns", "table_constraints"] {
+                let list = table_child_list(&schemas, name);
+                assert!(list.is_valid(0), "{name} must not be NULL at {depth:?}");
+                assert_eq!(list.value(0).len(), 0, "{name} must be empty at {depth:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn schemas_depth_leaves_tables_null() {
+        // Strictly below the requested depth: at Schemas depth each schema's db_schema_tables is
+        // NULL (not an empty list) — the level was not requested.
+        let batch = build(ObjectDepth::Schemas, sample()).unwrap();
+        let schemas = schemas_list(&batch);
+        assert!(schemas.is_valid(0));
+        let tables = tables_list(&schemas);
+        assert!(
+            tables.is_null(0),
+            "db_schema_tables must be NULL at Schemas depth"
+        );
+    }
+
+    #[test]
+    fn tables_depth_leaves_columns_and_constraints_null() {
+        // Strictly below the requested depth: at Tables depth each table's table_columns and
+        // table_constraints are NULL (not empty lists) — the column level was not requested.
+        let batch = build(ObjectDepth::Tables, sample()).unwrap();
+        let schemas = schemas_list(&batch);
+        for name in ["table_columns", "table_constraints"] {
+            let list = table_child_list(&schemas, name);
+            assert!(list.is_null(0), "{name} must be NULL at Tables depth");
+        }
     }
 
     #[test]
