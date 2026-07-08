@@ -2,7 +2,18 @@
 
 `tests/resilience.rs` drives the ADBC driver against the Spanner **emulator reached through a
 [Toxiproxy](https://github.com/Shopify/toxiproxy) TCP proxy**, injects transport-level faults, and
-asserts the driver behaves sanely under them. Nothing else in the suite exercises the failure paths.
+asserts the driver behaves sanely under them.
+
+There are two fault-injection harnesses, split by layer:
+
+- **This one (Toxiproxy) — transport faults**: latency, bandwidth throttles, TCP resets. Needs
+  Docker; non-gating CI.
+- **`tests/mock_spanner.rs` — logical gRPC faults**: an in-process mock
+  `google.spanner.v1.Spanner` server (the pinned client's own `spanner-grpc-mock` crate) scripted
+  per RPC to return exact gRPC statuses (`ABORTED` + `RetryInfo`, mid-stream `UNAVAILABLE`, a
+  stream that goes silent). Runs fully offline in plain `cargo test`; gating CI. This is the
+  complement the "Honest limitations" section below asks for — it *can* produce `ABORTED` and
+  other logical statuses that an L4 proxy cannot.
 
 ```
  driver ─(data-plane gRPC)─▶ Toxiproxy listener ─(upstream)─▶ emulator :9010
@@ -46,7 +57,10 @@ CI runs it non-gating via `.github/workflows/resilience.yml` (manual dispatch + 
   connection resets/timeouts — it does **not** speak gRPC and cannot make the emulator return a
   logical gRPC status. In particular it **cannot produce `ABORTED`**, so this harness does **not**
   test Spanner's ABORTED-driven read/write transaction replay (the driver's buffer-and-retry commit
-  path). That would need either a real Spanner instance under contention or a gRPC-aware fault proxy.
+  path). That would need either a real Spanner instance under contention or a gRPC-aware fault
+  source — the in-process mock server in `tests/mock_spanner.rs` is that source for logical
+  statuses on the *query* path (it asserts, e.g., that a surfaced `ABORTED` keeps `vendor_code`
+  10); scripting the full commit-abort-replay protocol through it is future work.
 
 - **A transport fault cannot make `commit()` fail — it makes it block.** Verified empirically while
   building the commit-fault test: the pinned client's `apply_request_defaults` marks *every* Spanner

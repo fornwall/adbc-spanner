@@ -166,3 +166,17 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 # google-cloud-spanner re-exports this crate's `Error` at runtime, so this is a test-only dependency.
 # Same git pin as the google-cloud family above (see the note there).
 google-cloud-gax = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
+# In-process mock `google.spanner.v1.Spanner` gRPC server (mockall + tonic), used by
+# tests/mock_spanner.rs to inject *logical* gRPC faults (ABORTED, mid-stream UNAVAILABLE, a hung
+# stream) fully offline — the complement of the Toxiproxy transport-fault harness (see
+# tests/RESILIENCE.md). This is the same mock the pinned client uses for its own end-to-end tests,
+# so its request/response protos match what the client sends on the wire.
+# Same git pin as the google-cloud family above (see the note there).
+spanner-grpc-mock = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
+# Used by tests/mock_spanner.rs to script the mock server: gRPC statuses (tonic), hand-encoded
+# `google.rpc.Status`/`RetryInfo` error details (prost/prost-types/bytes). Versions track what
+# the google-cloud family already pulls in, so these add no new major dependency lines.
+tonic = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+bytes = "1"
