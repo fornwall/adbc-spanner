@@ -727,7 +727,13 @@ convention) and is accepted as a `spanner:` connection-URI query parameter. Wire
 Python wrapper as an `access_token=` kwarg and documented in `README.md`, `python/README.md`,
 `docs/options.md`, and the `OPTION_ACCESS_TOKEN` rustdoc; offline unit tests cover the round-trip,
 the three mutual-exclusion conflicts, the emulator refusal, the bearer-header emission, and the
-no-leak rejection of a malformed token.); query options (optimizer version), directed reads, commit stats,
+no-leak rejection of a malformed token.); ~~query options (optimizer version)~~ (**Fixed.**
+`spanner.query.optimizer_version` and `spanner.query.optimizer_statistics_package`, connection +
+statement level [statement inherits, then overrides; `""` unsets; opaque pass-through strings
+round-tripping via `get_option`] — `QueryOptionsConfig` in `src/query_options.rs` sets `QueryOptions`
+on the query statement builder via `SpannerStatement::sql_builder`; offline unit tests cover the
+round-trip/unset, non-string rejection, and clone inheritance
+[`query_options::tests`].); directed reads, commit stats,
 `max_commit_delay`, `last_statement` optimization (free RPC saving for single-statement
 autocommit DML); ~~proto/enum columns (verify clean failure today)~~ (**Fixed.** They failed
 *silently*, not cleanly: `arrow_type` in `src/conversion.rs` mapped both `TypeCode::Proto` and
