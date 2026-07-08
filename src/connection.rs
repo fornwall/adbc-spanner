@@ -484,7 +484,8 @@ pub(crate) fn table_exists(
 }
 
 /// Run a query and return its single materialised record batch. Shared with the `INFORMATION_SCHEMA`
-/// collectors in [`crate::objects`] and [`crate::statistics`].
+/// collector in [`crate::statistics`] ([`crate::objects`] runs its queries concurrently on one
+/// multi-use read-only transaction instead).
 pub(crate) async fn query_batch(client: &DatabaseClient, sql: &str) -> Result<RecordBatch> {
     let transaction = client.single_use().build();
     let result_set = transaction

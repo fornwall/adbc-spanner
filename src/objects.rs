@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use adbc_core::error::{Error, Result, Status};
+use adbc_core::error::{Result, Status};
 use adbc_core::options::ObjectDepth;
 use adbc_core::schemas::GET_OBJECTS_SCHEMA;
 use arrow_array::{
@@ -20,8 +20,13 @@ use arrow_buffer::NullBuffer;
 use arrow_schema::Fields;
 use google_cloud_spanner::client::DatabaseClient;
 
-use crate::connection::{like_match, query_batch, str_col};
-use crate::error::err;
+use futures_util::try_join;
+use google_cloud_spanner::statement::Statement as SpannerSql;
+use google_cloud_spanner::transaction::MultiUseReadOnlyTransaction;
+
+use crate::connection::{like_match, str_col};
+use crate::conversion::result_set_to_batch;
+use crate::error::{err, from_spanner};
 use crate::nested::{arrow_err, field, list_item, list_of, list_of_nullable, struct_fields};
 use crate::runtime::{block_on_cancellable, CancelSignal, SharedRuntime};
 
@@ -96,6 +101,74 @@ pub(crate) fn collect_objects(
     let populate_columns = matches!(depth, ObjectDepth::All | ObjectDepth::Columns);
     let client = client.clone();
 
+    // Each present ADBC pattern filter is also pushed down into the corresponding
+    // INFORMATION_SCHEMA query as a bound-parameter `LIKE` predicate (never interpolated into
+    // the SQL text — the pattern is data, not SQL). The push-down only cuts transferred rows:
+    // the client-side `like_match` passes below remain the authoritative filter, so any corner
+    // where GoogleSQL `LIKE` and the ADBC pattern contract could disagree cannot change the
+    // result (see [`sql_like_pattern`] for the one known divergence, the escape character).
+    let schemata_stmt = filtered_query(
+        "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA",
+        &[("SCHEMA_NAME", db_schema)],
+        None,
+    );
+    let tables_stmt = populate_tables.then(|| {
+        filtered_query(
+            "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES",
+            &[("TABLE_SCHEMA", db_schema), ("TABLE_NAME", table_name)],
+            None,
+        )
+    });
+    let columns_stmt = populate_columns.then(|| {
+        filtered_query(
+            "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, \
+             IS_NULLABLE, SPANNER_TYPE \
+             FROM INFORMATION_SCHEMA.COLUMNS",
+            &[
+                ("TABLE_SCHEMA", db_schema),
+                ("TABLE_NAME", table_name),
+                ("COLUMN_NAME", column_name),
+            ],
+            Some("TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"),
+        )
+    });
+    // Constraints (primary/foreign/unique/check) and their key columns, populated at the
+    // same depth as columns. KEY_COLUMN_USAGE covers the key-based constraints; its rows are
+    // ordered so each constraint's columns come out in key order. For foreign keys,
+    // REFERENTIAL_CONSTRAINTS maps the FK to the referenced unique/primary-key constraint,
+    // whose own KEY_COLUMN_USAGE rows give the referenced (parent) columns in order — the
+    // ordering CONSTRAINT_COLUMN_USAGE does not preserve.
+    let constraints_stmt = populate_columns.then(|| {
+        filtered_query(
+            "SELECT TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE \
+             FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS",
+            &[("TABLE_SCHEMA", db_schema), ("TABLE_NAME", table_name)],
+            None,
+        )
+    });
+    // KEY_COLUMN_USAGE and REFERENTIAL_CONSTRAINTS stay unfiltered on purpose: a foreign key on
+    // a kept table may reference a unique/primary-key constraint on a table (or in a schema)
+    // that the filters exclude, and resolving `constraint_column_usage` needs the referenced
+    // constraint's own key-column rows.
+    let key_columns_stmt = populate_columns.then(|| {
+        SpannerSql::builder(
+            "SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, TABLE_SCHEMA, TABLE_NAME, \
+             COLUMN_NAME, CAST(ORDINAL_POSITION AS STRING), \
+             CAST(POSITION_IN_UNIQUE_CONSTRAINT AS STRING) \
+             FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE \
+             ORDER BY CONSTRAINT_SCHEMA, CONSTRAINT_NAME, ORDINAL_POSITION",
+        )
+        .build()
+    });
+    let referential_stmt = populate_columns.then(|| {
+        SpannerSql::builder(
+            "SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, UNIQUE_CONSTRAINT_SCHEMA, \
+             UNIQUE_CONSTRAINT_NAME \
+             FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS",
+        )
+        .build()
+    });
+
     let (
         schema_batch,
         table_batch,
@@ -104,84 +177,26 @@ pub(crate) fn collect_objects(
         key_column_batch,
         referential_batch,
     ) = block_on_cancellable(runtime, cancel, async move {
-        let schemas = query_batch(
-            &client,
-            "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA",
+        // All the metadata queries run concurrently, sharing ONE multi-use read-only
+        // transaction so they observe a single snapshot (the previous serial implementation
+        // used one single-use transaction per query, with no cross-query consistency).
+        // INFORMATION_SCHEMA queries are allowed in read-only transactions, and the client
+        // supports concurrent statements on one transaction: `execute_query` takes `&self`,
+        // and the inline-begin state machine serialises the implicit `BeginTransaction`
+        // among concurrent first statements (later ones wait for the begun transaction id).
+        let txn = client
+            .read_only_transaction()
+            .build()
+            .await
+            .map_err(from_spanner)?;
+        try_join!(
+            query_txn(&txn, schemata_stmt),
+            query_txn_opt(&txn, tables_stmt),
+            query_txn_opt(&txn, columns_stmt),
+            query_txn_opt(&txn, constraints_stmt),
+            query_txn_opt(&txn, key_columns_stmt),
+            query_txn_opt(&txn, referential_stmt),
         )
-        .await?;
-        let tables = if populate_tables {
-            Some(
-                query_batch(
-                    &client,
-                    "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES",
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-        let columns = if populate_columns {
-            Some(
-                query_batch(
-                    &client,
-                    "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, \
-                     IS_NULLABLE, SPANNER_TYPE \
-                     FROM INFORMATION_SCHEMA.COLUMNS \
-                     ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION",
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-        // Constraints (primary/foreign/unique/check) and their key columns, populated at the
-        // same depth as columns. KEY_COLUMN_USAGE covers the key-based constraints; its rows are
-        // ordered so each constraint's columns come out in key order. For foreign keys,
-        // REFERENTIAL_CONSTRAINTS maps the FK to the referenced unique/primary-key constraint,
-        // whose own KEY_COLUMN_USAGE rows give the referenced (parent) columns in order — the
-        // ordering CONSTRAINT_COLUMN_USAGE does not preserve.
-        let (constraints, key_columns, referential) = if populate_columns {
-            (
-                Some(
-                    query_batch(
-                        &client,
-                        "SELECT TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE \
-                         FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS",
-                    )
-                    .await?,
-                ),
-                Some(
-                    query_batch(
-                        &client,
-                        "SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, TABLE_SCHEMA, TABLE_NAME, \
-                         COLUMN_NAME, CAST(ORDINAL_POSITION AS STRING), \
-                         CAST(POSITION_IN_UNIQUE_CONSTRAINT AS STRING) \
-                         FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE \
-                         ORDER BY CONSTRAINT_SCHEMA, CONSTRAINT_NAME, ORDINAL_POSITION",
-                    )
-                    .await?,
-                ),
-                Some(
-                    query_batch(
-                        &client,
-                        "SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, UNIQUE_CONSTRAINT_SCHEMA, \
-                         UNIQUE_CONSTRAINT_NAME \
-                         FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS",
-                    )
-                    .await?,
-                ),
-            )
-        } else {
-            (None, None, None)
-        };
-        Ok::<_, Error>((
-            schemas,
-            tables,
-            columns,
-            constraints,
-            key_columns,
-            referential,
-        ))
     })?;
 
     let schema_names = str_col(&schema_batch, 0)?;
@@ -256,6 +271,81 @@ pub(crate) fn collect_objects(
         });
     }
     Ok(result)
+}
+
+/// Escape an ADBC `LIKE` pattern for GoogleSQL `LIKE`.
+///
+/// The ADBC pattern contract (implemented client-side by [`like_match`]) has no escape syntax:
+/// `%` and `_` are always wildcards and every other character — including `\` — is a literal.
+/// GoogleSQL `LIKE` agrees on `%`/`_` and case sensitivity, but treats `\` as an escape
+/// character; doubling each backslash turns it back into a literal, making the server-side
+/// predicate match the ADBC semantics. (`like_match` stays the authoritative filter regardless,
+/// so the push-down can only ever over-fetch, never change the result.)
+fn sql_like_pattern(pattern: &str) -> String {
+    pattern.replace('\\', "\\\\")
+}
+
+/// Build the SQL text and bound parameters for an `INFORMATION_SCHEMA` query, appending one
+/// `column LIKE @pN` predicate per present ADBC pattern filter. Split from [`filtered_query`] so
+/// the generated SQL is unit-testable offline.
+fn filtered_sql(
+    base: &str,
+    filters: &[(&str, Option<&str>)],
+    order_by: Option<&str>,
+) -> (String, Vec<(String, String)>) {
+    let mut sql = base.to_string();
+    let mut params = Vec::new();
+    for (column, pattern) in filters {
+        let Some(pattern) = pattern else { continue };
+        let name = format!("p{}", params.len());
+        let keyword = if params.is_empty() { "WHERE" } else { "AND" };
+        sql = format!("{sql} {keyword} {column} LIKE @{name}");
+        params.push((name, sql_like_pattern(pattern)));
+    }
+    if let Some(order_by) = order_by {
+        sql = format!("{sql} ORDER BY {order_by}");
+    }
+    (sql, params)
+}
+
+/// Build an `INFORMATION_SCHEMA` statement with each present ADBC pattern filter pushed down as
+/// a **bound-parameter** `LIKE` predicate. The pattern must never be interpolated into the SQL
+/// text: it is user-controlled data (the Snowflake ADBC driver shipped a SQL injection,
+/// apache/arrow-adbc#1338, by string-formatting these very patterns).
+fn filtered_query(
+    base: &str,
+    filters: &[(&str, Option<&str>)],
+    order_by: Option<&str>,
+) -> SpannerSql {
+    let (sql, params) = filtered_sql(base, filters, order_by);
+    let mut builder = SpannerSql::builder(sql);
+    for (name, value) in &params {
+        builder = builder.add_param(name.as_str(), value);
+    }
+    builder.build()
+}
+
+/// Run one metadata statement on the shared multi-use read-only transaction and materialise the
+/// result batch.
+async fn query_txn(
+    txn: &MultiUseReadOnlyTransaction,
+    statement: SpannerSql,
+) -> Result<RecordBatch> {
+    let result_set = txn.execute_query(statement).await.map_err(from_spanner)?;
+    let (_schema, batch) = result_set_to_batch(result_set).await?;
+    Ok(batch)
+}
+
+/// [`query_txn`] for a depth-gated statement: `None` (depth doesn't need the query) issues no
+/// RPC and yields `None`.
+async fn query_txn_opt(
+    txn: &MultiUseReadOnlyTransaction,
+    statement: Option<SpannerSql>,
+) -> Result<Option<RecordBatch>> {
+    match statement {
+        Some(statement) => query_txn(txn, statement).await.map(Some),
+        None => Ok(None),
+    }
 }
 
 /// One grouped `INFORMATION_SCHEMA.TABLES` row (per schema group).
@@ -1000,6 +1090,54 @@ mod tests {
             let list = table_child_list(&schemas, name);
             assert!(list.is_null(0), "{name} must be NULL at Tables depth");
         }
+    }
+
+    #[test]
+    fn sql_like_pattern_doubles_backslashes_only() {
+        // GoogleSQL LIKE treats `\` as an escape character; the ADBC pattern contract has none,
+        // so every backslash must become a literal. `%`/`_` pass through as wildcards (their
+        // semantics already agree) and everything else is untouched.
+        assert_eq!(sql_like_pattern("Sing%"), "Sing%");
+        assert_eq!(sql_like_pattern("S_ngers"), "S_ngers");
+        assert_eq!(sql_like_pattern(r"a\_b"), r"a\\_b");
+        assert_eq!(sql_like_pattern(r"a\\b"), r"a\\\\b");
+        assert_eq!(sql_like_pattern(""), "");
+    }
+
+    #[test]
+    fn filtered_sql_pushes_present_filters_as_bound_params() {
+        // No filters: the base SQL is unchanged (identical to the pre-push-down queries).
+        let (sql, params) = filtered_sql(
+            "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA",
+            &[("SCHEMA_NAME", None)],
+            None,
+        );
+        assert_eq!(sql, "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA");
+        assert!(params.is_empty());
+
+        // Present filters become `LIKE @pN` predicates; the pattern text lands only in the
+        // parameter list, never in the SQL string (the Snowflake driver's injection,
+        // apache/arrow-adbc#1338, came from string-formatting the pattern into the SQL).
+        let (sql, params) = filtered_sql(
+            "SELECT C FROM T",
+            &[
+                ("TABLE_SCHEMA", None),
+                ("TABLE_NAME", Some("Sing%")),
+                ("COLUMN_NAME", Some(r"evil'\--%")),
+            ],
+            Some("A, B"),
+        );
+        assert_eq!(
+            sql,
+            "SELECT C FROM T WHERE TABLE_NAME LIKE @p0 AND COLUMN_NAME LIKE @p1 ORDER BY A, B"
+        );
+        assert_eq!(
+            params,
+            vec![
+                ("p0".to_string(), "Sing%".to_string()),
+                ("p1".to_string(), r"evil'\\--%".to_string()),
+            ]
+        );
     }
 
     #[test]
