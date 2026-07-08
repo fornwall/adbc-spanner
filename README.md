@@ -281,7 +281,12 @@ full type fidelity.
 field metadata (`ARROW:extension:name` = `arrow.json`), so Arrow consumers that understand the
 extension recognize the logical JSON type while others still read plain strings. The extension is
 attached to the Arrow `Field`, not the storage `DataType`; for `ARRAY<JSON>` it sits on the list's
-child (`item`) field.
+child (`item`) field. The tag also works in the **bind** direction: a string parameter column
+carrying `arrow.json` binds as a Spanner `JSON`-typed parameter (a list of tagged strings as
+`ARRAY<JSON>`), which is required for inserting into a `JSON` column — Spanner does not coerce
+`STRING` parameters to `JSON` (without the tag, wrap the parameter in `PARSE_JSON(@p)` instead).
+Bulk-ingest create modes likewise create a `JSON` column for a tagged field. So JSON values
+round-trip: what `execute` reads from a `JSON` column can be bound straight back into one.
 
 `TIMESTAMP` is read at full nanosecond precision (matching the bind/write path). Arrow stores
 `Timestamp(Nanosecond)` as an `i64` count of nanoseconds since the Unix epoch, which spans only
