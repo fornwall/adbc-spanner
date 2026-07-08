@@ -59,5 +59,22 @@ jobs:
           echo "Spanner emulator admin API did not become ready" >&2
           exit 1
 
+      # Persist the C++ validation build tree (fetched + compiled arrow-adbc and
+      # GoogleTest under adbc-validation/build, plus our own harness objects) so the
+      # slow FetchContent clone + compile is reused across runs. The key is bound to
+      # the runner OS and a hash of adbc-validation/CMakeLists.txt — which carries the
+      # pinned ARROW_ADBC_TAG and every CMake/toolchain flag — so bumping the arrow-adbc
+      # rev (or any build flag) invalidates the cache. The build step below always runs,
+      # turning into an incremental no-op on a hit (and re-fetching the new tag when the
+      # rev changes), so a stale cache can never mask a real rev change. restore-keys
+      # lets a same-OS run seed the build tree for an incremental rebuild after a bump.
+      - name: Cache the ADBC C++ validation build tree
+        uses: actions/cache@v6
+        with:
+          path: adbc-validation/build
+          key: adbc-validation-${{ runner.os }}-${{ hashFiles('adbc-validation/CMakeLists.txt') }}
+          restore-keys: |
+            adbc-validation-${{ runner.os }}-
+
       - name: Run the ADBC C++ validation suite (gated subset)
         run: scripts/run-adbc-validation.sh

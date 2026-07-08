@@ -698,7 +698,16 @@ idempotent, so a repeated failure never spams new issues. No third-party action 
 `foundry-validation` ends in `|| true`, making harness breakage indistinguishable from expected
 dialect failures; the Windows import-lib copy is `|| true`-optional (`libraries.yml:138`); the
 wheel version parse greps `Cargo.toml` positionally — `cargo metadata | jq` is robust;
-`adbc-validation.yml` rebuilds arrow-adbc C++ + GoogleTest from source every run (cache it); the
+~~`adbc-validation.yml` rebuilds arrow-adbc C++ + GoogleTest from source every run (cache it)~~
+(**Fixed.** `adbc-validation.yml` now caches the `adbc-validation/build` tree (the FetchContent-cloned
++ compiled arrow-adbc driver-manager/validation harness and GoogleTest, plus the harness objects) via
+`actions/cache@v6` — the same version the repo already pins that action to in `fuzz.yml`. The key is
+`adbc-validation-${{ runner.os }}-${{ hashFiles('adbc-validation/CMakeLists.txt') }}`: keying on the
+CMakeLists hash means a bump of the pinned `ARROW_ADBC_TAG` (or any CMake/toolchain flag, all of which
+live in that file) invalidates the cache, while a `restore-keys: adbc-validation-${{ runner.os }}-`
+fallback seeds a same-OS build tree for an incremental rebuild. The build step still always runs, so on
+a hit it is an incremental no-op and on a rev change FetchContent re-fetches the new tag — a stale cache
+can never mask a real rev change.); the
 adbc-validation allowlist means new upstream tests never auto-enter the gate (periodic `--full`
 triage is manual); ~~dead crates.io/docs.rs badges in the README~~ (**Fixed.** The crate is unpublished
 (`publish = false`), so its crates.io/docs.rs badges pointed at nonexistent pages and rendered
