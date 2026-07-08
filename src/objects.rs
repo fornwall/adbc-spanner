@@ -332,7 +332,8 @@ async fn query_txn(
     statement: SpannerSql,
 ) -> Result<RecordBatch> {
     let result_set = txn.execute_query(statement).await.map_err(from_spanner)?;
-    let (_schema, batch) = result_set_to_batch(result_set).await?;
+    let (_schema, batch) =
+        result_set_to_batch(result_set, crate::conversion::TimestampPrecision::default()).await?;
     Ok(batch)
 }
 
