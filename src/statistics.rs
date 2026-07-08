@@ -45,6 +45,24 @@ const INT64_BRANCH: i8 = 0;
 /// unbounded fan-out against Spanner. They all share the driver's one Tokio runtime.
 const STATISTICS_SCAN_CONCURRENCY: usize = 8;
 
+/// Zero-based column indices into the `INFORMATION_SCHEMA` discovery batches read by
+/// [`collect_statistics`], named to mirror the `SELECT` list of the query that produces each batch.
+/// They must stay in lockstep with those `SELECT`s: reading through the names (rather than bare
+/// integers) makes a query edit that reorders or adds a column a compile-time concern here instead
+/// of a silent misread.
+mod tables_col {
+    // `SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES`
+    pub(super) const TABLE_SCHEMA: usize = 0;
+    pub(super) const TABLE_NAME: usize = 1;
+}
+mod columns_col {
+    // `SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, SPANNER_TYPE FROM INFORMATION_SCHEMA.COLUMNS`
+    pub(super) const TABLE_SCHEMA: usize = 0;
+    pub(super) const TABLE_NAME: usize = 1;
+    pub(super) const COLUMN_NAME: usize = 2;
+    pub(super) const SPANNER_TYPE: usize = 3;
+}
+
 /// One computed statistic for a table (or one of its columns).
 pub(crate) struct Statistic {
     pub table: String,
@@ -100,12 +118,15 @@ pub(crate) fn collect_statistics(
         )?
     };
 
-    let (ts, tn) = (str_col(&table_batch, 0)?, str_col(&table_batch, 1)?);
+    let (ts, tn) = (
+        str_col(&table_batch, tables_col::TABLE_SCHEMA)?,
+        str_col(&table_batch, tables_col::TABLE_NAME)?,
+    );
     let (cts, ctn, ccn, ctype) = (
-        str_col(&column_batch, 0)?,
-        str_col(&column_batch, 1)?,
-        str_col(&column_batch, 2)?,
-        str_col(&column_batch, 3)?,
+        str_col(&column_batch, columns_col::TABLE_SCHEMA)?,
+        str_col(&column_batch, columns_col::TABLE_NAME)?,
+        str_col(&column_batch, columns_col::COLUMN_NAME)?,
+        str_col(&column_batch, columns_col::SPANNER_TYPE)?,
     );
 
     // Group the COLUMNS rows by (schema, table) in one pass: (column name, whether its type is

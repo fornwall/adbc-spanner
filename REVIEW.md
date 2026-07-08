@@ -765,8 +765,13 @@ time by `ingest_mode_option` in `src/statement.rs` — which accepts both the ca
 and rejects unknown modes with the same `NotImplemented` error as before; `build_ingest_table_ddl`
 matches the enum exhaustively with no fallback arm, and `get_option` still reports the canonical
 spelling via `String::from(IngestMode)` — unit-tested offline by
-`ingest_mode_parses_both_spellings_and_rejects_unknown`), positional column
-indices into INFORMATION_SCHEMA batches, ~~`get_option_int` inconsistencies (database vs statement,
+`ingest_mode_parses_both_spellings_and_rejects_unknown`), ~~positional column
+indices into INFORMATION_SCHEMA batches~~ (**Fixed.** The bare numeric `str_col(batch, N)` /
+`batch.column(N)` reads in `src/objects.rs` and `src/statistics.rs` are now named `usize` constants,
+one `mod <query>_col` per `INFORMATION_SCHEMA` query, whose module doc comment reproduces that
+query's `SELECT` list so the read indices sit visibly beside the column order they must match; a
+pure no-behaviour-change refactor — identical indices, identical output), ~~`get_option_int`
+inconsistencies (database vs statement,
 and "not an integer" reported as `NotFound`)~~ (**Fixed.** All three levels' `get_option_int`/
 `get_option_double` now delegate to `get_option_string` and parse via shared helpers in
 `src/options.rs` (`int_from_stored_string` / `double_from_stored_string`): unset/unknown options
