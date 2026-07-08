@@ -84,6 +84,8 @@ path, not the original URI.
 | `spanner.rpc.timeout_seconds.query` | finite, non-negative seconds (fractions allowed); `0` disables; `""` unsets (see [RPC timeouts](#rpc-timeouts)) | unset (no deadline) | yes, when set (also via `get_option_double`) | Overall deadline on a query's **initial execution**: the `ExecuteStreamingSql` call plus the first chunk of the streamed result, the `execute_schema` / `execute_partitions` probes, and `read_partition`'s initial fetch. Expiry fails with `Timeout`. Becomes the default for statements this connection creates (statements may override). |
 | `spanner.rpc.timeout_seconds.update` | as `…query` | unset (no deadline) | yes, when set (also via `get_option_double`) | Overall deadline on each **write** operation: an autocommit DML / batch-DML transaction, the manual-mode commit, and each bulk-ingest commit chunk (covering any retries the client performs within it). A commit whose confirmation the driver stopped waiting for may still have landed server-side — the usual ambiguity of any timed-out commit. Same inheritance as `…query`. |
 | `spanner.rpc.timeout_seconds.fetch` | as `…query` | unset (no deadline) | yes, when set (also via `get_option_double`) | Overall deadline on **each subsequent chunk fetch** of a streamed result (after the first, which `…query` covers), enforced inside the background prefetch task so a stalled stream fails the consumer's next batch with `Timeout`. Same inheritance as `…query`. |
+| `spanner.retry.max_attempts` | positive integer; `""` unsets (see [Retry tuning](#retry-tuning)) | unset (client default, no cap) | yes, when set (also via `get_option_int`) | Cap on the number of attempts (first try + retries) the client makes for a retryable RPC; `1` disables retrying. Bounds the client's default retry policy without dropping its transport-error-on-idempotent retrying. Becomes the default for statements this connection creates (statements may override). |
+| `spanner.retry.max_elapsed_seconds` | finite, strictly positive seconds (fractions allowed); `""` unsets (see [Retry tuning](#retry-tuning)) | unset (client default, no cap) | yes, when set (also via `get_option_double`) | Cap on the total wall-clock time spent retrying a retryable RPC before the last error is surfaced. Combines with `spanner.retry.max_attempts` (whichever limit fires first wins). Same inheritance as `…max_attempts`. |
 
 Two standard connection options are **read-only**: `adbc.connection.catalog` and
 `adbc.connection.db_schema` (the "current" catalog/schema) both report `""` — a Spanner database
@@ -104,6 +106,8 @@ has a single, unnamed catalog and default schema — and cannot be set.
 | `spanner.rpc.timeout_seconds.query` | as the connection option; `0` disables; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement query-timeout override (see [RPC timeouts](#rpc-timeouts)). |
 | `spanner.rpc.timeout_seconds.update` | as the connection option; `0` disables; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement update-timeout override. |
 | `spanner.rpc.timeout_seconds.fetch` | as the connection option; `0` disables; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement fetch-timeout override. |
+| `spanner.retry.max_attempts` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_int`) | Per-statement retry-attempt-cap override (see [Retry tuning](#retry-tuning)). |
+| `spanner.retry.max_elapsed_seconds` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement retry-elapsed-cap override. |
 | `adbc.statement.bind_by_name` | boolean | `false` (positional) | yes (`true`/`false`) | How bound Arrow columns pair with the query's `@name` parameters, following the ADBC SQLite reference driver's `bind_by_name` convention ([apache/arrow-adbc#3362](https://github.com/apache/arrow-adbc/issues/3362)). **`false`** (the default): strictly positional — the *i*-th bound column binds to the *i*-th distinct parameter in query order, column names ignored (the ADBC ordinal contract positional clients and validation suites rely on). **`true`**: strict by-name — each column binds to `@<its own name>` (order-independent); a bound column that names no query parameter fails with `InvalidArguments` naming the missing parameter. See [README § Status](../README.md#status). |
 | `adbc.ingest.target_table` | string: table name | unset | yes, when set | **Standard ADBC.** Bulk-ingest target table. Setting it clears any SQL query on the statement (query and ingest target are mutually exclusive on one handle). |
 | `adbc.ingest.target_db_schema` | string: named schema (`""` = Spanner's default, unnamed schema) | unset (default schema) | yes, when set | **Standard ADBC.** Named schema qualifying the ingest target table. |
@@ -217,6 +221,39 @@ may still have landed server-side — the usual ambiguity of any commit whose co
 awaited. DDL (an admin long-running operation) and driver-internal metadata queries
 (`get_objects`, schema probes, statistics scans) are deliberately not bounded, mirroring the
 request-tag/priority scope.
+
+## Retry tuning
+
+Every data-plane RPC the driver issues is retried by the Spanner client under a default policy —
+strict [AIP-194](https://google.aip.dev/194), additionally retrying transport / IO errors on
+idempotent requests (which all the driver's data-plane RPCs are). That default has **no** attempt or
+elapsed-time cap, so a persistently `UNAVAILABLE` backend is retried until the operation-wide [RPC
+timeout](#rpc-timeouts) (if any) fires. The two `spanner.retry.*` options — available at connection
+*and* statement level — let you *bound* that retrying instead, mirroring the gax
+`RetryPolicyExt::with_attempt_limit` / `with_time_limit` knobs:
+
+- **`spanner.retry.max_attempts`** — the maximum number of attempts, the first try plus retries, as
+  a positive integer (accepted as an integer, a whole-valued double, or a numeric string). `1`
+  disables retrying. Round-trips through `get_option` and `get_option_int`.
+- **`spanner.retry.max_elapsed_seconds`** — an upper bound, in seconds, on the total wall-clock time
+  spent across attempts before the last error is surfaced as permanent. A finite, strictly positive
+  number (fractions allowed), accepted from a numeric string, integer or double. Round-trips through
+  `get_option` and `get_option_double`.
+
+The two are independent and may be combined — the retry loop stops at whichever limit is reached
+first. Zero, negative, non-finite and (for attempts) fractional or above-`u32::MAX` values fail with
+`InvalidArguments`; an empty string (`""`) unsets. A statement inherits the connection's values at
+creation and may override each independently.
+
+When **neither** is set the client keeps its default (unbounded) policy, so the feature is purely
+opt-in and by default changes nothing. When either is set, the driver applies a bounded policy that
+still retries transport / IO errors on idempotent requests exactly like the client's default — the
+attempt / elapsed limits are layered on top rather than replacing that behaviour — to every user
+query/DML statement, the read/write transaction runner's begin+commit RPCs, the bulk-ingest
+write-only transaction, and the `ExecuteBatchDml` batch. This tunes the *per-attempt* retry loop;
+the [RPC timeout](#rpc-timeouts) family bounds the *overall* per-operation wall time — the two are
+complementary. The transaction-level abort retry (Spanner's optimistic-concurrency re-run on
+`ABORTED`) is a separate policy and stays at the client default.
 
 ## Environment
 

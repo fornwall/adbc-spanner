@@ -77,6 +77,14 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   client's internal retries); expiry fails with ADBC `Timeout` status. Unset means no deadline —
   the pre-existing behaviour, where only `cancel` can interrupt a hung call. DDL and driver-internal
   metadata queries are not bounded.
+- Retry tuning: `spanner.retry.max_attempts` (a positive integer; `1` disables retrying) and
+  `spanner.retry.max_elapsed_seconds` (finite, strictly positive) bound the Spanner client's
+  *per-attempt* retry loop — settable on a connection (where they become the default for its
+  statements) or per statement, mirroring gax's attempt-count / elapsed-time knobs. Unset (the
+  default) leaves the client's own policy, which has no cap; setting either bounds it while
+  preserving its transport-error-on-idempotent retrying, and the two combine (whichever limit fires
+  first wins). `""` unsets; they round-trip via `get_option`/`get_option_int`/`get_option_double`.
+  This complements the *overall* per-operation `spanner.rpc.timeout_seconds.*` deadlines.
 - Parameter binding: `bind`/`bind_stream` an Arrow batch whose columns become Spanner named
   parameters; each bound row runs the statement once. How columns pair with the query's `@name`
   parameters is set by the `adbc.statement.bind_by_name` statement option (the [SQLite reference
@@ -268,6 +276,8 @@ database path, not the original URI.
 | `spanner.rpc.timeout_seconds.query`          | Deadline (seconds) on a query's initial execution; inherited by the connection's statements. |
 | `spanner.rpc.timeout_seconds.update`         | Deadline (seconds) on DML / batch-DML / commit / ingest-chunk operations; inherited by the connection's statements. |
 | `spanner.rpc.timeout_seconds.fetch`          | Deadline (seconds) on each subsequent chunk fetch of a streamed result; inherited by the connection's statements. |
+| `spanner.retry.max_attempts`                 | Cap on the client's retry attempts (first try + retries; `1` disables retrying); inherited by the connection's statements. |
+| `spanner.retry.max_elapsed_seconds`          | Cap on the client's total retry wall-clock time (seconds); combines with `max_attempts`; inherited by the connection's statements. |
 
 **Statement options** (via `set_option` on the statement):
 
@@ -284,6 +294,8 @@ database path, not the original URI.
 | `spanner.rpc.timeout_seconds.query`          | Per-statement query-timeout override. |
 | `spanner.rpc.timeout_seconds.update`         | Per-statement update-timeout override. |
 | `spanner.rpc.timeout_seconds.fetch`          | Per-statement fetch-timeout override. |
+| `spanner.retry.max_attempts`                 | Per-statement retry-attempt-cap override. |
+| `spanner.retry.max_elapsed_seconds`          | Per-statement retry-elapsed-cap override. |
 | `adbc.ingest.target_table`                   | Bulk-ingest target table. |
 | `adbc.ingest.target_db_schema`               | Named schema qualifying the ingest target table. |
 | `adbc.ingest.target_catalog`                 | Only the empty catalog is accepted (Spanner has a single, unnamed catalog). |
