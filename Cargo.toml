@@ -111,6 +111,10 @@ google-cloud-spanner = { git = "https://github.com/fornwall/google-cloud-rust", 
 google-cloud-auth = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
 # The `Poller` trait, to await the admin `UpdateDatabaseDdl` long-running operation used for DDL.
 google-cloud-lro = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
+# Well-known-types `Duration`, the type `set_max_commit_delay` takes for the `spanner.max_commit_delay`
+# option. Already in the graph (google-cloud-spanner depends on it as `wkt`); naming it directly lets
+# `src/request.rs` build the commit-delay value. Same git pin as the google-cloud family above.
+google-cloud-wkt = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
 # The Spanner client is async; we bridge it to the synchronous ADBC traits with a
 # dedicated multi-thread runtime.
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }

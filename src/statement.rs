@@ -38,6 +38,7 @@ use crate::conversion::{
 use crate::error::{
     err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
 };
+use crate::query_options::QueryOptionsConfig;
 use crate::request::RequestConfig;
 use crate::retry::RetryConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
@@ -122,6 +123,11 @@ pub struct SpannerStatement {
     /// request tag are overridable per statement. The transaction tag (connection-level only)
     /// rides along for the read/write transaction runners this statement builds.
     request: RequestConfig,
+    /// Query optimizer options (`spanner.query.optimizer_version` /
+    /// `spanner.query.optimizer_statistics_package`), inherited from the connection at creation time
+    /// and overridable per statement. Applied to every query statement builder this statement
+    /// produces (via [`Self::sql_builder`]).
+    query_options: QueryOptionsConfig,
     /// How `TIMESTAMP` columns map to Arrow (`spanner.max_timestamp_precision`), inherited from
     /// the connection at creation time and overridable per statement. Applied uniformly to every
     /// result path of this statement: `execute` (plain and bound queries), DML `THEN RETURN`
@@ -151,6 +157,7 @@ impl SpannerStatement {
         isolation: IsolationLevel,
         read_staleness: ReadStaleness,
         request: RequestConfig,
+        query_options: QueryOptionsConfig,
         timestamp_precision: TimestampPrecision,
         timeouts: RpcTimeouts,
         retry: RetryConfig,
@@ -177,6 +184,7 @@ impl SpannerStatement {
             max_partitions: None,
             read_staleness,
             request,
+            query_options,
             timestamp_precision,
             timeouts,
             retry,
@@ -191,12 +199,15 @@ impl SpannerStatement {
     }
 
     /// A Spanner statement builder for `sql` with this statement's request priority / request tag
-    /// (`spanner.request.priority` / `spanner.request.tag`) and retry policy
-    /// (`spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds`) applied. Every query/DML
-    /// statement the driver builds goes through here so the options apply uniformly.
+    /// (`spanner.request.priority` / `spanner.request.tag`), query optimizer options
+    /// (`spanner.query.optimizer_version` / `spanner.query.optimizer_statistics_package`) and retry
+    /// policy (`spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds`) applied. Every
+    /// query/DML statement the driver builds goes through here so the options apply uniformly.
     fn sql_builder(&self, sql: &str) -> StatementBuilder {
-        self.retry
-            .apply_to_statement(self.request.apply_to_statement(SpannerSql::builder(sql)))
+        self.retry.apply_to_statement(
+            self.query_options
+                .apply_to_statement(self.request.apply_to_statement(SpannerSql::builder(sql))),
+        )
     }
 
     /// Build one Spanner statement per bound row, binding its columns as named parameters.
@@ -924,6 +935,15 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) if k == crate::OPTION_REQUEST_TAG => {
                 self.request.set_request_tag(value)?;
             }
+            OptionStatement::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => {
+                self.request.set_max_commit_delay(value)?;
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_VERSION => {
+                self.query_options.set_optimizer_version(value)?;
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
+                self.query_options.set_optimizer_statistics_package(value)?;
+            }
             OptionStatement::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {
                 // `""` resets to the driver default (nanoseconds), not to the connection's value —
                 // the same unset semantics as the staleness options.
@@ -993,6 +1013,18 @@ impl Optionable for SpannerStatement {
             }
             OptionStatement::Other(k) if k == crate::OPTION_REQUEST_TAG => {
                 self.request.request_tag_string().map(str::to_string)
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => {
+                self.request.max_commit_delay_string().map(str::to_string)
+            }
+            OptionStatement::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_VERSION => self
+                .query_options
+                .optimizer_version_string()
+                .map(str::to_string),
+            OptionStatement::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
+                self.query_options
+                    .optimizer_statistics_package_string()
+                    .map(str::to_string)
             }
             // The effective mode: inherited from the connection at creation unless overridden.
             OptionStatement::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {

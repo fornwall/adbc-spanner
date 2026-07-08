@@ -727,8 +727,22 @@ convention) and is accepted as a `spanner:` connection-URI query parameter. Wire
 Python wrapper as an `access_token=` kwarg and documented in `README.md`, `python/README.md`,
 `docs/options.md`, and the `OPTION_ACCESS_TOKEN` rustdoc; offline unit tests cover the round-trip,
 the three mutual-exclusion conflicts, the emulator refusal, the bearer-header emission, and the
-no-leak rejection of a malformed token.); query options (optimizer version), directed reads, commit stats,
-`max_commit_delay`, `last_statement` optimization (free RPC saving for single-statement
+no-leak rejection of a malformed token.); ~~query options (optimizer version)~~ (**Fixed.**
+`spanner.query.optimizer_version` and `spanner.query.optimizer_statistics_package`, connection +
+statement level [statement inherits, then overrides; `""` unsets; opaque pass-through strings
+round-tripping via `get_option`] — `QueryOptionsConfig` in `src/query_options.rs` sets `QueryOptions`
+on the query statement builder via `SpannerStatement::sql_builder`; offline unit tests cover the
+round-trip/unset, non-string rejection, and clone inheritance
+[`query_options::tests`].); directed reads, commit stats,
+~~`max_commit_delay`~~ (**Fixed.** Added the `spanner.max_commit_delay` connection **and** statement
+option — a duration in `0..=500ms` (staleness grammar, `""` unsets, round-trips via `get_option`),
+stored on `RequestConfig` in `src/request.rs` and applied via the client's `set_max_commit_delay`
+at the read/write **commit** sites `RequestConfig` already threads through: autocommit DML, the
+`ExecuteBatchDml` batch runner, the manual-mode commit, and the ingest write-only txn
+(`apply_to_runner` / `apply_to_write_only`). Parsing/round-trip/cap covered by the offline unit
+tests `parses_max_commit_delay_with_units_and_enforces_the_500ms_cap` and
+`max_commit_delay_round_trips_and_unsets`; documented in `README.md`, `python/README.md`,
+`docs/options.md`, and the `OPTION_MAX_COMMIT_DELAY` rustdoc.), `last_statement` optimization (free RPC saving for single-statement
 autocommit DML); ~~proto/enum columns (verify clean failure today)~~ (**Fixed.** They failed
 *silently*, not cleanly: `arrow_type` in `src/conversion.rs` mapped both `TypeCode::Proto` and
 `TypeCode::Enum` through the catch-all `_ => DataType::Utf8` arm, so a `PROTO` column surfaced its
@@ -788,7 +802,12 @@ step's Windows branch (already gated on `runner.os == Windows`) no longer copies
 `adbc_spanner.dll.lib` with `2>/dev/null || true`; it now asserts the import library exists and
 `exit 1`s with a `::error::` message if not, so a build regression that drops it fails the job loudly
 instead of shipping a `.zip` missing the import lib.); the
-wheel version parse greps `Cargo.toml` positionally — `cargo metadata | jq` is robust;
+~~the
+wheel version parse greps `Cargo.toml` positionally — `cargo metadata | jq` is robust~~ (**Fixed.** The
+`python-wheels` job's "Sync wheel version to the crate" step no longer greps `Cargo.toml` positionally;
+it now derives the crate version via `cargo metadata --no-deps --format-version 1 | jq -r '.packages[] |
+select(.name == "adbc-spanner") | .version'`, the same robust parse the tag-only `version-gate` job
+already uses, so both jobs read the version identically.);
 ~~`adbc-validation.yml` rebuilds arrow-adbc C++ + GoogleTest from source every run (cache it)~~
 (**Fixed.** `adbc-validation.yml` now caches the `adbc-validation/build` tree (the FetchContent-cloned
 + compiled arrow-adbc driver-manager/validation harness and GoogleTest, plus the harness objects) via

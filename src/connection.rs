@@ -60,6 +60,7 @@ use google_cloud_spanner::transaction::ReadWriteTransaction;
 use crate::conversion::{TimestampPrecision, result_set_to_batch, stream_query};
 use crate::driver::Connected;
 use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
+use crate::query_options::QueryOptionsConfig;
 use crate::request::RequestConfig;
 use crate::retry::RetryConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
@@ -238,6 +239,10 @@ pub struct SpannerConnection {
     /// for statements created on the connection, which may override the priority and request tag
     /// (the transaction tag is connection-level only).
     request: RequestConfig,
+    /// Query optimizer options (`spanner.query.optimizer_version` /
+    /// `spanner.query.optimizer_statistics_package`). Unset by default; becomes the default for
+    /// statements created on the connection, which may override either field.
+    query_options: QueryOptionsConfig,
     /// How `TIMESTAMP` columns map to Arrow (`spanner.max_timestamp_precision`): nanoseconds that
     /// error on out-of-range instants (the default) or microseconds covering Spanner's full range.
     /// Becomes the default for statements created on the connection, which may override it; also
@@ -270,6 +275,7 @@ impl SpannerConnection {
             isolation: IsolationLevel::Unspecified,
             read_staleness: ReadStaleness::default(),
             request: RequestConfig::default(),
+            query_options: QueryOptionsConfig::default(),
             timestamp_precision: TimestampPrecision::default(),
             timeouts: RpcTimeouts::default(),
             retry: RetryConfig::default(),
@@ -681,6 +687,15 @@ impl Optionable for SpannerConnection {
             OptionConnection::Other(k) if k == crate::OPTION_TRANSACTION_TAG => {
                 self.request.set_transaction_tag(value)?;
             }
+            OptionConnection::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => {
+                self.request.set_max_commit_delay(value)?;
+            }
+            OptionConnection::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_VERSION => {
+                self.query_options.set_optimizer_version(value)?;
+            }
+            OptionConnection::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
+                self.query_options.set_optimizer_statistics_package(value)?;
+            }
             OptionConnection::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {
                 self.timestamp_precision = TimestampPrecision::parse_option(value)?;
             }
@@ -766,6 +781,43 @@ impl Optionable for SpannerConnection {
                         Status::NotFound,
                     )
                 }),
+            OptionConnection::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => self
+                .request
+                .max_commit_delay_string()
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    err(
+                        format!("option {} is not set", crate::OPTION_MAX_COMMIT_DELAY),
+                        Status::NotFound,
+                    )
+                }),
+            OptionConnection::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_VERSION => self
+                .query_options
+                .optimizer_version_string()
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    err(
+                        format!(
+                            "option {} is not set",
+                            crate::OPTION_QUERY_OPTIMIZER_VERSION
+                        ),
+                        Status::NotFound,
+                    )
+                }),
+            OptionConnection::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
+                self.query_options
+                    .optimizer_statistics_package_string()
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        err(
+                            format!(
+                                "option {} is not set",
+                                crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE
+                            ),
+                            Status::NotFound,
+                        )
+                    })
+            }
             // Always set (there is a default mode), so the effective value is always reported.
             OptionConnection::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {
                 Ok(self.timestamp_precision.as_str().to_string())
@@ -852,6 +904,7 @@ impl Connection for SpannerConnection {
             self.isolation.clone(),
             self.read_staleness.clone(),
             self.request.clone(),
+            self.query_options.clone(),
             self.timestamp_precision,
             self.timeouts,
             self.retry,

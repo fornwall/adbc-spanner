@@ -18,12 +18,20 @@
 //! - [`OPTION_TRANSACTION_TAG`](crate::OPTION_TRANSACTION_TAG) (`spanner.transaction.tag`) — a
 //!   free-form per-transaction tag, applied wherever a read/write transaction runner is built
 //!   (autocommit DML, the manual-mode commit, ingest commits). Connection level only.
+//! - [`OPTION_MAX_COMMIT_DELAY`](crate::OPTION_MAX_COMMIT_DELAY) (`spanner.max_commit_delay`) — the
+//!   maximum amount of time Spanner may delay a **commit** to batch it with others (a
+//!   throughput-for-latency trade-off). A duration in `0..=500ms`, applied at every read/write
+//!   commit site the runner / write-only builders cover (autocommit DML, the `ExecuteBatchDml`
+//!   batch runner, the manual-mode commit, and the bulk-ingest write-only transaction).
+//!   Connection and statement level.
 //!
 //! Like the read-staleness options, the connection's values become the default for statements it
 //! creates (which may override them), setting an empty string unsets a value, and every option
 //! round-trips through `get_option`. Driver-internal metadata queries (`get_objects`,
 //! `get_table_schema` probes, …) are deliberately left untagged — the options cover the user's own
 //! statements.
+
+use std::time::Duration;
 
 use adbc_core::error::Result;
 use adbc_core::options::OptionValue;
@@ -32,8 +40,14 @@ use google_cloud_spanner::builder::{
 };
 use google_cloud_spanner::model::request_options::Priority;
 use google_cloud_spanner::statement::StatementBuilder;
+use google_cloud_wkt::Duration as WktDuration;
 
 use crate::error::invalid_argument;
+use crate::staleness::parse_duration;
+
+/// Spanner caps `max_commit_delay` at 500 milliseconds (values above are rejected server-side); we
+/// validate the same bound at set time for a clean `InvalidArguments` instead of a commit error.
+const MAX_COMMIT_DELAY_CAP: Duration = Duration::from_millis(500);
 
 /// A parsed `spanner.request.priority` value. A driver-owned enum (rather than the client's
 /// non-exhaustive [`Priority`]) so the canonical option string can be recovered exactly for
@@ -91,6 +105,9 @@ pub(crate) struct RequestConfig {
     request_tag: Option<String>,
     /// Raw `spanner.transaction.tag` value, when set (connection-level only).
     transaction_tag: Option<String>,
+    /// Parsed `spanner.max_commit_delay`, with the raw option string kept for `get_option`
+    /// round-trip. Applied as the commit delay wherever a read/write commit is built.
+    max_commit_delay: Option<(String, Duration)>,
 }
 
 impl RequestConfig {
@@ -118,6 +135,20 @@ impl RequestConfig {
         Ok(())
     }
 
+    /// Handle a `set_option` for `spanner.max_commit_delay`. An empty value unsets it; a malformed
+    /// value or one outside `0..=500ms` is rejected with `InvalidArguments`.
+    pub(crate) fn set_max_commit_delay(&mut self, value: OptionValue) -> Result<()> {
+        let raw = as_string(value)?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            self.max_commit_delay = None;
+            return Ok(());
+        }
+        let duration = parse_max_commit_delay(trimmed)?;
+        self.max_commit_delay = Some((trimmed.to_string(), duration));
+        Ok(())
+    }
+
     /// The canonical `spanner.request.priority` value, for `get_option` round-trip.
     pub(crate) fn priority_string(&self) -> Option<&'static str> {
         self.priority.map(RequestPriority::as_str)
@@ -131,6 +162,19 @@ impl RequestConfig {
     /// The raw `spanner.transaction.tag` value, for `get_option` round-trip.
     pub(crate) fn transaction_tag_string(&self) -> Option<&str> {
         self.transaction_tag.as_deref()
+    }
+
+    /// The raw `spanner.max_commit_delay` value, for `get_option` round-trip.
+    pub(crate) fn max_commit_delay_string(&self) -> Option<&str> {
+        self.max_commit_delay.as_ref().map(|(raw, _)| raw.as_str())
+    }
+
+    /// The commit delay as the client's [`WktDuration`], when set. The conversion cannot fail — the
+    /// stored value was validated to `0..=500ms` at set time.
+    fn commit_delay(&self) -> Option<WktDuration> {
+        self.max_commit_delay
+            .as_ref()
+            .and_then(|(_, d)| WktDuration::try_from(*d).ok())
     }
 
     /// Apply the priority and request tag to a statement builder (queries and DML alike).
@@ -154,7 +198,8 @@ impl RequestConfig {
         builder
     }
 
-    /// Apply the commit priority and transaction tag to a read/write transaction runner builder.
+    /// Apply the commit priority, transaction tag and commit delay to a read/write transaction
+    /// runner builder.
     pub(crate) fn apply_to_runner(
         &self,
         mut builder: TransactionRunnerBuilder,
@@ -165,11 +210,14 @@ impl RequestConfig {
         if let Some(tag) = &self.transaction_tag {
             builder = builder.set_transaction_tag(tag.as_str());
         }
+        if let Some(delay) = self.commit_delay() {
+            builder = builder.set_max_commit_delay(delay);
+        }
         builder
     }
 
-    /// Apply the commit priority and transaction tag to a write-only transaction builder (the
-    /// mutation-based bulk-ingest commit path).
+    /// Apply the commit priority, transaction tag and commit delay to a write-only transaction
+    /// builder (the mutation-based bulk-ingest commit path).
     pub(crate) fn apply_to_write_only(
         &self,
         mut builder: WriteOnlyTransactionBuilder,
@@ -180,8 +228,23 @@ impl RequestConfig {
         if let Some(tag) = &self.transaction_tag {
             builder = builder.set_transaction_tag(tag.as_str());
         }
+        if let Some(delay) = self.commit_delay() {
+            builder = builder.set_max_commit_delay(delay);
+        }
         builder
     }
+}
+
+/// Parse a `spanner.max_commit_delay` value: a duration (the staleness duration grammar — `s`
+/// default, `ms`, `us`/`µs`, `ns`, `m`, `h`) that must fall within Spanner's `0..=500ms` range.
+pub(crate) fn parse_max_commit_delay(value: &str) -> Result<Duration> {
+    let duration = parse_duration(value)?;
+    if duration > MAX_COMMIT_DELAY_CAP {
+        return Err(invalid_argument(format!(
+            "spanner.max_commit_delay {value:?} exceeds Spanner's maximum of 500ms"
+        )));
+    }
+    Ok(duration)
 }
 
 /// Extract a string from an option value, erroring on any other value kind.
@@ -280,9 +343,61 @@ mod tests {
             assert_eq!(error.status, Status::InvalidArguments);
             let error = config.set_request_tag(value.clone()).unwrap_err();
             assert_eq!(error.status, Status::InvalidArguments);
-            let error = config.set_transaction_tag(value).unwrap_err();
+            let error = config.set_transaction_tag(value.clone()).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+            let error = config.set_max_commit_delay(value).unwrap_err();
             assert_eq!(error.status, Status::InvalidArguments);
         }
+    }
+
+    #[test]
+    fn parses_max_commit_delay_with_units_and_enforces_the_500ms_cap() {
+        // The staleness duration grammar (default seconds plus unit suffixes) applies.
+        assert_eq!(
+            parse_max_commit_delay("0.2s").unwrap(),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            parse_max_commit_delay("200ms").unwrap(),
+            Duration::from_millis(200)
+        );
+        assert_eq!(parse_max_commit_delay("0").unwrap(), Duration::ZERO);
+        // The boundary is inclusive.
+        assert_eq!(
+            parse_max_commit_delay("500ms").unwrap(),
+            Duration::from_millis(500)
+        );
+        // Above 500ms, negative, and malformed values are all rejected.
+        for bad in ["501ms", "1s", "0.6s", "-1ms", "abc", "1x"] {
+            let error = parse_max_commit_delay(bad).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "{bad}");
+        }
+    }
+
+    #[test]
+    fn max_commit_delay_round_trips_and_unsets() {
+        let mut config = RequestConfig::default();
+        assert_eq!(config.max_commit_delay_string(), None);
+        assert!(config.commit_delay().is_none());
+
+        // The raw value round-trips verbatim (surrounding whitespace trimmed), and a client
+        // WktDuration is produced.
+        config.set_max_commit_delay(s(" 100ms ")).unwrap();
+        assert_eq!(config.max_commit_delay_string(), Some("100ms"));
+        assert_eq!(
+            config.commit_delay(),
+            Some(WktDuration::try_from(Duration::from_millis(100)).unwrap())
+        );
+
+        // A rejected value leaves the stored one untouched.
+        let error = config.set_max_commit_delay(s("2s")).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert_eq!(config.max_commit_delay_string(), Some("100ms"));
+
+        // An empty string unsets.
+        config.set_max_commit_delay(s("")).unwrap();
+        assert_eq!(config.max_commit_delay_string(), None);
+        assert!(config.commit_delay().is_none());
     }
 
     /// Statement inheritance is a plain clone of the connection's config (mirroring
@@ -293,18 +408,23 @@ mod tests {
         connection.set_priority(s("low")).unwrap();
         connection.set_request_tag(s("conn-tag")).unwrap();
         connection.set_transaction_tag(s("txn-tag")).unwrap();
+        connection.set_max_commit_delay(s("100ms")).unwrap();
 
         let mut statement = connection.clone();
         assert_eq!(statement.priority_string(), Some("low"));
         assert_eq!(statement.request_tag_string(), Some("conn-tag"));
         assert_eq!(statement.transaction_tag_string(), Some("txn-tag"));
+        assert_eq!(statement.max_commit_delay_string(), Some("100ms"));
 
         statement.set_priority(s("high")).unwrap();
         statement.set_request_tag(s("")).unwrap();
+        statement.set_max_commit_delay(s("250ms")).unwrap();
         assert_eq!(statement.priority_string(), Some("high"));
         assert_eq!(statement.request_tag_string(), None);
+        assert_eq!(statement.max_commit_delay_string(), Some("250ms"));
         // The connection is unaffected by statement-level overrides.
         assert_eq!(connection.priority_string(), Some("low"));
         assert_eq!(connection.request_tag_string(), Some("conn-tag"));
+        assert_eq!(connection.max_commit_delay_string(), Some("100ms"));
     }
 }
