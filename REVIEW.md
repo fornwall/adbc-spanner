@@ -845,7 +845,11 @@ straight from the generated model type, asserts the status + a type-naming messa
 and array cases); the type-mapping tables/notes in the module docs and README were updated to match.);
 change streams and GQL graph
 queries may already work through plain SQL — one emulator test each would let the README claim
-them; telemetry/tracing hooks as a backlog entry.
+them; ~~telemetry/tracing hooks~~ (**Fixed.** the driver now emits `tracing` spans/events at the ADBC
+operation boundaries — connection open, query/DML/DDL, bulk ingest, manual commit/rollback — at
+`debug`/`trace`, recording only non-sensitive shapes/counts/kinds (never SQL text, params,
+credentials or row data); a no-op unless the host installs a subscriber, documented under README
+"Observability").
 
 **CI/misc.** ~~No dependabot/renovate (SHA-pinned actions and the two git-pin families drift
 unmonitored)~~ (**Fixed.** `.github/dependabot.yml` now monitors the `github-actions` and `cargo`

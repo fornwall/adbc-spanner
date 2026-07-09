@@ -309,6 +309,10 @@ impl SpannerDatabase {
                 .unwrap_or(DEFAULT_IMPERSONATION_LIFETIME_SECS),
         );
 
+        // Captured for the connection-opened trace event below (before `endpoint` is moved into the
+        // async block). Non-sensitive: just whether an explicit endpoint was configured.
+        let has_endpoint = endpoint.is_some();
+
         self.runtime.block_on(async move {
             let mut builder = Spanner::builder();
             if let Some(endpoint) = endpoint {
@@ -355,6 +359,10 @@ impl SpannerDatabase {
                 .build()
                 .await
                 .map_err(from_spanner)?;
+            // Non-sensitive operational fields only: the emulator flag and whether an explicit
+            // endpoint was configured. The database resource name and any credentials are never
+            // recorded.
+            tracing::debug!(emulator, has_endpoint, "spanner: connection opened");
             Ok(Connected {
                 client,
                 spanner,

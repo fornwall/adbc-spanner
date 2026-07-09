@@ -445,6 +445,17 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   considered and deliberately not implemented). Transport descriptors only over trusted channels and
   never execute one from an untrusted source; the `read_partition`/`execute_partitions` rustdoc
   states the same.
+- Observability: the driver emits `tracing` events at the ADBC operation boundaries — connection
+  open (`driver.rs::connect`), query/parameterized-query execution and DML (`statement.rs`,
+  `debug`), DDL (`run_ddl`), bulk ingest (`run_ingest`/`run_ingest_mutations` — start, per-chunk
+  `trace`, complete/buffered), and manual `commit`/`rollback` (`connection.rs`). `tracing` is a
+  facade dependency (already in the graph transitively) and a no-op unless the host installs a
+  subscriber, so it costs nothing for consumers who don't opt in. **Never log SQL text, bound
+  parameter values, credentials/tokens, or row data** — events carry only shapes/counts/kinds
+  (row/chunk/statement counts, affected-row counts, ingest mode, emulator flag), matching the
+  no-secret-leak discipline (`scrub_credential_error`). When adding a new operation, instrument at
+  the trait-method / helper boundary, not inside the per-row hot loops. README "Observability"
+  documents enabling it.
 - Still returning `NotImplemented` (keep the pattern until implemented): Substrait
   (`set_substrait_plan`) — Spanner executes GoogleSQL/PostgreSQL text, not Substrait plans.
 - Commits in this environment may need `-c commit.gpgsign=false` if no signing agent is present.

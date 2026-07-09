@@ -461,6 +461,31 @@ infinity. Those are the only two modes — there is deliberately no silently-wra
 > meantime, and downstream crates must take `adbc_core` from the same `arrow-adbc` git revision (see
 > the notes in `Cargo.toml`).
 
+## Observability
+
+The driver emits [`tracing`](https://docs.rs/tracing) spans/events at the meaningful ADBC operation
+boundaries — connection open, query execution, DML/DDL, bulk ingest, and manual
+`commit`/`rollback` — at `debug` (a `trace` event per committed ingest chunk). `tracing` is a
+facade: these calls are a **no-op unless the host application installs a subscriber**, so they add
+no runtime cost for consumers who do not opt in. To see them, add
+[`tracing-subscriber`](https://docs.rs/tracing-subscriber) to *your* application and install it
+before using the driver:
+
+```rust,ignore
+// In the host application (not a dependency of adbc-spanner):
+tracing_subscriber::fmt()
+    .with_env_filter("adbc_spanner=debug")
+    .init();
+```
+
+Loading the driver as a shared library (through an ADBC driver manager) does not wire up any
+subscriber; the events are available only to a Rust host that embeds the driver and installs one.
+
+**No sensitive data is ever recorded.** Events carry only shapes, counts and kinds —
+row/chunk/statement counts, affected-row counts, the ingest mode, the emulator flag. The driver
+**never** logs SQL text, bound parameter values, credentials, tokens, keyfile contents, or the
+database/table data itself, matching its strict no-secret-leak discipline.
+
 ## Testing
 
 Unit tests run with no external dependencies:

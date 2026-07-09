@@ -398,6 +398,14 @@ impl SpannerStatement {
         if self.bound.is_empty() {
             return Err(invalid_state("cannot ingest: no data has been bound"));
         }
+        // Shape/counts and the ingest mode — never the table's data. The table name is a schema
+        // identifier the caller chose (not a secret), the ingest mode is an enum.
+        let rows: usize = self.bound.iter().map(|b| b.num_rows()).sum();
+        tracing::debug!(
+            rows,
+            mode = ?self.ingest_mode,
+            "spanner: bulk ingest starting"
+        );
         let result = self.run_bound_ingest(table);
         // The bound data is consumed by the ingest attempt either way — including a failed
         // create-mode DDL: a reused statement handle must not silently re-ingest stale rows after
@@ -497,17 +505,24 @@ impl SpannerStatement {
         {
             let mut txn = self.txn.lock().unwrap();
             if !txn.autocommit() {
+                let mut buffered = 0_usize;
                 for batch in &self.bound {
                     for row in 0..batch.num_rows() {
                         txn.buffer_mutation(bind::insert_mutation(&target, batch, row)?);
+                        buffered += 1;
                     }
                 }
+                tracing::debug!(
+                    rows = buffered,
+                    "spanner: bulk ingest buffered in manual transaction"
+                );
                 return Ok(None);
             }
         }
         let mut total = 0_i64;
         let mut chunk: Vec<Mutation> = Vec::new();
         let mut budget = IngestChunkBudget::default();
+        let mut chunks = 0_usize;
         for batch in &self.bound {
             let columns = batch.num_columns();
             // A cheap per-row size estimate: the batch's Arrow buffer footprint averaged over its
@@ -516,18 +531,34 @@ impl SpannerStatement {
             let row_bytes = batch.get_array_memory_size() / batch.num_rows().max(1);
             for row in 0..batch.num_rows() {
                 if !budget.fits(columns, row_bytes) {
-                    total += self
+                    let committed = self
                         .write_mutation_chunk(std::mem::take(&mut chunk))
                         .map_err(|e| note_rows_already_committed(e, total))?;
+                    total += committed;
+                    tracing::trace!(
+                        chunk = chunks,
+                        rows = committed,
+                        "spanner: ingest chunk committed"
+                    );
+                    chunks += 1;
                     budget = IngestChunkBudget::default();
                 }
                 chunk.push(bind::insert_mutation(&target, batch, row)?);
                 budget.add(columns, row_bytes);
             }
         }
-        total += self
+        let committed = self
             .write_mutation_chunk(chunk)
             .map_err(|e| note_rows_already_committed(e, total))?;
+        total += committed;
+        if committed > 0 {
+            tracing::trace!(
+                chunk = chunks,
+                rows = committed,
+                "spanner: ingest chunk committed"
+            );
+        }
+        tracing::debug!(rows = total, "spanner: bulk ingest complete");
         Ok(Some(total))
     }
 
@@ -597,9 +628,12 @@ impl SpannerStatement {
         {
             let mut txn = self.txn.lock().unwrap();
             if !txn.autocommit() {
+                let buffered = statements.len();
                 for statement in statements {
                     txn.buffer(statement);
                 }
+                // Counts only — buffered DML is applied at the next manual commit.
+                tracing::debug!(buffered, "spanner: DML buffered in manual transaction");
                 return Ok(None);
             }
         }
@@ -614,6 +648,7 @@ impl SpannerStatement {
             &self.commit_stats,
             statements,
         )?;
+        tracing::debug!(rows_affected = count, "spanner: DML executed");
         Ok(Some(count))
     }
 
@@ -702,6 +737,10 @@ impl SpannerStatement {
             affected += count;
         }
         let schema = schema.unwrap_or_else(|| Arc::new(Schema::empty()));
+        tracing::debug!(
+            rows_affected = affected,
+            "spanner: DML (THEN RETURN) executed"
+        );
         Ok((batches, schema, affected))
     }
 
@@ -763,6 +802,11 @@ impl SpannerStatement {
         sql: &str,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let mut statements = self.build_bound_statements(sql, true)?;
+        // Row count only (one statement per bound row); never the SQL text or parameter values.
+        tracing::debug!(
+            bound_rows = statements.len(),
+            "spanner: executing parameterized query"
+        );
         let client = self.client.clone();
         let runtime = self.runtime.clone();
         let cancel = self.cancel.clone();
@@ -836,6 +880,8 @@ impl SpannerStatement {
                 "cannot execute DDL: the connection is read-only",
             ));
         }
+        // Statement count only — never the DDL text.
+        tracing::debug!(statements = statements.len(), "spanner: executing DDL");
         let spanner = self.spanner.clone();
         let database = self.database.clone();
         // DDL is issued through the write/update path, so the update timeout bounds the whole
@@ -1213,6 +1259,11 @@ impl Statement for SpannerStatement {
             self.bound.clear();
             return Ok(reader);
         }
+        // Shapes/counts only — never the SQL text (which may contain literals or secrets).
+        tracing::debug!(
+            rows_per_batch = self.rows_per_batch,
+            "spanner: executing query"
+        );
         let client = self.client.clone();
         let runtime = self.runtime.clone();
         let cancel = self.cancel.clone();

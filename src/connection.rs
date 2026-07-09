@@ -1204,6 +1204,12 @@ impl Connection for SpannerConnection {
         };
         let applied = pending.len();
         let applied_mutations = mutations.len();
+        // Counts only — never the buffered SQL or mutation data.
+        tracing::debug!(
+            statements = applied,
+            mutations = applied_mutations,
+            "spanner: committing manual transaction"
+        );
         self.apply_transaction(pending, mutations)?;
         // Drain exactly the statements/mutations that were applied; anything buffered concurrently
         // while the commit RPC ran stays pending for the next commit.
@@ -1220,6 +1226,11 @@ impl Connection for SpannerConnection {
                 "rollback invoked with autocommit enabled; no active transaction",
             ));
         }
+        tracing::debug!(
+            statements = st.pending.len(),
+            mutations = st.pending_mutations.len(),
+            "spanner: rolling back manual transaction"
+        );
         st.pending.clear();
         st.pending_mutations.clear();
         Ok(())
