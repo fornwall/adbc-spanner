@@ -79,7 +79,10 @@ EXCLUDED=(
   'SpannerStatementTest.SqlQueryRowsAffectedDelete'
   'SpannerStatementTest.SqlQueryRowsAffectedDeleteStream'
   'SpannerStatementTest.SqlSchemaFloats'
-  'SpannerStatementTest.Transactions'
+  # Transactions is NOT excluded: Spanner has no transactional DDL (DDL auto-commits
+  # via the admin API and cannot be rolled back), so the case can never apply. The
+  # `ddl_implicit_commit_txn` quirk makes it self-skip, which the gate tolerates —
+  # no expected-failure bookkeeping needed.
 
   # --- Bucket 2: ingest readback (and non-applicable ingest variants) ---------
   # Create-mode ingest is supported (synthetic adbc_ingest_key UUID PK), so these
