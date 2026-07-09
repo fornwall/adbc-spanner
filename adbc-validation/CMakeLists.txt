@@ -14,10 +14,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # (`DriverQuirks::FloatCastTypeName`, fornwall/arrow-adbc#7, based on the same
 # apache `main` rev the driver's adbc_core/adbc_ffi build on). Revert to a
 # versioned release tag once that quirk lands upstream.
+#
+# FORCE so this pin always wins over a value cached in a restored/incremental
+# build tree: a plain `set(... CACHE STRING)` is a no-op when the entry already
+# exists, so a stale `CMakeCache.txt` (e.g. seeded via the CI cache restore-keys
+# from a run on the old rev) would silently keep the previous tag and rebuild
+# against the wrong arrow-adbc source. FORCE makes a rev bump here authoritative.
 set(ARROW_ADBC_REPOSITORY "https://github.com/fornwall/arrow-adbc.git"
-    CACHE STRING "arrow-adbc git repository")
-set(ARROW_ADBC_TAG "bbb530e0c3ea5d3c3477a53d5560b71a8ec8b1ea"
-    CACHE STRING "arrow-adbc git rev (fornwall/arrow-adbc#7)")
+    CACHE STRING "arrow-adbc git repository" FORCE)
+set(ARROW_ADBC_TAG "010cbf38be8dce3e4fa4b3592e25aff8dbe1bc3a"
+    CACHE STRING "arrow-adbc git rev (fornwall/arrow-adbc#7)" FORCE)
 
 include(FetchContent)
 
