@@ -17,9 +17,21 @@ import typing
 
 import adbc_driver_manager.dbapi
 
-from . import ENTRYPOINT, _driver_path, option_kwargs
+from . import (
+    ENTRYPOINT,
+    ConnectionOptions,
+    DatabaseOptions,
+    StatementOptions,
+    _driver_path,
+    option_kwargs,
+)
 
-__all__ = ["connect"]
+__all__ = [
+    "connect",
+    "DatabaseOptions",
+    "ConnectionOptions",
+    "StatementOptions",
+]
 
 
 def connect(

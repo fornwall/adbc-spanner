@@ -375,8 +375,8 @@ Setting `spanner.impersonate.target_principal` layers
 [service-account impersonation](https://cloud.google.com/iam/docs/service-account-impersonation) on
 top of whichever base credentials above are in effect: the base credentials call the IAM Credentials
 `generateAccessToken` API to mint a short-lived token for the target service account, and the driver
-authenticates as that target. The option group mirrors the BigQuery ADBC driver's
-`bigquery.impersonate.*` options:
+authenticates as that target. The option group follows gcloud's `--impersonate-service-account`
+(and `google-cloud-auth`'s `impersonated` builder) naming:
 
 - `spanner.impersonate.target_principal` — the target service-account email (**required** to enable
   impersonation; when unset, authentication is unchanged).

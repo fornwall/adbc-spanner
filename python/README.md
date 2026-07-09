@@ -119,6 +119,31 @@ are handy from Python:
 | `spanner.query.optimizer_version` | conn/stmt | Pin the query optimizer version, e.g. `"6"` or `"latest"` (also `spanner.query.optimizer_statistics_package`). |
 | `spanner.rows_per_batch`   | statement  | Rows per streamed Arrow batch (default `8192`); lower it to cap peak memory.                   |
 
+### Typed option keys
+
+Rather than hand-writing the dotted option strings, you can use the `DatabaseOptions`,
+`ConnectionOptions`, and `StatementOptions` enums (each member's `.value` is the raw key) for
+typo-safety and discoverability — the same style as the BigQuery ADBC driver's `DatabaseOptions`:
+
+```python
+import adbc_driver_spanner.dbapi as spanner
+from adbc_driver_spanner import ConnectionOptions, StatementOptions
+
+with spanner.connect(
+    database="projects/p/instances/i/databases/d",
+    conn_kwargs={ConnectionOptions.READ_STALENESS.value: "max:10s"},
+) as conn:
+    cur = conn.cursor(
+        adbc_stmt_kwargs={StatementOptions.ROWS_PER_BATCH.value: "1024"}
+    )
+    cur.execute("SELECT * FROM Singers")
+```
+
+The common credential settings also have dedicated `connect()` keyword arguments (above) — prefer
+those; the enums cover the full option surface for the `db_kwargs=` / `conn_kwargs=` /
+`adbc_stmt_kwargs=` escape hatches. Every key is documented in
+[docs/options.md](https://github.com/fornwall/adbc-spanner/blob/main/docs/options.md).
+
 ### Read-only connections
 
 Pass `conn_kwargs={"adbc.connection.readonly": "true"}` to guarantee a connection can only read —

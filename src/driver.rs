@@ -29,8 +29,8 @@ use crate::{
 use std::time::Duration;
 
 /// The default lifetime, in seconds, of an impersonated access token when
-/// [`OPTION_IMPERSONATE_LIFETIME`] is left unset — one hour, matching both the BigQuery ADBC driver
-/// and the `google-cloud-auth` `impersonated` builder's own default.
+/// [`OPTION_IMPERSONATE_LIFETIME`] is left unset — one hour, matching the `google-cloud-auth`
+/// `impersonated` builder's own default (and gcloud's `--lifetime` default).
 const DEFAULT_IMPERSONATION_LIFETIME_SECS: u64 = 3600;
 
 /// The Spanner ADBC driver — the entry point for creating [`SpannerDatabase`] instances.
@@ -675,8 +675,7 @@ const SUPPORTED_CREDENTIAL_TYPES: &str =
     "service_account, authorized_user, impersonated_service_account, external_account";
 
 /// Build Google credentials from an inline JSON key, auto-detecting the credential flow from the
-/// JSON's top-level `"type"` field, mirroring the BigQuery ADBC driver and Google's own auth
-/// libraries.
+/// JSON's top-level `"type"` field, as Google's own auth libraries (and gcloud) do.
 ///
 /// Standard Google credential JSON carries a `"type"` discriminator; each value maps to a distinct
 /// auth flow with its own required fields:
@@ -771,8 +770,8 @@ fn scrub_credential_error(error: &google_cloud_auth::build_errors::Error) -> &'s
 /// The base credentials (built as usual from a keyfile or ADC) become the *source*: they are used to
 /// call the IAM Credentials `generateAccessToken` API and mint a short-lived token for
 /// `target_principal`. `delegates` is an optional delegation chain; `scopes` overrides the default
-/// `cloud-platform` scope when non-empty; `lifetime` bounds the minted token. This mirrors the
-/// BigQuery ADBC driver's `impersonate.*` option group.
+/// `cloud-platform` scope when non-empty; `lifetime` bounds the minted token. The `impersonate.*`
+/// option group follows gcloud's `--impersonate-service-account` / this `impersonated` builder.
 fn build_impersonated_credentials(
     source: Credentials,
     target_principal: &str,
