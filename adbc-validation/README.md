@@ -31,10 +31,13 @@ GoogleTest — is fetched and built from source at a pinned arrow-adbc release
 (`ARROW_ADBC_TAG` in `CMakeLists.txt`). No system packages are required.
 
 The **driver** (cdylib) links the `adbc_core` / `adbc_ffi` crates from a git pin
-(see `Cargo.toml`) that carries two fixes not yet in a crates.io release: an
-idempotent `AdbcError` release (no double-free on a second release) and
-`AdbcStatementExecuteQuery` writing `rows_affected = -1` on the query path
-(upstream [apache/arrow-adbc#4469](https://github.com/apache/arrow-adbc/pull/4469)).
+(an `apache/arrow-adbc` `main` revision — see `Cargo.toml`) that carries three FFI
+fixes not yet in a crates.io release: an idempotent `AdbcError` release (no
+double-free on a second release), `AdbcStatementExecuteQuery` writing
+`rows_affected = -1` on the query path (upstream
+[apache/arrow-adbc#4469](https://github.com/apache/arrow-adbc/pull/4469)), and the
+exporter preserving the caller's `AdbcError.private_data` on the ADBC 1.0.0 path
+(upstream [apache/arrow-adbc#4473](https://github.com/apache/arrow-adbc/pull/4473)).
 The **C++** validation library and driver manager come from `ARROW_ADBC_TAG`;
 they interoperate with the driver over the C ABI.
 
@@ -57,9 +60,11 @@ Spanner's model self-skip rather than fail.
   handling, trailing-semicolon queries (`SELECT current_date;;;` — the driver
   strips trailing statement terminators on the query path, which Spanner's
   single-use query API otherwise rejects), query cancellation, concurrent
-  statements, and result independence/invalidation.
+  statements, result independence/invalidation, and `AdbcError` compatibility
+  (the exporter preserves a 1.0.0 caller's `private_data` — apache/arrow-adbc#4473,
+  in the pinned `adbc_ffi` rev).
 
-**All 42 gated tests pass, 0 self-skip.** `DatabaseTest` and `ConnectionTest` run in
+**All 43 gated tests pass, 0 self-skip.** `DatabaseTest` and `ConnectionTest` run in
 full; the `StatementTest` cases are an explicit allowlist in
 `scripts/run-adbc-validation.sh`. `SpannerQuirks::supports_bulk_ingest` declares
 all four ingest modes (append, create, create_append, replace — the create
@@ -97,9 +102,6 @@ incremental driver work:
   table/column names) — it is captured natively instead: the driver quotes
   ingest identifiers (`bind::insert_sql`) and `tests/integration.rs` exercises
   an append-mode ingest into a table `create` with a column `index`.
-- **One upstream `adbc_ffi` gap** — `ErrorCompatibility` checks that the driver
-  preserves the caller's `AdbcError.private_data` / `private_driver`; the FFI
-  exporter does not. Not fixable from this crate.
 - **`ECANCELED` through the C stream** — `SqlQueryCancel` requires the result
   stream's `get_next` to return exactly `ECANCELED` (125) after a cancel, but
   arrow-rs's `FFI_ArrowArrayStream` exporter (which `adbc_ffi` uses to export
@@ -123,11 +125,12 @@ incremental driver work:
   (`execute_partitions` → `read_partition`, union of rows) is covered natively by
   `execute_partitions_round_trip` in `tests/integration.rs`.
 
-The two `adbc_ffi` issues that previously blocked a whole swath of these — a
-non-idempotent error release (which aborted the process) and a missing
-`rows_affected` on the query path — are **fixed** in the git-pinned `adbc_ffi`
-(see the top of this file), which is what unblocked `SqlQueryInts` /
-`SqlQueryStrings` / `SqlPrepareSelectNoParams` / `SqlPrepareErrorNoQuery`.
+The three `adbc_ffi` issues that previously blocked a whole swath of these — a
+non-idempotent error release (which aborted the process), a missing
+`rows_affected` on the query path, and a clobbered 1.0.0 `AdbcError.private_data` —
+are **fixed** in the git-pinned `adbc_ffi` (see the top of this file), which is
+what unblocked `SqlQueryInts` / `SqlQueryStrings` / `SqlPrepareSelectNoParams` /
+`SqlPrepareErrorNoQuery` and `ErrorCompatibility`.
 
 ## A note on `--full` process isolation
 

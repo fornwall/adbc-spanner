@@ -110,7 +110,7 @@ an **older, unrelated** yoshidan-style API (`Client::new`, `client.single()`, `a
 trust those. For ground truth, read the extracted source under
 `~/.cargo/git/checkouts/google-cloud-rust-*/` (the git dependency's checkout); `adbc_core` /
 `adbc_ffi` are likewise git-pinned, so their ground truth is the `arrow-adbc-*` checkout under the
-same directory (the fork tracks close to the 0.23.0 release).
+same directory (an `apache/arrow-adbc` `main` revision, a little ahead of the 0.23.0 release).
 
 **Temporary git pins (two families).** `Cargo.toml` pins two dependency families to git revisions,
 and **each is independently a crates.io publish blocker** — the crate cannot be published until
@@ -119,20 +119,24 @@ and **each is independently a crates.io publish blocker** — the crate cannot b
 1. The whole `google-cloud-*` family (spanner, auth, lro, `wkt`, both admin crates + `gax`)
    is pinned to a `google-cloud-rust` git revision, because native `STRUCT` mapping needs
    `Type::struct_type()`, which is on `main` but not yet in a crates.io release.
-2. `adbc_core` and `adbc_ffi` (and the dev-dependency `adbc_driver_manager`) are pinned to a
-   `fornwall/arrow-adbc` fork git revision — all three must share the *same* rev — carrying two
+2. `adbc_core` and `adbc_ffi` (and the dev-dependency `adbc_driver_manager`) are pinned to an
+   `apache/arrow-adbc` `main` git revision — all three must share the *same* rev — carrying three FFI
    fixes not yet in the 0.23 crates.io release: an idempotent `release_ffi_error` (no double-free on
-   the standard release-twice idiom) and `AdbcStatementExecuteQuery` writing `rows_affected = -1` on
-   the query path (submitted upstream as arrow-adbc PR #4469). Because a git source will not unify
-   with the crates.io `= "0.23"` release, downstream crates must also take `adbc_core` from this
-   same git rev (see `README.md`).
+   the standard release-twice idiom), `AdbcStatementExecuteQuery` writing `rows_affected = -1` on
+   the query path (arrow-adbc PR #4469), and the exporter preserving the caller's
+   `AdbcError.private_data` on the ADBC 1.0.0 path (arrow-adbc PR #4473 — this one lets the C++
+   `adbc_validation` `StatementTest.ErrorCompatibility` case pass, gated in
+   `scripts/run-adbc-validation.sh`). All three are now merged upstream, so this is a plain
+   `main`-tracking git pin (the fork it used to need is gone), still ahead of the 0.23 release.
+   Because a git source will not unify with the crates.io `= "0.23"` release, downstream crates must
+   also take `adbc_core` from this same git rev (see `README.md`).
 
 **Revert checklist — the single anchor.** The two revs are spread across ~9 `Cargo.toml` dependency
 lines plus `deny.toml` plus the docs; this list is the one place that enumerates every edit needed to
 revert a family to versioned crates.io releases. Current pinned revs:
 
 - `google-cloud-rust`: `3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1`
-- `fornwall/arrow-adbc`: `786e7f3488eb71b200ece775b027a647cf42db9e`
+- `apache/arrow-adbc`: `198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab`
 
 **Invariant:** the three arrow-adbc crates (`adbc_core`, `adbc_ffi`, `adbc_driver_manager`) must
 always share ONE rev; the eight `google-cloud-rust` crates likewise share ONE rev. When reverting,
@@ -151,7 +155,7 @@ touch *every* location for that family in lockstep:
   version-less git dev-dependency before flipping `publish` back on). (There is no `[patch]`
   section.)
 - `deny.toml` `allow-git` — drop the repo URL for each family once it no longer has any git dep.
-- `README.md` — the quickstart `adbc_core = { git = … rev = "786e7f3…" }` block and the surrounding
+- `README.md` — the quickstart `adbc_core = { git = … rev = "198f39a…" }` block and the surrounding
   "not on crates.io" / *Type mapping* notes that name the pins.
 - `CLAUDE.md` — this section (both the "Temporary git pins" note and this checklist); once *both*
   families are versioned, also re-enable `publish` (below) and revisit the `arrow-array`/`-schema`/
