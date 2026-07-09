@@ -26,7 +26,7 @@ use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::model::PartitionOptions;
 use google_cloud_spanner::model::execute_sql_request::QueryMode;
 use google_cloud_spanner::model::transaction_options::IsolationLevel;
-use google_cloud_spanner::mutation::Mutation;
+use google_cloud_spanner::mutation::{Mutation, MutationGroup};
 use google_cloud_spanner::statement::{Statement as SpannerSql, StatementBuilder};
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
@@ -37,7 +37,8 @@ use crate::conversion::{
 };
 use crate::directed_read::DirectedRead;
 use crate::error::{
-    err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
+    err, from_builder, from_spanner, from_status_parts, invalid_argument, invalid_state,
+    not_implemented,
 };
 use crate::query_options::QueryOptionsConfig;
 use crate::request::{CommitStats, RequestConfig};
@@ -104,6 +105,12 @@ pub struct SpannerStatement {
     /// once in `set_option` (comma-separated, trimmed, empties dropped); `""` unsets. See
     /// [`bind::create_table_sql`].
     ingest_primary_key: Option<Vec<String>>,
+    /// Route an autocommit bulk ingest's per-chunk mutations through Spanner's **BatchWrite** RPC
+    /// (`spanner.ingest.batch_write`, boolean, default `false`) instead of a write-only
+    /// transaction — a non-atomic, higher-throughput "firehose" transport. See
+    /// [`run_ingest_mutations`](Self::run_ingest_mutations). Ignored in manual-transaction mode,
+    /// where ingests buffer and commit atomically with the surrounding transaction.
+    ingest_batch_write: bool,
     /// How bound columns pair with the query's `@name` parameters
     /// (`adbc.statement.bind_by_name`): `false` (the default) binds positionally, `true` forces
     /// strict by-name. See [`bind::resolve_parameter_names`].
@@ -189,6 +196,7 @@ impl SpannerStatement {
             target_catalog: None,
             ingest_mode: None,
             ingest_primary_key: None,
+            ingest_batch_write: false,
             bind_by_name: false,
             rows_per_batch: DEFAULT_ROWS_PER_BATCH,
             data_boost: false,
@@ -517,7 +525,7 @@ impl SpannerStatement {
             for row in 0..batch.num_rows() {
                 if !budget.fits(columns, row_bytes) {
                     total += self
-                        .write_mutation_chunk(std::mem::take(&mut chunk))
+                        .commit_ingest_chunk(std::mem::take(&mut chunk))
                         .map_err(|e| note_rows_already_committed(e, total))?;
                     budget = IngestChunkBudget::default();
                 }
@@ -526,9 +534,21 @@ impl SpannerStatement {
             }
         }
         total += self
-            .write_mutation_chunk(chunk)
+            .commit_ingest_chunk(chunk)
             .map_err(|e| note_rows_already_committed(e, total))?;
         Ok(Some(total))
+    }
+
+    /// Apply one autocommit ingest chunk, dispatching on the `spanner.ingest.batch_write` option:
+    /// the default write-only transaction ([`write_mutation_chunk`](Self::write_mutation_chunk)),
+    /// or Spanner's BatchWrite RPC ([`batch_write_chunk`](Self::batch_write_chunk)) for a
+    /// non-atomic firehose load. Both return the chunk's ingested-row count.
+    fn commit_ingest_chunk(&self, mutations: Vec<Mutation>) -> Result<i64> {
+        if self.ingest_batch_write {
+            self.batch_write_chunk(mutations)
+        } else {
+            self.write_mutation_chunk(mutations)
+        }
     }
 
     /// Commit one ingest chunk in its own write-only transaction, returning its row count (`0` for
@@ -574,6 +594,71 @@ impl SpannerStatement {
         )?;
         self.commit_stats.record(mutation_count);
         Ok(count)
+    }
+
+    /// Apply one ingest chunk through Spanner's **BatchWrite** RPC (the
+    /// `spanner.ingest.batch_write` autocommit path), returning the number of rows applied.
+    ///
+    /// Each row's insert mutation is sent as its own [`MutationGroup`]. BatchWrite applies groups
+    /// **independently and non-atomically** — the same "not atomic as a whole" guarantee the
+    /// multi-chunk write-only path already carries, but now within a chunk too — which is what makes
+    /// it the cheaper firehose transport for large loads. Each streamed [`BatchWriteResponse`]
+    /// reports, per group index, whether it applied: an `OK`/absent status counts those rows as
+    /// applied, and the first non-`OK` group status becomes the returned error via
+    /// [`from_status_parts`] (so a duplicate primary key still surfaces as `AlreadyExists` and the
+    /// append/create remaps fire, exactly as on the write-only path). Because a non-atomic batch may
+    /// have applied some groups before the failing one, an error here is combined with the
+    /// already-committed-rows annotation by the caller ([`run_ingest_mutations`](Self::run_ingest_mutations)).
+    ///
+    /// BatchWrite carries no per-request commit options and its response has no commit statistics,
+    /// so `spanner.request.priority` / `spanner.request.tag` / `spanner.max_commit_delay` /
+    /// `spanner.commit_stats` do not apply on this path (documented on
+    /// [`OPTION_INGEST_BATCH_WRITE`](crate::OPTION_INGEST_BATCH_WRITE)).
+    fn batch_write_chunk(&self, mutations: Vec<Mutation>) -> Result<i64> {
+        if mutations.is_empty() {
+            return Ok(0);
+        }
+        let client = self.client.clone();
+        // One mutation group per row: groups are applied independently, so per-row insert failures
+        // (e.g. a duplicate key) do not roll back the rest of the chunk.
+        let groups: Vec<MutationGroup> = mutations
+            .into_iter()
+            .map(|m| MutationGroup::new(vec![m]))
+            .collect();
+        block_on_cancellable(
+            &self.runtime,
+            &self.cancel,
+            with_timeout(
+                self.timeouts.update_timeout(),
+                crate::OPTION_RPC_TIMEOUT_UPDATE,
+                async move {
+                    let mut stream = client
+                        .batch_write_transaction()
+                        .build()
+                        .execute_streaming(groups)
+                        .await
+                        .map_err(from_spanner)?;
+                    let mut applied = 0_i64;
+                    let mut first_error: Option<Error> = None;
+                    while let Some(response) = stream.next().await {
+                        let response = response.map_err(from_spanner)?;
+                        // An `OK` (or absent) status means the referenced groups applied; any other
+                        // status marks them failed — capture the first such failure to return.
+                        match response.status.as_ref().filter(|s| s.code != 0) {
+                            None => applied += response.indexes.len() as i64,
+                            Some(status) if first_error.is_none() => {
+                                first_error = Some(from_status_parts(status.code, &status.message));
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                    match first_error {
+                        Some(error) => Err(error),
+                        None => Ok(applied),
+                    }
+                },
+            ),
+        )
     }
 
     /// An empty result reader (empty schema, no rows), for statements that yield no result set.
@@ -955,6 +1040,9 @@ impl Optionable for SpannerStatement {
                     .collect();
                 self.ingest_primary_key = (!cols.is_empty()).then_some(cols);
             }
+            OptionStatement::Other(k) if k == crate::OPTION_INGEST_BATCH_WRITE => {
+                self.ingest_batch_write = ingest_batch_write_option(value)?;
+            }
             OptionStatement::Other(k) if k == crate::OPTION_BIND_BY_NAME => {
                 self.bind_by_name =
                     crate::options::bool_option(value, "option adbc.statement.bind_by_name")?;
@@ -1047,6 +1135,10 @@ impl Optionable for SpannerStatement {
             // The comma-joined key columns when set; unset (the synthetic key) reports NotFound.
             OptionStatement::Other(k) if k == crate::OPTION_INGEST_PRIMARY_KEY => {
                 self.ingest_primary_key.as_ref().map(|cols| cols.join(","))
+            }
+            // A plain boolean; reports "true"/"false" (the default is "false", write-only txn).
+            OptionStatement::Other(k) if k == crate::OPTION_INGEST_BATCH_WRITE => {
+                Some(self.ingest_batch_write.to_string())
             }
             // A plain boolean; reports "true"/"false" (the default is "false", positional).
             OptionStatement::Other(k) if k == crate::OPTION_BIND_BY_NAME => {
@@ -1578,6 +1670,16 @@ fn bool_option(value: OptionValue) -> Result<bool> {
     crate::options::bool_option(value, "option")
 }
 
+/// Parse the `spanner.ingest.batch_write` statement option. Like the driver's other unset-able
+/// booleans (`spanner.commit_stats`), an empty/whitespace string unsets it (back to `false`, the
+/// write-only-transaction path); otherwise it is a bool-ish value.
+fn ingest_batch_write_option(value: OptionValue) -> Result<bool> {
+    match &value {
+        OptionValue::String(s) if s.trim().is_empty() => Ok(false),
+        _ => crate::options::bool_option(value, "option spanner.ingest.batch_write"),
+    }
+}
+
 /// Parse a positive `max_partitions` option, accepted as either an integer or a numeric string.
 fn max_partitions_option(value: OptionValue) -> Result<i64> {
     crate::options::positive_i64(value, "max_partitions")
@@ -1813,6 +1915,26 @@ mod tests {
         assert_eq!(error.status, Status::NotImplemented);
         // Malformed values fail boolean coercion, not the temporary-table check.
         let error = check_ingest_temporary(OptionValue::String("maybe".into())).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+    }
+
+    #[test]
+    fn ingest_batch_write_option_coerces_and_unsets_on_empty() {
+        // Every accepted truthy / falsy spelling coerces, as a string or an int.
+        for truthy in ["true", "TRUE", "1", "yes"] {
+            assert!(ingest_batch_write_option(OptionValue::String(truthy.into())).unwrap());
+        }
+        for falsy in ["false", "FALSE", "0", "no"] {
+            assert!(!ingest_batch_write_option(OptionValue::String(falsy.into())).unwrap());
+        }
+        assert!(ingest_batch_write_option(OptionValue::Int(1)).unwrap());
+        assert!(!ingest_batch_write_option(OptionValue::Int(0)).unwrap());
+        // Empty / whitespace unsets it, back to the default (false) — never an error.
+        for empty in ["", "   "] {
+            assert!(!ingest_batch_write_option(OptionValue::String(empty.into())).unwrap());
+        }
+        // A non-bool string is rejected with InvalidArguments (the shared boolean coercion).
+        let error = ingest_batch_write_option(OptionValue::String("maybe".into())).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
     }
 

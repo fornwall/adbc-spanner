@@ -338,7 +338,17 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   exact row count the earlier chunks already committed), while manual-mode ingests buffer their
   mutations unchunked (`TxnState::pending_mutations`) and commit atomically **with** the buffered
   DML in one read/write transaction via `ReadWriteTransaction::buffer` — note Spanner applies
-  buffered mutations at commit, after the transaction's DML executes), `get_info` (static
+  buffered mutations at commit, after the transaction's DML executes; the `spanner.ingest.batch_write`
+  statement option [boolean via `ingest_batch_write_option` = `options::bool_option` with empty-string
+  unsetting, default false, round-trips via `get_option`] instead routes each **autocommit** ingest
+  chunk through Spanner's **BatchWrite** RPC — `DatabaseClient::batch_write_transaction().execute_streaming`,
+  each row shipped as its own `MutationGroup`, non-atomic per-group — for firehose loads
+  [`SpannerStatement::{commit_ingest_chunk,batch_write_chunk}`]; it preserves chunking, insert
+  semantics, the row count and the append `NotFound`/`AlreadyExists` remap [a non-OK group status →
+  `error::from_status_parts`, mapping the numeric gRPC code like `from_spanner`], is **ignored** in
+  manual mode [which buffers + commits atomically], and — since BatchWrite takes no per-request commit
+  options — bypasses the request priority/tag, `max_commit_delay` and `commit_stats` settings on that
+  path), `get_info` (static
   driver/vendor metadata),
   `get_objects` (incl. foreign-key `constraint_column_usage`), `get_table_types`/`get_table_schema`,
   `get_parameter_schema`, `Connection`/`Statement::cancel` (a shared, sticky `CancelSignal`

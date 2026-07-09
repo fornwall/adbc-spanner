@@ -2221,6 +2221,142 @@ fn bulk_ingest_chunks_past_the_byte_budget() {
     drop_chunked.execute_update().expect("drop chunked table");
 }
 
+/// `spanner.ingest.batch_write`: an autocommit bulk ingest routed through Spanner's BatchWrite RPC
+/// (rather than a write-only transaction) lands every row and reports the exact affected-row count,
+/// the option round-trips through `get_option`, and a duplicate primary key still surfaces as the
+/// append-mode `AlreadyExists` remap — i.e. insert/count/error semantics are preserved across the
+/// alternate transport. The emulator implements the BatchWrite RPC.
+#[test]
+fn bulk_ingest_via_batch_write() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping bulk_ingest_via_batch_write");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    let mut ddl = connection.new_statement().expect("new statement");
+    ddl.set_sql_query(
+        "DROP TABLE IF EXISTS AdbcBatchWrite; \
+         CREATE TABLE AdbcBatchWrite (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
+    )
+    .unwrap();
+    ddl.execute_update().expect("create batch-write table");
+
+    const ROWS: usize = 5;
+    let rows = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("Id", DataType::Int64, false),
+            Field::new("Name", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from((0..ROWS as i64).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(
+                (0..ROWS).map(|i| format!("row-{i}")).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+
+    let mut ingest = connection.new_statement().expect("new statement");
+    ingest
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcBatchWrite".into()),
+        )
+        .unwrap();
+    ingest
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_INGEST_BATCH_WRITE.into()),
+            OptionValue::String("true".into()),
+        )
+        .unwrap();
+    // The option round-trips through get_option (and empty-string unsets back to the default).
+    assert_eq!(
+        ingest
+            .get_option_string(OptionStatement::Other(
+                adbc_spanner::OPTION_INGEST_BATCH_WRITE.into()
+            ))
+            .unwrap(),
+        "true"
+    );
+    ingest.bind(rows.clone()).expect("bind batch-write rows");
+    assert_eq!(
+        ingest.execute_update().expect("batch-write ingest"),
+        Some(ROWS as i64),
+        "BatchWrite ingest must report the exact applied-row count"
+    );
+
+    // Every row landed exactly once, readable back.
+    let mut read = connection.new_statement().expect("new statement");
+    read.set_sql_query("SELECT Id, Name FROM AdbcBatchWrite ORDER BY Id")
+        .unwrap();
+    let batches = read
+        .execute()
+        .expect("read batch-write rows")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut seen = 0_usize;
+    for batch in &batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            assert_eq!(ids.value(row), seen as i64);
+            assert_eq!(names.value(row), format!("row-{seen}"));
+            seen += 1;
+        }
+    }
+    assert_eq!(
+        seen, ROWS,
+        "all BatchWrite-ingested rows must be readable back"
+    );
+
+    // A re-ingest of the same primary keys through the BatchWrite path still surfaces the
+    // append-mode AlreadyExists remap (the per-group insert failure maps to ALREADY_EXISTS just as
+    // the write-only path's does), naming the target table.
+    let mut dup = connection.new_statement().expect("new statement");
+    dup.set_option(
+        OptionStatement::TargetTable,
+        OptionValue::String("AdbcBatchWrite".into()),
+    )
+    .unwrap();
+    dup.set_option(
+        OptionStatement::Other(adbc_spanner::OPTION_INGEST_BATCH_WRITE.into()),
+        OptionValue::String("true".into()),
+    )
+    .unwrap();
+    dup.bind(rows).expect("bind duplicate batch-write rows");
+    let error = dup
+        .execute_update()
+        .expect_err("a duplicate primary key must fail the BatchWrite ingest");
+    assert_eq!(error.status, Status::AlreadyExists);
+    assert!(
+        error.message.contains("AdbcBatchWrite"),
+        "the AlreadyExists error should name the target table: {error}"
+    );
+
+    let mut drop_bw = connection.new_statement().expect("new statement");
+    drop_bw.set_sql_query("DROP TABLE AdbcBatchWrite").unwrap();
+    drop_bw.execute_update().expect("drop batch-write table");
+}
+
 /// `spanner.max_timestamp_precision`: a stored TIMESTAMP outside Arrow's nanosecond range
 /// (year 9999) errors loudly in the default mode — naming the column, the value and the escape
 /// hatch — and reads back exactly in `microseconds` mode, where `execute_schema` advertises the

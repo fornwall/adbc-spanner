@@ -35,7 +35,7 @@ and what the statistics query filters on — so every reported value round-trips
 `table_type` filter. Covered by a round-trip assertion in the main integration test (filter
 `get_objects` by the types `get_table_types` reports; the known base table must come back).
 
-### ~~3. Bulk ingest is one DML statement per row in one unchunked transaction~~ (fixed — stage (a); stage (b), the Mutation API, remains open) (performance + features, found independently by both)
+### ~~3. Bulk ingest is one DML statement per row in one unchunked transaction~~ (fixed — stages (a) and (b)) (performance + features, found independently by both)
 
 **Fixed (stage (a): chunking).** Autocommit bulk ingest now builds and ships its `INSERT`s **chunk
 by chunk** (`SpannerStatement::run_ingest_dml` in `src/statement.rs`), each chunk applied in its own
@@ -57,10 +57,33 @@ enforcement and the append-mode NotFound/AlreadyExists remap are untouched. Cove
 boundary unit tests in `src/statement.rs` (mutation-limit cut, byte-budget cut, oversized-row
 never-starves) and by `bulk_ingest_chunks_past_the_byte_budget` in `tests/integration.rs` (six
 ~1 MiB rows cross the byte budget → multiple transactions; count sums and every row lands exactly
-once). **Still open — stage (b):** move ingest to the Mutation API (`Mutation::new_insert_builder`,
-`apply` — append/replace map naturally; mutations are cheaper than DML and raise the effective
-per-commit capacity), optionally `batch_write_transaction` (BatchWrite) behind an option for
-non-atomic firehose loads; all exposed by the pinned client and still unused.
+once).
+
+**Fixed (stage (b): Mutation API + BatchWrite).** Ingest no longer builds per-row `INSERT` DML at
+all: every bound row now becomes one native insert **[`Mutation`](src/bind.rs)**
+(`bind::insert_mutation`, via `Mutation::new_insert_builder`), reusing the exact `cell_value`
+Arrow→Spanner mapping parameter binding uses, so the two cannot drift. Autocommit chunks commit via
+`DatabaseClient::write_only_transaction` (`write_mutation_chunk`) and manual-mode ingests buffer the
+same mutations into the read/write transaction (`ReadWriteTransaction::buffer`) — mutations are
+cheaper than DML (nothing SQL-parsed/planned per row) and raise the effective per-commit capacity.
+The `batch_write_transaction` (BatchWrite) firehose transport is now wired in behind the
+`spanner.ingest.batch_write` statement option (boolean, default false, `""` unsets, round-trips via
+`get_option` — `ingest_batch_write_option` in `src/statement.rs`): when set, each **autocommit**
+ingest chunk is routed through `DatabaseClient::batch_write_transaction().execute_streaming` with one
+`MutationGroup` per row (`commit_ingest_chunk` → `batch_write_chunk`), Spanner applying the groups
+**non-atomically** — the same "not atomic as a whole" guarantee the multi-chunk write-only path
+already carries. Chunking (`IngestChunkBudget`), the ingested-row count, the read-only-connection
+guard and the append-mode `NotFound`/`AlreadyExists` remap are all preserved across the two
+transports: a non-OK group status maps through `error::from_status_parts` (the same numeric-gRPC-code
+→ ADBC status table `from_spanner` uses), so a duplicate primary key still surfaces as
+`AlreadyExists`. Manual-transaction mode is **unaffected** — it ignores the flag and keeps buffering
++ committing atomically. Because BatchWrite carries no per-request commit options, the request
+priority/tag, `max_commit_delay` and `commit_stats` settings do not apply on that path (documented on
+`OPTION_INGEST_BATCH_WRITE`). Covered by offline coercion/round-trip unit tests
+(`ingest_batch_write_option_coerces_and_unsets_on_empty` in `src/statement.rs`,
+`from_status_parts_maps_numeric_codes_like_from_spanner` in `src/error.rs`) and the self-skipping
+`bulk_ingest_via_batch_write` integration test (BatchWrite ingest lands every row, exact count,
+`get_option` round-trip, duplicate-PK `AlreadyExists` remap).
 
 ### ~~4. Nothing in the tag→publish path runs a single test (CI/release)~~ (fixed)
 

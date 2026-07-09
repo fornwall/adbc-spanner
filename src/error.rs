@@ -130,6 +130,24 @@ fn map_detail(detail: &StatusDetails) -> Option<(String, Vec<u8>)> {
     Some((key, serde_json::to_vec(&value).ok()?))
 }
 
+/// Build an ADBC error from a `google.rpc.Status`-style numeric code and message.
+///
+/// The BatchWrite (`spanner.ingest.batch_write`) path surfaces a failed mutation group as a
+/// `google.rpc.Status` embedded in a streamed `BatchWriteResponse` — a numeric gRPC `code` plus a
+/// `message` — rather than as a `google_cloud_spanner::Error`. This maps that numeric code onto the
+/// closest ADBC [`Status`] through the very same [`status_for_grpc_code`] table [`from_spanner`]
+/// uses (converting the number to its canonical name via [`google_cloud_gax::error::rpc::Code`]) and
+/// keeps the numeric code in `vendor_code`. A duplicate primary key therefore surfaces as
+/// [`Status::AlreadyExists`] exactly as it does on the write-only commit path, so the bulk-ingest
+/// append/create error remaps still fire identically for both ingest transports.
+pub(crate) fn from_status_parts(code: i32, message: &str) -> Error {
+    use google_cloud_gax::error::rpc::Code;
+    let status = status_for_grpc_code(Code::from(code).name());
+    let mut adbc = err(format!("Spanner batch-write error: {message}"), status);
+    adbc.vendor_code = code;
+    adbc
+}
+
 /// Translate a Spanner *client/admin builder* construction error into an ADBC error.
 ///
 /// The top-level `Spanner` client builder and the admin builders fail with
@@ -210,6 +228,32 @@ mod tests {
         assert_eq!(status_for_grpc_code("UNAVAILABLE"), Status::IO);
         // Transient contention, not a driver/database defect: IO, not Internal.
         assert_eq!(status_for_grpc_code("ABORTED"), Status::IO);
+    }
+
+    #[test]
+    fn from_status_parts_maps_numeric_codes_like_from_spanner() {
+        use google_cloud_gax::error::rpc::Code;
+        // A duplicate primary key on the BatchWrite path arrives as a numeric ALREADY_EXISTS (6)
+        // and must surface as the same ADBC status the write-only path produces, so the ingest
+        // append/create remaps fire identically.
+        let adbc = from_status_parts(Code::AlreadyExists as i32, "Row already exists");
+        assert_eq!(adbc.status, Status::AlreadyExists);
+        assert_eq!(adbc.vendor_code, 6);
+        assert!(adbc.message.contains("Row already exists"));
+        // NOT_FOUND (5) → NotFound, INVALID_ARGUMENT (3) → InvalidArguments, and the numeric code
+        // is preserved in vendor_code throughout.
+        assert_eq!(
+            from_status_parts(Code::NotFound as i32, "no table").status,
+            Status::NotFound
+        );
+        assert_eq!(
+            from_status_parts(Code::InvalidArgument as i32, "bad").status,
+            Status::InvalidArguments
+        );
+        // An unmapped/unknown numeric code falls back to Internal but still keeps the code.
+        let internal = from_status_parts(13, "boom");
+        assert_eq!(internal.status, Status::Internal);
+        assert_eq!(internal.vendor_code, 13);
     }
 
     #[test]
