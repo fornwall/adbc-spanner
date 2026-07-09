@@ -12,7 +12,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Pin to the arrow-adbc release matching the adbc_core / adbc_ffi 0.23 crates the
 # driver builds on. Bump both together.
-set(ARROW_ADBC_TAG "apache-arrow-adbc-23" CACHE STRING "arrow-adbc release tag")
+#
+# FORCE so this pin always wins over a value cached in a restored/incremental
+# build tree: a plain `set(... CACHE STRING)` is a no-op when the entry already
+# exists, so a stale `CMakeCache.txt` (e.g. one restored from a run on the old
+# rev) would silently keep the previous tag and rebuild against the wrong
+# arrow-adbc source. FORCE makes a rev bump here authoritative.
+set(ARROW_ADBC_TAG "apache-arrow-adbc-23" CACHE STRING "arrow-adbc release tag" FORCE)
 
 include(FetchContent)
 
