@@ -112,6 +112,12 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   default) leaves the client's own policy, which has no cap; setting either bounds it while
   preserving its transport-error-on-idempotent retrying, and the two combine (whichever limit fires
   first wins). `""` unsets; they round-trip via `get_option`/`get_option_int`/`get_option_double`.
+  Three further knobs tune the *delay between* attempts (the client's exponential backoff):
+  `spanner.retry.backoff.initial_seconds`, `spanner.retry.backoff.max_seconds` and
+  `spanner.retry.backoff.multiplier` (each finite, strictly positive; client defaults 1s / 60s / ×2).
+  Setting any one replaces the client's default backoff (unset knobs take the defaults, clamped to
+  the gax recommended ranges); they are independent of the attempt / elapsed-time caps, `""` unsets,
+  and they round-trip via `get_option`/`get_option_double`.
   This complements the *overall* per-operation `spanner.rpc.timeout_seconds.*` deadlines.
 - Parameter binding: `bind`/`bind_stream` an Arrow batch whose columns become Spanner named
   parameters; each bound row runs the statement once. How columns pair with the query's `@name`
@@ -325,6 +331,9 @@ database path, not the original URI.
 | `spanner.rpc.timeout_seconds.fetch`          | Deadline (seconds) on each subsequent chunk fetch of a streamed result; inherited by the connection's statements. |
 | `spanner.retry.max_attempts`                 | Cap on the client's retry attempts (first try + retries; `1` disables retrying); inherited by the connection's statements. |
 | `spanner.retry.max_elapsed_seconds`          | Cap on the client's total retry wall-clock time (seconds); combines with `max_attempts`; inherited by the connection's statements. |
+| `spanner.retry.backoff.initial_seconds`      | Initial delay of the client's retry backoff (seconds; client default 1s); independent of the caps; inherited by the connection's statements. |
+| `spanner.retry.backoff.max_seconds`          | Maximum backoff delay (seconds; client default 60s); inherited by the connection's statements. |
+| `spanner.retry.backoff.multiplier`           | Per-attempt backoff growth factor (client default `2.0`); inherited by the connection's statements. |
 
 **Statement options** (via `set_option` on the statement):
 
@@ -349,6 +358,9 @@ database path, not the original URI.
 | `spanner.rpc.timeout_seconds.fetch`          | Per-statement fetch-timeout override. |
 | `spanner.retry.max_attempts`                 | Per-statement retry-attempt-cap override. |
 | `spanner.retry.max_elapsed_seconds`          | Per-statement retry-elapsed-cap override. |
+| `spanner.retry.backoff.initial_seconds`      | Per-statement backoff-initial-delay override. |
+| `spanner.retry.backoff.max_seconds`          | Per-statement backoff-maximum-delay override. |
+| `spanner.retry.backoff.multiplier`           | Per-statement backoff-multiplier override. |
 | `adbc.ingest.target_table`                   | Bulk-ingest target table. |
 | `adbc.ingest.target_db_schema`               | Named schema qualifying the ingest target table. |
 | `adbc.ingest.target_catalog`                 | Only the empty catalog is accepted (Spanner has a single, unnamed catalog). |

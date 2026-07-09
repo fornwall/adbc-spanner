@@ -663,6 +663,48 @@ pub const OPTION_RETRY_MAX_ATTEMPTS: &str = "spanner.retry.max_attempts";
 /// Mirrors the gax `RetryPolicyExt::with_time_limit` knob.
 pub const OPTION_RETRY_MAX_ELAPSED_SECONDS: &str = "spanner.retry.max_elapsed_seconds";
 
+/// Driver-specific connection **and** statement option: the **initial delay**, in seconds, of the
+/// Spanner client's exponential backoff between retry attempts. A finite, strictly positive number
+/// of seconds (fractions allowed); unset (the default) leaves the client's own backoff, whose
+/// initial delay is 1 second.
+///
+/// The value is accepted as a numeric string, an integer, or a double, and round-trips through
+/// `get_option` and `get_option_double`. An empty string unsets it. Setting this (or
+/// [`OPTION_RETRY_BACKOFF_MAX_SECONDS`] / [`OPTION_RETRY_BACKOFF_MULTIPLIER`]) replaces the client's
+/// default backoff with an exponential backoff whose unset knobs take the client defaults (initial
+/// 1s, maximum 60s, multiplier 2.0), clamped to the gax recommended ranges. This is independent of
+/// the [`OPTION_RETRY_MAX_ATTEMPTS`] / [`OPTION_RETRY_MAX_ELAPSED_SECONDS`] limits (which bound *how
+/// many* / *how long* retries run) — either family may be set on its own. Set on a connection it
+/// becomes the default for statements it creates; a statement may override it.
+///
+/// Mirrors the gax `ExponentialBackoffBuilder::with_initial_delay` knob.
+pub const OPTION_RETRY_BACKOFF_INITIAL_SECONDS: &str = "spanner.retry.backoff.initial_seconds";
+
+/// Driver-specific connection **and** statement option: the **maximum delay**, in seconds, the
+/// Spanner client's exponential backoff between retry attempts is truncated at. A finite, strictly
+/// positive number of seconds (fractions allowed); unset (the default) leaves the client's own
+/// backoff, whose maximum delay is 60 seconds. When it ends up below the effective initial delay it
+/// is raised to it by the gax clamp.
+///
+/// Value handling, combination with the other `spanner.retry.backoff.*` knobs, and
+/// connection→statement inheritance are as [`OPTION_RETRY_BACKOFF_INITIAL_SECONDS`].
+///
+/// Mirrors the gax `ExponentialBackoffBuilder::with_maximum_delay` knob.
+pub const OPTION_RETRY_BACKOFF_MAX_SECONDS: &str = "spanner.retry.backoff.max_seconds";
+
+/// Driver-specific connection **and** statement option: the **growth factor** the Spanner client's
+/// exponential backoff multiplies the delay by after each attempt. A finite, strictly positive
+/// number; unset (the default) leaves the client's own backoff, whose multiplier is `2.0`. A value
+/// below `1.0` (a shrinking backoff) is floored to `1.0` — a constant delay — by the gax clamp.
+///
+/// The value is accepted as a numeric string, an integer, or a double, and round-trips through
+/// `get_option` and `get_option_double`. An empty string unsets it. Combination with the other
+/// `spanner.retry.backoff.*` knobs and connection→statement inheritance are as
+/// [`OPTION_RETRY_BACKOFF_INITIAL_SECONDS`].
+///
+/// Mirrors the gax `ExponentialBackoffBuilder::with_scaling` knob.
+pub const OPTION_RETRY_BACKOFF_MULTIPLIER: &str = "spanner.retry.backoff.multiplier";
+
 /// Driver-specific **connection** option: a free-form **transaction tag**, applied wherever the
 /// driver builds a read/write transaction (autocommit DML, the manual-mode commit, ingest commits)
 /// and attached by Spanner to every operation of that transaction. Unset by default; set an empty
@@ -788,6 +830,9 @@ mod options_doc_tests {
             crate::OPTION_RPC_TIMEOUT_FETCH,
             crate::OPTION_RETRY_MAX_ATTEMPTS,
             crate::OPTION_RETRY_MAX_ELAPSED_SECONDS,
+            crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS,
+            crate::OPTION_RETRY_BACKOFF_MAX_SECONDS,
+            crate::OPTION_RETRY_BACKOFF_MULTIPLIER,
             // Standard ADBC (spec) options the driver handles.
             constants::ADBC_OPTION_URI,
             constants::ADBC_CONNECTION_OPTION_AUTOCOMMIT,
