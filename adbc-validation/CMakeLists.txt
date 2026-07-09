@@ -14,10 +14,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # single-partition assumption (fornwall/arrow-adbc#9, based on the same apache
 # `main` rev the driver's adbc_core/adbc_ffi build on). Revert to a versioned
 # release tag once that change lands upstream.
+#
+# FORCE so this pin always wins over a value cached in a restored/incremental
+# build tree: a plain `set(... CACHE STRING)` is a no-op when the entry already
+# exists, so a stale `CMakeCache.txt` (e.g. one restored from a run on the old
+# rev) would silently keep the previous tag and rebuild against the wrong
+# arrow-adbc source. FORCE makes a rev bump here authoritative.
 set(ARROW_ADBC_REPOSITORY "https://github.com/fornwall/arrow-adbc.git"
-    CACHE STRING "arrow-adbc git repository")
+    CACHE STRING "arrow-adbc git repository" FORCE)
 set(ARROW_ADBC_TAG "90adf8c0e0125fafc19d25fadd69d8e7af4c74b2"
-    CACHE STRING "arrow-adbc git rev (fornwall/arrow-adbc#9)")
+    CACHE STRING "arrow-adbc git rev (fornwall/arrow-adbc#9)" FORCE)
 
 include(FetchContent)
 

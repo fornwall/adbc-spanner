@@ -64,17 +64,21 @@ jobs:
       # slow FetchContent clone + compile is reused across runs. The key is bound to
       # the runner OS and a hash of adbc-validation/CMakeLists.txt — which carries the
       # pinned ARROW_ADBC_TAG and every CMake/toolchain flag — so bumping the arrow-adbc
-      # rev (or any build flag) invalidates the cache. The build step below always runs,
-      # turning into an incremental no-op on a hit (and re-fetching the new tag when the
-      # rev changes), so a stale cache can never mask a real rev change. restore-keys
-      # lets a same-OS run seed the build tree for an incremental rebuild after a bump.
+      # rev (or any build flag) mints a fresh key.
+      #
+      # Deliberately NO restore-keys: a partial-key hit would restore a build tree
+      # (including its CMakeCache.txt) from a run on the *old* arrow-adbc rev, and
+      # FetchContent may then keep the stale checkout instead of re-fetching the new
+      # tag — masking the rev bump and compiling against the wrong arrow-adbc source.
+      # An exact key match is safe (same CMakeLists → same rev + flags); a rev bump
+      # is an exact miss → empty tree → clean clone of the correct rev. The cost is a
+      # cold rebuild of arrow-adbc + GoogleTest on each CMakeLists change, which is
+      # rare (only rev/flag bumps) and worth the correctness guarantee.
       - name: Cache the ADBC C++ validation build tree
         uses: actions/cache@v6
         with:
           path: .adbc-validation-build
           key: adbc-validation-${{ runner.os }}-${{ hashFiles('adbc-validation/CMakeLists.txt') }}
-          restore-keys: |
-            adbc-validation-${{ runner.os }}-
 
       - name: Run the ADBC C++ validation suite (gated subset)
         run: scripts/run-adbc-validation.sh
