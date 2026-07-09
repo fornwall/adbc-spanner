@@ -646,7 +646,17 @@ in `src/statement.rs`) plus a DML-rejection assertion in the execute_schema sect
 also flagged by the CI review, which notes `cargo doc` runs without `--all-features` unlike
 docs.rs)~~ (**Fixed.** `ci.yml` now has a dedicated `cargo test --doc --all-features` step after
 the unit tests, and the docs step runs `cargo doc --no-deps --all-features` to match docs.rs);
-keyfile/impersonation auth is offline-unit-tested only, never exercised end-to-end;
+~~keyfile/impersonation auth is offline-unit-tested only, never exercised end-to-end~~
+(**Fixed.** An opt-in `auth_end_to_end` test module in `tests/integration.rs` now drives both
+credential paths against a **real** Cloud Spanner database and proves each authenticates with a
+trivial `SELECT 1`: `keyfile_auth_end_to_end` connects via `spanner.keyfile`, and
+`impersonation_auth_end_to_end` connects via `spanner.impersonate.target_principal` (layered on ADC).
+Both **self-skip cleanly** — green, no failure, like the existing `SPANNER_GCP_DATABASE` tests — when
+their env vars are unset, so a plain `cargo test` stays green with no credentials. They read
+`SPANNER_GCP_DATABASE` (the real target, reused; the emulator refuses these credentials so it is
+never touched) plus `SPANNER_TEST_KEYFILE` (path to a service-account JSON key) for the keyfile test
+and `SPANNER_TEST_IMPERSONATE_TARGET_PRINCIPAL` (the principal to impersonate) for the impersonation
+test — documented in CLAUDE.md's testing section);
 ~~weak assertions (`AdbcDdl` note value unchecked, `replace`-ingest values unchecked, only row
 counts)~~ (**Fixed.** The `AdbcDdl` round-trip now downcasts the read-back `Note` column and asserts
 it equals the inserted `"hello"`, not just that one row came back; the create-mode ingest test now

@@ -181,6 +181,14 @@ is cross-compiled, off the universal Apple toolchain) and installs NASM only on 
     and `CREATE TABLE IF NOT EXISTS Singers`, and cleans up its own scratch tables, so it is safe to
     re-run against a persistent database. No driver change was needed — `SpannerDatabase::connect`
     already falls back to ADC when there is no emulator host and no keyfile.
+- **Opt-in end-to-end auth tests** (`auth_end_to_end` module in `tests/integration.rs`) exercise the
+  `spanner.keyfile` and `spanner.impersonate.target_principal` credential paths against a **real**
+  database (the emulator refuses these credentials) with a trivial `SELECT 1`. They self-skip cleanly
+  when their env vars are unset, so `cargo test` stays green without credentials. They read
+  `SPANNER_GCP_DATABASE` (the real target, reused) plus `SPANNER_TEST_KEYFILE` (path to a
+  service-account JSON key → `keyfile_auth_end_to_end`) and/or
+  `SPANNER_TEST_IMPERSONATE_TARGET_PRINCIPAL` (a principal to impersonate, base creds from ADC →
+  `impersonation_auth_end_to_end`).
 - Setup creates the database/table via the admin clients (`instance_admin_builder()` /
   `database_admin_builder()` → `create_instance` [emulator only] / `create_database(..).poller()`),
   then exercises the driver (DML insert + typed SELECT). It runs once per binary behind a mutex
