@@ -79,7 +79,7 @@ echo ">> building the adbc-spanner cdylib"
 cargo build
 
 echo ">> building the ADBC validation harness (fetches arrow-adbc + googletest)"
-BUILD_DIR="${ADBC_VALIDATION_BUILD_DIR:-$REPO_ROOT/adbc-validation/build}"
+BUILD_DIR="${ADBC_VALIDATION_BUILD_DIR:-$REPO_ROOT/.adbc-validation-build}"
 cmake -S "$REPO_ROOT/adbc-validation" -B "$BUILD_DIR" \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 >/dev/null
 cmake --build "$BUILD_DIR" --target spanner_validation -j"$(nproc 2>/dev/null || echo 2)"
