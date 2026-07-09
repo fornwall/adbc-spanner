@@ -39,6 +39,12 @@ jobs:
       # harness can't masquerade as an all-expected-dialect-skips green run. Enforced
       # by pytest_sessionfinish in foundry-validation/tests/conftest.py.
       FOUNDRY_VALIDATION_REQUIRE_PASSES: "1"
+      # Pin *which* cases skip against foundry-validation/skip_baseline.txt, so a
+      # suite-ref bump can't silently slip a new case into skip (no coverage) or
+      # leave a now-passing case silently skipped. Fails the job on either drift;
+      # regenerate the baseline with FOUNDRY_UPDATE_SKIP_BASELINE=1. Also enforced by
+      # pytest_sessionfinish in foundry-validation/tests/conftest.py.
+      FOUNDRY_VALIDATION_CHECK_SKIP_BASELINE: "1"
 
     steps:
       - uses: actions/checkout@v7

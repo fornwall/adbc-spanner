@@ -1,0 +1,87 @@
+# Foundry validation skip-inventory baseline.
+#
+# The sorted set of pytest nodeids expected to SKIP on a full suite run. One nodeid
+# per line, optionally followed by "  # <reason>" for reviewer readability. The
+# comparison key is the NODEID ALONE — the trailing reason is not compared (reasons
+# live in the .txtcase files and are maintained there; comparing them here would
+# couple this guard to unrelated reason edits).
+#
+# Why it exists: the suite reports Spanner's SQL-dialect divergences as per-case
+# skips. Without a pinned inventory, bumping ADBC_VALIDATION_REF can silently slip a
+# new upstream case into skip with no coverage, and a case that starts passing can
+# stay silently skipped (its skip never removed to enable it). This baseline pins
+# exactly which cases skip so either drift fails CI.
+#
+# Guard: foundry-validation/tests/conftest.py, enforced only when
+# FOUNDRY_VALIDATION_CHECK_SKIP_BASELINE is set (the CI workflow sets it). It fails a
+# full run on either an *unlisted skip* (skipping now, not in this file) or a *stale
+# entry* (in this file, not skipping now — it passes/fails/was renamed).
+#
+# Regenerate after a legitimate skip-set change (rewrites this file from the run):
+#   FOUNDRY_UPDATE_SKIP_BASELINE=1 scripts/run-foundry-validation.sh
+
+tests/test_connection.py::TestConnection::test_get_objects_constraints_check[spanner:emulator]  # not implemented
+tests/test_connection.py::TestConnection::test_get_objects_constraints_foreign[spanner:emulator]  # not implemented
+tests/test_connection.py::TestConnection::test_get_objects_constraints_unique[spanner:emulator]  # not implemented
+tests/test_connection.py::TestConnection::test_get_table_schema_catalog[spanner:emulator]  # secondary_catalog not supported
+tests/test_connection.py::TestConnection::test_get_table_schema_schema[spanner:emulator]  # secondary_schema not supported
+tests/test_connection.py::TestConnection::test_set_current_catalog[spanner:emulator]  # not implemented
+tests/test_connection.py::TestConnection::test_set_current_schema[spanner:emulator]  # not implemented
+tests/test_ingest.py::TestIngest::test_catalog[spanner:emulator]  # not implemented
+tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/decimal]  # Spanner NUMERIC is fixed precision/scale (38,9); it does not round-trip the case's decimal
+tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/decimal_scale_equals_precision]  # Spanner NUMERIC is fixed precision/scale (38,9); it does not round-trip the case's decimal
+tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/decimal_scale_negative]  # Spanner NUMERIC is fixed precision/scale (38,9); it does not round-trip the case's decimal
+tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/decimal_scale_zero]  # Spanner NUMERIC is fixed precision/scale (38,9); it does not round-trip the case's decimal
+tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/fixed_size_binary]  # Spanner has no fixed-size binary type (only BYTES(MAX))
+tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/int16]  # Spanner returns all integers as INT64, not the case's int16
+tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/int32]  # Spanner returns all integers as INT64, not the case's int32
+tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/time_ms]  # Spanner has no TIME-of-day type
+tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/time_ns]  # Spanner has no TIME-of-day type
+tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/time_s]  # Spanner has no TIME-of-day type
+tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/time_us]  # Spanner has no TIME-of-day type
+tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/timestamp_ms]  # Spanner TIMESTAMP is timezone-aware (UTC); the driver returns Timestamp(_, UTC), not the case's tz-naive timestamp
+tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/timestamp_ns]  # Spanner TIMESTAMP is timezone-aware (UTC); the driver returns Timestamp(_, UTC), not the case's tz-naive timestamp
+tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/timestamp_s]  # Spanner TIMESTAMP is timezone-aware (UTC); the driver returns Timestamp(_, UTC), not the case's tz-naive timestamp
+tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/timestamp_us]  # Spanner TIMESTAMP is timezone-aware (UTC); the driver returns Timestamp(_, UTC), not the case's tz-naive timestamp
+tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/timestamptz_ms]  # Spanner returns TIMESTAMP as Arrow Timestamp(Nanosecond); does not match the case's unit
+tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/timestamptz_s]  # Spanner returns TIMESTAMP as Arrow Timestamp(Nanosecond); does not match the case's unit
+tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/timestamptz_us]  # Spanner returns TIMESTAMP as Arrow Timestamp(Nanosecond); does not match the case's unit
+tests/test_ingest.py::TestIngest::test_not_null[spanner:emulator]  # not implemented
+tests/test_ingest.py::TestIngest::test_replace_catalog[spanner:emulator:ingest/string]  # not implemented
+tests/test_ingest.py::TestIngest::test_replace_schema[spanner:emulator:ingest/string]  # not implemented
+tests/test_ingest.py::TestIngest::test_schema[spanner:emulator]  # not implemented
+tests/test_ingest.py::TestIngest::test_temporary[spanner:emulator:ingest/string]  # not implemented
+tests/test_query.py::TestQuery::test_execute_schema[spanner:emulator:type/select/decimal]  # Spanner NUMERIC is fixed precision/scale (38,9); it does not round-trip the case's NUMERIC(10,2)
+tests/test_query.py::TestQuery::test_execute_schema[spanner:emulator:type/select/int16]  # Spanner has one 64-bit integer type; a SMALLINT value reads back as INT64, not the case's Int16
+tests/test_query.py::TestQuery::test_execute_schema[spanner:emulator:type/select/int32]  # Spanner has one 64-bit integer type; an INTEGER value reads back as INT64, not the case's Int32
+tests/test_query.py::TestQuery::test_execute_schema[spanner:emulator:type/select/time]  # Spanner has no TIME-of-day type
+tests/test_query.py::TestQuery::test_execute_schema[spanner:emulator:type/select/timestamp]  # case includes 9999-12-31, outside Arrow's nanosecond timestamp range (~1677-2262)
+tests/test_query.py::TestQuery::test_get_table_schema[spanner:emulator:type/select/decimal]  # Spanner NUMERIC is fixed precision/scale (38,9); it does not round-trip the case's NUMERIC(10,2)
+tests/test_query.py::TestQuery::test_get_table_schema[spanner:emulator:type/select/int16]  # Spanner has one 64-bit integer type; a SMALLINT value reads back as INT64, not the case's Int16
+tests/test_query.py::TestQuery::test_get_table_schema[spanner:emulator:type/select/int32]  # Spanner has one 64-bit integer type; an INTEGER value reads back as INT64, not the case's Int32
+tests/test_query.py::TestQuery::test_get_table_schema[spanner:emulator:type/select/time]  # Spanner has no TIME-of-day type
+tests/test_query.py::TestQuery::test_get_table_schema[spanner:emulator:type/select/timestamp]  # case includes 9999-12-31, outside Arrow's nanosecond timestamp range (~1677-2262)
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/decimal]  # Spanner NUMERIC is fixed precision/scale (38,9); it does not round-trip the case's DECIMAL(10,2)
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/fixed_size_binary]  # Spanner has no fixed-size binary type (only BYTES(MAX))
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/float16]  # Spanner has no 16-bit float type
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/int16]  # Spanner has one 64-bit integer type; a bound INT16 reads back as INT64, not the case's narrower type
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/int32]  # Spanner has one 64-bit integer type; a bound INT32 reads back as INT64, not the case's narrower type
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/time_ms]  # Spanner has no TIME-of-day type
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/time_ns]  # Spanner has no TIME-of-day type
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/time_s]  # Spanner has no TIME-of-day type
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/time_us]  # Spanner has no TIME-of-day type
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/timestamp_ms]  # case binds timestamps outside Arrow's nanosecond range (~1677-2262), which the driver's nanosecond TIMESTAMP read path cannot represent
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/timestamp_ns]  # case binds timestamps outside Arrow's nanosecond range (~1677-2262), which the driver's nanosecond TIMESTAMP read path cannot represent
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/timestamp_s]  # case binds timestamps outside Arrow's nanosecond range (~1677-2262), which the driver's nanosecond TIMESTAMP read path cannot represent
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/timestamp_us]  # case binds timestamps outside Arrow's nanosecond range (~1677-2262), which the driver's nanosecond TIMESTAMP read path cannot represent
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/timestamptz_ms]  # case binds timestamps outside Arrow's nanosecond range (~1677-2262), which the driver's nanosecond TIMESTAMP read path cannot represent
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/timestamptz_s]  # case binds timestamps outside Arrow's nanosecond range (~1677-2262), which the driver's nanosecond TIMESTAMP read path cannot represent
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/literal/decimal]  # Spanner NUMERIC is fixed precision/scale (38,9); it does not round-trip the case's NUMERIC(10,2)
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/literal/int16]  # Spanner has one 64-bit integer type; a SMALLINT literal reads back as INT64, not the case's Int16
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/literal/int32]  # Spanner has one 64-bit integer type; an INT literal reads back as INT64, not the case's Int32
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/literal/time]  # Spanner has no TIME-of-day type
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/select/decimal]  # Spanner NUMERIC is fixed precision/scale (38,9); it does not round-trip the case's NUMERIC(10,2)
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/select/int16]  # Spanner has one 64-bit integer type; a SMALLINT value reads back as INT64, not the case's Int16
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/select/int32]  # Spanner has one 64-bit integer type; an INTEGER value reads back as INT64, not the case's Int32
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/select/time]  # Spanner has no TIME-of-day type
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/select/timestamp]  # case includes 9999-12-31, outside Arrow's nanosecond timestamp range (~1677-2262)
