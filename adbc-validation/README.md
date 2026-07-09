@@ -14,7 +14,7 @@ the Rust trait-level tests in `tests/integration.rs`.
 ## Running
 
 ```sh
-# Throwaway emulator, gated (CI) subset — the same thing CI runs:
+# Throwaway emulator, the CI checks (gate + expected-failure + stale guards):
 scripts/run-adbc-validation.sh
 
 # Throwaway emulator, every test (local exploration; expect failures/skips):
@@ -69,9 +69,11 @@ Spanner's model self-skip rather than fail.
   create over an existing table → error, incompatible-schema append → error — the
   one `SqlIngest*` case with no non-Spanner DDL or `SELECT *` readback to block it).
 
-**All 44 gated tests pass, 0 self-skip.** `DatabaseTest` and `ConnectionTest` run in
-full; the `StatementTest` cases are an explicit allowlist in
-`scripts/run-adbc-validation.sh`. `SpannerQuirks::supports_bulk_ingest` declares
+The gate runs **every case except the documented `EXCLUDED` expected-failures**
+(see the next section), and they all pass or self-skip — today **44 cases, 0
+self-skip**. `DatabaseTest` and `ConnectionTest` pass in full; from `StatementTest`
+everything but the `EXCLUDED` list in `scripts/run-adbc-validation.sh` runs here.
+`SpannerQuirks::supports_bulk_ingest` declares
 all four ingest modes (append, create, create_append, replace — the create
 modes build the table from the ingest data's Arrow schema with a synthetic
 `adbc_ingest_key` UUID primary key satisfying Spanner's mandatory-key rule),
@@ -83,12 +85,48 @@ and `MetadataGetTableSchemaEscaping` (both gated upstream on
 valid empty catalog — Spanner has no per-column statistics to name, which the
 suite accepts.)
 
-## Follow-up work: the remaining `StatementTest` cases
+## How the gate stays honest: one `EXCLUDED` list, three checks
 
-The rest of `StatementTest` (runnable via `--full`) is gated incrementally as
-each case is understood. Every remaining case now fails **cleanly** (no aborts —
-see the note below); they fall into the following buckets, none of them
-incremental driver work:
+There is no allowlist of cases to run. Instead `scripts/run-adbc-validation.sh`
+carries a single `EXCLUDED` array — the cases that are known-not-passing or
+not-applicable to Spanner's model, each tagged with a reason grouped by the
+buckets below — and derives everything from it. On the default (CI) run it makes
+three assertions:
+
+1. **Gate (negative filter).** It runs `spanner_validation --gtest_filter=-<EXCLUDED>`,
+   i.e. *every case except* the excluded ones, and requires them all to pass or
+   self-skip. This is what **auto-enrolls new upstream tests**: a case added by a
+   bump of `ARROW_ADBC_TAG` is not in `EXCLUDED`, so it runs in the gate. If it
+   fails, CI goes red and you triage it — fix the driver, or add it to `EXCLUDED`
+   with a reason. Nothing new can silently escape the suite.
+2. **Expected-failure guard (xfail-strict).** It then runs *only* the excluded
+   cases (`--gtest_filter=<EXCLUDED> --gtest_output=xml:…`), captures the
+   (deliberately non-zero) exit, and parses the JUnit XML per test case. If any
+   excluded case actually **passed** (ran with no failure — a *skip* does not
+   count), CI fails: an expected-failure that started passing must be removed from
+   `EXCLUDED` so the gate enforces it. This keeps the list from silently
+   accumulating cases the driver has since grown to satisfy.
+3. **Stale guard.** It enumerates the available cases via `--gtest_list_tests`
+   (no database needed) and fails if any `EXCLUDED` entry no longer exists
+   upstream (renamed/removed), so the list can't rot.
+
+So the manual periodic `--full` triage is gone: new cases run automatically, a
+regressing exclusion or a fixed exclusion both turn CI red, and CI just calls this
+script (see `.github/workflows/adbc-validation.yml`). Run only the static stale
+guard — no emulator required — with:
+
+```sh
+scripts/run-adbc-validation.sh --check-drift
+```
+
+Today `EXCLUDED` holds **56** cases (44 non-excluded gate cases + 56 excluded =
+100 upstream cases total).
+
+## The `EXCLUDED` cases, by bucket
+
+Every excluded case (runnable individually via `--full`) fails **cleanly** (no
+aborts — see the note below) or self-skips; they fall into the following buckets,
+none of them incremental driver work:
 
 - **Suite-internal non-Spanner DDL** — several cases issue hardcoded
   `CREATE TABLE x (foo INT)` / `TEXT` / `FLOAT` with no primary key and
