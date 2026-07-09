@@ -131,3 +131,34 @@ Known remaining gaps (documented, not yet addressed):
   Spanner table has a mandatory primary key, and even the empty `PRIMARY KEY ()` singleton form
   still produces a `PK_<table>` row in `INFORMATION_SCHEMA.TABLE_CONSTRAINTS` (verified on the
   emulator), so the FK tables report two constraints (PK + FK) where the suite asserts exactly one.
+
+## Skip-inventory baseline guard
+
+Spanner's SQL-dialect divergences surface as per-case **skips** (each `.txtcase` carries a
+`skip = "reason"`). `skip_baseline.txt` pins the sorted set of pytest **nodeids** expected to skip on
+a full run — one nodeid per line, with an optional `  # <reason>` annotation for readability (the
+reason is *not* compared; only the nodeid is). Without this pin, bumping `ADBC_VALIDATION_REF` (the
+pinned upstream suite, in `scripts/run-foundry-validation.sh`) could silently slip a new upstream case
+into skip with no coverage, or leave a case that started passing sitting silently skipped. This is the
+Foundry analog of the closed-set/xfail-strict guard in `scripts/run-adbc-validation.sh` for the C++
+suite, adapted to the skip-based pytest model; the existing `FOUNDRY_VALIDATION_REQUIRE_PASSES` guard
+only catches the degenerate *everything*-skipped case, not per-case drift.
+
+`pytest_sessionfinish` (in `tests/conftest.py`) enforces the baseline only when
+`FOUNDRY_VALIDATION_CHECK_SKIP_BASELINE` is set — the workflow sets it, so ad-hoc local `-k`/`-m`
+subset runs (which collect only part of the suite) don't fire it. It fails the run on either drift:
+
+- **Unlisted skip** — a case skipping now that is *not* in the baseline: a new/regressed case is
+  skipping without being acknowledged. Triage it (fix it, or add it to the baseline via
+  regeneration).
+- **Stale entry** — a baseline nodeid that did *not* skip this run: the case no longer skips. If it
+  now passes, remove its `.txtcase` skip and regenerate the baseline (this is what makes newly-passing
+  cases get enabled instead of sitting silently skipped); if it now fails or was renamed upstream,
+  investigate.
+
+Regenerate the baseline after a legitimate skip-set change — this rewrites `skip_baseline.txt` from
+the current run instead of comparing:
+
+```sh
+FOUNDRY_UPDATE_SKIP_BASELINE=1 scripts/run-foundry-validation.sh
+```
