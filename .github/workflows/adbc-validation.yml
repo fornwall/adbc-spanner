@@ -60,7 +60,7 @@ jobs:
           exit 1
 
       # Persist the C++ validation build tree (fetched + compiled arrow-adbc and
-      # GoogleTest under adbc-validation/build, plus our own harness objects) so the
+      # GoogleTest under .adbc-validation-build, plus our own harness objects) so the
       # slow FetchContent clone + compile is reused across runs. The key is bound to
       # the runner OS and a hash of adbc-validation/CMakeLists.txt — which carries the
       # pinned ARROW_ADBC_TAG and every CMake/toolchain flag — so bumping the arrow-adbc
@@ -71,7 +71,7 @@ jobs:
       - name: Cache the ADBC C++ validation build tree
         uses: actions/cache@v6
         with:
-          path: adbc-validation/build
+          path: .adbc-validation-build
           key: adbc-validation-${{ runner.os }}-${{ hashFiles('adbc-validation/CMakeLists.txt') }}
           restore-keys: |
             adbc-validation-${{ runner.os }}-
