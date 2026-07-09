@@ -296,7 +296,7 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   the underlying `CREATE TABLE` DDL error surfaces) and that the failed ingest left the table's row
   count unchanged. The shared `ingest_into(table, mode)` helper (a small refactor of the former
   `ingest_create`) backs all three cases.
-- **Resilience suite misses some likely production failures** (`tests/resilience.rs`):
+- ~~**Resilience suite misses some likely production failures** (`tests/resilience.rs`):
   mid-stream disconnect after batches were consumed, latency/timeout toxics (by default nothing
   bounds the wait — building the commit-fault test confirmed the client marks all data-plane RPCs
   idempotent and retries transport faults with no attempt cap, so a commit under a persistent
@@ -306,7 +306,21 @@ batch read-only transaction so every partition executes at that bound. Parsing l
   with `Timeout` in-deadline rather than hanging, then recovers once the deadline is unset), and
   truncated streams. (Faults during a
   manual-transaction commit are now covered by
-  `commit_under_transport_fault_never_loses_the_write`.)
+  `commit_under_transport_fault_never_loses_the_write`.)~~ (fixed)
+  **Fixed.** The two remaining uncovered failure modes now have dedicated tests in
+  `tests/resilience.rs` (self-skipping without a Toxiproxy target, `SerialGuard` under
+  `--test-threads=1`, exactly like the existing ones). **`mid_stream_disconnect_after_batches_surfaces_error_then_recovers`**
+  pulls several real batches off a large streamed result (proving rows were delivered), then injects
+  a `reset_peer` toxic and drains the rest on a watchdog-bounded worker thread: the next post-buffer
+  chunk fetch must surface a clean ADBC error (not hang, not panic, not a silently-short result),
+  and once the toxic is removed a fresh query recovers — exercising the resumption path that
+  `reset_peer_surfaces_error_then_recovers` (which resets a query *before* it starts) does not.
+  **`truncated_stream_surfaces_error_then_recovers`** uses a `limit_data` toxic to close the
+  connection cleanly after a byte cap (`TRUNCATE_AFTER_BYTES`, above the ~12 MB receive buffer so
+  `execute()` and the first batches succeed, well below the ~48 MB result so the stream is cut
+  mid-flight): the reader must surface an error on the fetch past the cap rather than treat a
+  truncated result as complete, and a fresh query recovers once the cap is removed. A new
+  `Toxiproxy::add_limit_data` helper backs the truncation toxic.
 - ~~**`statement.rs` has zero unit tests**; the option-coercion error paths (`rows_per_batch=0`,
   bad bools, negative `max_partitions`, unknown-option statuses) are pure functions guarding the
   C-ABI boundary and are unit-testable offline.~~
