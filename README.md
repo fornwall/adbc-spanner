@@ -4,17 +4,11 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 An [ADBC](https://arrow.apache.org/adbc/) (Arrow Database Connectivity) driver for
-[Google Cloud Spanner](https://cloud.google.com/spanner), written in Rust.
+[Google Cloud Spanner](https://cloud.google.com/spanner), available as:
 
-It implements the native Rust [`adbc_core`](https://crates.io/crates/adbc_core) driver traits on top
-of the official [`google-cloud-spanner`](https://crates.io/crates/google-cloud-spanner) preview
-client from [googleapis/google-cloud-rust](https://github.com/googleapis/google-cloud-rust). Query
-results come back as Apache Arrow record batches, so Spanner data flows into the Arrow ecosystem
-(DataFusion, Polars, Flight, …) without a row-by-row copy.
-
-```text
-SpannerDriver ──▶ SpannerDatabase ──▶ SpannerConnection ──▶ SpannerStatement
-```
+- A [python package](https://pypi.org/project/adbc-driver-spanner/)
+- A [rust crate](https://crates.io/crates/adbc-spanner).
+- A [loadable shared library driver](#shared-library-loadable-driver)
 
 ## Status
 
@@ -33,11 +27,6 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
 - DDL (`CREATE`/`ALTER`/`DROP`/`RENAME`/…), routed to the Database Admin `UpdateDatabaseDdl` API. A
   `;`-separated batch is submitted as a single schema change, so multi-step changes (e.g. dbt's
   intermediate-table build then rename swap) are near-atomic.
-- [Property graphs and GQL graph queries](https://cloud.google.com/spanner/docs/graph/queries-overview):
-  declare a graph over existing tables with a `CREATE PROPERTY GRAPH` DDL statement, then run
-  `GRAPH … MATCH … RETURN` graph-traversal queries through `execute` like any other read query — GQL
-  needs no special driver support, since Spanner surfaces it as an ordinary GoogleSQL query returning
-  a typed result set.
 - Transactions: autocommit by default, or manual multi-statement transactions (set
   `adbc.connection.autocommit` to `false`, then `commit`/`rollback`). In manual mode DML — and any
   bulk ingest's insert mutations — is buffered
@@ -216,70 +205,6 @@ Prebuilt libraries for Linux, macOS and Windows are
 attached to every CI run and to each tagged [release](https://github.com/fornwall/adbc-spanner/releases).
 To build one yourself: `cargo build --release` → `target/release/libadbc_spanner.so`.
 
-Example, loading it from the Python driver manager:
-
-```python
-import adbc_driver_manager
-db = adbc_driver_manager.AdbcDatabase(
-    driver="/path/to/libadbc_spanner.so",
-    entrypoint="AdbcSpannerInit",
-    # or a connection URI carrying options as query parameters:
-    # "spanner:///projects/…/databases/…?spanner.endpoint=http://localhost:9010&spanner.emulator=true"
-    uri="projects/my-project/instances/my-instance/databases/my-db",
-)
-```
-
-## Usage
-
-Add the dependency (this crate plus the Arrow crates you consume results with). The crate is not
-yet on crates.io — it pins both `google-cloud-*` and `adbc_core`/`adbc_ffi` (to an
-[`apache/arrow-adbc`](https://github.com/apache/arrow-adbc) `main` revision) to git revisions (see
-the note under *Type mapping*) — so depend on it via git until those pins are lifted:
-
-```toml
-[dependencies]
-adbc-spanner = { git = "https://github.com/fornwall/adbc-spanner", tag = "v0.5.0" }
-# `adbc_core` must come from the SAME git source as `adbc-spanner`'s own dependency:
-# Cargo does not unify a git source with the crates.io registry, so a plain
-# `adbc_core = "0.23"` here would resolve to a *different*, incompatible `adbc_core`
-# than the traits `SpannerDriver` implements, and the quickstart would not compile.
-adbc_core = { git = "https://github.com/apache/arrow-adbc", rev = "198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab" }
-arrow-array = "58"
-```
-
-```rust
-use adbc_core::options::{OptionDatabase, OptionValue};
-use adbc_core::{Connection, Database, Driver, Statement};
-use arrow_array::cast::AsArray;
-use arrow_array::types::Int64Type;
-use adbc_spanner::SpannerDriver;
-
-fn main() -> adbc_core::error::Result<()> {
-    let mut driver = SpannerDriver::try_new()?;
-
-    // The Spanner database path is supplied through the standard `uri` option.
-    let database = driver.new_database_with_opts([(
-        OptionDatabase::Uri,
-        OptionValue::String("projects/my-project/instances/my-instance/databases/my-db".into()),
-    )])?;
-
-    let mut connection = database.new_connection()?;
-    let mut statement = connection.new_statement()?;
-
-    statement.set_sql_query("SELECT SingerId FROM Singers ORDER BY SingerId")?;
-    let reader = statement.execute()?;
-
-    for batch in reader {
-        let batch = batch?;
-        let ids = batch.column(0).as_primitive::<Int64Type>();
-        for id in ids.values() {
-            println!("singer {id}");
-        }
-    }
-    Ok(())
-}
-```
-
 ### Configuration options
 
 Options exist at three levels — **database**, **connection** and **statement** — matching the ADBC
@@ -290,17 +215,6 @@ level, bulk ingest, and so on — are accepted alongside them.
 
 **[docs/options.md](docs/options.md) is the complete, authoritative reference**: every option, at
 each level, with its exact type and allowed values, default, and `get_option` round-trip behaviour.
-Rather than repeat that matrix here, a few illustrative examples of how options are used in
-practice:
-
-- **Stale reads** (connection or statement) — `spanner.read.staleness = "max:10s"` (bounded
-  staleness) or `spanner.read.timestamp = "2026-07-07T00:00:00Z"` (absolute). A statement inherits
-  the connection's bound and may override it (set `""` to force a strong read).
-- **Authentication** (database) — `spanner.keyfile = "/path/to/key.json"` (a Google credential JSON
-  file) or `spanner.access_token = "<bearer-token>"` (a caller-supplied OAuth 2.0 token, sent
-  verbatim with no refresh). See [Authentication](#authentication).
-- **Streaming batch size** (statement) — `spanner.rows_per_batch = "16384"` sets the number of rows
-  converted into each Arrow `RecordBatch` streamed by `execute` (default `8192`).
 
 Instead of a bare database path, `uri` / `spanner.database` also accept a **connection URI** with
 the `spanner:` scheme whose query parameters are database-level options (see
