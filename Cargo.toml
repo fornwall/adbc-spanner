@@ -124,7 +124,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
 # `stream::iter` + `StreamExt::buffer_unordered` to run the per-table `get_statistics`
 # aggregate scans with bounded concurrency on the shared runtime.
 futures-util = "0.3"
-serde_json = "1"
+# `float_roundtrip` makes the float *parser* round-trip-accurate (nearest-f64), matching ryu on the
+# serialize side. Without it serde_json's default fast parser can land one ULP off, so a decoded
+# partition descriptor carrying a large float re-encodes to a *different* value on each pass — the
+# `decode → encode` fixed point the partition round-trip relies on never settles. See the
+# `partition_descriptor_round_trips_large_floats` regression test in `connection.rs`.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 base64 = "0.22"
 # Build the `Authorization: Bearer <token>` header for the static-token credential backing the
 # `spanner.access_token` option (a minimal `google-cloud-auth` `CredentialsProvider`). Same `http`
