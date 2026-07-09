@@ -748,9 +748,14 @@ ADBC `Timeout`; see `docs/options.md`); ~~per-attempt retry *tuning* (policies)~
 client's gax retry policy via the builders' `with_retry_policy` / `with_begin_retry_policy` /
 `with_commit_retry_policy`, layering `RetryPolicyExt::{with_attempt_limit,with_time_limit}` on a
 driver-local copy of the client's `SpannerRetryPolicy` so the transport-on-idempotent retry is
-preserved — `src/retry.rs`; `RetryConfig` mirrors `RpcTimeouts`/`RequestConfig`). Custom *backoff*
-(the gax `BackoffPolicy` / `ExponentialBackoff`, settable via the same builders'
-`with_backoff_policy`) is a possible follow-up but was left out to keep the surface focused.
+preserved — `src/retry.rs`; `RetryConfig` mirrors `RpcTimeouts`/`RequestConfig`).
+~~Custom *backoff* (the gax `BackoffPolicy` / `ExponentialBackoff`, settable via the same builders'
+`with_backoff_policy`) is a possible follow-up but was left out to keep the surface focused.~~
+**done** — `spanner.retry.backoff.{initial_seconds,max_seconds,multiplier}` (same connection +
+statement pattern) build a gax `ExponentialBackoff` (unset knobs default to the client's 1s/60s/×2,
+`.clamp()`-ed to the recommended ranges) applied via `with_backoff_policy` /
+`with_{begin,commit}_backoff_policy` at the same four sites as the retry policy, independent of the
+attempt/elapsed caps — `src/retry.rs`.
 ~~PostgreSQL-dialect databases are
 unsupported *and undetected* — minimum viable is probing the dialect once and failing fast with a
 clear error~~ (**wontfix** — not worth the effort. Reliable dialect detection is only best-effort

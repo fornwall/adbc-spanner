@@ -416,8 +416,15 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   `with_retry_policy` / `with_begin_retry_policy` / `with_commit_retry_policy` at the same sites the
   request tags cover [`sql_builder`, `run_batch_txn`'s runner + `ExecuteBatchDml` batch, the ingest
   write-only txn]; unset = the client's own unbounded policy, so it is purely opt-in. Bounds the
-  *per-attempt* retry loop, complementary to the *overall* RPC-timeout deadlines; custom *backoff*
-  via `with_backoff_policy` is a deliberate non-goal for now. The transaction-level abort retry
+  *per-attempt* retry loop, complementary to the *overall* RPC-timeout deadlines. Custom **backoff**
+  is also supported via three orthogonal knobs
+  `spanner.retry.backoff.{initial_seconds,max_seconds,multiplier}` [same connection+statement /
+  inherit-then-override / `""`-unsets pattern; f64, finite + strictly positive, round-trip via
+  `get_option`/`get_option_double`] — `RetryConfig::backoff_policy_arg` builds a gax
+  `ExponentialBackoff` (unset knobs default to the client's 1s/60s/×2, `.clamp()`-ed to the gax
+  recommended ranges so it never fails to build) and applies it via `with_backoff_policy` /
+  `with_begin_backoff_policy` / `with_commit_backoff_policy` at the same four sites; independent of
+  the attempt/elapsed caps (either family may be set alone). The transaction-level abort retry
   stays at the client default).
   (`get_statistics` computes exact `ROW_COUNT`/`NULL_COUNT`/`DISTINCT_COUNT` via one aggregate scan
   per table — see `src/statistics.rs`; `approximate=true` serves the same exact stats (exact values

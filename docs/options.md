@@ -93,6 +93,9 @@ path, not the original URI.
 | `spanner.rpc.timeout_seconds.fetch` | as `…query` | unset (no deadline) | yes, when set (also via `get_option_double`) | Overall deadline on **each subsequent chunk fetch** of a streamed result (after the first, which `…query` covers), enforced inside the background prefetch task so a stalled stream fails the consumer's next batch with `Timeout`. Same inheritance as `…query`. |
 | `spanner.retry.max_attempts` | positive integer; `""` unsets (see [Retry tuning](#retry-tuning)) | unset (client default, no cap) | yes, when set (also via `get_option_int`) | Cap on the number of attempts (first try + retries) the client makes for a retryable RPC; `1` disables retrying. Bounds the client's default retry policy without dropping its transport-error-on-idempotent retrying. Becomes the default for statements this connection creates (statements may override). |
 | `spanner.retry.max_elapsed_seconds` | finite, strictly positive seconds (fractions allowed); `""` unsets (see [Retry tuning](#retry-tuning)) | unset (client default, no cap) | yes, when set (also via `get_option_double`) | Cap on the total wall-clock time spent retrying a retryable RPC before the last error is surfaced. Combines with `spanner.retry.max_attempts` (whichever limit fires first wins). Same inheritance as `…max_attempts`. |
+| `spanner.retry.backoff.initial_seconds` | finite, strictly positive seconds (fractions allowed); `""` unsets (see [Retry tuning](#retry-tuning)) | unset (client default, 1s) | yes, when set (also via `get_option_double`) | Initial delay of the client's exponential backoff between retry attempts. Setting any `spanner.retry.backoff.*` knob replaces the client's default backoff (unset knobs take the client defaults 1s / 60s / ×2, clamped to the gax recommended ranges). Independent of the attempt / elapsed-time caps. Same inheritance as `…max_attempts`. |
+| `spanner.retry.backoff.max_seconds` | finite, strictly positive seconds (fractions allowed); `""` unsets (see [Retry tuning](#retry-tuning)) | unset (client default, 60s) | yes, when set (also via `get_option_double`) | Ceiling the growing backoff delay is truncated at. Raised to the effective initial delay if set below it. Same combination / inheritance as `…backoff.initial_seconds`. |
+| `spanner.retry.backoff.multiplier` | finite, strictly positive number; `""` unsets (see [Retry tuning](#retry-tuning)) | unset (client default, `2.0`) | yes, when set (also via `get_option_double`) | Per-attempt growth factor for the backoff delay. A value below `1.0` is floored to `1.0` (constant delay). Same combination / inheritance as `…backoff.initial_seconds`. |
 
 Two standard connection options are **read-only**: `adbc.connection.catalog` and
 `adbc.connection.db_schema` (the "current" catalog/schema) both report `""` — a Spanner database
@@ -121,6 +124,9 @@ has a single, unnamed catalog and default schema — and cannot be set.
 | `spanner.rpc.timeout_seconds.fetch` | as the connection option; `0` disables; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement fetch-timeout override. |
 | `spanner.retry.max_attempts` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_int`) | Per-statement retry-attempt-cap override (see [Retry tuning](#retry-tuning)). |
 | `spanner.retry.max_elapsed_seconds` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement retry-elapsed-cap override. |
+| `spanner.retry.backoff.initial_seconds` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement backoff-initial-delay override. |
+| `spanner.retry.backoff.max_seconds` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement backoff-maximum-delay override. |
+| `spanner.retry.backoff.multiplier` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement backoff-multiplier override. |
 | `adbc.statement.bind_by_name` | boolean | `false` (positional) | yes (`true`/`false`) | How bound Arrow columns pair with the query's `@name` parameters, following the ADBC SQLite reference driver's `bind_by_name` convention ([apache/arrow-adbc#3362](https://github.com/apache/arrow-adbc/issues/3362)). **`false`** (the default): strictly positional — the *i*-th bound column binds to the *i*-th distinct parameter in query order, column names ignored (the ADBC ordinal contract positional clients and validation suites rely on). **`true`**: strict by-name — each column binds to `@<its own name>` (order-independent); a bound column that names no query parameter fails with `InvalidArguments` naming the missing parameter. See [README § Status](../README.md#status). |
 | `adbc.ingest.target_table` | string: table name | unset | yes, when set | **Standard ADBC.** Bulk-ingest target table. Setting it clears any SQL query on the statement (query and ingest target are mutually exclusive on one handle). |
 | `adbc.ingest.target_db_schema` | string: named schema (`""` = Spanner's default, unnamed schema) | unset (default schema) | yes, when set | **Standard ADBC.** Named schema qualifying the ingest target table. |
@@ -300,6 +306,24 @@ The two are independent and may be combined — the retry loop stops at whicheve
 first. Zero, negative, non-finite and (for attempts) fractional or above-`u32::MAX` values fail with
 `InvalidArguments`; an empty string (`""`) unsets. A statement inherits the connection's values at
 creation and may override each independently.
+
+Three further options tune the *delay between* attempts — the client's truncated exponential backoff
+with jitter — mirroring the gax `ExponentialBackoffBuilder` knobs:
+
+- **`spanner.retry.backoff.initial_seconds`** — the first inter-attempt delay, in seconds (client
+  default 1s).
+- **`spanner.retry.backoff.max_seconds`** — the ceiling the growing delay is truncated at, in seconds
+  (client default 60s); raised to the effective initial delay if set below it.
+- **`spanner.retry.backoff.multiplier`** — the per-attempt growth factor (client default `2.0`); a
+  value below `1.0` is floored to `1.0` (a constant delay).
+
+Setting **any** of them replaces the client's default backoff with an exponential backoff whose unset
+knobs take the client defaults, with the whole combination clamped to the gax recommended ranges
+(initial delay ≥ 1ms, maximum delay in `[1s, 24h]`, multiplier in `[1.0, 32.0]`) so it can never fail
+to build. Each is a finite, strictly positive number accepted from a numeric string, integer or
+double, round-trips through `get_option` / `get_option_double`, and an empty string unsets it. These
+backoff knobs are **orthogonal** to the attempt / elapsed-time caps above — either family may be set
+on its own — and inherit connection→statement the same way.
 
 When **neither** is set the client keeps its default (unbounded) policy, so the feature is purely
 opt-in and by default changes nothing. When either is set, the driver applies a bounded policy that

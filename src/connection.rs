@@ -769,6 +769,15 @@ impl Optionable for SpannerConnection {
             OptionConnection::Other(k) if k == crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
                 self.retry.set_max_elapsed_seconds(value)?;
             }
+            OptionConnection::Other(k) if k == crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS => {
+                self.retry.set_backoff_initial_seconds(value)?;
+            }
+            OptionConnection::Other(k) if k == crate::OPTION_RETRY_BACKOFF_MAX_SECONDS => {
+                self.retry.set_backoff_max_seconds(value)?;
+            }
+            OptionConnection::Other(k) if k == crate::OPTION_RETRY_BACKOFF_MULTIPLIER => {
+                self.retry.set_backoff_multiplier(value)?;
+            }
             other => {
                 return Err(not_implemented(&format!(
                     "unsupported Spanner connection option: {}",
@@ -944,6 +953,39 @@ impl Optionable for SpannerConnection {
                         format!(
                             "option {} is not set",
                             crate::OPTION_RETRY_MAX_ELAPSED_SECONDS
+                        ),
+                        Status::NotFound,
+                    )
+                })
+            }
+            OptionConnection::Other(k) if k == crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS => {
+                self.retry.backoff_initial_seconds_string().ok_or_else(|| {
+                    err(
+                        format!(
+                            "option {} is not set",
+                            crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS
+                        ),
+                        Status::NotFound,
+                    )
+                })
+            }
+            OptionConnection::Other(k) if k == crate::OPTION_RETRY_BACKOFF_MAX_SECONDS => {
+                self.retry.backoff_max_seconds_string().ok_or_else(|| {
+                    err(
+                        format!(
+                            "option {} is not set",
+                            crate::OPTION_RETRY_BACKOFF_MAX_SECONDS
+                        ),
+                        Status::NotFound,
+                    )
+                })
+            }
+            OptionConnection::Other(k) if k == crate::OPTION_RETRY_BACKOFF_MULTIPLIER => {
+                self.retry.backoff_multiplier_string().ok_or_else(|| {
+                    err(
+                        format!(
+                            "option {} is not set",
+                            crate::OPTION_RETRY_BACKOFF_MULTIPLIER
                         ),
                         Status::NotFound,
                     )
