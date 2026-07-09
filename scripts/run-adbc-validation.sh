@@ -33,12 +33,6 @@ FULL=0
 # Spanner-model / suite-portability gaps (documented in the README), and an
 # allowlist keeps the gate meaningful without tracking every non-applicable case.
 #
-# NOTE: SqlPartitionedInts is intentionally NOT gated even though partitioned
-# execution is implemented: the upstream case hardcodes exactly one partition for
-# `SELECT 42`, but Spanner's partitionQuery may return more (the emulator returns
-# 2). The driver's partition round-trip is covered by execute_partitions_round_trip
-# in tests/integration.rs instead. See adbc-validation/README.md.
-#
 # NOTE: SqlQueryCancel is NOT gated even though cancellation is implemented (and
 # sticky): the case requires the C stream's get_next to return exactly ECANCELED
 # after a cancel, but arrow-rs's FFI stream exporter (used by adbc_ffi) can only
@@ -76,6 +70,11 @@ GATED_FILTER+=':SpannerStatementTest.SqlSchemaErrors'
 GATED_FILTER+=':SpannerStatementTest.ConcurrentStatements'
 GATED_FILTER+=':SpannerStatementTest.ResultIndependence'
 GATED_FILTER+=':SpannerStatementTest.ResultInvalidation'
+# SqlPartitionedInts: the upstream case hardcoded exactly one partition for
+# `SELECT 42`, but Spanner's partitionQuery may return more (the emulator returns
+# 2). The fork branch (arrow-adbc#9) accepts >=1 partitions and reads the union of
+# all of them, so the driver's execute_partitions/read_partition round-trip passes.
+GATED_FILTER+=':SpannerStatementTest.SqlPartitionedInts'
 
 # No target configured: run under a throwaway emulator, then re-enter this script.
 if [ -z "${SPANNER_EMULATOR_HOST:-}" ] && [ -z "${SPANNER_GCP_DATABASE:-}" ]; then

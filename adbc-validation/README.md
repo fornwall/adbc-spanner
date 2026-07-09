@@ -41,7 +41,11 @@ double-free on a second release), `AdbcStatementExecuteQuery` writing
 exporter preserving the caller's `AdbcError.private_data` on the ADBC 1.0.0 path
 (upstream [apache/arrow-adbc#4473](https://github.com/apache/arrow-adbc/pull/4473)).
 The **C++** validation library and driver manager come from `ARROW_ADBC_TAG`;
-they interoperate with the driver over the C ABI.
+they interoperate with the driver over the C ABI. That tag is temporarily pinned to
+the [`fornwall/arrow-adbc#9`](https://github.com/fornwall/arrow-adbc/pull/9) fork
+branch (based on the same apache `main` rev), which relaxes `TestSqlPartitionedInts`
+to accept more than one partition; revert to a versioned release once that change
+lands upstream.
 
 `SpannerQuirks` (in `spanner_validation.cc`) describes Spanner's capabilities to
 the suite — named `@p` parameters, DDL via the admin API, all four ingest modes,
@@ -67,9 +71,12 @@ Spanner's model self-skip rather than fail.
   in the pinned `adbc_ffi` rev), and the ingest **error paths** (`SqlIngestErrors`:
   ingest-without-bind → `INVALID_STATE`, append to a nonexistent table → error,
   create over an existing table → error, incompatible-schema append → error — the
-  one `SqlIngest*` case with no non-Spanner DDL or `SELECT *` readback to block it).
+  one `SqlIngest*` case with no non-Spanner DDL or `SELECT *` readback to block it),
+  and partitioned execution (`SqlPartitionedInts`: `execute_partitions` →
+  `read_partition` over the union of all partitions, via the arrow-adbc#9 relaxed
+  partition-count assertion).
 
-**All 44 gated tests pass, 0 self-skip.** `DatabaseTest` and `ConnectionTest` run in
+**All 45 gated tests pass, 0 self-skip.** `DatabaseTest` and `ConnectionTest` run in
 full; the `StatementTest` cases are an explicit allowlist in
 `scripts/run-adbc-validation.sh`. `SpannerQuirks::supports_bulk_ingest` declares
 all four ingest modes (append, create, create_append, replace — the create
@@ -123,14 +130,15 @@ incremental driver work:
   `cancel_between_stream_chunks_cancels_the_next_fetch` in
   `tests/integration.rs`; fixing the errno needs a status-aware stream export
   in `adbc_ffi` (the git-pinned fork), at which point the case can be re-gated.
-- **Rigid single-partition assumption** — `SqlPartitionedInts` is now *runnable*
-  (the driver implements `execute_partitions`/`read_partition`, and the
-  `supports_partitioned_data` quirk is `true`), but the upstream case hardcodes
-  `ASSERT_EQ(1, num_partitions)` ("Assume only 1 partition") for `SELECT 42`.
-  Spanner's `partitionQuery` is free to return more — the emulator returns 2 — so
-  the case cannot be gated. The driver's own partitioned round-trip
-  (`execute_partitions` → `read_partition`, union of rows) is covered natively by
-  `execute_partitions_round_trip` in `tests/integration.rs`.
+- **Rigid single-partition assumption** — the upstream `SqlPartitionedInts`
+  hardcoded `ASSERT_EQ(1, num_partitions)` ("Assume only 1 partition") for
+  `SELECT 42`, but Spanner's `partitionQuery` is free to return more (the emulator
+  returns 2). The [`fornwall/arrow-adbc#9`](https://github.com/fornwall/arrow-adbc/pull/9)
+  fork branch relaxes this to `ASSERT_GE(num_partitions, 1)` and reads the union of
+  all partitions, so with the driver's `execute_partitions`/`read_partition` (and
+  the `supports_partitioned_data` quirk) the case now **passes and is gated**. The
+  same round-trip is also covered natively by `execute_partitions_round_trip` in
+  `tests/integration.rs`.
 
 The three `adbc_ffi` issues that previously blocked a whole swath of these — a
 non-idempotent error release (which aborted the process), a missing

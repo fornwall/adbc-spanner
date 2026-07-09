@@ -10,9 +10,14 @@ project(adbc_spanner_validation LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Pin to the arrow-adbc release matching the adbc_core / adbc_ffi 0.23 crates the
-# driver builds on. Bump both together.
-set(ARROW_ADBC_TAG "apache-arrow-adbc-23" CACHE STRING "arrow-adbc release tag")
+# Temporary pin to the arrow-adbc fork branch that relaxes TestSqlPartitionedInts'
+# single-partition assumption (fornwall/arrow-adbc#9, based on the same apache
+# `main` rev the driver's adbc_core/adbc_ffi build on). Revert to a versioned
+# release tag once that change lands upstream.
+set(ARROW_ADBC_REPOSITORY "https://github.com/fornwall/arrow-adbc.git"
+    CACHE STRING "arrow-adbc git repository")
+set(ARROW_ADBC_TAG "735752f51c9fa153b11e535bc0568ab9a85d7db8"
+    CACHE STRING "arrow-adbc git rev (fornwall/arrow-adbc#9)")
 
 include(FetchContent)
 
@@ -36,9 +41,8 @@ set(ADBC_DRIVER_BIGQUERY OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
   arrow_adbc
-  GIT_REPOSITORY https://github.com/apache/arrow-adbc.git
+  GIT_REPOSITORY ${ARROW_ADBC_REPOSITORY}
   GIT_TAG ${ARROW_ADBC_TAG}
-  GIT_SHALLOW TRUE
   # The C/C++ project lives under c/ in the monorepo.
   SOURCE_SUBDIR c)
 FetchContent_MakeAvailable(arrow_adbc)
