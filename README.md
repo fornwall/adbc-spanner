@@ -471,70 +471,19 @@ infinity. Those are the only two modes — there is deliberately no silently-wra
 **[docs/testing.md](docs/testing.md) is the full testing overview** — a map of every kind of test
 (unit/doctest, emulator integration, real Cloud Spanner, resilience/fault-injection, the ADBC C++
 and Foundry validation suites, fuzzing and benchmarks), how to run each locally, and which CI
-workflow runs it. The quickstart below is the essentials.
+workflow runs it.
 
-Unit tests run with no external dependencies:
-
-```sh
-cargo test
-```
-
-The end-to-end integration test in [`tests/integration.rs`](tests/integration.rs) runs the driver
-against Cloud Spanner. It is **skipped automatically** unless a target is configured, so the command
-above stays green everywhere. Two targets are supported:
-
-- `SPANNER_EMULATOR_HOST` — a local [Cloud Spanner emulator](https://cloud.google.com/spanner/docs/emulator).
-  The host may be anything, but the **gRPC port must be `9010`**: the pinned `google-cloud-rust`
-  client derives the admin/REST endpoint by literally substituting `9010`→`9020` in the gRPC
-  endpoint, so on any other port the admin requests (DDL, `create_database`) are sent to the gRPC
-  port and fail cryptically (`error sending request … /ddl`), while plain queries keep working. Move
-  the *host* freely (e.g. a docker-network IP to run several emulators at once), but leave the port
-  at `9010` (admin REST then lands on `9020`).
-- `SPANNER_GCP_DATABASE` — a real Cloud Spanner database, given as `project.instance.database`,
-  reached with [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)
-  (e.g. after `gcloud auth application-default login`).
-
-The helper script starts the emulator in Docker, points the tests at it, and tears it down again:
+Unit tests need no external dependencies, and the Spanner integration tests
+([`tests/integration.rs`](tests/integration.rs)) **skip automatically** unless a target is
+configured — so `cargo test` stays green everywhere:
 
 ```sh
-scripts/with-emulator.sh cargo test --test integration -- --nocapture
-
-# Or against a real instance:
-SPANNER_GCP_DATABASE=my-project.my-instance.my-db cargo test --test integration -- --nocapture
+cargo test                             # unit + doctests (integration self-skips)
+scripts/with-emulator.sh cargo test    # full suite against a throwaway emulator
 ```
 
-The integration suite also includes an **FFI smoke test** that loads the built shared library through
-the ADBC [driver manager](https://crates.io/crates/adbc_driver_manager) (via the `AdbcSpannerInit`
-C entrypoint) and runs a query — exercising the C ABI that the trait-level tests bypass.
-
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `cargo fmt --check`, `clippy`,
-`rustdoc -D warnings`, a `--no-default-features` build, the full test suite against an emulator
-service container, and supply-chain checks (`cargo-deny` + `cargo-machete`).
-
-### Fuzzing
-
-The [`fuzz/`](fuzz/) crate has [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) targets over
-the parts that parse untrusted strings — SQL statement splitting / DDL detection (`sql`), value
-parsers for `DATE`/`TIMESTAMP`/`NUMERIC` (`values`), and the `LIKE` matcher (`like`) — asserting the
-absence of panics (and, for `like`, no exponential blowup). Run one locally on nightly:
-
-```sh
-cargo +nightly fuzz run sql
-```
-
-Fuzzing runs weekly (and on demand) in CI ([`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml)).
-
-### Benchmarks
-
-[Criterion](https://github.com/bheisler/criterion.rs) benchmarks in
-[`benches/conversion.rs`](benches/conversion.rs) cover the driver's hottest path — decoding Spanner
-wire values into Arrow arrays (`src/conversion.rs`). They run entirely offline against synthetic
-values (no network or emulator), one default-size streaming chunk (8192 rows) per benchmark:
-
-```sh
-cargo bench                 # full measurement
-cargo bench -- --test       # fast single-pass sanity run
-```
+See **[docs/testing.md](docs/testing.md)** for real-instance targets, the C++/Foundry validation
+suites, fuzzing, and benchmarks.
 
 ## Releasing
 
