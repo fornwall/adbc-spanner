@@ -177,6 +177,13 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   descriptor, and `Connection::read_partition()` streams one partition's rows back as Arrow.
   `spanner.data_boost_enabled` bakes [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview)
   into the descriptors; `spanner.max_partitions` hints the partition count.
+- [Change streams](https://cloud.google.com/spanner/docs/change-streams) work through the driver's
+  ordinary SQL paths — no dedicated support is needed. `CREATE CHANGE STREAM … FOR <table>` /
+  `DROP CHANGE STREAM` run through the DDL path like any other DDL; the stream is introspectable via
+  `INFORMATION_SCHEMA.CHANGE_STREAMS` / `CHANGE_STREAM_TABLES`; and its generated
+  [`READ_<stream>` table-valued function](https://cloud.google.com/spanner/docs/change-streams/details#change_streams-query-syntax)
+  runs as an ordinary query, with the driver mapping its nested `ChangeRecord`
+  (`data_change_record` / `heartbeat_record` / `child_partitions_record`) natively to Arrow.
 - Error reporting: a Spanner/gRPC failure maps onto the closest ADBC status, keeps the exact numeric
   gRPC code in the ADBC error's `vendor_code` (so a retry loop can detect `ABORTED` = 10 precisely),
   and forwards the response's structured
