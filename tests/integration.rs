@@ -1001,7 +1001,9 @@ fn query_and_dml_round_trip() {
         .bind(default_mode_rows)
         .expect("bind default-mode ingest rows");
     assert_eq!(
-        ingest_default.execute_update().expect("default-mode ingest"),
+        ingest_default
+            .execute_update()
+            .expect("default-mode ingest"),
         Some(2)
     );
     assert_eq!(count_rows(&mut connection, "AdbcDefaultMode"), 2);
@@ -1019,7 +1021,9 @@ fn query_and_dml_round_trip() {
             OptionValue::String("AdbcDefaultMode".into()),
         )
         .unwrap();
-    ingest_dup.bind(dup_rows).expect("bind duplicate ingest rows");
+    ingest_dup
+        .bind(dup_rows)
+        .expect("bind duplicate ingest rows");
     let dup_err = ingest_dup
         .execute_update()
         .expect_err("create onto an existing table must fail");
