@@ -70,6 +70,10 @@ GATED_FILTER+=':SpannerStatementTest.SqlQueryInts'
 GATED_FILTER+=':SpannerStatementTest.SqlQueryStrings'
 GATED_FILTER+=':SpannerStatementTest.SqlQueryErrors'
 GATED_FILTER+=':SpannerStatementTest.SqlQueryTrailingSemicolons'
+# SqlQueryFloats / SqlSchemaFloats run `SELECT CAST(1.5 AS FLOAT64)` via the
+# FloatCastTypeName quirk (arrow-adbc fork PR #7); Spanner has no `FLOAT` keyword.
+GATED_FILTER+=':SpannerStatementTest.SqlQueryFloats'
+GATED_FILTER+=':SpannerStatementTest.SqlSchemaFloats'
 GATED_FILTER+=':SpannerStatementTest.SqlSchemaInts'
 GATED_FILTER+=':SpannerStatementTest.SqlSchemaStrings'
 GATED_FILTER+=':SpannerStatementTest.SqlSchemaErrors'

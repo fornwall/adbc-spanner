@@ -10,9 +10,14 @@ project(adbc_spanner_validation LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Pin to the arrow-adbc release matching the adbc_core / adbc_ffi 0.23 crates the
-# driver builds on. Bump both together.
-set(ARROW_ADBC_TAG "apache-arrow-adbc-23" CACHE STRING "arrow-adbc release tag")
+# Temporary pin to the arrow-adbc fork branch that adds the float-cast-type quirk
+# (`DriverQuirks::FloatCastTypeName`, fornwall/arrow-adbc#7, based on the same
+# apache `main` rev the driver's adbc_core/adbc_ffi build on). Revert to a
+# versioned release tag once that quirk lands upstream.
+set(ARROW_ADBC_REPOSITORY "https://github.com/fornwall/arrow-adbc.git"
+    CACHE STRING "arrow-adbc git repository")
+set(ARROW_ADBC_TAG "bbb530e0c3ea5d3c3477a53d5560b71a8ec8b1ea"
+    CACHE STRING "arrow-adbc git rev (fornwall/arrow-adbc#7)")
 
 include(FetchContent)
 
@@ -36,9 +41,8 @@ set(ADBC_DRIVER_BIGQUERY OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
   arrow_adbc
-  GIT_REPOSITORY https://github.com/apache/arrow-adbc.git
+  GIT_REPOSITORY ${ARROW_ADBC_REPOSITORY}
   GIT_TAG ${ARROW_ADBC_TAG}
-  GIT_SHALLOW TRUE
   # The C/C++ project lives under c/ in the monorepo.
   SOURCE_SUBDIR c)
 FetchContent_MakeAvailable(arrow_adbc)

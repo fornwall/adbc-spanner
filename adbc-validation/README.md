@@ -41,7 +41,11 @@ double-free on a second release), `AdbcStatementExecuteQuery` writing
 exporter preserving the caller's `AdbcError.private_data` on the ADBC 1.0.0 path
 (upstream [apache/arrow-adbc#4473](https://github.com/apache/arrow-adbc/pull/4473)).
 The **C++** validation library and driver manager come from `ARROW_ADBC_TAG`;
-they interoperate with the driver over the C ABI.
+they interoperate with the driver over the C ABI. That tag is temporarily pinned to
+the [`fornwall/arrow-adbc#7`](https://github.com/fornwall/arrow-adbc/pull/7) fork
+branch (based on the same apache `main` rev), which adds the `FloatCastTypeName`
+`DriverQuirks` hook so `SELECT CAST(1.5 AS FLOAT64)` runs against Spanner; revert to
+a versioned release once that quirk lands upstream.
 
 `SpannerQuirks` (in `spanner_validation.cc`) describes Spanner's capabilities to
 the suite — named `@p` parameters, DDL via the admin API, all four ingest modes,
@@ -67,9 +71,12 @@ Spanner's model self-skip rather than fail.
   in the pinned `adbc_ffi` rev), and the ingest **error paths** (`SqlIngestErrors`:
   ingest-without-bind → `INVALID_STATE`, append to a nonexistent table → error,
   create over an existing table → error, incompatible-schema append → error — the
-  one `SqlIngest*` case with no non-Spanner DDL or `SELECT *` readback to block it).
+  one `SqlIngest*` case with no non-Spanner DDL or `SELECT *` readback to block it),
+  and floating-point `execute`/`execute_schema` (`SqlQueryFloats` / `SqlSchemaFloats`:
+  `SELECT CAST(1.5 AS FLOAT64)` via the `FloatCastTypeName` quirk, since GoogleSQL has
+  no `FLOAT` keyword).
 
-**All 44 gated tests pass, 0 self-skip.** `DatabaseTest` and `ConnectionTest` run in
+**All 46 gated tests pass, 0 self-skip.** `DatabaseTest` and `ConnectionTest` run in
 full; the `StatementTest` cases are an explicit allowlist in
 `scripts/run-adbc-validation.sh`. `SpannerQuirks::supports_bulk_ingest` declares
 all four ingest modes (append, create, create_append, replace — the create

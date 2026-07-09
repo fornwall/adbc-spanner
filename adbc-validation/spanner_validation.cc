@@ -127,6 +127,11 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
     return "@p" + std::to_string(index);
   }
 
+  // GoogleSQL/Spanner has no `FLOAT` type keyword; a 64-bit float is `FLOAT64`.
+  // The suite's `SELECT CAST(1.5 AS <type>)` cases use this quirk
+  // (arrow-adbc fork PR #7) so they run against Spanner.
+  std::string FloatCastTypeName() const override { return "FLOAT64"; }
+
   // The driver supports all four ingest modes; for the create modes it builds
   // the table from the ingest data's Arrow schema with a synthetic
   // `adbc_ingest_key` UUID primary key (Spanner mandates a primary key).
