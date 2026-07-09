@@ -16,9 +16,9 @@
 #
 # The suite's base query corpus assumes a portable SQL dialect (no mandatory PRIMARY KEY,
 # INTEGER/BIGINT type names, positional $1 parameters); the Spanner-dialect overrides under
-# python/validation/queries/spanner/ cover the corpus, so this run GATES CI
+# foundry-validation/queries/spanner/ cover the corpus, so this run GATES CI
 # (foundry-validation.yml). Every case passes or skips with a reason — no expected failures;
-# see python/validation/README.md.
+# see foundry-validation/README.md.
 #
 # -e matters here: without it a failed `cargo build` let the suite proceed and
 # validate a *stale* previously-built cdylib — plausible-looking results for old code.
@@ -96,5 +96,5 @@ fi
 
 echo ">> ADBC_SPANNER_DATABASE=$ADBC_SPANNER_DATABASE"
 echo ">> running the Foundry validation suite"
-cd "$REPO_ROOT/python/validation"
+cd "$REPO_ROOT/foundry-validation"
 exec "$PYTHON" -m pytest -p no:cacheprovider "$@"

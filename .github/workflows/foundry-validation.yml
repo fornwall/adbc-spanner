@@ -1,9 +1,9 @@
 name: Foundry validation
 
 # The ADBC Driver Foundry validation suite (adbc-drivers/validation) as a type/feature coverage
-# harness. Gating: the Spanner-dialect overrides under python/validation/queries/spanner/ cover
+# harness. Gating: the Spanner-dialect overrides under foundry-validation/queries/spanner/ cover
 # the whole corpus (every case passes or skips with a reason — no expected failures; see
-# python/validation/README.md). The canonical Apache C++ conformance suite runs in
+# foundry-validation/README.md). The canonical Apache C++ conformance suite runs in
 # adbc-validation.yml.
 on:
   push:
@@ -37,7 +37,7 @@ jobs:
       # Fail the job if the suite runs but exercises no real coverage — i.e. every
       # collected case was skipped/errored rather than actually passing — so a broken
       # harness can't masquerade as an all-expected-dialect-skips green run. Enforced
-      # by pytest_sessionfinish in python/validation/tests/conftest.py.
+      # by pytest_sessionfinish in foundry-validation/tests/conftest.py.
       FOUNDRY_VALIDATION_REQUIRE_PASSES: "1"
 
     steps:

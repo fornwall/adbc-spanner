@@ -871,7 +871,7 @@ idempotent, so a repeated failure never spams new issues. No third-party action 
 dialect failures~~ (**Fixed.** The trailing `|| true` is gone: the workflow's "Run the Foundry
 validation suite" step now runs `scripts/run-foundry-validation.sh` directly, and the job runs on
 pushes to main and pull requests rather than being an informational, always-green `workflow_dispatch`
-run. The Spanner-dialect override corpus under `python/validation/queries/spanner/` now covers the
+run. The Spanner-dialect override corpus under `foundry-validation/queries/spanner/` now covers the
 whole suite — every case passes or skips with a reason, no expected failures or xfails — so genuine
 harness breakage now fails the job loudly instead of being swallowed: a failed `cargo build` or
 validation-package install (`set -euo pipefail`), an emulator/database-never-ready condition (an
@@ -880,7 +880,7 @@ which stay gated by the "database listable" readiness loop), a pytest collection
 crashed cdylib, or any case that unexpectedly fails or errors. The one remaining way an all-green run
 could exercise no real coverage — every collected case *skipped* (pytest exits 0 when nothing fails),
 which would again make a silently-broken harness look like all-expected-dialect-skips — is now closed
-by a `pytest_sessionfinish` guard in `python/validation/tests/conftest.py`: when
+by a `pytest_sessionfinish` guard in `foundry-validation/tests/conftest.py`: when
 `FOUNDRY_VALIDATION_REQUIRE_PASSES` is set (the workflow sets it) it forces a `TESTS_FAILED` exit if
 the suite collected cases but none actually passed, mirroring the env-gated fail-loud convention of
 the `ADBC_TEST_REQUIRE_TARGET` skip guard; ad-hoc local `-k` runs, which don't set the flag, are
