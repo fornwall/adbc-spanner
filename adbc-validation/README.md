@@ -64,9 +64,12 @@ Spanner's model self-skip rather than fail.
   single-use query API otherwise rejects), query cancellation, concurrent
   statements, result independence/invalidation, and `AdbcError` compatibility
   (the exporter preserves a 1.0.0 caller's `private_data` — apache/arrow-adbc#4473,
-  in the pinned `adbc_ffi` rev).
+  in the pinned `adbc_ffi` rev), and the ingest **error paths** (`SqlIngestErrors`:
+  ingest-without-bind → `INVALID_STATE`, append to a nonexistent table → error,
+  create over an existing table → error, incompatible-schema append → error — the
+  one `SqlIngest*` case with no non-Spanner DDL or `SELECT *` readback to block it).
 
-**All 43 gated tests pass, 0 self-skip.** `DatabaseTest` and `ConnectionTest` run in
+**All 44 gated tests pass, 0 self-skip.** `DatabaseTest` and `ConnectionTest` run in
 full; the `StatementTest` cases are an explicit allowlist in
 `scripts/run-adbc-validation.sh`. `SpannerQuirks::supports_bulk_ingest` declares
 all four ingest modes (append, create, create_append, replace — the create
@@ -96,7 +99,9 @@ incremental driver work:
 - **Ingest readback** — the driver supports create-mode ingest (with a
   synthetic `adbc_ingest_key` UUID primary key, since Spanner mandates one),
   and since the quirks declare it the `SqlIngest*` cases now *run* under
-  `--full` instead of skipping — but they remain blocked: they read the data
+  `--full` instead of skipping — but the readback cases remain blocked (the
+  error-path-only `SqlIngestErrors`, which needs no readback, is gated): they read
+  the data
   back via a hardcoded double-quoted `SELECT * FROM "bulk_ingest" ORDER BY "col" …`
   (not valid GoogleSQL, no quirks hook), and `SELECT *` would also surface the
   synthetic key column, breaking the single-column result assertions. Where the
