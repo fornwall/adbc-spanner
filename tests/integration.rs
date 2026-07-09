@@ -7297,6 +7297,174 @@ fn rpc_timeouts() {
     drop.execute_update().expect("drop rpc-timeout table");
 }
 
+/// Spanner **change streams** are usable through the driver's ordinary SQL paths — no dedicated
+/// driver support is needed. This exercises the full plain-SQL surface end-to-end:
+///
+/// 1. `CREATE CHANGE STREAM … FOR <table>` and `DROP CHANGE STREAM` run through the driver's DDL
+///    path (`execute_update`), just like any other DDL.
+/// 2. The stream is introspectable through `INFORMATION_SCHEMA.CHANGE_STREAMS` /
+///    `CHANGE_STREAM_TABLES` as ordinary read queries.
+/// 3. The generated `READ_<stream>` table-valued function runs through the ordinary query path and
+///    the driver maps its richly-nested `ChangeRecord` result (a `List<Struct<data_change_record,
+///    heartbeat_record, child_partitions_record>>`) natively to Arrow.
+///
+/// The `READ_` TVF is a *tailing* read: its `start_timestamp` must be at or after the change
+/// stream's earliest read timestamp, which the emulator tracks at ~now (it keeps no historical
+/// change data), so we read a small window that begins in the very near future. The initial call
+/// with `partition_token => NULL` deterministically yields the stream's child-partition record;
+/// surfacing an actual `data_change_record` would require following those partition tokens in a
+/// streaming follow-up read (timing-sensitive), which is out of scope here — we assert on the fully
+/// mapped result *schema* plus a non-empty result instead, which is deterministic.
+#[test]
+fn change_stream_via_plain_sql() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping change_stream_via_plain_sql");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    // --- (1) DDL: create the watched table and a change stream over it, via plain SQL. ---
+    run(
+        &mut connection,
+        "DROP TABLE IF EXISTS AdbcChangeStream; \
+         CREATE TABLE AdbcChangeStream (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
+    );
+    run(
+        &mut connection,
+        "CREATE CHANGE STREAM AdbcChangeStreamCs FOR AdbcChangeStream",
+    );
+
+    // --- (2) The stream is introspectable through INFORMATION_SCHEMA as ordinary read queries. ---
+    let mut streams = connection.new_statement().expect("new statement");
+    streams
+        .set_sql_query(
+            "SELECT CHANGE_STREAM_NAME FROM INFORMATION_SCHEMA.CHANGE_STREAMS \
+             WHERE CHANGE_STREAM_NAME = 'AdbcChangeStreamCs'",
+        )
+        .unwrap();
+    let stream_batches: Vec<_> = streams
+        .execute()
+        .expect("query change stream metadata")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect change stream metadata");
+    let stream_rows: usize = stream_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        stream_rows, 1,
+        "the change stream should be listed exactly once"
+    );
+    let names = stream_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.value(0), "AdbcChangeStreamCs");
+
+    // The change stream must be associated with the watched table.
+    let mut tables = connection.new_statement().expect("new statement");
+    tables
+        .set_sql_query(
+            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.CHANGE_STREAM_TABLES \
+             WHERE CHANGE_STREAM_NAME = 'AdbcChangeStreamCs'",
+        )
+        .unwrap();
+    let table_batches: Vec<_> = tables
+        .execute()
+        .expect("query change stream tables")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect change stream tables");
+    let watched: Vec<String> = table_batches
+        .iter()
+        .flat_map(|b| {
+            let col = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            (0..col.len())
+                .map(|i| col.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        watched,
+        vec!["AdbcChangeStream".to_string()],
+        "the change stream should watch exactly the AdbcChangeStream table"
+    );
+
+    // Seed a write so the stream has data to have captured (before the tailing window).
+    run(
+        &mut connection,
+        "INSERT INTO AdbcChangeStream (Id, Name) VALUES (1, 'alpha'), (2, 'beta')",
+    );
+
+    // --- (3) Read the change stream through its generated READ_ TVF as an ordinary query. ---
+    //
+    // A short tailing window starting in the near future (the emulator's earliest-read timestamp
+    // tracks ~now). The initial NULL-partition read returns the stream's child-partition record.
+    let start = chrono::Utc::now() + chrono::Duration::milliseconds(500);
+    let end = chrono::Utc::now() + chrono::Duration::seconds(3);
+    let start_lit = start.to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let end_lit = end.to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let read_sql = format!(
+        "SELECT ChangeRecord FROM READ_AdbcChangeStreamCs (\
+             start_timestamp => TIMESTAMP '{start_lit}', \
+             end_timestamp => TIMESTAMP '{end_lit}', \
+             partition_token => NULL, \
+             heartbeat_milliseconds => 2000)"
+    );
+    let mut reader_stmt = connection.new_statement().expect("new statement");
+    reader_stmt.set_sql_query(read_sql).unwrap();
+    let reader = reader_stmt.execute().expect("read change stream TVF");
+    let schema = reader.schema();
+
+    // The driver maps the whole ChangeRecord type natively: a List<Struct<...>> whose element struct
+    // carries the three change-record variants.
+    assert_eq!(schema.fields().len(), 1);
+    let change_field = schema.field(0);
+    assert_eq!(change_field.name(), "ChangeRecord");
+    let DataType::List(elem) = change_field.data_type() else {
+        panic!(
+            "ChangeRecord should map to a List, got {:?}",
+            change_field.data_type()
+        );
+    };
+    let DataType::Struct(record_fields) = elem.data_type() else {
+        panic!(
+            "ChangeRecord element should be a Struct, got {:?}",
+            elem.data_type()
+        );
+    };
+    let record_field_names: Vec<&str> = record_fields.iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(
+        record_field_names,
+        vec![
+            "data_change_record",
+            "heartbeat_record",
+            "child_partitions_record"
+        ],
+        "the change record struct should expose all three record variants"
+    );
+
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect change stream records");
+    let record_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert!(
+        record_rows >= 1,
+        "the initial change-stream read should yield at least the child-partition record"
+    );
+
+    // --- Cleanup: the stream must be dropped before the table it watches. ---
+    run(&mut connection, "DROP CHANGE STREAM AdbcChangeStreamCs");
+    run(&mut connection, "DROP TABLE AdbcChangeStream");
+}
+
 /// Opt-in **end-to-end auth** tests: drive the `spanner.keyfile` and
 /// `spanner.impersonate.target_principal` credential paths against a **real** Cloud Spanner database
 /// and prove each one authenticates by running a trivial `SELECT 1`.

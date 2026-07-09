@@ -871,13 +871,14 @@ schema-build time instead of returning a corrupt column. The rejection recurses,
 `proto_and_enum_columns_are_rejected_cleanly` in `src/conversion.rs` (offline; builds the types
 straight from the generated model type, asserts the status + a type-naming message for the scalar
 and array cases); the type-mapping tables/notes in the module docs and README were updated to match.);
-change streams and ~~GQL graph
-queries~~ (**Fixed** for GQL: property graphs and GQL graph queries do work through plain SQL — a
-`CREATE PROPERTY GRAPH` DDL over ordinary node/edge tables plus a `GRAPH … MATCH … RETURN` query run
-through the normal `execute` path, verified end-to-end against the emulator by
-`gql_graph_query_round_trip` in `tests/integration.rs` and claimed in the README/CLAUDE.md feature
-lists; the change-streams half is still open) may already work through plain SQL — one emulator test
-each would let the README claim them; ~~telemetry/tracing hooks~~ (**Won't fix.** A `tracing`-event
+~~change streams and GQL graph queries~~ (**Fixed.** Both now work through the ordinary plain-SQL
+paths. Change streams: `CREATE`/`DROP CHANGE STREAM` DDL, `INFORMATION_SCHEMA.CHANGE_STREAMS`/
+`CHANGE_STREAM_TABLES` introspection, and the generated `READ_<stream>` TVF (nested `ChangeRecord`
+mapped natively to Arrow), covered by `change_stream_via_plain_sql`. GQL graph queries: a `CREATE
+PROPERTY GRAPH` DDL over ordinary node/edge tables plus a `GRAPH … MATCH … RETURN` query on the
+normal `execute` path, covered by `gql_graph_query_round_trip`. Both verified end-to-end against the
+emulator in `tests/integration.rs` and claimed in the README/CLAUDE.md feature lists.);
+~~telemetry/tracing hooks~~ (**Won't fix.** A `tracing`-event
 prototype was implemented and reviewed in PR #194, then dropped: emitting Rust `tracing` events is
 invisible to the driver's primary consumers, who load the **cdylib through an ADBC driver manager**
 (the Python wheel / C hosts) where no Rust subscriber is ever installed — a `tracing` subscriber only

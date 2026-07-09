@@ -465,6 +465,17 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   considered and deliberately not implemented). Transport descriptors only over trusted channels and
   never execute one from an untrusted source; the `read_partition`/`execute_partitions` rustdoc
   states the same.
+- Change streams: no dedicated driver code — they ride the ordinary SQL paths. `CREATE`/`DROP CHANGE
+  STREAM` go through the DDL path; `INFORMATION_SCHEMA.CHANGE_STREAMS`/`CHANGE_STREAM_TABLES` are
+  plain read queries; and the generated `READ_<stream>` TVF runs through the normal `execute` query
+  path, with `conversion.rs`'s native STRUCT/ARRAY mapping surfacing the nested `ChangeRecord`
+  (`data_change_record`/`heartbeat_record`/`child_partitions_record`) as Arrow `List<Struct<…>>`.
+  The emulator supports change-stream DDL + metadata + the TVF but keeps no historical change data
+  (its earliest-read timestamp tracks ~now), so the `READ_` TVF is a near-future tailing read whose
+  initial `partition_token => NULL` call yields the child-partition record; surfacing an actual
+  `data_change_record` needs the streaming child-partition follow-up read, out of scope for the test.
+  Covered by `change_stream_via_plain_sql` in `tests/integration.rs` (asserts DDL + `INFORMATION_SCHEMA`
+  rows + the fully-mapped TVF result schema). Claimed in README.md.
 - Still returning `NotImplemented` (keep the pattern until implemented): Substrait
   (`set_substrait_plan`) — Spanner executes GoogleSQL/PostgreSQL text, not Substrait plans.
 - Commits in this environment may need `-c commit.gpgsign=false` if no signing agent is present.
