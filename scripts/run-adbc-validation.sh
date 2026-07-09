@@ -59,6 +59,13 @@ GATED_FILTER+=':SpannerStatementTest.SqlPrepareSelectNoParams'
 GATED_FILTER+=':SpannerStatementTest.SqlPrepareUpdateNoParams'
 GATED_FILTER+=':SpannerStatementTest.SqlPrepareErrorNoQuery'
 GATED_FILTER+=':SpannerStatementTest.SqlPrepareErrorParamCountMismatch'
+# SqlIngestErrors exercises the ingest error paths only (no readback): ingest
+# without bind -> INVALID_STATE, append to a nonexistent table -> error, create
+# over an existing table -> error, and an incompatible-schema append -> error.
+# It uses a single int64 column and the quirks DropTable (no hardcoded
+# non-Spanner DDL, no SELECT * readback), so unlike the other SqlIngest* cases it
+# passes cleanly against the driver.
+GATED_FILTER+=':SpannerStatementTest.SqlIngestErrors'
 GATED_FILTER+=':SpannerStatementTest.SqlQueryInts'
 GATED_FILTER+=':SpannerStatementTest.SqlQueryStrings'
 GATED_FILTER+=':SpannerStatementTest.SqlQueryErrors'
