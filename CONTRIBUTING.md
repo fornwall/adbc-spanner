@@ -7,6 +7,9 @@ temporary dependency pins (see [Dependency pins](#dependency-pins) below).
 
 ## Building and testing
 
+See [docs/testing.md](docs/testing.md) for the full testing overview (all suites, how to run each,
+and which CI workflow runs it). The essentials:
+
 ```sh
 cargo build                 # builds the rlib and the cdylib (libadbc_spanner.so/.dylib/.dll)
 cargo test                  # unit tests + doctests; the emulator integration test self-skips
