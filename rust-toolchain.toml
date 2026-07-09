@@ -3,8 +3,8 @@
 # without pinning an exact version. It guarantees contributors have the rustfmt + clippy
 # components CI enforces (`cargo fmt --all --check`, `cargo clippy -D warnings`).
 #
-# Note: the crate's MSRV is declared separately as `rust-version = "1.96"` in Cargo.toml; this
-# file sets the default dev toolchain, not the minimum supported one.
+# Note: the crate's MSRV is declared separately in Cargo.toml; this file sets the
+# default dev toolchain, not the minimum supported one.
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]
