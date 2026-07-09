@@ -293,14 +293,14 @@ with spanner.connect(
     autocommit=True,                         # apply immediately; returns the row count
 ) as conn:
     with conn.cursor() as cur:
-        # `append` (the default) inserts into an existing table.
+        # `append` inserts into an existing table (the default mode is `create`).
         rows = cur.adbc_ingest("Singers", pa.Table.from_pandas(frame), mode="append")
 ```
 
 The `mode` selects how the target table is handled:
 
-- `append` — insert into an existing table (the default).
-- `create` — create the table from the data's Arrow schema first, erroring if it already exists.
+- `create` — create the table from the data's Arrow schema first, erroring if it already exists (the default).
+- `append` — insert into an existing table.
 - `create_append` — create the table only if it is absent, then insert.
 - `replace` — drop any existing table, recreate it from the schema, then insert.
 

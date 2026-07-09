@@ -95,9 +95,9 @@ pub struct SpannerStatement {
     target_catalog: Option<String>,
     /// Ingest mode (`adbc.ingest.mode`), parsed once in `set_option` (which rejects unknown
     /// modes) so the ingest paths match it exhaustively; `get_option` reports the spec's
-    /// canonical `adbc.ingest.mode.*` spelling. `append` (default), `create`, `create_append`,
-    /// and `replace`; the create/replace modes build the table from the ingest data's Arrow
-    /// schema.
+    /// canonical `adbc.ingest.mode.*` spelling. `create` (the ADBC spec default — unset `None`
+    /// resolves to it), `append`, `create_append`, and `replace`; the create/replace modes build
+    /// the table from the ingest data's Arrow schema.
     ingest_mode: Option<IngestMode>,
     /// Primary-key columns for a create-mode bulk ingest (`spanner.ingest.primary_key`). `None`
     /// (the default) makes the create modes append a synthetic `adbc_ingest_key` UUID key; `Some`
@@ -266,18 +266,20 @@ impl SpannerStatement {
 
     /// DDL to run before an ingest, for the create/replace ingest modes (`None` for append).
     ///
-    /// `create` builds the table (erroring if it exists), `create_append` builds it if absent, and
-    /// `replace` drops any existing table first. The schema comes from the bound ingest data.
+    /// `create` (the default — see [`ingest_mode`](Self::ingest_mode)) builds the table (erroring
+    /// if it exists), `create_append` builds it if absent, and `replace` drops any existing table
+    /// first. The schema comes from the bound ingest data.
     fn build_ingest_table_ddl(
         &self,
         table: &str,
         mode: Option<IngestMode>,
     ) -> Result<Option<Vec<String>>> {
         // Exhaustive: unknown modes were already rejected by `set_option` (`ingest_mode_option`).
+        // Unset (`None`) is `create`, the ADBC spec default.
         let (if_not_exists, drop_first) = match mode {
-            // Append (the default) into an existing table: no DDL.
-            None | Some(IngestMode::Append) => return Ok(None),
-            Some(IngestMode::Create) => (false, false),
+            // Append into an existing table: no DDL.
+            Some(IngestMode::Append) => return Ok(None),
+            None | Some(IngestMode::Create) => (false, false),
             Some(IngestMode::CreateAppend) => (true, false),
             Some(IngestMode::Replace) => (false, true),
         };
@@ -418,8 +420,8 @@ impl SpannerStatement {
     /// on every exit path (success, failed DDL, failed insert) in one place.
     fn run_bound_ingest(&self, table: &str) -> Result<Option<i64>> {
         let ingest_ddl = self.build_ingest_table_ddl(table, self.ingest_mode)?;
-        // `append` (the default) is the only mode that inserts into a pre-existing table, so it is
-        // the only one whose failure the ADBC spec wants remapped to NotFound / AlreadyExists.
+        // `append` is the only mode that inserts into a pre-existing table, so it is the only one
+        // whose failure the ADBC spec wants remapped to NotFound / AlreadyExists.
         // `build_ingest_table_ddl` returns `None` for exactly that mode.
         let is_append = ingest_ddl.is_none();
         if let Some(ddl) = ingest_ddl {
@@ -446,7 +448,8 @@ impl SpannerStatement {
     /// drops first, so their DDL failures are never about the table already existing. If the table
     /// is absent — or the probe itself fails — the original DDL error surfaces unchanged.
     fn remap_ingest_create_error(&self, table: &str, error: Error) -> Error {
-        if !matches!(self.ingest_mode, Some(IngestMode::Create)) {
+        // Unset (`None`) is `create`, the default, so remap its DDL failure too.
+        if !matches!(self.ingest_mode, None | Some(IngestMode::Create)) {
             return error;
         }
         let db_schema = self.target_db_schema.as_deref().unwrap_or("");
@@ -1130,8 +1133,11 @@ impl Optionable for SpannerStatement {
             // Only the spec default (`false`) is ever accepted (see `check_ingest_temporary`), so
             // the driver's state is always `false` — report exactly that.
             OptionStatement::Temporary => Some(false.to_string()),
-            // Reported in the spec's canonical `adbc.ingest.mode.*` spelling.
-            OptionStatement::IngestMode => self.ingest_mode.map(String::from),
+            // Reported in the spec's canonical `adbc.ingest.mode.*` spelling; unset reports the
+            // effective default, `create`.
+            OptionStatement::IngestMode => {
+                Some(String::from(self.ingest_mode.unwrap_or(IngestMode::Create)))
+            }
             // The comma-joined key columns when set; unset (the synthetic key) reports NotFound.
             OptionStatement::Other(k) if k == crate::OPTION_INGEST_PRIMARY_KEY => {
                 self.ingest_primary_key.as_ref().map(|cols| cols.join(","))
