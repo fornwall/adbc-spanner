@@ -16,7 +16,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # release tag once that change lands upstream.
 set(ARROW_ADBC_REPOSITORY "https://github.com/fornwall/arrow-adbc.git"
     CACHE STRING "arrow-adbc git repository")
-set(ARROW_ADBC_TAG "735752f51c9fa153b11e535bc0568ab9a85d7db8"
+set(ARROW_ADBC_TAG "d16588b5dbc8720ba559fc538c2ea434599df82e"
     CACHE STRING "arrow-adbc git rev (fornwall/arrow-adbc#9)")
 
 include(FetchContent)
