@@ -161,7 +161,21 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   // catalog()/db_schema() return), so the connection reports them rather than NOT_FOUND.
   bool supports_metadata_current_catalog() const override { return true; }
   bool supports_metadata_current_db_schema() const override { return true; }
-  bool supports_ingest_view_types() const override { return false; }
+  // View-typed columns, a target catalog, and a target db-schema are all real
+  // driver capabilities (the driver binds Arrow view layouts, accepts the single
+  // unnamed catalog "", and has named-schema support), so declare them rather than
+  // hiding the cases behind a false quirk. The two families then diverge:
+  //   - SqlIngest{BinaryView,StringView} *run* and fail with the rest of the
+  //     ingest-readback family (blocked by the suite's hardcoded `SELECT *`
+  //     readback) — an excluded expected-failure that flips to passing once that
+  //     readback is fixed.
+  //   - SqlIngest{TargetCatalog,TargetSchema,TargetCatalogSchema} only ingest and
+  //     never read back, so they pass cleanly and are gate-enforced (not excluded).
+  bool supports_ingest_view_types() const override { return true; }
+  bool supports_bulk_ingest_catalog() const override { return true; }
+  bool supports_bulk_ingest_db_schema() const override { return true; }
+  // Spanner has no float16 type and no temporary tables, so these stay unsupported;
+  // the corresponding cases self-skip (and are not excluded).
   bool supports_ingest_float16() const override { return false; }
 
   std::string catalog() const override { return ""; }

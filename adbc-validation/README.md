@@ -119,19 +119,36 @@ guard — no emulator required — with:
 scripts/run-adbc-validation.sh --check-drift
 ```
 
-Today `EXCLUDED` holds **55** cases (45 non-excluded cases — 44 passing plus
-`Transactions`, which self-skips — + 55 excluded = 100 upstream cases total).
+Today `EXCLUDED` holds **45** cases (55 non-excluded cases — 49 passing plus 6 that
+self-skip: `Transactions`, `SqlIngestFloat16`, and the four `SqlIngestTemporary*` —
++ 45 excluded = 100 upstream cases total).
 
-`Transactions` is deliberately **not** excluded: it creates a table inside an
-uncommitted transaction and expects it hidden from other connections and removed
-on rollback, which requires transactional DDL. Spanner has none — DDL goes through
-the admin `UpdateDatabaseDdl` API, auto-commits immediately, and cannot be rolled
-back — so the case can never apply. The `ddl_implicit_commit_txn` quirk (set in
-`spanner_validation.cc`) makes it **self-skip** via the case's own guard, which the
-gate tolerates. That is cleaner than carrying it as an expected failure: an
-inapplicable case can never "start passing", so it needs no expected-failure
-bookkeeping, and a skip states the truth ("not applicable to Spanner") rather than
-implying the driver got it wrong.
+Six cases are deliberately **not** excluded because they **self-skip**, which the
+gate tolerates — so they need no expected-failure bookkeeping. Each is inapplicable
+to Spanner's model, so it can never "start passing", and a skip states the truth
+("not applicable to Spanner") rather than implying the driver got it wrong:
+
+- `Transactions` creates a table inside an uncommitted transaction and expects it
+  hidden from other connections and removed on rollback — i.e. transactional DDL.
+  Spanner has none (DDL goes through the admin `UpdateDatabaseDdl` API, auto-commits
+  immediately, and cannot be rolled back), so the `ddl_implicit_commit_txn` quirk
+  makes the case self-skip via its own guard.
+- `SqlIngestFloat16` — Spanner has no 16-bit float type (`supports_ingest_float16`
+  is `false`).
+- `SqlIngestTemporary{,Append,Replace,Exclusive}` — Spanner has no temporary tables
+  (`supports_bulk_ingest_temporary` is `false`; the driver also rejects
+  `adbc.ingest.temporary=true` outright).
+
+The view-type and target-catalog/db-schema ingest variants are the *opposite* call:
+the driver genuinely supports those inputs, so their quirks are declared `true`
+rather than hiding the cases behind a false quirk. The two families then diverge:
+
+- `SqlIngestBinaryView` / `SqlIngestStringView` **run and fail** with the rest of the
+  ingest-readback family (below) — kept in `EXCLUDED` as expected failures that will
+  flip to passing once the readback is fixed.
+- `SqlIngestTargetCatalog` / `SqlIngestTargetSchema` / `SqlIngestTargetCatalogSchema`
+  only ingest and **never read back**, so with the create-mode default they pass
+  cleanly and are gate-enforced (not excluded).
 
 ## The `EXCLUDED` cases, by bucket
 
@@ -157,7 +174,11 @@ none of them incremental driver work:
   value is separable — the ingest **identifier-escaping** tests (reserved-word
   table/column names) — it is captured natively instead: the driver quotes
   ingest identifiers (`bind::insert_sql`) and `tests/integration.rs` exercises
-  an append-mode ingest into a table `create` with a column `index`.
+  an append-mode ingest into a table `create` with a column `index`. The
+  view-type variants (`BinaryView`/`StringView`) ride in this bucket too — their
+  quirks are declared `true`, so they run and fail on the same readback (see the
+  note above for why the `TargetCatalog`/`TargetSchema` variants pass instead, and
+  why `Float16` / `Temporary*` self-skip).
 - **`ECANCELED` through the C stream** — `SqlQueryCancel` requires the result
   stream's `get_next` to return exactly `ECANCELED` (125) after a cancel, but
   arrow-rs's `FFI_ArrowArrayStream` exporter (which `adbc_ffi` uses to export
