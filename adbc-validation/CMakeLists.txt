@@ -10,15 +10,20 @@ project(adbc_spanner_validation LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Pin to the arrow-adbc release matching the adbc_core / adbc_ffi 0.23 crates the
-# driver builds on. Bump both together.
+# Pin to an apache/arrow-adbc `main` revision, matching the family of the
+# adbc_core / adbc_ffi git pin the driver builds on (see Cargo.toml). Tracking
+# `main` (rather than the 0.23 release tag) picks up the C++ validation fix in
+# apache/arrow-adbc#4493 — TestSqlPartitionedInts now allows >1 partition, so
+# SpannerStatementTest.SqlPartitionedInts is gate-enforced instead of excluded.
+# Bump the SHA to advance the suite.
 #
 # FORCE so this pin always wins over a value cached in a restored/incremental
 # build tree: a plain `set(... CACHE STRING)` is a no-op when the entry already
 # exists, so a stale `CMakeCache.txt` (e.g. one restored from a run on the old
 # rev) would silently keep the previous tag and rebuild against the wrong
 # arrow-adbc source. FORCE makes a rev bump here authoritative.
-set(ARROW_ADBC_TAG "apache-arrow-adbc-23" CACHE STRING "arrow-adbc release tag" FORCE)
+set(ARROW_ADBC_TAG "f9886ddca13a2ea2f044a453216b3973b66cd98f"
+    CACHE STRING "arrow-adbc main revision" FORCE)
 
 include(FetchContent)
 

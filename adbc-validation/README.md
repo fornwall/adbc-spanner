@@ -29,8 +29,8 @@ The script builds the cdylib and the harness, creates the emulator
 instance/database when needed, and runs the suite. Requirements beyond the Rust
 toolchain: a C++17 compiler, CMake (≥ 3.20) and git. Everything else — the
 arrow-adbc validation library, the ADBC driver manager, fmt, nanoarrow and
-GoogleTest — is fetched and built from source at a pinned arrow-adbc release
-(`ARROW_ADBC_TAG` in `CMakeLists.txt`). No system packages are required.
+GoogleTest — is fetched and built from source at a pinned arrow-adbc `main`
+revision (`ARROW_ADBC_TAG` in `CMakeLists.txt`). No system packages are required.
 
 The **driver** (cdylib) links the `adbc_core` / `adbc_ffi` crates from a git pin
 (an `apache/arrow-adbc` `main` revision — see `Cargo.toml`) that carries three FFI
@@ -70,7 +70,7 @@ Spanner's model self-skip rather than fail.
   one `SqlIngest*` case with no non-Spanner DDL or `SELECT *` readback to block it).
 
 The gate runs **every case except the documented `EXCLUDED` expected-failures**
-(see the next section), and they all pass or self-skip — today **44 cases, 0
+(see the next section), and they all pass or self-skip — today **45 cases, 0
 self-skip**. `DatabaseTest` and `ConnectionTest` pass in full; from `StatementTest`
 everything but the `EXCLUDED` list in `scripts/run-adbc-validation.sh` runs here.
 `SpannerQuirks::supports_bulk_ingest` declares
@@ -172,14 +172,16 @@ none of them incremental driver work:
   `cancel_between_stream_chunks_cancels_the_next_fetch` in
   `tests/integration.rs`; fixing the errno needs a status-aware stream export
   in `adbc_ffi` (the git-pinned fork), at which point the case can be re-gated.
-- **Rigid single-partition assumption** — `SqlPartitionedInts` is now *runnable*
-  (the driver implements `execute_partitions`/`read_partition`, and the
-  `supports_partitioned_data` quirk is `true`), but the upstream case hardcodes
-  `ASSERT_EQ(1, num_partitions)` ("Assume only 1 partition") for `SELECT 42`.
-  Spanner's `partitionQuery` is free to return more — the emulator returns 2 — so
-  the case cannot be gated. The driver's own partitioned round-trip
-  (`execute_partitions` → `read_partition`, union of rows) is covered natively by
-  `execute_partitions_round_trip` in `tests/integration.rs`.
+
+`SqlPartitionedInts` was formerly a fourth bucket ("rigid single-partition
+assumption"): the upstream case hardcoded `ASSERT_EQ(1, num_partitions)` for
+`SELECT 42`, but Spanner's `partitionQuery` is free to return more — the emulator
+returns 2. apache/arrow-adbc#4493 relaxed it to allow `>= 1` partitions and assert
+on the *union* of all of them, so with `ARROW_ADBC_TAG` on a `main` revision that
+carries the fix the case now passes and is **gate-enforced** (the driver
+implements `execute_partitions`/`read_partition` and the `supports_partitioned_data`
+quirk is `true`). Its round-trip is additionally covered natively by
+`execute_partitions_round_trip` in `tests/integration.rs`.
 
 The three `adbc_ffi` issues that previously blocked a whole swath of these — a
 non-idempotent error release (which aborted the process), a missing

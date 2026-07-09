@@ -146,14 +146,13 @@ EXCLUDED=(
   # sticky; covered natively by cancel_between_stream_chunks_cancels_the_next_fetch
   # in tests/integration.rs.
   'SpannerStatementTest.SqlQueryCancel'
-
-  # --- Bucket 4: rigid single-partition assumption ----------------------------
-  # SqlPartitionedInts hardcodes ASSERT_EQ(1, num_partitions) for `SELECT 42`, but
-  # Spanner's partitionQuery may return more (the emulator returns 2). The driver's
-  # partition round-trip is covered by execute_partitions_round_trip in
-  # tests/integration.rs.
-  'SpannerStatementTest.SqlPartitionedInts'
 )
+# SqlPartitionedInts is NOT excluded: it used to hardcode ASSERT_EQ(1, num_partitions)
+# for `SELECT 42` (Spanner's partitionQuery may return more — the emulator returns 2),
+# but apache/arrow-adbc#4493 relaxed it to allow >=1 partitions and assert on the union
+# of all of them, so it now passes and is gate-enforced (see ARROW_ADBC_TAG in
+# adbc-validation/CMakeLists.txt). The round-trip is additionally covered by
+# execute_partitions_round_trip in tests/integration.rs.
 
 # The colon-joined --gtest_filter value for the EXCLUDED set. Prefixed with `-`
 # it negates (the gate: run everything else); bare it selects only these (the
