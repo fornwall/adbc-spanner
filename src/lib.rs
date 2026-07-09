@@ -491,6 +491,29 @@ pub const OPTION_BIND_BY_NAME: &str = "adbc.statement.bind_by_name";
 /// driver's other unset string options.
 pub const OPTION_INGEST_PRIMARY_KEY: &str = "spanner.ingest.primary_key";
 
+/// Driver-specific **statement** option: route an autocommit bulk ingest's per-chunk mutations
+/// through Spanner's **BatchWrite** RPC instead of a write-only transaction, for non-atomic,
+/// high-throughput ("firehose") loads.
+///
+/// A boolean, default `false`. When `false` (the default) each ingest chunk commits in its own
+/// write-only transaction. When `true`, each autocommit ingest chunk is instead sent through
+/// `BatchWrite`, whose mutation groups Spanner applies **non-atomically** and independently — the
+/// same per-chunk, not-atomic-as-a-whole guarantee the multi-chunk write-only path already has, but
+/// via the cheaper BatchWrite transport. Insert semantics, chunking, the ingested-row count, the
+/// read-only-connection guard and the append-mode `NotFound`/`AlreadyExists` remap are all
+/// preserved.
+///
+/// Only affects **autocommit** ingests. In manual-transaction mode ingests buffer their mutations
+/// and commit atomically with the surrounding transaction, so BatchWrite does not apply there and
+/// this flag is ignored. Because `BatchWrite` takes no per-request commit options, the
+/// `spanner.request.priority` / `spanner.request.tag` / `spanner.max_commit_delay` /
+/// `spanner.commit_stats` settings are **not** applied on this path (and `spanner.commit_stats`
+/// consequently reports no `mutation_count` for a BatchWrite ingest).
+///
+/// `""` (empty) unsets it, back to the write-only-transaction path. `get_option` round-trips the
+/// effective value as `"true"`/`"false"`.
+pub const OPTION_INGEST_BATCH_WRITE: &str = "spanner.ingest.batch_write";
+
 /// Driver-specific connection **and** statement option: the **read staleness** for read-only
 /// queries, as `"exact:<duration>"` or `"max:<duration>"`.
 ///

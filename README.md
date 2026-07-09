@@ -144,7 +144,13 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   so it shows up in a later `SELECT *` from the table. To key on your own data instead, set
   `spanner.ingest.primary_key` to one or more existing ingest columns (comma-separated for a
   composite key, in key order) — those become the primary key and no synthetic column is added; a
-  named column absent from the data fails with `InvalidArguments`.
+  named column absent from the data fails with `InvalidArguments`. For non-atomic,
+  high-throughput ("firehose") loads, set `spanner.ingest.batch_write=true` to route an autocommit
+  ingest's per-chunk mutations through Spanner's **BatchWrite** RPC instead of a write-only
+  transaction (insert/count/error semantics and chunking preserved; BatchWrite applies its mutation
+  groups non-atomically). It only affects autocommit ingests — a manual transaction ignores it and
+  still buffers and commits atomically — and, since BatchWrite carries no per-request commit options,
+  the priority / request-tag / `max_commit_delay` / `commit_stats` options do not apply on that path.
 - Metadata: `get_table_types()`, `get_table_schema()`, and `get_objects()` (catalog/schema/table/
   column introspection from `INFORMATION_SCHEMA`; columns report the Spanner-native type, e.g.
   `STRING(MAX)`, as `xdbc_type_name`).
