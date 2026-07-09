@@ -468,6 +468,11 @@ infinity. Those are the only two modes — there is deliberately no silently-wra
 
 ## Testing
 
+**[docs/testing.md](docs/testing.md) is the full testing overview** — a map of every kind of test
+(unit/doctest, emulator integration, real Cloud Spanner, resilience/fault-injection, the ADBC C++
+and Foundry validation suites, fuzzing and benchmarks), how to run each locally, and which CI
+workflow runs it. The quickstart below is the essentials.
+
 Unit tests run with no external dependencies:
 
 ```sh

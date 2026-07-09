@@ -1,5 +1,7 @@
 # Resilience / fault-injection harness
 
+> Part of the testing overview in [docs/testing.md](../docs/testing.md).
+
 `tests/resilience.rs` drives the ADBC driver against the Spanner **emulator reached through a
 [Toxiproxy](https://github.com/Shopify/toxiproxy) TCP proxy**, injects transport-level faults, and
 asserts the driver behaves sanely under them.

@@ -1,5 +1,7 @@
 # ADBC C++ validation suite
 
+> Part of the testing overview in [docs/testing.md](../docs/testing.md).
+
 Runs the canonical [Apache Arrow ADBC validation suite][suite] against
 `adbc-spanner`. The suite is the driver-agnostic conformance test battery that
 the in-tree ADBC drivers (SQLite, PostgreSQL, Snowflake, …) use. It exercises the

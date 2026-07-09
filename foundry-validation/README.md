@@ -1,5 +1,7 @@
 # Foundry validation harness
 
+> Part of the testing overview in [docs/testing.md](../docs/testing.md).
+
 An adapter that runs the **ADBC Driver Foundry** validation suite
 ([adbc-drivers/validation](https://github.com/adbc-drivers/validation)) against the adbc-spanner
 driver. It is a **type/feature coverage matrix** — complementary to, not a replacement for, the
