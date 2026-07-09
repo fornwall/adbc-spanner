@@ -794,6 +794,12 @@ fn query_and_dml_round_trip() {
             OptionValue::String("AdbcTxn".into()),
         )
         .unwrap();
+        // Append into the pre-existing AdbcTxn table (the default mode is `create`).
+        s.set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .unwrap();
         s.bind(rows).expect("bind manual-mode ingest rows");
         assert_eq!(
             s.execute_update().expect("buffered ingest"),
@@ -968,6 +974,67 @@ fn query_and_dml_round_trip() {
     ingest.bind(rows).expect("bind ingest rows");
     assert_eq!(ingest.execute_update().expect("ingest"), Some(2));
     assert_eq!(count_rows(&mut connection, "AdbcBind"), 2);
+
+    // With no ingest mode set, the driver defaults to `create` (the ADBC spec default), building
+    // the table from the bound data — not `append` into a pre-existing one. Ingesting into a fresh
+    // table name without a mode must therefore create it and insert the rows.
+    let default_mode_rows = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(vec![7, 8]))],
+    )
+    .unwrap();
+    let mut ingest_default = connection.new_statement().expect("new statement");
+    ingest_default
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcDefaultMode".into()),
+        )
+        .unwrap();
+    // Unset mode reports the effective default, `create`.
+    assert_eq!(
+        ingest_default
+            .get_option_string(OptionStatement::IngestMode)
+            .unwrap(),
+        "adbc.ingest.mode.create"
+    );
+    ingest_default
+        .bind(default_mode_rows)
+        .expect("bind default-mode ingest rows");
+    assert_eq!(
+        ingest_default.execute_update().expect("default-mode ingest"),
+        Some(2)
+    );
+    assert_eq!(count_rows(&mut connection, "AdbcDefaultMode"), 2);
+    // A second unset-mode (create) ingest into the now-existing table must fail with AlreadyExists,
+    // confirming the default is `create` rather than `append`.
+    let dup_rows = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(vec![9]))],
+    )
+    .unwrap();
+    let mut ingest_dup = connection.new_statement().expect("new statement");
+    ingest_dup
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcDefaultMode".into()),
+        )
+        .unwrap();
+    ingest_dup.bind(dup_rows).expect("bind duplicate ingest rows");
+    let dup_err = ingest_dup
+        .execute_update()
+        .expect_err("create onto an existing table must fail");
+    assert_eq!(
+        dup_err.status,
+        adbc_core::error::Status::AlreadyExists,
+        "default (create) ingest onto an existing table must be AlreadyExists, got: {dup_err:?}"
+    );
+    let mut drop_default = connection.new_statement().expect("new statement");
+    drop_default
+        .set_sql_query("DROP TABLE AdbcDefaultMode")
+        .unwrap();
+    drop_default
+        .execute_update()
+        .expect("drop default-mode table");
 
     // Append onto a missing target table must surface as the ADBC-mandated NotFound (not a generic
     // mapped Spanner INVALID_ARGUMENT). The driver probes INFORMATION_SCHEMA on the failure path and
@@ -1599,6 +1666,12 @@ fn query_and_dml_round_trip() {
         .set_option(
             OptionStatement::TargetTable,
             OptionValue::String("create".into()),
+        )
+        .unwrap();
+    esc_ingest
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
         )
         .unwrap();
     esc_ingest.bind(esc_rows).expect("bind reserved-word rows");
@@ -2274,6 +2347,13 @@ fn bulk_ingest_via_batch_write() {
             OptionValue::String("AdbcBatchWrite".into()),
         )
         .unwrap();
+    // Append into the pre-created table (the default mode is `create`).
+    ingest
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .unwrap();
     ingest
         .set_option(
             OptionStatement::Other(adbc_spanner::OPTION_INGEST_BATCH_WRITE.into()),
@@ -2335,6 +2415,11 @@ fn bulk_ingest_via_batch_write() {
     dup.set_option(
         OptionStatement::TargetTable,
         OptionValue::String("AdbcBatchWrite".into()),
+    )
+    .unwrap();
+    dup.set_option(
+        OptionStatement::IngestMode,
+        OptionValue::String("append".into()),
     )
     .unwrap();
     dup.set_option(
@@ -2737,6 +2822,12 @@ fn bulk_ingest_edge_cases() {
             OptionValue::String("AdbcEdge".into()),
         )
         .unwrap();
+    nowhere
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .unwrap();
     assert_eq!(
         nowhere
             .execute_update()
@@ -2800,6 +2891,12 @@ fn bulk_ingest_edge_cases() {
         .set_option(
             OptionStatement::TargetTable,
             OptionValue::String("AdbcEdge".into()),
+        )
+        .unwrap();
+    handle
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
         )
         .unwrap();
     handle
@@ -3880,6 +3977,13 @@ fn conformance_via_driver_manager() {
         .set_option(
             OptionStatement::TargetTable,
             OptionValue::String("AdbcConf".into()),
+        )
+        .unwrap();
+    // Append into the pre-existing AdbcConf table (the default mode is `create`).
+    ingest
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
         )
         .unwrap();
     ingest.bind(rows).expect("bind ingest rows");

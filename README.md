@@ -136,8 +136,9 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   committed atomically with any buffered DML on `commit`; Spanner applies buffered mutations at
   commit time, after the transaction's DML has executed. All four `adbc.ingest.mode` values are
   supported:
-  `append` (the default — insert into an existing table), `create` (create the table first, failing
-  if it exists), `create_append` (create if absent, then insert) and `replace` (drop and recreate).
+  `create` (the ADBC spec default — create the table first, failing if it exists), `append` (insert
+  into an existing table), `create_append` (create if absent, then insert) and `replace` (drop and
+  recreate).
   The three create modes build the table from the ingest data's Arrow schema, adding a synthetic
   `adbc_ingest_key` `STRING` primary key populated with a UUID per row, because Spanner requires
   every table to have a primary key and the ingest data carries none. That column is a real column,
