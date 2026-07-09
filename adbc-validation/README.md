@@ -119,8 +119,19 @@ guard — no emulator required — with:
 scripts/run-adbc-validation.sh --check-drift
 ```
 
-Today `EXCLUDED` holds **56** cases (44 non-excluded gate cases + 56 excluded =
-100 upstream cases total).
+Today `EXCLUDED` holds **55** cases (45 non-excluded cases — 44 passing plus
+`Transactions`, which self-skips — + 55 excluded = 100 upstream cases total).
+
+`Transactions` is deliberately **not** excluded: it creates a table inside an
+uncommitted transaction and expects it hidden from other connections and removed
+on rollback, which requires transactional DDL. Spanner has none — DDL goes through
+the admin `UpdateDatabaseDdl` API, auto-commits immediately, and cannot be rolled
+back — so the case can never apply. The `ddl_implicit_commit_txn` quirk (set in
+`spanner_validation.cc`) makes it **self-skip** via the case's own guard, which the
+gate tolerates. That is cleaner than carrying it as an expected failure: an
+inapplicable case can never "start passing", so it needs no expected-failure
+bookkeeping, and a skip states the truth ("not applicable to Spanner") rather than
+implying the driver got it wrong.
 
 ## The `EXCLUDED` cases, by bucket
 
@@ -133,7 +144,7 @@ none of them incremental driver work:
   double-quoted identifiers. There is no quirks hook for these, and they are not
   valid Spanner DDL (which needs `INT64`/`FLOAT64`, a `PRIMARY KEY`, backtick
   quoting). Covers e.g. `SqlBind`, `SqlQueryEmpty`, `SqlQueryFloats`,
-  `SqlSchemaFloats`, `SqlQueryRowsAffectedDelete`, `Transactions`.
+  `SqlSchemaFloats`, `SqlQueryRowsAffectedDelete`.
 - **Ingest readback** — the driver supports create-mode ingest (with a
   synthetic `adbc_ingest_key` UUID primary key, since Spanner mandates one),
   and since the quirks declare it the `SqlIngest*` cases now *run* under
