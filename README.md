@@ -33,6 +33,11 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
 - DDL (`CREATE`/`ALTER`/`DROP`/`RENAME`/…), routed to the Database Admin `UpdateDatabaseDdl` API. A
   `;`-separated batch is submitted as a single schema change, so multi-step changes (e.g. dbt's
   intermediate-table build then rename swap) are near-atomic.
+- [Property graphs and GQL graph queries](https://cloud.google.com/spanner/docs/graph/queries-overview):
+  declare a graph over existing tables with a `CREATE PROPERTY GRAPH` DDL statement, then run
+  `GRAPH … MATCH … RETURN` graph-traversal queries through `execute` like any other read query — GQL
+  needs no special driver support, since Spanner surfaces it as an ordinary GoogleSQL query returning
+  a typed result set.
 - Transactions: autocommit by default, or manual multi-statement transactions (set
   `adbc.connection.autocommit` to `false`, then `commit`/`rollback`). In manual mode DML — and any
   bulk ingest's insert mutations — is buffered

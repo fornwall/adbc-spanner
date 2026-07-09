@@ -309,7 +309,10 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
 - Supported so far: streaming queries (`execute` returns a lazy `SpannerBatchReader` that converts
   bounded row chunks to Arrow on demand — chunk size via `spanner.rows_per_batch` — with a
   background task prefetching the next chunk ahead of the consumer), DML, DDL (via
-  admin `UpdateDatabaseDdl`), manual transactions
+  admin `UpdateDatabaseDdl`), GQL graph queries (a `CREATE PROPERTY GRAPH` DDL over existing
+  node/edge tables plus `GRAPH … MATCH … RETURN` queries run through the plain `execute` query path —
+  no special driver support; covered by `gql_graph_query_round_trip` in `tests/integration.rs`),
+  manual transactions
   (buffer-and-commit), native Arrow types for DATE/TIMESTAMP/NUMERIC and native `List`/`Struct` for
   ARRAY/STRUCT, parameter binding (positional by default — the *i*-th bound column binds the *i*-th
   distinct `@param` in query order, column names ignored; the `adbc.statement.bind_by_name`
