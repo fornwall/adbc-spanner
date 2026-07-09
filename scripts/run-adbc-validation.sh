@@ -90,15 +90,16 @@ EXCLUDED=(
   # `SELECT * FROM "bulk_ingest" ...` (not GoogleSQL, no quirks hook), and `SELECT *`
   # would also surface the synthetic key column, breaking the single-column
   # assertions. The type/temp/target variants that Spanner does not model (float16,
-  # temporary tables, ...) self-skip; either way they are not gated. Ingest
-  # identifier-escaping is captured natively in tests/integration.rs instead.
+  # temporary tables, ...) self-skip; either way they are not gated.
+  # (SqlIngest{Table,Column}Escaping are NOT here: they create-mode ingest with no
+  # readback, so with the create default they pass cleanly and are gate-enforced;
+  # identifier-escaping is additionally covered natively in tests/integration.rs.)
   # (SqlIngestErrors is NOT here: it exercises only the ingest error paths, with no
   # readback and no non-Spanner DDL, so it passes cleanly and is enforced by the gate.)
   'SpannerStatementTest.SqlIngestAppend'
   'SpannerStatementTest.SqlIngestBinary'
   'SpannerStatementTest.SqlIngestBinaryView'
   'SpannerStatementTest.SqlIngestBool'
-  'SpannerStatementTest.SqlIngestColumnEscaping'
   'SpannerStatementTest.SqlIngestCreateAppend'
   'SpannerStatementTest.SqlIngestDate32'
   'SpannerStatementTest.SqlIngestDuration'
@@ -122,7 +123,6 @@ EXCLUDED=(
   'SpannerStatementTest.SqlIngestString'
   'SpannerStatementTest.SqlIngestStringDictionary'
   'SpannerStatementTest.SqlIngestStringView'
-  'SpannerStatementTest.SqlIngestTableEscaping'
   'SpannerStatementTest.SqlIngestTargetCatalog'
   'SpannerStatementTest.SqlIngestTargetCatalogSchema'
   'SpannerStatementTest.SqlIngestTargetSchema'
