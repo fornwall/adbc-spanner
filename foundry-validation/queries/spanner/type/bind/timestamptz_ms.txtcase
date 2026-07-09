@@ -1,3 +1,3 @@
 // part: metadata
 
-skip = "case binds timestamps outside Arrow's nanosecond range (~1677-2262), which the driver's nanosecond TIMESTAMP read path cannot represent"
+skip = "Spanner has one TIMESTAMP type; the driver reads it as Arrow Timestamp(Nanosecond) (default) or Timestamp(Microsecond) via spanner.max_timestamp_precision, never the case's Millisecond unit, so the read-back array unit never matches"
