@@ -79,6 +79,14 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   an optional `s`/`ms`/`us`/`ns`/`m`/`h` suffix, e.g. `100ms`, `0.2s`); values above 500ms or
   malformed ones are rejected with `InvalidArguments`, `""` unsets, and it round-trips via
   `get_option`.
+- Commit statistics: `spanner.commit_stats` (a boolean, default `false`) requests Spanner return
+  [commit statistics](https://docs.cloud.google.com/spanner/docs/commit-statistics) on the read/write
+  commits the driver builds (the same four sites as `spanner.max_commit_delay`). When enabled, the
+  **mutation count** of the most recent commit is captured and read back via
+  `spanner.commit_stats.mutation_count` (`get_option` / `get_option_int`) — on the statement for
+  autocommit DML and bulk ingest, on the connection for a manual-mode commit; it is `NotFound` until
+  such a commit has run. Settable on a connection (becomes the default for its statements) or per
+  statement, `""` unsets, and the flag round-trips via `get_option`.
 - RPC timeouts: `spanner.rpc.timeout_seconds.query` (a query's initial execution, through the first
   chunk of its streamed result — also the driver-internal metadata reads: `get_objects`,
   `get_statistics`, `get_table_schema`, the ingest table-exists probe),
@@ -305,6 +313,8 @@ database path, not the original URI.
 | `spanner.query.optimizer_statistics_package` | [Optimizer statistics package](https://docs.cloud.google.com/spanner/docs/query-optimizer/statistics-packages) applied to every query; inherited by the connection's statements. |
 | `spanner.transaction.tag`                    | Transaction tag attached to every read/write transaction the driver builds. Connection-level only. |
 | `spanner.max_commit_delay`                   | [Maximum commit delay](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions) (a duration in `0..=500ms`) Spanner may add to a read/write commit to batch it with others; applies to autocommit DML, batch DML, the manual-mode commit and bulk ingest; inherited by the connection's statements. |
+| `spanner.commit_stats`                       | Request [commit statistics](https://docs.cloud.google.com/spanner/docs/commit-statistics) (default `false`) on the read/write commits the driver builds; inherited by the connection's statements. |
+| `spanner.commit_stats.mutation_count`        | Read-only: mutation count from the connection's most recent manual-mode commit run with `spanner.commit_stats`; `NotFound` until one has run. |
 | `spanner.rpc.timeout_seconds.query`          | Deadline (seconds) on a query's initial execution and the driver-internal metadata reads (`get_objects` / `get_statistics` / `get_table_schema`); inherited by the connection's statements. |
 | `spanner.rpc.timeout_seconds.update`         | Deadline (seconds) on DML / batch-DML / commit / ingest-chunk / DDL operations; inherited by the connection's statements. |
 | `spanner.rpc.timeout_seconds.fetch`          | Deadline (seconds) on each subsequent chunk fetch of a streamed result; inherited by the connection's statements. |
@@ -325,6 +335,8 @@ database path, not the original URI.
 | `spanner.request.tag`                        | Per-statement request-tag override. |
 | `spanner.directed_read`                      | Per-statement directed-read override (applies to read-only queries). |
 | `spanner.max_commit_delay`                   | Per-statement max-commit-delay override. |
+| `spanner.commit_stats`                       | Per-statement commit-stats override (default `false`). |
+| `spanner.commit_stats.mutation_count`        | Read-only: mutation count from this statement's most recent autocommit DML / bulk-ingest commit run with `spanner.commit_stats`; `NotFound` until one has run. |
 | `spanner.query.optimizer_version`            | Per-statement optimizer-version override. |
 | `spanner.query.optimizer_statistics_package` | Per-statement optimizer-statistics-package override. |
 | `spanner.rpc.timeout_seconds.query`          | Per-statement query-timeout override. |

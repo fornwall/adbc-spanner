@@ -40,7 +40,7 @@ use crate::error::{
     err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
 };
 use crate::query_options::QueryOptionsConfig;
-use crate::request::RequestConfig;
+use crate::request::{CommitStats, RequestConfig};
 use crate::retry::RetryConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
 use crate::staleness::ReadStaleness;
@@ -147,6 +147,11 @@ pub struct SpannerStatement {
     /// default) leaves the client's own retry policy; when set it bounds the client's retrying on
     /// every statement/DML/transaction builder this statement produces.
     retry: RetryConfig,
+    /// Mutation count captured from this statement's most recent commit that requested commit
+    /// statistics (`spanner.commit_stats`) — autocommit DML or a bulk ingest — read back via
+    /// `spanner.commit_stats.mutation_count`. Statement-owned and **not** inherited from the
+    /// connection (the connection owns the manual-mode commit's stats); fresh (unset) per statement.
+    commit_stats: CommitStats,
     /// Cancellation signal for this statement's in-flight execution (see [`Statement::cancel`]).
     cancel: CancelSignal,
 }
@@ -195,6 +200,7 @@ impl SpannerStatement {
             timestamp_precision,
             timeouts,
             retry,
+            commit_stats: CommitStats::default(),
             cancel: CancelSignal::new(),
         }
     }
@@ -540,14 +546,14 @@ impl SpannerStatement {
         let client = self.client.clone();
         let request = self.request.clone();
         let retry = self.retry;
-        block_on_cancellable(
+        let mutation_count = block_on_cancellable(
             &self.runtime,
             &self.cancel,
             with_timeout(
                 self.timeouts.update_timeout(),
                 crate::OPTION_RPC_TIMEOUT_UPDATE,
                 async move {
-                    retry
+                    let response = retry
                         .apply_to_write_only(
                             request.apply_to_write_only(client.write_only_transaction()),
                         )
@@ -555,10 +561,18 @@ impl SpannerStatement {
                         .write(mutations)
                         .await
                         .map_err(from_spanner)?;
-                    Ok::<(), Error>(())
+                    // The commit stats (only when `spanner.commit_stats` requested them) ride on the
+                    // write-only commit response.
+                    Ok::<Option<i64>, Error>(
+                        response
+                            .commit_stats
+                            .as_ref()
+                            .map(|stats| stats.mutation_count),
+                    )
                 },
             ),
         )?;
+        self.commit_stats.record(mutation_count);
         Ok(count)
     }
 
@@ -597,6 +611,7 @@ impl SpannerStatement {
             self.request.clone(),
             self.retry,
             self.timeouts.update_timeout(),
+            &self.commit_stats,
             statements,
         )?;
         Ok(Some(count))
@@ -653,9 +668,16 @@ impl SpannerStatement {
                 })
                 .await
                 .map_err(from_spanner)?;
-            Ok::<_, Error>(outcome.result)
+            // The commit stats (only when `spanner.commit_stats` requested them) ride on the commit
+            // response of this THEN RETURN read/write transaction.
+            let mutation_count = outcome
+                .commit_response
+                .commit_stats
+                .as_ref()
+                .map(|stats| stats.mutation_count);
+            Ok::<_, Error>((outcome.result, mutation_count))
         };
-        let results = block_on_cancellable(
+        let (results, mutation_count) = block_on_cancellable(
             &self.runtime,
             &self.cancel,
             with_timeout(
@@ -664,6 +686,7 @@ impl SpannerStatement {
                 transaction,
             ),
         )?;
+        self.commit_stats.record(mutation_count);
 
         let mut schema = None;
         let mut batches = Vec::with_capacity(results.len());
@@ -963,6 +986,9 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => {
                 self.request.set_max_commit_delay(value)?;
             }
+            OptionStatement::Other(k) if k == crate::OPTION_COMMIT_STATS => {
+                self.request.set_commit_stats(value)?;
+            }
             OptionStatement::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_VERSION => {
                 self.query_options.set_optimizer_version(value)?;
             }
@@ -1044,6 +1070,15 @@ impl Optionable for SpannerStatement {
             }
             OptionStatement::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => {
                 self.request.max_commit_delay_string().map(str::to_string)
+            }
+            // A plain boolean; always reports the effective value ("true"/"false", default "false").
+            OptionStatement::Other(k) if k == crate::OPTION_COMMIT_STATS => {
+                Some(self.request.commit_stats_string().to_string())
+            }
+            // The captured mutation count from this statement's most recent commit (autocommit DML
+            // or bulk ingest) that requested commit stats; None → NotFound below.
+            OptionStatement::Other(k) if k == crate::OPTION_COMMIT_STATS_MUTATION_COUNT => {
+                self.commit_stats.mutation_count().map(|n| n.to_string())
             }
             OptionStatement::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_VERSION => self
                 .query_options

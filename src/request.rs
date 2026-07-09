@@ -24,6 +24,11 @@
 //!   commit site the runner / write-only builders cover (autocommit DML, the `ExecuteBatchDml`
 //!   batch runner, the manual-mode commit, and the bulk-ingest write-only transaction).
 //!   Connection and statement level.
+//! - [`OPTION_COMMIT_STATS`](crate::OPTION_COMMIT_STATS) (`spanner.commit_stats`) — a boolean that,
+//!   when `true`, requests Spanner return commit statistics on the read/write commits the driver
+//!   builds (the same four sites as `max_commit_delay`). The returned mutation count is captured
+//!   into a [`CommitStats`] cell, readable back through `spanner.commit_stats.mutation_count`.
+//!   Connection and statement level.
 //!
 //! Like the read-staleness options, the connection's values become the default for statements it
 //! creates (which may override them), setting an empty string unsets a value, and every option
@@ -31,6 +36,7 @@
 //! `get_table_schema` probes, …) are deliberately left untagged — the options cover the user's own
 //! statements.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adbc_core::error::Result;
@@ -108,6 +114,9 @@ pub(crate) struct RequestConfig {
     /// Parsed `spanner.max_commit_delay`, with the raw option string kept for `get_option`
     /// round-trip. Applied as the commit delay wherever a read/write commit is built.
     max_commit_delay: Option<(String, Duration)>,
+    /// `spanner.commit_stats`: whether to request Spanner return commit statistics on the read/write
+    /// commits the driver builds. `false` (the default) leaves them off.
+    return_commit_stats: bool,
 }
 
 impl RequestConfig {
@@ -147,6 +156,30 @@ impl RequestConfig {
         let duration = parse_max_commit_delay(trimmed)?;
         self.max_commit_delay = Some((trimmed.to_string(), duration));
         Ok(())
+    }
+
+    /// Handle a `set_option` for `spanner.commit_stats`. An empty string unsets it (back to the
+    /// default of not requesting stats); otherwise a bool-ish value (`true`/`false`/`1`/`0`/…).
+    pub(crate) fn set_commit_stats(&mut self, value: OptionValue) -> Result<()> {
+        if let OptionValue::String(s) = &value
+            && s.trim().is_empty()
+        {
+            self.return_commit_stats = false;
+            return Ok(());
+        }
+        self.return_commit_stats =
+            crate::options::bool_option(value, "option spanner.commit_stats")?;
+        Ok(())
+    }
+
+    /// The canonical `spanner.commit_stats` value (`"true"`/`"false"`), for `get_option` round-trip.
+    /// Always reported (the effective boolean), like the other plain-boolean statement options.
+    pub(crate) fn commit_stats_string(&self) -> &'static str {
+        if self.return_commit_stats {
+            "true"
+        } else {
+            "false"
+        }
     }
 
     /// The canonical `spanner.request.priority` value, for `get_option` round-trip.
@@ -213,6 +246,9 @@ impl RequestConfig {
         if let Some(delay) = self.commit_delay() {
             builder = builder.set_max_commit_delay(delay);
         }
+        if self.return_commit_stats {
+            builder = builder.set_return_commit_stats(true);
+        }
         builder
     }
 
@@ -231,7 +267,40 @@ impl RequestConfig {
         if let Some(delay) = self.commit_delay() {
             builder = builder.set_max_commit_delay(delay);
         }
+        if self.return_commit_stats {
+            builder = builder.set_return_commit_stats(true);
+        }
         builder
+    }
+}
+
+/// A shared cell holding the mutation count from the most recent commit that returned commit
+/// statistics (i.e. one built while [`OPTION_COMMIT_STATS`](crate::OPTION_COMMIT_STATS) was set).
+///
+/// Interior-mutable and `Arc`-shared so the driver's commit paths (which take `&self`) can record
+/// into it while `get_option_int` (also `&self`) reads it back. Each connection and statement owns
+/// its **own** cell — a statement does not inherit the connection's — because the count belongs to
+/// whichever object actually ran the commit (statement: autocommit DML / bulk ingest; connection:
+/// the manual-mode commit). Unset (`None`) until such a commit has run; `get_option` surfaces that
+/// as [`Status::NotFound`](adbc_core::error::Status::NotFound).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CommitStats {
+    mutation_count: Arc<Mutex<Option<i64>>>,
+}
+
+impl CommitStats {
+    /// Record a commit's mutation count when the server returned commit statistics. A `None`
+    /// (stats not requested, or requested but not returned) leaves any prior value untouched. When
+    /// several commits run (e.g. a chunked bulk ingest), the most recent one wins.
+    pub(crate) fn record(&self, count: Option<i64>) {
+        if let Some(count) = count {
+            *self.mutation_count.lock().unwrap() = Some(count);
+        }
+    }
+
+    /// The most recent recorded mutation count, or `None` if no commit with stats has run.
+    pub(crate) fn mutation_count(&self) -> Option<i64> {
+        *self.mutation_count.lock().unwrap()
     }
 }
 
@@ -400,6 +469,60 @@ mod tests {
         assert!(config.commit_delay().is_none());
     }
 
+    #[test]
+    fn commit_stats_flag_round_trips_and_unsets() {
+        let mut config = RequestConfig::default();
+        // Default is off, always reported as an effective boolean.
+        assert_eq!(config.commit_stats_string(), "false");
+
+        // Accepts the shared bool-ish spellings (string and integer).
+        for truthy in ["true", "1", "yes", "TRUE"] {
+            config.set_commit_stats(s(truthy)).unwrap();
+            assert_eq!(config.commit_stats_string(), "true", "{truthy}");
+        }
+        config.set_commit_stats(OptionValue::Int(1)).unwrap();
+        assert_eq!(config.commit_stats_string(), "true");
+        for falsy in ["false", "0", "no"] {
+            config.set_commit_stats(s(falsy)).unwrap();
+            assert_eq!(config.commit_stats_string(), "false", "{falsy}");
+        }
+
+        // An empty string unsets (back to the default of not requesting stats).
+        config.set_commit_stats(s("true")).unwrap();
+        assert_eq!(config.commit_stats_string(), "true");
+        config.set_commit_stats(s("")).unwrap();
+        assert_eq!(config.commit_stats_string(), "false");
+
+        // A non-bool string is rejected and leaves the stored value untouched.
+        config.set_commit_stats(s("true")).unwrap();
+        let error = config.set_commit_stats(s("maybe")).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert_eq!(config.commit_stats_string(), "true");
+    }
+
+    #[test]
+    fn commit_stats_sink_records_most_recent_and_ignores_none() {
+        let sink = CommitStats::default();
+        assert_eq!(sink.mutation_count(), None);
+
+        // A `None` (stats not returned) leaves it unset.
+        sink.record(None);
+        assert_eq!(sink.mutation_count(), None);
+
+        // A recorded value is readable; a later commit overwrites, but a `None` afterwards does not.
+        sink.record(Some(5));
+        assert_eq!(sink.mutation_count(), Some(5));
+        sink.record(Some(9));
+        assert_eq!(sink.mutation_count(), Some(9));
+        sink.record(None);
+        assert_eq!(sink.mutation_count(), Some(9));
+
+        // Clones share the same cell (Arc-backed).
+        let clone = sink.clone();
+        sink.record(Some(11));
+        assert_eq!(clone.mutation_count(), Some(11));
+    }
+
     /// Statement inheritance is a plain clone of the connection's config (mirroring
     /// `ReadStaleness`): the clone starts with the connection's values and overrides independently.
     #[test]
@@ -409,22 +532,27 @@ mod tests {
         connection.set_request_tag(s("conn-tag")).unwrap();
         connection.set_transaction_tag(s("txn-tag")).unwrap();
         connection.set_max_commit_delay(s("100ms")).unwrap();
+        connection.set_commit_stats(s("true")).unwrap();
 
         let mut statement = connection.clone();
         assert_eq!(statement.priority_string(), Some("low"));
         assert_eq!(statement.request_tag_string(), Some("conn-tag"));
         assert_eq!(statement.transaction_tag_string(), Some("txn-tag"));
         assert_eq!(statement.max_commit_delay_string(), Some("100ms"));
+        assert_eq!(statement.commit_stats_string(), "true");
 
         statement.set_priority(s("high")).unwrap();
         statement.set_request_tag(s("")).unwrap();
         statement.set_max_commit_delay(s("250ms")).unwrap();
+        statement.set_commit_stats(s("false")).unwrap();
         assert_eq!(statement.priority_string(), Some("high"));
         assert_eq!(statement.request_tag_string(), None);
         assert_eq!(statement.max_commit_delay_string(), Some("250ms"));
+        assert_eq!(statement.commit_stats_string(), "false");
         // The connection is unaffected by statement-level overrides.
         assert_eq!(connection.priority_string(), Some("low"));
         assert_eq!(connection.request_tag_string(), Some("conn-tag"));
         assert_eq!(connection.max_commit_delay_string(), Some("100ms"));
+        assert_eq!(connection.commit_stats_string(), "true");
     }
 }

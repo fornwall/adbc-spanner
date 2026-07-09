@@ -1994,6 +1994,114 @@ fn query_and_dml_round_trip() {
     }
 }
 
+/// With `spanner.commit_stats` enabled, an autocommit DML commit captures Spanner's returned
+/// mutation count, readable back on the statement via `spanner.commit_stats.mutation_count`
+/// (`NotFound` before any such commit has run).
+///
+/// The **emulator does not populate commit statistics** (it returns `CommitResponse.commit_stats =
+/// None` even when `return_commit_stats` is requested), so the positive-count assertion runs only
+/// against a real Cloud Spanner target; on the emulator the mutation count stays `NotFound` after
+/// the commit and that is asserted instead. The option plumbing (flag round-trip, read-only-key
+/// rejection, pre-commit `NotFound`) is exercised on both.
+#[test]
+fn commit_stats_reports_mutation_count() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping commit_stats_reports_mutation_count");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    // Start from a known-empty table.
+    let mut delete = connection.new_statement().expect("new statement");
+    delete
+        .set_sql_query("DELETE FROM Singers WHERE true")
+        .unwrap();
+    delete.execute_update().expect("delete");
+
+    let mut insert = connection.new_statement().expect("new statement");
+    insert
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_COMMIT_STATS.to_string()),
+            OptionValue::String("true".to_string()),
+        )
+        .expect("enable commit stats");
+    // The flag round-trips as the effective boolean.
+    assert_eq!(
+        insert
+            .get_option_string(OptionStatement::Other(
+                adbc_spanner::OPTION_COMMIT_STATS.to_string()
+            ))
+            .expect("read commit_stats flag"),
+        "true"
+    );
+    // No commit has run yet, so the mutation count is NotFound.
+    let before = insert
+        .get_option_int(OptionStatement::Other(
+            adbc_spanner::OPTION_COMMIT_STATS_MUTATION_COUNT.to_string(),
+        ))
+        .expect_err("mutation count must be NotFound before any commit");
+    assert_eq!(before.status, Status::NotFound);
+
+    insert
+        .set_sql_query(
+            "INSERT INTO Singers (SingerId, Name, Active, Score) \
+             VALUES (1, 'Alice', true, 4.5), (2, 'Bob', false, 3.25)",
+        )
+        .unwrap();
+    assert_eq!(insert.execute_update().expect("insert"), Some(2));
+
+    let mutation_count = insert.get_option_int(OptionStatement::Other(
+        adbc_spanner::OPTION_COMMIT_STATS_MUTATION_COUNT.to_string(),
+    ));
+    if target.is_emulator {
+        // The emulator ignores `return_commit_stats`, so no count is captured.
+        assert_eq!(
+            mutation_count
+                .expect_err("emulator returns no commit stats")
+                .status,
+            Status::NotFound
+        );
+    } else {
+        // Real Spanner returns stats; the captured mutation count is positive (two rows × several
+        // columns' worth of mutations — the exact number is Spanner's to decide, so only assert it
+        // is meaningfully non-zero).
+        let mutations = mutation_count.expect("mutation count present after a commit with stats");
+        assert!(
+            mutations > 0,
+            "expected a positive mutation count, got {mutations}"
+        );
+    }
+
+    // Setting the read-only mutation-count key is rejected.
+    let rejected = insert.set_option(
+        OptionStatement::Other(adbc_spanner::OPTION_COMMIT_STATS_MUTATION_COUNT.to_string()),
+        OptionValue::Int(1),
+    );
+    assert_eq!(
+        rejected
+            .expect_err("mutation-count key is read-only")
+            .status,
+        Status::NotImplemented
+    );
+
+    // Clean up.
+    let mut cleanup = connection.new_statement().expect("new statement");
+    cleanup
+        .set_sql_query("DELETE FROM Singers WHERE true")
+        .unwrap();
+    cleanup.execute_update().expect("cleanup delete");
+}
+
 /// A bulk ingest big enough to cross the driver's per-chunk byte budget (~4 MiB) is split into
 /// several `ExecuteBatchDml` transactions. The split must be invisible in the result: the returned
 /// affected-row count is the sum across chunks, and every row lands exactly once with its full
