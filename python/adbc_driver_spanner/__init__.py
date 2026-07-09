@@ -16,9 +16,18 @@ import typing
 
 import adbc_driver_manager
 
+from ._options import ConnectionOptions, DatabaseOptions, StatementOptions
 from ._version import __version__
 
-__all__ = ["connect", "option_kwargs", "ENTRYPOINT", "__version__"]
+__all__ = [
+    "connect",
+    "option_kwargs",
+    "ENTRYPOINT",
+    "DatabaseOptions",
+    "ConnectionOptions",
+    "StatementOptions",
+    "__version__",
+]
 
 #: C entrypoint exported by the shared library (see src/ffi.rs).
 ENTRYPOINT = "AdbcSpannerInit"
@@ -94,6 +103,7 @@ def connect(
     impersonate_delegates: typing.Optional[typing.Union[str, typing.Sequence[str]]] = None,
     impersonate_scopes: typing.Optional[typing.Union[str, typing.Sequence[str]]] = None,
     impersonate_lifetime: typing.Optional[typing.Union[int, str]] = None,
+    access_token: typing.Optional[str] = None,
     db_kwargs: typing.Optional[typing.Mapping[str, str]] = None,
 ) -> adbc_driver_manager.AdbcDatabase:
     """Create a low-level ADBC database handle for Spanner.
@@ -115,7 +125,8 @@ def connect(
     impersonate_target_principal:
         Service account to impersonate. Setting it enables service-account
         impersonation on top of the base credentials above; leave it unset for no
-        impersonation. Mirrors the BigQuery driver's ``impersonate.*`` options.
+        impersonation. Follows gcloud's ``--impersonate-service-account`` /
+        ``google-cloud-auth``'s ``impersonated`` builder naming.
     impersonate_delegates:
         Optional delegation chain (a comma-separated string or a sequence of
         service-account emails).
