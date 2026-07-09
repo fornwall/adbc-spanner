@@ -2,7 +2,7 @@
 name = "adbc-spanner"
 version = "0.6.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.97"
 license = "Apache-2.0"
 description = "ADBC (Arrow Database Connectivity) driver for Google Cloud Spanner"
 repository = "https://github.com/fornwall/adbc-spanner"

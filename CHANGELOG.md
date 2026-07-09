@@ -10,7 +10,9 @@ Releases are cut with [`cargo-release`](https://github.com/crate-ci/cargo-releas
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- MSRV raised to 1.97.
 
 ## [0.6.0] - 2026-07-08
 
