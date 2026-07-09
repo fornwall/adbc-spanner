@@ -778,8 +778,21 @@ at the read/write **commit** sites `RequestConfig` already threads through: auto
 (`apply_to_runner` / `apply_to_write_only`). Parsing/round-trip/cap covered by the offline unit
 tests `parses_max_commit_delay_with_units_and_enforces_the_500ms_cap` and
 `max_commit_delay_round_trips_and_unsets`; documented in `README.md`, `python/README.md`,
-`docs/options.md`, and the `OPTION_MAX_COMMIT_DELAY` rustdoc.), `last_statement` optimization (free RPC saving for single-statement
-autocommit DML); ~~proto/enum columns (verify clean failure today)~~ (**Fixed.** They failed
+`docs/options.md`, and the `OPTION_MAX_COMMIT_DELAY` rustdoc.), ~~`last_statement` optimization (free RPC saving for single-statement
+autocommit DML)~~ (**Fixed.** A single-statement autocommit DML is the entire read/write
+transaction, so `run_batch_dml` in `src/connection.rs` now flags its `ExecuteBatchDml` batch as the
+transaction's last request via the client's `BatchDmlBuilder::set_last_statements(true)` — Spanner
+then releases the transaction as part of the same round-trip, saving the separate `Commit` RPC.
+The flag is gated on `statements.len() == 1`: a multi-statement `;`-batch is left unflagged
+(conservative — the flag asserts the whole batch ends the transaction, which we reserve for the
+unambiguous single-statement case), and the manual-commit path (`run_batch_txn` from
+`SpannerConnection::apply_transaction`) passes `false` because it buffers mutations that Spanner
+applies *at* commit, so its batch is never the transaction's last request. The `THEN RETURN`
+(`ExecuteSql`) path is left untouched. Semantics-preserving: the doc note that `last_statement` may
+defer some error reporting to commit is harmless here since the runner commits immediately after
+the batch, so the affected-row count and durability are unchanged — covered by the extended
+`query_and_dml_round_trip` emulator test, which updates one row through the flagged path, asserts
+the affected-row count, and reads the value back to confirm it committed.); ~~proto/enum columns (verify clean failure today)~~ (**Fixed.** They failed
 *silently*, not cleanly: `arrow_type` in `src/conversion.rs` mapped both `TypeCode::Proto` and
 `TypeCode::Enum` through the catch-all `_ => DataType::Utf8` arm, so a `PROTO` column surfaced its
 base64-serialized proto blob and an `ENUM` its bare numeric value as if they were real `STRING`

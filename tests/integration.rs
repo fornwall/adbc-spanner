@@ -449,6 +449,43 @@ fn query_and_dml_round_trip() {
         (2, "Bob", false, 3.25)
     );
 
+    // --- single-statement autocommit DML carries the `last_statement` optimization ---
+    //
+    // A single-statement autocommit UPDATE is the entire read/write transaction, so the driver
+    // flags its `ExecuteBatchDml` batch as the transaction's last request (`last_statements=true`),
+    // letting Spanner release the transaction without a separate Commit RPC. The flag must not
+    // change the observable result: the statement still reports its exact affected-row count and
+    // the write is durably committed. Update one row, assert the count, and read it back.
+    let mut update = connection.new_statement().expect("new statement");
+    update
+        .set_sql_query("UPDATE Singers SET Score = 9.5 WHERE SingerId = 1")
+        .unwrap();
+    assert_eq!(
+        update.execute_update().expect("single-statement update"),
+        Some(1),
+        "a single-statement autocommit UPDATE must still report its affected-row count"
+    );
+
+    let mut check = connection.new_statement().expect("new statement");
+    check
+        .set_sql_query("SELECT Score FROM Singers WHERE SingerId = 1")
+        .unwrap();
+    let check_batches = check
+        .execute()
+        .expect("read back updated row")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect updated row");
+    let updated_score = check_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(
+        updated_score.value(0),
+        9.5,
+        "the last_statement-optimized UPDATE must be durably committed"
+    );
+
     // --- get_table_schema reflects the table's column types ---
 
     let singers_schema = connection
