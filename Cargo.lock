@@ -39,7 +39,7 @@ dependencies = [
 [[package]]
 name = "adbc_core"
 version = "0.24.0"
-source = "git+https://github.com/fornwall/arrow-adbc?rev=786e7f3488eb71b200ece775b027a647cf42db9e#786e7f3488eb71b200ece775b027a647cf42db9e"
+source = "git+https://github.com/apache/arrow-adbc?rev=198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab#198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -48,7 +48,7 @@ dependencies = [
 [[package]]
 name = "adbc_driver_manager"
 version = "0.24.0"
-source = "git+https://github.com/fornwall/arrow-adbc?rev=786e7f3488eb71b200ece775b027a647cf42db9e#786e7f3488eb71b200ece775b027a647cf42db9e"
+source = "git+https://github.com/apache/arrow-adbc?rev=198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab#198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab"
 dependencies = [
  "adbc_core",
  "adbc_ffi",
@@ -65,7 +65,7 @@ dependencies = [
 [[package]]
 name = "adbc_ffi"
 version = "0.24.0"
-source = "git+https://github.com/fornwall/arrow-adbc?rev=786e7f3488eb71b200ece775b027a647cf42db9e#786e7f3488eb71b200ece775b027a647cf42db9e"
+source = "git+https://github.com/apache/arrow-adbc?rev=198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab#198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab"
 dependencies = [
  "adbc_core",
  "arrow-array",

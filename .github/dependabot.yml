@@ -2,7 +2,7 @@
 #
 # Note: the two git-pinned dependency families — the `google-cloud-*` crates
 # (pinned to a `google-cloud-rust` revision) and `adbc_core`/`adbc_ffi`/
-# `adbc_driver_manager` (pinned to a `fornwall/arrow-adbc` fork revision) — are
+# `adbc_driver_manager` (pinned to an `apache/arrow-adbc` `main` revision) — are
 # intentionally out of Dependabot's scope: it does not bump git-revision deps,
 # and those are reverted manually per the CLAUDE.md checklist.
 version: 2

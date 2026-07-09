@@ -50,6 +50,10 @@ FULL=0
 GATED_FILTER='SpannerDatabaseTest.*:SpannerConnectionTest.*'
 GATED_FILTER+=':SpannerStatementTest.NewInit'
 GATED_FILTER+=':SpannerStatementTest.Release'
+# ErrorCompatibility exercises the ADBC 1.0.0-sized AdbcError path: the exporter must
+# preserve the caller's private_data rather than clobber it (apache/arrow-adbc#4473, in the
+# pinned arrow-adbc `main` rev).
+GATED_FILTER+=':SpannerStatementTest.ErrorCompatibility'
 GATED_FILTER+=':SpannerStatementTest.SqlPrepareGetParameterSchema'
 GATED_FILTER+=':SpannerStatementTest.SqlPrepareSelectNoParams'
 GATED_FILTER+=':SpannerStatementTest.SqlPrepareUpdateNoParams'

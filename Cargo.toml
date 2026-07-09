@@ -78,19 +78,22 @@ harness = false
 # `publish = false` release gate) and the invariant that the three arrow-adbc crates share one rev.
 # --- adbc_core / adbc_ffi pinned to a git revision (temporary) ---
 # The abstract ADBC driver traits, and the C FFI driver exporter that generates the
-# `AdbcSpannerInit` entrypoint for the shared library. Pinned to a fork of
-# apache/arrow-adbc carrying two fixes that are not in the latest crates.io release (0.23):
+# `AdbcSpannerInit` entrypoint for the shared library. Pinned to apache/arrow-adbc `main`,
+# which carries three FFI fixes that are not yet in the latest crates.io release (0.23):
 #   1. `release_ffi_error` is idempotent — it nulls the error's message / private_data /
 #      release pointers after freeing, so a second release (which consumers do via the
 #      standard `if (error.release) error.release(&error)` idiom) is a safe no-op rather
-#      than a double-free. Already on arrow-adbc `main`; only missing from the 0.23 release.
+#      than a double-free.
 #   2. `AdbcStatementExecuteQuery` writes `rows_affected = -1` on the query path (a result
-#      stream was requested) instead of leaving the caller's out-parameter untouched.
-#      Submitted upstream as https://github.com/apache/arrow-adbc/pull/4469.
-# Both let the C++ `adbc_validation` suite behave correctly against this driver (see
-# adbc-validation/). Revert to a versioned crates.io release once these ship.
-adbc_core = { git = "https://github.com/fornwall/arrow-adbc", rev = "786e7f3488eb71b200ece775b027a647cf42db9e" }
-adbc_ffi = { git = "https://github.com/fornwall/arrow-adbc", rev = "786e7f3488eb71b200ece775b027a647cf42db9e", optional = true }
+#      stream was requested) instead of leaving the caller's out-parameter untouched
+#      (https://github.com/apache/arrow-adbc/pull/4469).
+#   3. The exporter preserves the caller's `AdbcError.private_data` on the ADBC 1.0.0 path
+#      instead of clobbering it (https://github.com/apache/arrow-adbc/pull/4473).
+# Together they let the C++ `adbc_validation` suite behave correctly against this driver
+# (see adbc-validation/), including its `StatementTest.ErrorCompatibility` case. Revert to a
+# versioned crates.io release once these ship in one.
+adbc_core = { git = "https://github.com/apache/arrow-adbc", rev = "198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab" }
+adbc_ffi = { git = "https://github.com/apache/arrow-adbc", rev = "198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab", optional = true }
 # Arrow types the ADBC traits are expressed in. Kept in the range the (git) adbc crates
 # allow (>=58, <60) so the RecordBatch / Schema / RecordBatchReader types unify across them.
 arrow-array = ">=58, <60"
@@ -184,7 +187,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync"
 proptest = "1"
 # Driver manager: loads the built cdylib through the C ABI for the FFI smoke test.
 # Same git pin as adbc_core / adbc_ffi above (the three must share one revision).
-adbc_driver_manager = { git = "https://github.com/fornwall/arrow-adbc", rev = "786e7f3488eb71b200ece775b027a647cf42db9e" }
+adbc_driver_manager = { git = "https://github.com/apache/arrow-adbc", rev = "198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab" }
 # Loads the built cdylib directly (bypassing the driver manager) so the raw-FFI lifecycle test
 # can drive double-release / error-struct-reuse paths the managed wrappers never hit. Already in
 # the dependency graph via adbc_driver_manager; same version range.

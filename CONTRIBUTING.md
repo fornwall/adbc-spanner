@@ -78,7 +78,7 @@ tag disagrees with the crate version, so crate / tag / wheel cannot drift.
 blocks `cargo publish`:
 
 1. the `google-cloud-*` family (to a `google-cloud-rust` revision), and
-2. `adbc_core` / `adbc_ffi` / `adbc_driver_manager` (to a `fornwall/arrow-adbc` fork revision).
+2. `adbc_core` / `adbc_ffi` / `adbc_driver_manager` (to an `apache/arrow-adbc` `main` revision).
 
 Do not edit these pins ad hoc. The **Revert checklist** in `CLAUDE.md` ("Temporary git pins") is the
 single source of truth: it lists both current revision SHAs and every location (`Cargo.toml`,
