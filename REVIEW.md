@@ -877,7 +877,16 @@ queries~~ (**Fixed** for GQL: property graphs and GQL graph queries do work thro
 through the normal `execute` path, verified end-to-end against the emulator by
 `gql_graph_query_round_trip` in `tests/integration.rs` and claimed in the README/CLAUDE.md feature
 lists; the change-streams half is still open) may already work through plain SQL — one emulator test
-each would let the README claim them; telemetry/tracing hooks as a backlog entry.
+each would let the README claim them; ~~telemetry/tracing hooks~~ (**Won't fix.** A `tracing`-event
+prototype was implemented and reviewed in PR #194, then dropped: emitting Rust `tracing` events is
+invisible to the driver's primary consumers, who load the **cdylib through an ADBC driver manager**
+(the Python wheel / C hosts) where no Rust subscriber is ever installed — a `tracing` subscriber only
+fires for a Rust host embedding the rlib directly. It also delivered events, not spans, so it
+captured no operation latency — the one high-value signal. The upstream ADBC direction is
+OpenTelemetry **spans** exported from *inside* the loaded driver, selected by `OTEL_TRACES_EXPORTER`
+(the Go Snowflake/BigQuery drivers), which does reach driver-manager consumers. If observability is
+revisited, that env-var-configured OTel export path — reachable from the cdylib — is the design to
+match, not Rust-host-only event logging.).
 
 **CI/misc.** ~~No dependabot/renovate (SHA-pinned actions and the two git-pin families drift
 unmonitored)~~ (**Fixed.** `.github/dependabot.yml` now monitors the `github-actions` and `cargo`
