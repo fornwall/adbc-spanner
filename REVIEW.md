@@ -946,9 +946,22 @@ CMakeLists hash means a bump of the pinned `ARROW_ADBC_TAG` (or any CMake/toolch
 live in that file) invalidates the cache, while a `restore-keys: adbc-validation-${{ runner.os }}-`
 fallback seeds a same-OS build tree for an incremental rebuild. The build step still always runs, so on
 a hit it is an incremental no-op and on a rev change FetchContent re-fetches the new tag — a stale cache
-can never mask a real rev change.); the
+can never mask a real rev change.); ~~the
 adbc-validation allowlist means new upstream tests never auto-enter the gate (periodic `--full`
-triage is manual); ~~dead crates.io/docs.rs badges in the README~~ (**Fixed.** The crate is unpublished
+triage is manual)~~ (**Fixed.** `scripts/run-adbc-validation.sh` dropped the explicit run-allowlist for a single `EXCLUDED`
+list (the cases known-not-passing / not-applicable to Spanner, each tagged with a reason grouped by the
+README's buckets) and derives three CI checks from it. (1) *Gate*: it runs everything **except** the
+excluded cases (`--gtest_filter=-<EXCLUDED>`) and requires them all to pass/skip — so a brand-new upstream
+case (e.g. after an `ARROW_ADBC_TAG` bump) is not excluded, **auto-runs** in the gate, and turns CI red if
+it fails, instead of silently never running. (2) *Expected-failure guard* (xfail-strict): it runs only the
+excluded cases with `--gtest_output=xml`, parses the JUnit per-testcase result, and fails if any excluded
+case actually **passed** (a skip does not count), so an exclusion the driver has since grown to satisfy
+must be removed and re-enforced by the gate. (3) *Stale guard*: it enumerates cases via
+`--gtest_list_tests` (list-only, no database — also what `--check-drift` runs) and fails if any `EXCLUDED`
+entry no longer exists upstream, so the list can't rot. Ordering: build → stale guard → emulator DB →
+gate → expected-failure guard. So new tests auto-enroll, and both a regressing and a fixed exclusion fail
+CI; the periodic `--full` triage is gone. `.github/workflows/adbc-validation.yml` needed no change — it
+just calls the script.); ~~dead crates.io/docs.rs badges in the README~~ (**Fixed.** The crate is unpublished
 (`publish = false`), so its crates.io/docs.rs badges pointed at nonexistent pages and rendered
 broken — both removed from `README.md`; the working GitHub Actions CI badge (and the License
 badge) are kept.); ~~no consolidated
