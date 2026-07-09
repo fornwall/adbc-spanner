@@ -1600,4 +1600,28 @@ mod tests {
         assert!(str_col(&batch, 0).is_ok());
         assert_eq!(str_col(&batch, 1).unwrap_err().status, Status::Internal);
     }
+
+    #[test]
+    fn partition_descriptor_round_trips_large_floats() {
+        // Regression for a nightly fuzz find (adbc-spanner#188): a descriptor whose payload
+        // carries an integer literal too large for i64/u64 is parsed to f64, so re-encoding emits
+        // a ryu float. serde_json's default float parser is fast-but-imprecise (up to one ULP
+        // off), so `parse(ryu(x)) != x` and each decode → encode pass drifted to an adjacent ULP —
+        // the fixed point `read_partition` relies on never settled. The `float_roundtrip` feature
+        // makes the parser exact, so a single re-encode is already the fixed point.
+        //
+        // The unknown keys land in the generated request's `_unknown_fields` as `serde_json::Value`
+        // numbers, exercising exactly that float path.
+        let descriptor = br#"{"v": 1, "partition": {"inner": {"Query": {"con[": 44444424444444444249, "/+%n":4444440000000000000000074074764, "/s%n": "prns/s"}}}}"#;
+
+        let partition = decode_partition(descriptor).expect("descriptor decodes");
+        let first = encode_partition(&partition).expect("a decoded partition re-encodes");
+        // `encode_partition`'s own output must be a byte-stable fixed point under decode → encode.
+        let normalized = decode_partition(&first).expect("re-encoded descriptor decodes");
+        let again = encode_partition(&normalized).expect("a decoded partition re-encodes");
+        assert_eq!(
+            first, again,
+            "decode → encode of an encoder's output must be byte-stable"
+        );
+    }
 }
