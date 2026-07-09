@@ -4408,6 +4408,167 @@ fn retry_tuning_round_trip_and_execute() {
         .expect("DML with bounded retry policy commits");
 }
 
+/// Spanner **property graphs** and **GQL graph queries** work through plain SQL: the graph is
+/// declared with a `CREATE PROPERTY GRAPH` DDL statement over ordinary node/edge tables, and a
+/// `GRAPH … MATCH … RETURN` query executes through the normal `execute` query path — no special
+/// driver support is required, since GoogleSQL surfaces GQL as just another read-only query. This
+/// exercises the full round-trip against the emulator: create the tables, declare the graph, insert
+/// rows, then traverse an edge with `MATCH (a)-[e]->(b)` and assert the returned columns/rows.
+#[test]
+fn gql_graph_query_round_trip() {
+    let Some(target) = test_target() else {
+        eprintln!(
+            "neither SPANNER_EMULATOR_HOST nor SPANNER_GCP_DATABASE set — \
+             skipping GQL graph-query integration test"
+        );
+        return;
+    };
+
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    // Schema: a node table `GqlAccount` and an edge table `GqlTransfer` whose (source, destination)
+    // keys reference it. All DDL is idempotent so the test can re-run against a persistent target.
+    // The `CREATE PROPERTY GRAPH` declaration must come after its underlying tables exist, so it is
+    // submitted as a second batch. Names are prefixed `Gql` to avoid colliding with other tests.
+    let mut ddl = connection.new_statement().expect("new statement");
+    ddl.set_sql_query(
+        "DROP PROPERTY GRAPH IF EXISTS GqlFinGraph; \
+         DROP TABLE IF EXISTS GqlTransfer; \
+         DROP TABLE IF EXISTS GqlAccount; \
+         CREATE TABLE GqlAccount (Id INT64 NOT NULL, Name STRING(MAX)) PRIMARY KEY (Id); \
+         CREATE TABLE GqlTransfer ( \
+             Id INT64 NOT NULL, ToId INT64 NOT NULL, Amount FLOAT64 \
+         ) PRIMARY KEY (Id, ToId)",
+    )
+    .unwrap();
+    assert_eq!(ddl.execute_update().expect("create graph tables"), None);
+
+    let mut graph_ddl = connection.new_statement().expect("new statement");
+    graph_ddl
+        .set_sql_query(
+            "CREATE PROPERTY GRAPH GqlFinGraph \
+                 NODE TABLES (GqlAccount KEY (Id) LABEL Account PROPERTIES (Id, Name)) \
+                 EDGE TABLES ( \
+                     GqlTransfer \
+                         KEY (Id, ToId) \
+                         SOURCE KEY (Id) REFERENCES GqlAccount (Id) \
+                         DESTINATION KEY (ToId) REFERENCES GqlAccount (Id) \
+                         LABEL Transfer PROPERTIES (Amount) \
+                 )",
+        )
+        .unwrap();
+    assert_eq!(
+        graph_ddl.execute_update().expect("create property graph"),
+        None
+    );
+
+    // Populate three accounts and two transfers (1 -> 2 of 100.0, 2 -> 3 of 42.5).
+    let mut ins = connection.new_statement().expect("new statement");
+    ins.set_sql_query(
+        "INSERT INTO GqlAccount (Id, Name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')",
+    )
+    .unwrap();
+    assert_eq!(ins.execute_update().expect("insert accounts"), Some(3));
+
+    let mut ins_edges = connection.new_statement().expect("new statement");
+    ins_edges
+        .set_sql_query(
+            "INSERT INTO GqlTransfer (Id, ToId, Amount) VALUES (1, 2, 100.0), (2, 3, 42.5)",
+        )
+        .unwrap();
+    assert_eq!(
+        ins_edges.execute_update().expect("insert transfers"),
+        Some(2)
+    );
+
+    // The GQL graph query: traverse each transfer edge and return the endpoint names + amount.
+    // Executed through the ordinary query path (`execute`), exactly like any GoogleSQL SELECT.
+    let mut gql = connection.new_statement().expect("new statement");
+    gql.set_sql_query(
+        "GRAPH GqlFinGraph \
+         MATCH (a:Account)-[t:Transfer]->(b:Account) \
+         RETURN a.Name AS src, b.Name AS dst, t.Amount AS amount",
+    )
+    .unwrap();
+    let reader = gql.execute().expect("execute GQL graph query");
+
+    // The Arrow schema reflects the RETURN clause's projected columns and their GoogleSQL types.
+    let schema = reader.schema();
+    assert_eq!(schema.field(0).name(), "src");
+    assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+    assert_eq!(schema.field(1).name(), "dst");
+    assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+    assert_eq!(schema.field(2).name(), "amount");
+    assert_eq!(schema.field(2).data_type(), &DataType::Float64);
+
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect GQL result batches");
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 2,
+        "expected two edges back from the graph match"
+    );
+
+    // Collect the returned edges into a set, since the graph-match traversal makes no ordering
+    // guarantee without an explicit `ORDER BY`.
+    let mut edges = Vec::new();
+    for batch in &batches {
+        let src = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let dst = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let amount = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            edges.push((
+                src.value(i).to_string(),
+                dst.value(i).to_string(),
+                amount.value(i),
+            ));
+        }
+    }
+    edges.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+    assert_eq!(
+        edges,
+        vec![
+            ("Bob".to_string(), "Carol".to_string(), 42.5),
+            ("Alice".to_string(), "Bob".to_string(), 100.0),
+        ],
+        "the two transfer edges must round-trip through the graph match"
+    );
+
+    // Clean up the scratch schema so a persistent `SPANNER_GCP_DATABASE` re-run stays tidy.
+    let mut cleanup = connection.new_statement().expect("new statement");
+    cleanup
+        .set_sql_query(
+            "DROP PROPERTY GRAPH IF EXISTS GqlFinGraph; \
+             DROP TABLE IF EXISTS GqlTransfer; \
+             DROP TABLE IF EXISTS GqlAccount",
+        )
+        .unwrap();
+    cleanup.execute_update().expect("drop graph schema");
+}
+
 /// Serialize the schema-mutating / DML-heavy tests against each other. Spanner rejects a schema
 /// change while a read-write transaction is in progress on the database, so the DDL-heavy
 /// `query_and_dml_round_trip` cannot run concurrently with the DML-heavy property tests. Each holds
