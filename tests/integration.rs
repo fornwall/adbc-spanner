@@ -6333,6 +6333,87 @@ fn readonly_connection_rejects_writes() {
         .expect("disable readonly again");
 }
 
+/// Cross-thread propagation of the live `adbc.connection.readonly` flag. The flag is a shared
+/// `Arc<AtomicBool>` a statement reads at *execution* time, so a toggle on the connection from a
+/// *different* thread must be observed by a statement created earlier on this thread — the
+/// concurrency guarantee behind the same-thread toggle in [`readonly_connection_rejects_writes`].
+/// The read-only check runs *before* any RPC, so the DML here never reaches Spanner in the locked
+/// case; a valid target is needed only to build the connection/statement, hence the `test_target()`
+/// gating. A channel handshake orders the other thread's store ahead of this thread's execute, so
+/// the test is deterministic (no sleeps).
+#[test]
+fn readonly_toggle_from_another_thread_locks_existing_statement() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping readonly_toggle_from_another_thread");
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    use adbc_core::error::Status;
+    use std::sync::mpsc;
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    // Create the statement while the connection is still writable (the default), and confirm it can
+    // write — the `WHERE false` DML is a real no-op commit that returns a count of 0.
+    let mut dml = connection.new_statement().expect("new statement");
+    dml.set_sql_query("DELETE FROM Singers WHERE false")
+        .unwrap();
+    assert_eq!(
+        dml.execute_update()
+            .expect("a fresh statement on a writable connection can write"),
+        Some(0),
+        "the DML runs as a no-op while the connection is writable"
+    );
+
+    // Flip `adbc.connection.readonly=true` from a SECOND thread that owns the connection. The
+    // channel send/recv orders that store ahead of the execute below.
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let toggler = std::thread::spawn(move || {
+        connection
+            .set_option(
+                OptionConnection::ReadOnly,
+                OptionValue::String("true".into()),
+            )
+            .expect("enable readonly from another thread");
+        ready_tx.send(()).expect("signal readonly set");
+        // Hand the connection back so the caller can reset it; the flag itself outlives this thread
+        // regardless, since the statement holds its own clone of the shared `Arc<AtomicBool>`.
+        connection
+    });
+    ready_rx.recv().expect("wait for the readonly toggle");
+
+    // The pre-existing statement — created before the toggle, living on this thread — must now
+    // observe the flag set by the other thread and reject the write with `InvalidState`, before any
+    // RPC is issued.
+    let relock_err = dml
+        .execute_update()
+        .expect_err("readonly toggled from another thread must lock a pre-existing statement");
+    assert_eq!(
+        relock_err.status,
+        Status::InvalidState,
+        "the read-only flag propagates across threads: a toggle on the connection from another \
+         thread immediately locks a statement created earlier on this thread, got: {relock_err:?}"
+    );
+
+    // Reclaim the connection and leave it writable for any later use of the shared database.
+    let mut connection = toggler.join().expect("toggler thread must not panic");
+    connection
+        .set_option(
+            OptionConnection::ReadOnly,
+            OptionValue::String("false".into()),
+        )
+        .expect("disable readonly");
+}
+
 /// `rollback()` without an active manual transaction — i.e. in autocommit mode, the default — is
 /// an `InvalidState` error, while `rollback()` inside a manual transaction with nothing buffered
 /// is a harmless no-op that discards nothing and keeps the connection in manual mode.
