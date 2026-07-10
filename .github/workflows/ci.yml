@@ -67,6 +67,11 @@ jobs:
       - name: Build the shared library (for the FFI smoke test)
         run: cargo build
 
+      - name: Mock-server fault-injection tests
+        # Fully offline, deterministic gRPC fault-injection suite (in-process mock
+        # server) — needs no emulator, so run it before the emulator setup below.
+        run: cargo test --test mock_spanner
+
       - name: Wait for the Spanner emulator
         run: |
           # Wait for the admin API to actually serve RPCs, not just for the gRPC
