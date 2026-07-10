@@ -803,6 +803,16 @@ impl Optionable for SpannerConnection {
             OptionConnection::Other(k) if k == crate::OPTION_RETRY_BACKOFF_MULTIPLIER => {
                 self.retry.set_backoff_multiplier(value)?;
             }
+            // A Spanner database exposes a single, unnamed catalog and (default) schema — both `""`,
+            // which is what the `get_option` side always reports — and neither can be switched. So
+            // setting either to `""` is a conformant no-op; any other value is an `InvalidArguments`
+            // (the requested catalog/schema does not exist), not `NotImplemented`.
+            OptionConnection::CurrentCatalog => {
+                check_unnamed_catalog_or_schema(value, "current catalog")?;
+            }
+            OptionConnection::CurrentSchema => {
+                check_unnamed_catalog_or_schema(value, "current schema")?;
+            }
             other => {
                 return Err(not_implemented(&format!(
                     "unsupported Spanner connection option: {}",
@@ -1411,6 +1421,24 @@ fn parse_bool(value: OptionValue) -> Result<bool> {
     crate::options::bool_option(value, "option")
 }
 
+/// Validate a `current_catalog` / `current_schema` set request. A Spanner database exposes a single,
+/// unnamed (`""`) catalog and (default) schema — mirrored by the `get_option` side, which always
+/// reports `""` — and there is no way to switch either. So the only conformant value is the empty
+/// string, accepted as a no-op; any other value is rejected with `InvalidArguments` (the requested
+/// catalog/schema does not exist), not `NotImplemented`. `what` names the option in the error.
+fn check_unnamed_catalog_or_schema(value: OptionValue, what: &str) -> Result<()> {
+    let OptionValue::String(s) = value else {
+        return Err(invalid_argument(format!("expected a string {what} value")));
+    };
+    if s.is_empty() {
+        Ok(())
+    } else {
+        Err(invalid_argument(format!(
+            "Spanner exposes a single unnamed {what}; only \"\" is valid, got {s:?}"
+        )))
+    }
+}
+
 fn connection_option_name(key: &OptionConnection) -> String {
     key.as_ref().to_string()
 }
@@ -1492,6 +1520,27 @@ mod tests {
         let err = check_lookup_catalog(Some("main")).unwrap_err();
         assert_eq!(err.status, Status::NotFound);
         assert!(err.message.contains("\"main\""), "{}", err.message);
+    }
+
+    #[test]
+    fn setting_current_catalog_or_schema_accepts_only_the_empty_string() {
+        let set = |s: &str| {
+            check_unnamed_catalog_or_schema(OptionValue::String(s.to_string()), "current catalog")
+        };
+        // Spanner's single unnamed catalog/schema is `""`, so setting it to `""` is a no-op success.
+        assert!(set("").is_ok());
+        // Any other value names a catalog/schema that does not exist → InvalidArguments (not
+        // NotImplemented, which is what the blanket fall-through arm would have produced).
+        let err = set("foo").unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(err.message.contains("\"foo\""), "{}", err.message);
+        // A non-string option value is likewise rejected as an invalid argument.
+        assert_eq!(
+            check_unnamed_catalog_or_schema(OptionValue::Int(1), "current schema")
+                .unwrap_err()
+                .status,
+            Status::InvalidArguments
+        );
     }
 
     /// A garbage partition descriptor — `read_partition`'s input is caller-supplied opaque bytes —
