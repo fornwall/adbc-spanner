@@ -10,6 +10,30 @@ project(adbc_spanner_validation LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Optional sanitizers for the whole C++ side of the suite (this harness + the ADBC driver
+# manager + the adbc_validation object library + vendored nanoarrow/fmt). Set e.g.
+# `-DSPANNER_VALIDATION_SANITIZE=address,undefined` (the run script forwards
+# ADBC_VALIDATION_SANITIZE). The flags are added *before* FetchContent below so the fetched
+# arrow-adbc sources inherit them too.
+#
+# The Rust cdylib itself is NOT instrumented — it is built separately by cargo (stable) and
+# dlopen-loaded by the driver manager. That still catches the memory bugs that matter at the C
+# ABI boundary: ASan's malloc/free/memcpy interceptors are process-wide, and Rust's default
+# allocator is libc malloc, so double-free / heap-overflow / use-after-free on the C-ABI structs
+# shared across the boundary (ArrowArray/ArrowSchema release callbacks, AdbcError private_data)
+# are reported — with symbolized Rust frames — even though the cdylib is uninstrumented. Errors
+# that never touch an interceptor (a plain out-of-bounds store inside Rust) would need a nightly
+# `-Zsanitizer=address` cdylib build, which is out of scope here (cargo-fuzz already ASan-covers
+# the offline parser paths).
+set(SPANNER_VALIDATION_SANITIZE ""
+    CACHE STRING "comma-separated -fsanitize list for the C++ suite (e.g. address,undefined)")
+if(SPANNER_VALIDATION_SANITIZE)
+  message(STATUS "Sanitizers: -fsanitize=${SPANNER_VALIDATION_SANITIZE}")
+  add_compile_options(-fsanitize=${SPANNER_VALIDATION_SANITIZE}
+                      -fno-omit-frame-pointer -fno-sanitize-recover=all)
+  add_link_options(-fsanitize=${SPANNER_VALIDATION_SANITIZE})
+endif()
+
 # Pin to an apache/arrow-adbc `main` revision, matching the family of the
 # adbc_core / adbc_ffi git pin the driver builds on (see Cargo.toml). Tracking
 # `main` (rather than the 0.23 release tag) picks up the C++ validation fix in
