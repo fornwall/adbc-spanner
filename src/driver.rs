@@ -13,7 +13,7 @@ use google_cloud_auth::credentials::{
     CacheableResource, Credentials, CredentialsProvider, EntityTag,
 };
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
-use http::header::{AUTHORIZATION, HeaderValue};
+use http::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use http::{Extensions, HeaderMap};
 
 use crate::connection::SpannerConnection;
@@ -24,9 +24,14 @@ use crate::runtime::{SharedRuntime, new_runtime};
 use crate::{
     OPTION_ACCESS_TOKEN, OPTION_DATABASE, OPTION_EMULATOR, OPTION_ENDPOINT,
     OPTION_IMPERSONATE_DELEGATES, OPTION_IMPERSONATE_LIFETIME, OPTION_IMPERSONATE_SCOPES,
-    OPTION_IMPERSONATE_TARGET_PRINCIPAL, OPTION_KEYFILE, OPTION_KEYFILE_JSON,
+    OPTION_IMPERSONATE_TARGET_PRINCIPAL, OPTION_KEYFILE, OPTION_KEYFILE_JSON, OPTION_QUOTA_PROJECT,
 };
 use std::time::Duration;
+
+/// The HTTP request header carrying the quota / billing project (`spanner.auth.quota_project`).
+/// Matches the `google-cloud-auth` `QUOTA_PROJECT_KEY` that its `with_quota_project_id` emits, so
+/// the credential-builder and the access-token paths attach the identical header.
+const QUOTA_PROJECT_HEADER: &str = "x-goog-user-project";
 
 /// The default lifetime, in seconds, of an impersonated access token when
 /// [`OPTION_IMPERSONATE_LIFETIME`] is left unset — one hour, matching the `google-cloud-auth`
@@ -111,6 +116,11 @@ pub struct SpannerDatabase {
     /// bearer token directly (no refresh); it is mutually exclusive with the keyfile/impersonation
     /// options and with emulator mode.
     access_token: Option<String>,
+    /// The quota / billing project charged for API usage (`spanner.auth.quota_project`), sent as the
+    /// `x-goog-user-project` header. `None` = the credential's own project. Not a secret (a bare
+    /// project id), so it renders in `Debug` and round-trips through `get_option`. Composes with
+    /// every non-emulator credential path; refused in emulator mode.
+    quota_project: Option<String>,
 }
 
 impl std::fmt::Debug for SpannerDatabase {
@@ -134,6 +144,7 @@ impl std::fmt::Debug for SpannerDatabase {
             .field("impersonate_scopes", &self.impersonate_scopes)
             .field("impersonate_lifetime_secs", &self.impersonate_lifetime_secs)
             .field("access_token", &redact(&self.access_token))
+            .field("quota_project", &self.quota_project)
             .finish()
     }
 }
@@ -152,6 +163,7 @@ impl SpannerDatabase {
             impersonate_scopes: Vec::new(),
             impersonate_lifetime_secs: None,
             access_token: None,
+            quota_project: None,
         }
     }
 
@@ -297,18 +309,28 @@ impl SpannerDatabase {
         // credentials the user explicitly configured would be an environment-controlled security
         // downgrade (a stray `SPANNER_EMULATOR_HOST` redirecting real-database traffic, sans auth,
         // to an attacker-chosen endpoint), so the combination is refused instead. Ambient ADC does
-        // not trip this — only explicit driver options do.
-        if emulator && let Some(option) = self.explicit_credential_option() {
+        // not trip this — only explicit driver options do. The quota (billing) project is refused
+        // on the same grounds: the emulator ignores it, so it would be silently dropped.
+        if emulator {
             let cause = if self.emulator {
                 "the `spanner.emulator` option"
             } else {
                 "the `SPANNER_EMULATOR_HOST` environment variable"
             };
-            return Err(invalid_state(format!(
-                "emulator mode (enabled by {cause}) forces anonymous plaintext credentials \
-                 and would silently ignore the configured `{option}` option; unset the \
-                 credential option(s) or disable emulator mode"
-            )));
+            if let Some(option) = self.explicit_credential_option() {
+                return Err(invalid_state(format!(
+                    "emulator mode (enabled by {cause}) forces anonymous plaintext credentials \
+                     and would silently ignore the configured `{option}` option; unset the \
+                     credential option(s) or disable emulator mode"
+                )));
+            }
+            if self.quota_project.is_some() {
+                return Err(invalid_state(format!(
+                    "emulator mode (enabled by {cause}) forces anonymous plaintext credentials \
+                     and would silently ignore the configured `{OPTION_QUOTA_PROJECT}` option; \
+                     unset it or disable emulator mode"
+                )));
+            }
         }
 
         // An explicit access token is a complete credential on its own — it *is* the bearer token,
@@ -330,6 +352,11 @@ impl SpannerDatabase {
         let credentials_json = self.credentials_json()?;
         let access_token = self.access_token.clone();
 
+        // The quota / billing project, attached to whichever non-emulator credential wins below via
+        // `with_quota_project_id` (ADC / keyfile / impersonation) or the `x-goog-user-project`
+        // header (access token). `None` leaves the credential's own project in charge.
+        let quota_project = self.quota_project.clone();
+
         // Impersonation config, applied on top of the base credentials below when a target is set.
         let impersonate_target = self.impersonate_target_principal.clone();
         let impersonate_delegates = self.impersonate_delegates.clone();
@@ -347,15 +374,19 @@ impl SpannerDatabase {
             if emulator {
                 builder = builder.with_credentials(AnonymousCredentials::new().build());
             } else if let Some(token) = access_token {
-                // A caller-supplied OAuth2 bearer token, sent verbatim with no refresh. Mutual
-                // exclusion with the keyfile/impersonation options was checked above.
-                builder = builder.with_credentials(build_static_token_credentials(&token)?);
+                // A caller-supplied OAuth2 bearer token, sent verbatim with no refresh (plus the
+                // quota-project header, if any). Mutual exclusion with the keyfile/impersonation
+                // options was checked above.
+                builder = builder.with_credentials(build_static_token_credentials(
+                    &token,
+                    quota_project.as_deref(),
+                )?);
             } else if let Some(target) = impersonate_target {
                 // Build the base credential exactly as the non-impersonated path does — an explicit
                 // keyfile, or ADC when none is given — then wrap it so it is only used to mint a
                 // short-lived token for `target` (optionally through a delegation chain).
                 let source = match credentials_json {
-                    Some(json) => build_credentials_from_json(&json)?,
+                    Some(json) => build_credentials_from_json(&json, None)?,
                     None => AdcCredentials::default().build().map_err(|e| {
                         err(
                             format!(
@@ -373,12 +404,35 @@ impl SpannerDatabase {
                     &impersonate_delegates,
                     &impersonate_scopes,
                     impersonate_lifetime,
+                    quota_project.as_deref(),
                 )?;
                 builder = builder.with_credentials(credentials);
             } else if let Some(json) = credentials_json {
-                builder = builder.with_credentials(build_credentials_from_json(&json)?);
+                builder = builder.with_credentials(build_credentials_from_json(
+                    &json,
+                    quota_project.as_deref(),
+                )?);
+            } else if let Some(project) = quota_project.as_deref() {
+                // No explicit credential option, but a quota (billing) project was requested: build
+                // Application Default Credentials *explicitly* so `with_quota_project_id` can attach
+                // the `x-goog-user-project` header (otherwise the client would resolve ADC itself,
+                // with no place to hang the quota project on).
+                let credentials = AdcCredentials::default()
+                    .with_quota_project_id(project)
+                    .build()
+                    .map_err(|e| {
+                        err(
+                            format!(
+                                "failed to build Application Default Credentials with quota \
+                                 project {project:?}: {}",
+                                scrub_credential_error(&e)
+                            ),
+                            Status::InvalidArguments,
+                        )
+                    })?;
+                builder = builder.with_credentials(credentials);
             }
-            // Otherwise: Application Default Credentials.
+            // Otherwise: Application Default Credentials, resolved by the client.
             let spanner = builder.build().await.map_err(from_builder)?;
             let client = spanner
                 .database_client(database.clone())
@@ -443,6 +497,11 @@ impl Optionable for SpannerDatabase {
             OptionDatabase::Other(name) if name == OPTION_ACCESS_TOKEN => {
                 self.access_token = Some(string_value(&key, value)?)
             }
+            OptionDatabase::Other(name) if name == OPTION_QUOTA_PROJECT => {
+                // `""` unsets, back to the credential's own project (the house "" pattern).
+                let project = string_value(&key, value)?;
+                self.quota_project = (!project.is_empty()).then_some(project);
+            }
             other => {
                 return Err(not_implemented(&format!(
                     "unsupported Spanner database option: {}",
@@ -479,6 +538,9 @@ impl Optionable for SpannerDatabase {
             // Round-trips verbatim, matching the keyfile_json convention (which likewise returns the
             // stored secret unchanged); ADBC has no notion of a write-only option.
             OptionDatabase::Other(name) if name == OPTION_ACCESS_TOKEN => self.access_token.clone(),
+            OptionDatabase::Other(name) if name == OPTION_QUOTA_PROJECT => {
+                self.quota_project.clone()
+            }
             _ => None,
         };
         value.ok_or_else(|| {
@@ -541,7 +603,7 @@ pub(crate) fn ensure_scheme(host: &str) -> String {
 /// Exactly the options that configure a [`SpannerDatabase`] besides the database path itself; the
 /// path aliases (`uri` / [`OPTION_DATABASE`]) are deliberately absent — the URI's path component is
 /// the one way to name the database. Unknown keys are rejected with `InvalidArguments`.
-const URI_QUERY_OPTIONS: [&str; 9] = [
+const URI_QUERY_OPTIONS: [&str; 10] = [
     OPTION_ENDPOINT,
     OPTION_EMULATOR,
     OPTION_KEYFILE,
@@ -551,6 +613,7 @@ const URI_QUERY_OPTIONS: [&str; 9] = [
     OPTION_IMPERSONATE_SCOPES,
     OPTION_IMPERSONATE_LIFETIME,
     OPTION_ACCESS_TOKEN,
+    OPTION_QUOTA_PROJECT,
 ];
 
 /// If `value` is a connection URI — it starts with the `spanner:` scheme (ASCII case-insensitive,
@@ -722,7 +785,11 @@ const SUPPORTED_CREDENTIAL_TYPES: &str =
 /// happen here for the JSON supplied through the `spanner.keyfile` / `spanner.keyfile_json`
 /// options. Previously every keyfile was forced through the `service_account` builder, which failed
 /// (or misbehaved) for any other credential type.
-fn build_credentials_from_json(json: &str) -> Result<Credentials> {
+///
+/// `quota_project`, when `Some`, is attached to whichever builder is selected via its
+/// `with_quota_project_id`, so the resulting credentials send the `x-goog-user-project` billing
+/// header (the `spanner.auth.quota_project` option).
+fn build_credentials_from_json(json: &str, quota_project: Option<&str>) -> Result<Credentials> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|e| {
         err(
             format!("invalid credential JSON key: {e}"),
@@ -741,11 +808,24 @@ fn build_credentials_from_json(json: &str) -> Result<Credentials> {
         })?
         .to_owned();
 
+    // Each credential-type branch has a differently-typed builder, all sharing a
+    // `with_quota_project_id` method; this local macro applies the quota project uniformly.
+    macro_rules! with_quota_project {
+        ($builder:expr) => {{
+            let builder = $builder;
+            match quota_project {
+                Some(project) => builder.with_quota_project_id(project),
+                None => builder,
+            }
+        }};
+    }
     let result = match credential_type.as_str() {
-        "service_account" => ServiceAccountCredentials::new(value).build(),
-        "authorized_user" => UserAccountCredentials::new(value).build(),
-        "impersonated_service_account" => ImpersonatedCredentials::new(value).build(),
-        "external_account" => ExternalAccountCredentials::new(value).build(),
+        "service_account" => with_quota_project!(ServiceAccountCredentials::new(value)).build(),
+        "authorized_user" => with_quota_project!(UserAccountCredentials::new(value)).build(),
+        "impersonated_service_account" => {
+            with_quota_project!(ImpersonatedCredentials::new(value)).build()
+        }
+        "external_account" => with_quota_project!(ExternalAccountCredentials::new(value)).build(),
         other => {
             return Err(invalid_argument(format!(
                 "unsupported credential `type` {other:?}; expected one of \
@@ -808,6 +888,7 @@ fn build_impersonated_credentials(
     delegates: &[String],
     scopes: &[String],
     lifetime: Duration,
+    quota_project: Option<&str>,
 ) -> Result<Credentials> {
     let mut builder = ImpersonatedCredentials::from_source_credentials(source)
         .with_target_principal(target_principal)
@@ -817,6 +898,11 @@ fn build_impersonated_credentials(
     }
     if !scopes.is_empty() {
         builder = builder.with_scopes(scopes.iter().cloned());
+    }
+    // The quota project belongs on the final (impersonated) credential; the auth crate gives the
+    // builder value precedence over any carried by the source.
+    if let Some(project) = quota_project {
+        builder = builder.with_quota_project_id(project);
     }
     builder.build().map_err(|e| {
         err(
@@ -875,7 +961,12 @@ impl CredentialsProvider for StaticTokenCredentials {
 /// malformed token (one carrying characters illegal in an HTTP header value) is rejected up front
 /// with a clean `InvalidArguments` — and the token itself is never interpolated into the error, so
 /// no token material can leak (the `scrub_credential_error` discipline).
-fn build_static_token_credentials(token: &str) -> Result<Credentials> {
+///
+/// `quota_project`, when `Some`, adds the `x-goog-user-project` billing header (the
+/// `spanner.auth.quota_project` option) — the same header the credential-builder paths emit via
+/// `with_quota_project_id`, here attached manually since the static-token provider does not use a
+/// builder. It is a bare project id, not a secret, so it is not marked sensitive.
+fn build_static_token_credentials(token: &str, quota_project: Option<&str>) -> Result<Credentials> {
     let mut value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
         invalid_argument(format!(
             "the `{OPTION_ACCESS_TOKEN}` option contains characters that are not valid in an HTTP \
@@ -885,6 +976,15 @@ fn build_static_token_credentials(token: &str) -> Result<Credentials> {
     value.set_sensitive(true);
     let mut headers = HeaderMap::new();
     headers.insert(AUTHORIZATION, value);
+    if let Some(project) = quota_project {
+        let project = HeaderValue::from_str(project).map_err(|_| {
+            invalid_argument(format!(
+                "the `{OPTION_QUOTA_PROJECT}` option contains characters that are not valid in an \
+                 HTTP header value"
+            ))
+        })?;
+        headers.insert(HeaderName::from_static(QUOTA_PROJECT_HEADER), project);
+    }
     Ok(Credentials::from(StaticTokenCredentials {
         headers,
         entity_tag: EntityTag::new(),
@@ -1275,7 +1375,7 @@ mod tests {
         // The custom static-token credential emits `Authorization: Bearer <token>` verbatim, marks
         // it sensitive, and reports "not modified" for a matching cache tag. Runs inside a runtime
         // because `headers()` is async (though it does no I/O).
-        let credentials = build_static_token_credentials("ya29.the-token").unwrap();
+        let credentials = build_static_token_credentials("ya29.the-token", None).unwrap();
         let runtime = new_runtime().unwrap();
         runtime.block_on(async {
             let resource = credentials.headers(Extensions::new()).await.unwrap();
@@ -1289,6 +1389,8 @@ mod tests {
                 value.is_sensitive(),
                 "the bearer token must be marked sensitive"
             );
+            // No quota project was requested, so no billing header is attached.
+            assert!(headers.get(QUOTA_PROJECT_HEADER).is_none());
 
             // A request carrying the same entity tag is told the headers have not changed.
             let mut extensions = Extensions::new();
@@ -1305,7 +1407,7 @@ mod tests {
         // A token containing characters illegal in an HTTP header value (here a newline) is rejected
         // up front, and the token material never appears in the error message.
         const TOKEN: &str = "bad\ntoken-SECRET-do-not-leak";
-        let error = build_static_token_credentials(TOKEN).unwrap_err();
+        let error = build_static_token_credentials(TOKEN, None).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
         assert!(
             error.message.contains(OPTION_ACCESS_TOKEN),
@@ -1317,6 +1419,109 @@ mod tests {
             "access-token error leaked token material: {}",
             error.message
         );
+    }
+
+    #[test]
+    fn quota_project_option_round_trips_and_unsets() {
+        // The billing project is a bare project id (not a secret), so it round-trips verbatim; it is
+        // unset by default and `""` clears it, back to NotFound — the house "" pattern.
+        let mut db = new_database();
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(OPTION_QUOTA_PROJECT.into()))
+                .unwrap_err()
+                .status,
+            Status::NotFound
+        );
+        db.set_option(
+            OptionDatabase::Other(OPTION_QUOTA_PROJECT.into()),
+            OptionValue::String("my-billing-project".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(OPTION_QUOTA_PROJECT.into()))
+                .unwrap(),
+            "my-billing-project"
+        );
+        // `""` unsets.
+        db.set_option(
+            OptionDatabase::Other(OPTION_QUOTA_PROJECT.into()),
+            OptionValue::String(String::new()),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(OPTION_QUOTA_PROJECT.into()))
+                .unwrap_err()
+                .status,
+            Status::NotFound
+        );
+    }
+
+    #[test]
+    fn quota_project_renders_in_debug_and_is_not_a_secret() {
+        // Unlike the credential fields, the billing project is not redacted (it is a project id).
+        let mut db = new_database();
+        db.quota_project = Some("my-billing-project".into());
+        let rendered = format!("{db:?}");
+        assert!(
+            rendered.contains(r#"quota_project: Some("my-billing-project")"#),
+            "quota_project not shown verbatim: {rendered}"
+        );
+    }
+
+    #[test]
+    fn emulator_mode_with_a_quota_project_is_refused() {
+        // The emulator forces anonymous credentials and ignores billing, so a configured quota
+        // project would be silently dropped — refused at connect() like the credential options.
+        let mut db = new_database();
+        db.database = Some("projects/p/instances/i/databases/d".into());
+        db.emulator = true;
+        db.quota_project = Some("my-billing-project".into());
+        let error = db.connect().unwrap_err();
+        assert_eq!(error.status, Status::InvalidState);
+        assert!(error.message.contains("emulator mode"));
+        assert!(error.message.contains(OPTION_QUOTA_PROJECT));
+    }
+
+    #[test]
+    fn access_token_credentials_send_the_quota_project_header() {
+        // With a quota project, the static-token credential attaches `x-goog-user-project` alongside
+        // the bearer token — the actual on-the-wire billing header — and leaves it non-sensitive
+        // (a project id, not a secret). This is the strongest offline assertion of header emission;
+        // the builder paths (ADC/keyfile/impersonation) emit the identical header but only mint
+        // tokens over the network, so they cannot be exercised offline.
+        let credentials =
+            build_static_token_credentials("ya29.the-token", Some("my-billing-project")).unwrap();
+        let runtime = new_runtime().unwrap();
+        runtime.block_on(async {
+            let resource = credentials.headers(Extensions::new()).await.unwrap();
+            let headers = match resource {
+                CacheableResource::New { data, .. } => data,
+                CacheableResource::NotModified => panic!("expected fresh headers"),
+            };
+            let value = headers
+                .get(QUOTA_PROJECT_HEADER)
+                .expect("x-goog-user-project header");
+            assert_eq!(value.to_str().unwrap(), "my-billing-project");
+            assert!(
+                !value.is_sensitive(),
+                "the quota project is a project id, not a secret"
+            );
+            // The bearer token is still present and sensitive.
+            let auth = headers.get(AUTHORIZATION).expect("authorization header");
+            assert_eq!(auth.to_str().unwrap(), "Bearer ya29.the-token");
+            assert!(auth.is_sensitive());
+        });
+    }
+
+    #[test]
+    fn quota_project_does_not_conflict_with_an_access_token() {
+        // The billing project composes with every credential path, including the access token — it
+        // is not a credential, so it is absent from the access-token conflict set.
+        let mut db = new_database();
+        db.access_token = Some("ya29.test-token".into());
+        db.quota_project = Some("my-billing-project".into());
+        assert_eq!(db.conflicting_credential_with_access_token(), None);
+        assert_eq!(db.explicit_credential_option(), Some(OPTION_ACCESS_TOKEN));
     }
 
     // Only explicit driver options count as credentials: a fresh database (which would fall back to
@@ -1356,14 +1561,14 @@ mod tests {
 
     #[test]
     fn malformed_credential_json_is_rejected() {
-        let error = build_credentials_from_json("{ not valid json").unwrap_err();
+        let error = build_credentials_from_json("{ not valid json", None).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
         assert!(error.message.contains("invalid credential JSON key"));
     }
 
     #[test]
     fn credential_json_without_a_type_is_rejected() {
-        let error = build_credentials_from_json("{\"private_key\":\"x\"}").unwrap_err();
+        let error = build_credentials_from_json("{\"private_key\":\"x\"}", None).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
         assert!(error.message.contains("missing a string `type` field"));
         assert!(error.message.contains("service_account"));
@@ -1371,14 +1576,15 @@ mod tests {
 
     #[test]
     fn credential_json_with_a_non_string_type_is_rejected() {
-        let error = build_credentials_from_json("{\"type\":42}").unwrap_err();
+        let error = build_credentials_from_json("{\"type\":42}", None).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
         assert!(error.message.contains("missing a string `type` field"));
     }
 
     #[test]
     fn credential_json_with_an_unknown_type_is_rejected() {
-        let error = build_credentials_from_json("{\"type\":\"gdch_service_account\"}").unwrap_err();
+        let error =
+            build_credentials_from_json("{\"type\":\"gdch_service_account\"}", None).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
         assert!(error.message.contains("unsupported credential `type`"));
         assert!(error.message.contains("gdch_service_account"));
@@ -1399,7 +1605,7 @@ mod tests {
             "refresh_token": "test-refresh-token"
         }"#;
         let runtime = new_runtime().unwrap();
-        runtime.block_on(async { assert!(build_credentials_from_json(json).is_ok()) });
+        runtime.block_on(async { assert!(build_credentials_from_json(json, None).is_ok()) });
     }
 
     // A `service_account` keyfile is still routed to the service-account flow. A key with an invalid
@@ -1409,6 +1615,7 @@ mod tests {
     fn service_account_credential_json_is_routed_to_the_service_account_flow() {
         let error = build_credentials_from_json(
             "{\"type\":\"service_account\",\"private_key\":\"not-a-key\"}",
+            None,
         )
         .unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
@@ -1431,7 +1638,7 @@ mod tests {
         let json = format!(
             "{{\"type\":\"service_account\",\"private_key\":\"{SECRET}\",\"private_key_id\":42}}"
         );
-        let error = build_credentials_from_json(&json).unwrap_err();
+        let error = build_credentials_from_json(&json, None).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
         // The message names the detected credential type (safe, user-supplied config) ...
         assert!(
@@ -1614,13 +1821,14 @@ mod tests {
         }"#;
         let runtime = new_runtime().unwrap();
         runtime.block_on(async {
-            let source = build_credentials_from_json(source_json).unwrap();
+            let source = build_credentials_from_json(source_json, None).unwrap();
             let result = build_impersonated_credentials(
                 source,
                 "target@project.iam.gserviceaccount.com",
                 &["delegate@project.iam.gserviceaccount.com".to_string()],
                 &["https://www.googleapis.com/auth/cloud-platform".to_string()],
                 Duration::from_secs(1200),
+                Some("my-billing-project"),
             );
             assert!(result.is_ok());
         });
