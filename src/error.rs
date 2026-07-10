@@ -179,6 +179,9 @@ fn status_for_grpc_code(code_name: &str) -> Status {
         "CANCELLED" => Status::Cancelled,
         // ADBC's IO status documents "a remote service may be unavailable".
         "UNAVAILABLE" => Status::IO,
+        // The operation is not implemented / not supported by the backend — ADBC has a dedicated
+        // variant that fits this far better than the "driver bug" Internal fallback.
+        "UNIMPLEMENTED" => Status::NotImplemented,
         // ABORTED is Spanner's routine "transaction contended, please retry" signal. The client's
         // read/write runner retries it internally (indefinitely under the default policy the driver
         // uses), so a DML/commit/ingest caller does not normally see it; it reaches here only in the
@@ -228,6 +231,11 @@ mod tests {
         assert_eq!(status_for_grpc_code("UNAVAILABLE"), Status::IO);
         // Transient contention, not a driver/database defect: IO, not Internal.
         assert_eq!(status_for_grpc_code("ABORTED"), Status::IO);
+        // Not-supported operations map to the dedicated NotImplemented, not the Internal fallback.
+        assert_eq!(
+            status_for_grpc_code("UNIMPLEMENTED"),
+            Status::NotImplemented
+        );
     }
 
     #[test]
@@ -305,6 +313,23 @@ mod tests {
         assert_eq!(adbc.status, Status::IO);
         assert_eq!(adbc.vendor_code, Code::Aborted as i32);
         assert_eq!(adbc.vendor_code, 10);
+    }
+
+    #[test]
+    fn unimplemented_maps_to_not_implemented() {
+        use google_cloud_gax::error::Error as GaxError;
+        use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
+
+        let gax = GaxError::service(
+            RpcStatus::default()
+                .set_code(Code::Unimplemented)
+                .set_message("Operation not supported"),
+        );
+        let adbc = from_spanner(gax);
+        // A far better fit than the Internal "driver bug" fallback; the exact code still survives.
+        assert_eq!(adbc.status, Status::NotImplemented);
+        assert_eq!(adbc.vendor_code, Code::Unimplemented as i32);
+        assert_eq!(adbc.vendor_code, 12);
     }
 
     #[test]
