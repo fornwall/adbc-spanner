@@ -1397,6 +1397,45 @@ fn query_and_dml_round_trip() {
         Some(2)
     );
     assert_eq!(count_rows(&mut connection, "AdbcCreateAppend"), 4);
+    // Third ingest: table present but the bound schema is incompatible. Per the ADBC contract,
+    // `create_append` must error with AlreadyExists when the table exists and the schema does not
+    // match (the `CREATE TABLE IF NOT EXISTS` is a no-op, then the insert fails on the unknown
+    // column and the driver remaps it — the same probe path as `append`).
+    let create_append_mismatch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "NoSuchColumn",
+            DataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(Int64Array::from(vec![1]))],
+    )
+    .unwrap();
+    let mut ingest_ca_mismatch = connection.new_statement().expect("new statement");
+    ingest_ca_mismatch
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcCreateAppend".into()),
+        )
+        .unwrap();
+    ingest_ca_mismatch
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("create_append".into()),
+        )
+        .unwrap();
+    ingest_ca_mismatch
+        .bind(create_append_mismatch)
+        .expect("bind rows for create_append schema-mismatch ingest");
+    let ca_mismatch_err = ingest_ca_mismatch
+        .execute_update()
+        .expect_err("create_append with an incompatible schema must fail");
+    assert_eq!(
+        ca_mismatch_err.status,
+        adbc_core::error::Status::AlreadyExists,
+        "create_append with an incompatible schema must be AlreadyExists, got: {ca_mismatch_err:?}"
+    );
+    // The rejected ingest changed nothing.
+    assert_eq!(count_rows(&mut connection, "AdbcCreateAppend"), 4);
     // The data columns read back even though the table also carries the synthetic key column.
     let mut read_create_append = connection.new_statement().expect("new statement");
     read_create_append
