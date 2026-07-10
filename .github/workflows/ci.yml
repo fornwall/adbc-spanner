@@ -42,11 +42,16 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Third-party actions are pinned to a commit SHA (first-party actions/* stay on their
+        # major tag) — a hijacked mutable tag would otherwise run in CI with repo read access.
+        # dtolnay/rust-toolchain reads the toolchain from its ref name, so pinning the SHA
+        # requires selecting the toolchain explicitly below. Trailing comment names the ref.
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch, 2026-06-30
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -133,9 +138,11 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch, 2026-06-30
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - uses: actions/setup-python@v6
         with:
@@ -179,7 +186,9 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Lint GitHub Actions workflows
-        run: docker run --rm -v "${PWD}:/repo" --workdir /repo rhysd/actionlint:1.7.12 -color
+        # Third-party Docker image pinned to its digest (a tag is mutable and could be re-pushed);
+        # trailing comment names the tag the digest was resolved from.
+        run: docker run --rm -v "${PWD}:/repo" --workdir /repo rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color # 1.7.12
 
   # Supply-chain + hygiene checks (no build / emulator needed):
   # cargo-deny — security advisories (RUSTSEC), license compliance, banned/duplicate
@@ -191,11 +200,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
         with:
           command: check
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2
         with:
           tool: cargo-machete
 
