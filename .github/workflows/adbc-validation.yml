@@ -88,17 +88,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Two toolchain steps, one per matrix leg, so each can pin its OWN dtolnay/rust-toolchain
-      # SHA (the action reads the toolchain from its ref name, so the SHA and the requested
-      # toolchain must agree). Third-party actions are pinned to a commit SHA (first-party
-      # actions/* stay on their major tag) — a hijacked mutable tag would otherwise run in CI
-      # with repo read access. Expressions are deliberately NOT used in `uses:` (support is
-      # patchy); a plain `if:` per leg keeps the SHA a literal.
+      # Two toolchain steps, one per matrix leg. The stable leg installs the version pinned in
+      # rust-toolchain.toml via the setup-rust composite (the single source of truth); the nightly
+      # leg below pins its own dtolnay/rust-toolchain SHA (the action reads the toolchain from its
+      # ref name, so the SHA and the requested toolchain must agree). A plain `if:` per leg keeps
+      # each step's SHA a literal.
       - name: Install Rust toolchain (stable)
         if: matrix.toolchain == 'stable'
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch, 2026-06-30
-        with:
-          toolchain: stable
+        uses: ./.github/actions/setup-rust
 
       - name: Install Rust toolchain (nightly, for the -Zsanitizer=address cdylib)
         # The rust-asan leg needs nightly for -Zsanitizer=address / -Zbuild-std, plus the rust-src
