@@ -545,6 +545,15 @@ impl SpannerStatement {
     /// chunks already committed (see [`note_rows_already_committed`]), so the caller knows the
     /// table's state. Building per chunk also bounds memory: only one chunk of mutations is
     /// materialised at a time, instead of all N rows up front.
+    ///
+    /// The `rows × columns` budget cannot see the **secondary-index** entries that also count
+    /// toward the per-commit cap, so a heavily-indexed table can overshoot it even inside a
+    /// driver-"safe" chunk. As a reactive backstop, a write-only chunk whose commit is rejected for
+    /// *too many mutations* is split in half and its halves retried, down to a single row — see
+    /// [`write_mutation_range`](Self::write_mutation_range). Like the multi-chunk case, a bisected
+    /// chunk is not atomic as a whole; the row count and the already-committed accounting stay
+    /// exact. (The BatchWrite path — `spanner.ingest.batch_write` — is not bisected: it ships one
+    /// group per row, so the mutation cap does not bind it the same way.)
     fn run_ingest_mutations(&self, table: &str) -> Result<Option<i64>> {
         // Mutations name their target table directly (no SQL quoting; a named schema joins with a
         // plain dot).
@@ -560,41 +569,133 @@ impl SpannerStatement {
                 return Ok(None);
             }
         }
+        // Autocommit: walk the flattened row sequence (all bound batches concatenated), cutting it
+        // into commit chunks by the same [`IngestChunkBudget`]. A chunk is a contiguous
+        // `[start, end)` **range** over that sequence rather than a materialised `Vec<Mutation>`;
+        // its mutations are (re)built cheaply from the batches on demand
+        // ([`commit_ingest_range`](Self::commit_ingest_range)), so nothing is cloned up front just
+        // to enable the reactive bisect-and-retry the write-only path performs when a chunk
+        // overshoots Spanner's per-commit mutation cap.
         let mut total = 0_i64;
-        let mut chunk: Vec<Mutation> = Vec::new();
         let mut budget = IngestChunkBudget::default();
+        let mut chunk_start = 0_usize;
+        let mut row_index = 0_usize;
         for batch in &self.bound {
             let columns = batch.num_columns();
             // A cheap per-row size estimate: the batch's Arrow buffer footprint averaged over its
             // rows. Capacity-based, so it slightly over-estimates the wire size — the conservative
             // direction for a budget.
             let row_bytes = batch.get_array_memory_size() / batch.num_rows().max(1);
-            for row in 0..batch.num_rows() {
+            for _ in 0..batch.num_rows() {
                 if !budget.fits(columns, row_bytes) {
-                    total += self
-                        .commit_ingest_chunk(std::mem::take(&mut chunk))
-                        .map_err(|e| note_rows_already_committed(e, total))?;
+                    total += self.commit_ingest_range(&target, chunk_start, row_index, total)?;
                     budget = IngestChunkBudget::default();
+                    chunk_start = row_index;
                 }
-                chunk.push(bind::insert_mutation(&target, batch, row)?);
                 budget.add(columns, row_bytes);
+                row_index += 1;
             }
         }
-        total += self
-            .commit_ingest_chunk(chunk)
-            .map_err(|e| note_rows_already_committed(e, total))?;
+        total += self.commit_ingest_range(&target, chunk_start, row_index, total)?;
         Ok(Some(total))
     }
 
-    /// Apply one autocommit ingest chunk, dispatching on the `spanner.ingest.batch_write` option:
-    /// the default write-only transaction ([`write_mutation_chunk`](Self::write_mutation_chunk)),
-    /// or Spanner's BatchWrite RPC ([`batch_write_chunk`](Self::batch_write_chunk)) for a
-    /// non-atomic firehose load. Both return the chunk's ingested-row count.
-    fn commit_ingest_chunk(&self, mutations: Vec<Mutation>) -> Result<i64> {
+    /// Build the insert mutations for the flattened row range `[start, end)` across the bound
+    /// batches, mapping each global row index back to its `(batch, row)`.
+    ///
+    /// The same cheap Arrow→Spanner build the forward path uses ([`bind::insert_mutation`]), so a
+    /// bisected retry rebuilds a half's mutations straight from the batches — no `Vec<Mutation>` is
+    /// cloned on the happy path solely to keep a copy around for a retry that usually never happens.
+    fn build_range_mutations(
+        &self,
+        target: &str,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<Mutation>> {
+        let mut mutations = Vec::with_capacity(end.saturating_sub(start));
+        let mut base = 0_usize;
+        for batch in &self.bound {
+            let rows = batch.num_rows();
+            // Intersect the requested global range with this batch's slice of the flattened
+            // sequence (`[base, base + rows)`), then translate to batch-local row offsets.
+            let lo = start.max(base).saturating_sub(base);
+            let hi = end.min(base + rows).saturating_sub(base);
+            for row in lo..hi {
+                mutations.push(bind::insert_mutation(target, batch, row)?);
+            }
+            base += rows;
+            if base >= end {
+                break;
+            }
+        }
+        Ok(mutations)
+    }
+
+    /// Commit the flattened row range `[start, end)` as one autocommit ingest chunk, dispatching on
+    /// the `spanner.ingest.batch_write` option: the default write-only transaction (with the
+    /// reactive mutation-limit bisect — [`write_mutation_range`](Self::write_mutation_range)), or
+    /// Spanner's BatchWrite RPC ([`batch_write_chunk`](Self::batch_write_chunk)) for a non-atomic
+    /// firehose load. Both return the range's ingested-row count (`0` for an empty range).
+    ///
+    /// `prior_total` is how many rows this ingest's earlier chunks have already committed; it is
+    /// woven into a mid-ingest failure via [`note_rows_already_committed`] so the caller learns the
+    /// exact table state.
+    fn commit_ingest_range(
+        &self,
+        target: &str,
+        start: usize,
+        end: usize,
+        prior_total: i64,
+    ) -> Result<i64> {
+        if start >= end {
+            return Ok(0);
+        }
         if self.ingest_batch_write {
+            // BatchWrite ships one MutationGroup per row and applies groups independently, so the
+            // per-commit mutation cap does not bind it the way a write-only `Commit` is bound — it
+            // is deliberately left out of the mutation-limit bisect. (Its own per-request size limit
+            // could warrant a follow-up, but is not this backstop's concern.)
+            let mutations = self.build_range_mutations(target, start, end)?;
             self.batch_write_chunk(mutations)
+                .map_err(|e| note_rows_already_committed(e, prior_total))
         } else {
-            self.write_mutation_chunk(mutations)
+            self.write_mutation_range(target, start, end, prior_total)
+        }
+    }
+
+    /// Commit the flattened row range `[start, end)` in one write-only transaction, **splitting it
+    /// in half and retrying the two halves** if — and only if — Spanner rejects the commit for
+    /// exceeding its per-commit mutation limit.
+    ///
+    /// The forward path sizes chunks by `rows × columns` mutations ([`IngestChunkBudget`]), but the
+    /// *true* commit-time mutation count also includes secondary-index entries the driver cannot
+    /// see, so a heavily-indexed table can overshoot Spanner's ~80,000-mutation cap even inside a
+    /// driver-"safe" chunk. This is the reactive backstop: on that specific error
+    /// ([`is_mutation_limit_exceeded`]) the range is bisected and each half retried, recursing down
+    /// to a single row. Every **other** error — a duplicate key (`AlreadyExists`), a bad value, a
+    /// timeout, a cancel, an `ABORTED` — propagates unchanged, so the append/create remaps and the
+    /// [`note_rows_already_committed`] annotation still fire. A single row that *still* overshoots
+    /// is genuinely un-splittable, so its error propagates too (no infinite recursion, no empty
+    /// commit). Like the multi-chunk ingest, a bisected chunk is **not atomic as a whole**; the
+    /// summed row count and the "rows already committed" accounting stay exact — `prior_total` is
+    /// threaded through the recursion so a mid-bisect failure reports every row committed before it.
+    fn write_mutation_range(
+        &self,
+        target: &str,
+        start: usize,
+        end: usize,
+        prior_total: i64,
+    ) -> Result<i64> {
+        let mutations = self.build_range_mutations(target, start, end)?;
+        match self.write_mutation_chunk(mutations) {
+            Ok(count) => Ok(count),
+            Err(error) if end - start > 1 && is_mutation_limit_exceeded(&error) => {
+                let mid = start + (end - start) / 2;
+                let left = self.write_mutation_range(target, start, mid, prior_total)?;
+                let right = self.write_mutation_range(target, mid, end, prior_total + left)?;
+                Ok(left + right)
+            }
+            Err(error) => Err(note_rows_already_committed(error, prior_total)),
         }
     }
 
@@ -1804,6 +1905,30 @@ fn note_rows_already_committed(error: Error, committed: i64) -> Error {
     annotated
 }
 
+/// Whether `error` is Spanner's specific "this commit has too many mutations" rejection — the one
+/// error the autocommit bulk-ingest write-only path treats as recoverable by splitting the failing
+/// chunk and retrying its halves (see [`SpannerStatement::write_mutation_range`]).
+///
+/// Deliberately narrow. Spanner reports the per-commit mutation-count limit as an `INVALID_ARGUMENT`
+/// whose message reads "The transaction contains too many mutations. …Please reduce the number of
+/// writes, or use fewer indexes. (Maximum number: N)" — a phrasing that has stayed stable across the
+/// successive 20k→40k→80k limit bumps and names the exact cause (index entries) this backstop
+/// targets. We match on the ADBC [`Status::InvalidArguments`] **and** that anchor phrase so that no
+/// *other* `INVALID_ARGUMENT` — a malformed value, an unparseable literal, a schema mismatch — is
+/// ever mistaken for it and silently bisected; those must keep propagating so the ingest
+/// append/create remaps and [`note_rows_already_committed`] still fire. The numeric gRPC code stays
+/// available in the error's `vendor_code` (INVALID_ARGUMENT = 3). The companion commit-size limit
+/// (~100 MB / the gRPC request-size cap) is intentionally **not** matched here: the byte budget
+/// ([`INGEST_CHUNK_BYTE_BUDGET`]) already keeps chunks well under it, and its "request too large"
+/// wording is far less stable than the mutation-count phrasing.
+fn is_mutation_limit_exceeded(error: &Error) -> bool {
+    error.status == Status::InvalidArguments
+        && error
+            .message
+            .to_ascii_lowercase()
+            .contains("too many mutations")
+}
+
 /// Per-chunk mutation budget for bulk ingest. Spanner caps a single commit at ~80,000 mutations,
 /// and an insert mutation counts roughly its column count **plus** secondary-index entries the
 /// driver cannot see, so the budget stays at a quarter of the cap to leave headroom for indexed
@@ -1944,6 +2069,45 @@ mod tests {
         );
         assert_eq!(annotated.status, Status::AlreadyExists);
         assert_eq!(annotated.vendor_code, 6);
+    }
+
+    #[test]
+    fn mutation_limit_predicate_matches_only_the_too_many_mutations_error() {
+        // The real Spanner rejection: INVALID_ARGUMENT with the stable "too many mutations" phrase.
+        // `from_spanner` prefixes "Spanner error: ", which the substring match sees through.
+        let mut over_limit = err(
+            "Spanner error: The transaction contains too many mutations. Insert and update \
+             operations count with the multiplicity of the number of columns they affect. …Please \
+             reduce the number of writes, or use fewer indexes. (Maximum number: 80000)",
+            Status::InvalidArguments,
+        );
+        over_limit.vendor_code = 3; // INVALID_ARGUMENT
+        assert!(is_mutation_limit_exceeded(&over_limit));
+
+        // Right phrase, wrong status: only an INVALID_ARGUMENT is the mutation-limit rejection.
+        let mut wrong_status = over_limit.clone();
+        wrong_status.status = Status::Internal;
+        assert!(!is_mutation_limit_exceeded(&wrong_status));
+
+        // Other INVALID_ARGUMENTs must NOT bisect — they have to propagate so the append/create
+        // remaps and the committed-rows annotation still fire.
+        for message in [
+            "Spanner error: Invalid value for column Foo: expected INT64",
+            "Spanner error: Syntax error: Unexpected token",
+            "Spanner error: The commit request is too large",
+            "Spanner error: Table not found: Nope",
+        ] {
+            let other = err(message, Status::InvalidArguments);
+            assert!(
+                !is_mutation_limit_exceeded(&other),
+                "must not match: {message}"
+            );
+        }
+
+        // A duplicate primary key (AlreadyExists) — the most important non-match — never bisects.
+        let mut dup = err("Spanner error: row already exists", Status::AlreadyExists);
+        dup.vendor_code = 6;
+        assert!(!is_mutation_limit_exceeded(&dup));
     }
 
     #[test]

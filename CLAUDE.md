@@ -336,7 +336,18 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   `DatabaseClient::write_only_transaction` under Spanner's per-commit limits — `IngestChunkBudget`
   in `src/statement.rs`, ~rows × columns mutations + an approximate byte budget — so a multi-chunk
   ingest commits per chunk and is not atomic as a whole (a mid-ingest chunk failure reports the
-  exact row count the earlier chunks already committed), while manual-mode ingests buffer their
+  exact row count the earlier chunks already committed); because that `rows × columns` estimate
+  cannot see the **secondary-index** entries that also count toward the ~80,000-mutation cap, a
+  write-only chunk whose commit is nonetheless rejected for *too many mutations* is **bisected and
+  retried** down to a single row (`is_mutation_limit_exceeded` gates *only* that specific
+  `INVALID_ARGUMENT`; every other error — duplicate-key `AlreadyExists`, bad value, timeout — still
+  propagates and fires the append/create remaps; a chunk is walked as a `[start,end)` row range and
+  each half's mutations rebuilt from the batches, so nothing is cloned on the happy path;
+  `SpannerStatement::{commit_ingest_range,write_mutation_range,build_range_mutations}`, covered by
+  `ingest_bisects_a_chunk_that_overshoots_the_mutation_limit` in `tests/mock_spanner.rs`; the
+  `INGEST_CHUNK_MUTATION_LIMIT` default stays 20k — the backstop just makes a future bump safe — and
+  the BatchWrite path is out of scope since it ships one group per row), while manual-mode ingests
+  buffer their
   mutations unchunked (`TxnState::pending_mutations`) and commit atomically **with** the buffered
   DML in one read/write transaction via `ReadWriteTransaction::buffer` — note Spanner applies
   buffered mutations at commit, after the transaction's DML executes; the `spanner.ingest.batch_write`
