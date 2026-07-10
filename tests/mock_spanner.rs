@@ -41,7 +41,8 @@ use adbc_core::options::{OptionDatabase, OptionStatement, OptionValue};
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_spanner::{SpannerConnection, SpannerDriver};
 use arrow_array::cast::AsArray;
-use arrow_schema::{ArrowError, DataType};
+use arrow_array::{RecordBatch, StringArray};
+use arrow_schema::{ArrowError, DataType, Field, Schema};
 use prost::Message;
 use spanner_grpc_mock::MockSpanner;
 use spanner_grpc_mock::google::spanner::v1;
@@ -286,6 +287,45 @@ fn aborted_with_retry_info(message: &str) -> tonic::Status {
         message,
         bytes::Bytes::from(status_proto.encode_to_vec()),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Bulk-ingest scripting helpers
+// ---------------------------------------------------------------------------
+
+/// A one-STRING-column (`c`) record batch of `n` rows — each row becomes one insert mutation, so
+/// the mock sees exactly `n` mutations in the resulting `Commit`.
+fn ingest_batch(n: usize) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Utf8, false)]));
+    let column = StringArray::from((0..n).map(|i| format!("v{i}")).collect::<Vec<_>>());
+    RecordBatch::try_new(schema, vec![Arc::new(column)]).expect("build ingest batch")
+}
+
+/// Spanner's per-commit mutation-limit rejection: an `INVALID_ARGUMENT` carrying the stable "too
+/// many mutations" phrasing the driver's `is_mutation_limit_exceeded` keys off.
+fn too_many_mutations_status() -> tonic::Status {
+    tonic::Status::invalid_argument(
+        "The transaction contains too many mutations. Insert and update operations count with the \
+         multiplicity of the number of columns they affect. The total mutation count includes any \
+         changes to indexes that the transaction generates. Please reduce the number of writes, or \
+         use fewer indexes. (Maximum number: 80000)",
+    )
+}
+
+/// A default successful `Commit` response (no commit stats requested).
+fn commit_ok() -> tonic::Result<tonic::Response<v1::CommitResponse>> {
+    Ok(tonic::Response::new(v1::CommitResponse::default()))
+}
+
+/// Serve `BeginTransaction` (the write-only ingest path begins a read/write transaction before each
+/// `Commit`), returning a fixed transaction id.
+fn serve_begin_transaction(mock: &mut MockSpanner) {
+    mock.expect_begin_transaction().returning(|_| {
+        Ok(tonic::Response::new(v1::Transaction {
+            id: b"mock-txn".to_vec(),
+            ..Default::default()
+        }))
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -612,5 +652,146 @@ fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
     assert!(
         cancel_latency < Duration::from_secs(10),
         "cancel took {cancel_latency:?} to unblock the reader"
+    );
+}
+
+/// (d) **Self-healing bulk ingest.** An autocommit ingest chunk the driver sized as "safe"
+/// (rows × columns under its 20k budget) can still overshoot Spanner's *true* per-commit mutation
+/// cap once invisible secondary-index entries are counted. The mock rejects any `Commit` carrying
+/// more than 40 mutations with the real "too many mutations" `INVALID_ARGUMENT`, and accepts the
+/// rest. The driver must react by **bisecting** the failing chunk and retrying its halves down to a
+/// size the server accepts — so all 100 rows land, the returned count is exact, and the server saw
+/// more than one `Commit` (the retries with smaller batches).
+#[test]
+fn ingest_bisects_a_chunk_that_overshoots_the_mutation_limit() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "ingest_bisects_a_chunk_that_overshoots_the_mutation_limit",
+    );
+
+    // Every scripted commit records the mutation count it saw and fails-big / succeeds-small on it,
+    // so the outcome is decided by chunk *size*, not call order — deterministic under the bisect.
+    let commit_sizes: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+    let sizes_in_mock = commit_sizes.clone();
+    let server = MockServer::start(move |mock| {
+        serve_begin_transaction(mock);
+        mock.expect_commit().returning(move |request| {
+            let mutations = request.into_inner().mutations.len();
+            sizes_in_mock.lock().unwrap().push(mutations);
+            if mutations > 40 {
+                Err(too_many_mutations_status())
+            } else {
+                commit_ok()
+            }
+        });
+    });
+
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().expect("new statement");
+    // `append` mode inserts into a pre-existing table, so no admin/DDL client is built (the mock
+    // serves only data-plane RPCs).
+    statement
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("MockTable".into()),
+        )
+        .expect("set target table");
+    statement
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .expect("set ingest mode append");
+    statement.bind(ingest_batch(100)).expect("bind ingest data");
+
+    let count = statement
+        .execute_update()
+        .expect("the ingest must self-heal, not fail on the over-limit chunk");
+
+    assert_eq!(
+        count,
+        Some(100),
+        "every bound row must land once the chunk is bisected under the limit"
+    );
+
+    let sizes = commit_sizes.lock().unwrap();
+    // The single 100-row chunk overshoots (>40) and is bisected: 100 → 50 → 25. So the server saw
+    // several commits, the last (accepted) ones each carried at most 40 mutations, and the accepted
+    // commits sum to exactly the 100 rows.
+    assert!(
+        sizes.len() > 1,
+        "the driver must have retried with smaller commits; saw commit sizes {sizes:?}"
+    );
+    let accepted: usize = sizes.iter().copied().filter(|&n| n <= 40).sum();
+    assert_eq!(
+        accepted, 100,
+        "the accepted (<=40-mutation) commits must cover all 100 rows; saw {sizes:?}"
+    );
+    assert!(
+        sizes.iter().any(|&n| n > 40),
+        "the test must actually exercise an over-limit commit; saw {sizes:?}"
+    );
+}
+
+/// (d′) The negative companion: a `Commit` failure that is **not** the mutation-limit rejection
+/// must propagate unchanged — no bisecting. The mock fails every commit with `ALREADY_EXISTS` (a
+/// duplicate primary key), and the driver must surface that status after exactly **one** commit,
+/// with the append remap naming the target table. Proves the bisect predicate is narrow: only the
+/// specific "too many mutations" error triggers a retry.
+#[test]
+fn ingest_does_not_bisect_a_non_mutation_limit_error() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "ingest_does_not_bisect_a_non_mutation_limit_error",
+    );
+
+    let commits = Arc::new(AtomicUsize::new(0));
+    let commits_in_mock = commits.clone();
+    let server = MockServer::start(move |mock| {
+        serve_begin_transaction(mock);
+        mock.expect_commit().returning(move |_| {
+            commits_in_mock.fetch_add(1, Ordering::SeqCst);
+            Err(tonic::Status::already_exists(
+                "Row [v0] in table MockTable already exists",
+            ))
+        });
+    });
+
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("MockTable".into()),
+        )
+        .expect("set target table");
+    statement
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .expect("set ingest mode append");
+    statement.bind(ingest_batch(100)).expect("bind ingest data");
+
+    let error = statement
+        .execute_update()
+        .expect_err("a duplicate-key commit must fail the ingest, not be bisected away");
+
+    // AlreadyExists propagates (remapped by the append contract to name the table), and there was
+    // exactly one commit attempt — the driver did not split-and-retry a non-limit error.
+    assert_eq!(
+        error.status,
+        AdbcStatus::AlreadyExists,
+        "got error: {error}"
+    );
+    assert!(
+        error.message.contains("MockTable"),
+        "the append remap should name the target table; got: {}",
+        error.message
+    );
+    assert_eq!(
+        commits.load(Ordering::SeqCst),
+        1,
+        "a non-mutation-limit error must not trigger the bisect retry"
     );
 }
