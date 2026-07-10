@@ -73,7 +73,12 @@ FetchContent_Declare(
   arrow_adbc
   GIT_REPOSITORY https://github.com/apache/arrow-adbc.git
   GIT_TAG ${ARROW_ADBC_TAG}
-  GIT_SHALLOW TRUE
+  # NOT GIT_SHALLOW: ARROW_ADBC_TAG is a specific `main` commit, and a shallow clone
+  # (`--depth 1`) fetches only upstream's current tip — so checking out the pinned SHA
+  # works only while it happens to be that tip and breaks the moment upstream `main`
+  # advances past it (a cold clone then fails with "unable to read tree <sha>"). A full
+  # clone reliably contains the pinned commit. This runs only on a cache miss (a rev bump
+  # or a new runner), so the extra history costs nothing on the common cached path.
   # The C/C++ project lives under c/ in the monorepo.
   SOURCE_SUBDIR c)
 FetchContent_MakeAvailable(arrow_adbc)
