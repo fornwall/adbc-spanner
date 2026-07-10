@@ -384,32 +384,51 @@ impl RecordBatchReader for SpannerBatchReader {
     }
 }
 
-/// Wrap a sequence of per-bound-row query statements as one streaming Arrow
+/// A lazy source of the per-bound-row query statements a [`BoundQueryBatchReader`] executes, one at
+/// a time. Each `SpannerSql` (its query text plus bound parameter map) is materialised only right
+/// before it is handed to Spanner, so a large `executemany` SELECT holds a single statement in
+/// memory rather than one per bound row. Implemented in `src/statement.rs`. `next_statement` yields
+/// `None` once every bound row is drained; a per-row bind failure surfaces as `Some(Err(..))` at
+/// that point in the stream.
+pub(crate) trait BoundStatementSource: Send {
+    fn next_statement(&mut self) -> Option<Result<SpannerSql>>;
+}
+
+/// An exhausted [`BoundStatementSource`], installed on a [`BoundQueryBatchReader`] after it surfaces
+/// an error so any subsequent `next` yields `None` rather than executing more statements.
+struct NoBoundStatements;
+
+impl BoundStatementSource for NoBoundStatements {
+    fn next_statement(&mut self) -> Option<Result<SpannerSql>> {
+        None
+    }
+}
+
+/// Wrap a lazy source of per-bound-row query statements as one streaming Arrow
 /// [`RecordBatchReader`], executing every statement inside the same **multi-use read-only
 /// transaction** so all bound rows see a single, mutually consistent snapshot.
 ///
-/// The first statement is executed here and its first chunk pulled (settling the schema — every
-/// statement is the same SQL, so the schema is shared); the reader then streams the remaining
-/// chunks and statements lazily, executing each subsequent statement only once its predecessor's
-/// result set drains. Like [`stream_query`], rows are converted to Arrow in bounded chunks of
-/// `batch_size` (plus the [`CHUNK_BYTE_BUDGET`]), so the concatenated result is never fully
-/// materialised. The reader owns `transaction`, keeping the snapshot alive for as long as it is
-/// iterated; Spanner read-only transactions need no commit/rollback, so dropping it is cleanup
-/// enough.
+/// The first statement is built and executed here and its first chunk pulled (settling the schema —
+/// every statement is the same SQL, so the schema is shared); the reader then streams the remaining
+/// chunks and statements lazily, building **and** executing each subsequent statement only once its
+/// predecessor's result set drains — so at most one per-row `SpannerSql` resides in memory at a
+/// time. Like [`stream_query`], rows are converted to Arrow in bounded chunks of `batch_size` (plus
+/// the [`CHUNK_BYTE_BUDGET`]), so the concatenated result is never fully materialised. The reader
+/// owns `transaction`, keeping the snapshot alive for as long as it is iterated; Spanner read-only
+/// transactions need no commit/rollback, so dropping it is cleanup enough.
 pub(crate) async fn stream_bound_query(
     runtime: SharedRuntime,
     cancel: CancelSignal,
     transaction: MultiUseReadOnlyTransaction,
-    statements: Vec<SpannerSql>,
+    mut statements: Box<dyn BoundStatementSource>,
     batch_size: usize,
     precision: TimestampPrecision,
     fetch_timeout: Option<Duration>,
 ) -> Result<BoundQueryBatchReader> {
-    let mut statements = statements.into_iter();
-    let mut result_set = match statements.next() {
+    let mut result_set = match statements.next_statement() {
         Some(statement) => Some(
             transaction
-                .execute_query(statement)
+                .execute_query(statement?)
                 .await
                 .map_err(from_spanner)?,
         ),
@@ -446,8 +465,8 @@ pub(crate) struct BoundQueryBatchReader {
     schema: SchemaRef,
     /// The shared snapshot every statement executes in; owned so it outlives lazy iteration.
     transaction: MultiUseReadOnlyTransaction,
-    /// The not-yet-executed per-bound-row statements.
-    statements: std::vec::IntoIter<SpannerSql>,
+    /// The lazy source of not-yet-built, not-yet-executed per-bound-row statements.
+    statements: Box<dyn BoundStatementSource>,
     /// The live result set of the statement currently being drained, if any.
     result_set: Option<ResultSet>,
     /// The first chunk of rows, fetched up front to settle the schema; emitted on the first `next`.
@@ -459,12 +478,12 @@ pub(crate) struct BoundQueryBatchReader {
 }
 
 /// Pull the next non-empty chunk for [`BoundQueryBatchReader`]: drain the current result set in
-/// bounded chunks, and when it ends, execute the next statement in the same `transaction` —
-/// looping so a bound row with an empty result never surfaces as a spurious empty batch. `None`
+/// bounded chunks, and when it ends, build and execute the next statement in the same `transaction`
+/// — looping so a bound row with an empty result never surfaces as a spurious empty batch. `None`
 /// means everything is drained.
 async fn next_bound_chunk(
     transaction: &MultiUseReadOnlyTransaction,
-    statements: &mut std::vec::IntoIter<SpannerSql>,
+    statements: &mut dyn BoundStatementSource,
     result_set: &mut Option<ResultSet>,
     batch_size: usize,
 ) -> Result<Option<Vec<Row>>> {
@@ -476,11 +495,11 @@ async fn next_bound_chunk(
             }
             *result_set = None;
         }
-        match statements.next() {
+        match statements.next_statement() {
             Some(statement) => {
                 *result_set = Some(
                     transaction
-                        .execute_query(statement)
+                        .execute_query(statement?)
                         .await
                         .map_err(from_spanner)?,
                 );
@@ -516,7 +535,7 @@ impl Iterator for BoundQueryBatchReader {
             with_timeout(
                 *fetch_timeout,
                 crate::OPTION_RPC_TIMEOUT_FETCH,
-                next_bound_chunk(transaction, statements, result_set, *batch_size),
+                next_bound_chunk(transaction, statements.as_mut(), result_set, *batch_size),
             ),
         ) {
             Ok(None) => None,
@@ -525,7 +544,7 @@ impl Iterator for BoundQueryBatchReader {
                 // Stop after surfacing the error: drop the live result set and any statements
                 // still pending.
                 self.result_set = None;
-                self.statements = Vec::new().into_iter();
+                self.statements = Box::new(NoBoundStatements);
                 Some(Err(to_arrow_error(e)))
             }
         }

@@ -33,7 +33,7 @@ use google_cloud_spanner::transaction::ReadWriteTransaction;
 use crate::bind;
 use crate::connection::{SharedTxn, apply_isolation};
 use crate::conversion::{
-    TimestampPrecision, result_set_to_batch, stream_bound_query, stream_query,
+    BoundStatementSource, TimestampPrecision, result_set_to_batch, stream_bound_query, stream_query,
 };
 use crate::directed_read::DirectedRead;
 use crate::error::{
@@ -64,6 +64,44 @@ enum DmlOutcome {
         schema: SchemaRef,
         affected: i64,
     },
+}
+
+/// The lazy [`BoundStatementSource`] backing [`SpannerStatement::execute_bound_query`]: it builds
+/// each per-bound-row `SpannerSql` on demand, right before the reader executes it, so a large
+/// `executemany` SELECT holds a single statement in memory instead of one per row.
+///
+/// Parameter names are resolved once per batch up front (paired into `groups`); this defers only
+/// the per-row [`bind::bind_params`] + `read_sql_builder`-clone, producing the exact same statement
+/// sequence, in the same order, the eager path would have — one `(names, batch)` group at a time,
+/// row by row, skipping past a drained batch.
+struct LazyBoundStatements {
+    /// A fully-configured read-only query builder for the SQL (directed reads + request tags +
+    /// query optimizer options + retry already applied); cloned once per row before binding.
+    base_builder: StatementBuilder,
+    /// The resolved column→parameter names paired with each non-empty bound batch, in bind order.
+    groups: Vec<(Vec<String>, RecordBatch)>,
+    /// Cursor into `groups`.
+    group: usize,
+    /// Next row to bind within `groups[group].1`.
+    row: usize,
+}
+
+impl BoundStatementSource for LazyBoundStatements {
+    fn next_statement(&mut self) -> Option<Result<SpannerSql>> {
+        loop {
+            let (names, batch) = self.groups.get(self.group)?;
+            if self.row >= batch.num_rows() {
+                self.group += 1;
+                self.row = 0;
+                continue;
+            }
+            let row = self.row;
+            self.row += 1;
+            return Some(
+                bind::bind_params(self.base_builder.clone(), names, batch, row).map(|b| b.build()),
+            );
+        }
+    }
 }
 
 /// An ADBC statement bound to a Spanner [`DatabaseClient`].
@@ -239,11 +277,14 @@ impl SpannerStatement {
         self.directed_read.apply_to_statement(self.sql_builder(sql))
     }
 
-    /// Build one Spanner statement per bound row, binding its columns as named parameters. When
-    /// `for_read` the per-row builders carry the directed-read replica selection
-    /// (`spanner.directed_read`) — the read-only bound-query path; the DML (`THEN RETURN`) path
-    /// passes `false` so directed reads never reach a read/write transaction.
-    fn build_bound_statements(&self, sql: &str, for_read: bool) -> Result<Vec<SpannerSql>> {
+    /// Build one Spanner statement per bound row for the **DML** (`THEN RETURN` / `ExecuteBatchDml`)
+    /// path, binding each row's columns as named parameters. The builders use
+    /// [`sql_builder`](Self::sql_builder) (not [`read_sql_builder`](Self::read_sql_builder)) so the
+    /// directed-read replica selection never reaches a read/write transaction, which Spanner
+    /// rejects. The read-only bound-query path builds its statements lazily instead (see
+    /// [`execute_bound_query`](Self::execute_bound_query)), one at a time, rather than materialising
+    /// the whole `Vec` up front.
+    fn build_bound_statements(&self, sql: &str) -> Result<Vec<SpannerSql>> {
         let mut statements = Vec::new();
         for batch in &self.bound {
             if batch.num_rows() == 0 {
@@ -253,12 +294,8 @@ impl SpannerStatement {
             // for every row instead of re-lexing the SQL per bound row.
             let names = bind::resolve_parameter_names(sql, batch, self.bind_by_name)?;
             for row in 0..batch.num_rows() {
-                let builder = if for_read {
-                    self.read_sql_builder(sql)
-                } else {
-                    self.sql_builder(sql)
-                };
-                statements.push(bind::bind_params(builder, &names, batch, row)?.build());
+                statements
+                    .push(bind::bind_params(self.sql_builder(sql), &names, batch, row)?.build());
             }
         }
         Ok(statements)
@@ -378,7 +415,7 @@ impl SpannerStatement {
     /// statements so the whole batch is applied atomically. Shared by `execute` and `execute_update`.
     fn build_dml_statements(&self, sql: &str) -> Result<Vec<SpannerSql>> {
         if !self.bound.is_empty() {
-            self.build_bound_statements(sql, false)
+            self.build_bound_statements(sql)
         } else {
             Ok(crate::sql::split_statements(sql)
                 .into_iter()
@@ -824,7 +861,7 @@ impl SpannerStatement {
                 .map(|s| self.sql_builder(&s).build())
                 .collect()
         } else {
-            self.build_bound_statements(sql, false)?
+            self.build_bound_statements(sql)?
         };
         let (batches, schema, affected) = self.execute_returning_dml(statements)?;
         Ok(DmlOutcome::Returning {
@@ -850,7 +887,25 @@ impl SpannerStatement {
         &self,
         sql: &str,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        let mut statements = self.build_bound_statements(sql, true)?;
+        // Resolve the column→parameter mapping once per non-empty bound batch — the eager path's
+        // up-front count/name validation (it lexes `sql`), kept here so a structural mismatch still
+        // fails before any statement runs — pairing each mapping with its batch. Only the per-row
+        // `bind::bind_params` is deferred to the reader, so at most one `SpannerSql` resides in
+        // memory at a time (O(1)) rather than one per bound row (O(rows)).
+        let mut groups: Vec<(Vec<String>, RecordBatch)> = Vec::new();
+        let mut total_rows = 0usize;
+        for batch in &self.bound {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let names = bind::resolve_parameter_names(sql, batch, self.bind_by_name)?;
+            total_rows += batch.num_rows();
+            groups.push((names, batch.clone()));
+        }
+        // One fully-configured read-only query builder (directed reads + request tags + query
+        // optimizer options + retry applied, exactly as the eager path's `read_sql_builder`), cloned
+        // per row before binding — the shared config is applied once, not re-resolved per row.
+        let base_builder = self.read_sql_builder(sql);
         let client = self.client.clone();
         let runtime = self.runtime.clone();
         let cancel = self.cancel.clone();
@@ -860,12 +915,13 @@ impl SpannerStatement {
         // timeout bounds each later chunk as the reader is iterated.
         let query_timeout = self.timeouts.query_timeout();
         let fetch_timeout = self.timeouts.fetch_timeout();
-        if statements.len() <= 1 {
+        if total_rows <= 1 {
             // Zero or one bound row. One statement is one snapshot already, and the single-use
             // transaction keeps the exact semantics of the bounded-staleness kinds.
-            let Some(statement) = statements.pop() else {
+            let Some((names, batch)) = groups.first() else {
                 return Ok(Self::empty_reader());
             };
+            let statement = bind::bind_params(base_builder, names, batch, 0)?.build();
             let bound = self.read_staleness.timestamp_bound()?;
             let reader = block_on_cancellable(
                 &self.runtime,
@@ -890,6 +946,12 @@ impl SpannerStatement {
             return Ok(Box::new(reader));
         }
         let bound = self.read_staleness.multi_use_timestamp_bound()?;
+        let statements: Box<dyn BoundStatementSource> = Box::new(LazyBoundStatements {
+            base_builder,
+            groups,
+            group: 0,
+            row: 0,
+        });
         let reader = block_on_cancellable(
             &self.runtime,
             &self.cancel,
