@@ -4923,6 +4923,202 @@ fn gql_graph_query_round_trip() {
     cleanup.execute_update().expect("drop graph schema");
 }
 
+/// Named schemas (`CREATE SCHEMA foo`): a table living in a non-default schema must round-trip
+/// through the ordinary query/DML path and be reflected by the schema-aware metadata calls
+/// (`get_table_schema`, `get_objects`) and the schema-qualified bulk-ingest path
+/// (`adbc.ingest.target_db_schema`).
+///
+/// Spanner reports its default (unnamed) schema as `TABLE_SCHEMA = ''`; a named schema reports its
+/// own name. Every other integration assertion uses the default schema, so this is the one test
+/// that drives the non-empty `db_schema` branches end-to-end against the emulator. The driver code
+/// already supports named schemas throughout (`INFORMATION_SCHEMA.SCHEMATA` enumeration in
+/// `collect_objects`, `qualified_table` in `get_table_schema`, `target_db_schema` on ingest); this
+/// test is the coverage that was missing.
+#[test]
+fn named_schema_round_trip() {
+    let Some(target) = test_target() else {
+        eprintln!(
+            "neither SPANNER_EMULATOR_HOST nor SPANNER_GCP_DATABASE set — \
+             skipping named-schema integration test"
+        );
+        return;
+    };
+
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    // Idempotent setup so the test re-runs cleanly against a persistent `SPANNER_GCP_DATABASE`:
+    // drop the table first (a non-empty schema cannot be dropped), then ensure the schema and
+    // (re)create the table inside it. `CREATE SCHEMA IF NOT EXISTS` is the form the C++
+    // adbc-validation harness uses too.
+    let mut ddl = connection.new_statement().expect("new statement");
+    ddl.set_sql_query(
+        "DROP TABLE IF EXISTS adbc_ns.Widget; \
+         CREATE SCHEMA IF NOT EXISTS adbc_ns; \
+         CREATE TABLE adbc_ns.Widget ( \
+             Id INT64 NOT NULL, Label STRING(MAX) \
+         ) PRIMARY KEY (Id)",
+    )
+    .unwrap();
+    assert_eq!(
+        ddl.execute_update().expect("create named schema + table"),
+        None
+    );
+
+    // --- Data plane: the schema-qualified table name works through the ordinary DML + query path.
+    let mut ins = connection.new_statement().expect("new statement");
+    ins.set_sql_query("INSERT INTO adbc_ns.Widget (Id, Label) VALUES (1, 'alpha'), (2, 'beta')")
+        .unwrap();
+    assert_eq!(ins.execute_update().expect("insert widgets"), Some(2));
+    assert_eq!(count_rows(&mut connection, "adbc_ns.Widget"), 2);
+
+    // --- get_table_schema honours the db_schema argument: `adbc_ns.Widget` resolves to its two
+    // columns, whereas the same table name in the default schema does not exist.
+    let widget_schema = connection
+        .get_table_schema(None, Some("adbc_ns"), "Widget")
+        .expect("get_table_schema for the named-schema table");
+    assert_eq!(widget_schema.fields().len(), 2);
+    assert_eq!(widget_schema.field(0).name(), "Id");
+    assert_eq!(widget_schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(widget_schema.field(1).name(), "Label");
+    assert_eq!(widget_schema.field(1).data_type(), &DataType::Utf8);
+
+    let missing_default = connection
+        .get_table_schema(None, Some(""), "Widget")
+        .expect_err("Widget lives only in adbc_ns, not the default schema");
+    assert_eq!(missing_default.status, Status::NotFound);
+
+    // --- get_objects with a db_schema filter surfaces the named schema, its table and columns.
+    let objects = connection
+        .get_objects(
+            ObjectDepth::All,
+            None,
+            Some("adbc_ns"),
+            Some("Widget"),
+            None,
+            None,
+        )
+        .expect("get_objects")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect objects");
+
+    // Locate the `adbc_ns` schema in the single (unnamed) catalog's db_schemas list.
+    let ob = &objects[0];
+    let schema_list = ob.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+    let schemas = schema_list.value(0);
+    let schemas = schemas.as_any().downcast_ref::<StructArray>().unwrap();
+    let schema_names = schemas
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let idx = (0..schemas.len())
+        .find(|&i| schema_names.value(i) == "adbc_ns")
+        .expect("adbc_ns schema present in get_objects result");
+
+    // db_schema_tables (field 1): List<Struct{table_name, table_type, table_columns, ...}>. The
+    // `Widget` table filter leaves exactly one table under this schema.
+    let table_lists = schemas
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let tables = table_lists.value(idx);
+    let tables = tables.as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(tables.len(), 1);
+    let table_name = tables
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(table_name.value(0), "Widget");
+
+    // table_columns (field 2): the two Widget columns, in ordinal order.
+    let column_lists = tables
+        .column(2)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let columns = column_lists.value(0);
+    let columns = columns.as_any().downcast_ref::<StructArray>().unwrap();
+    let column_name = columns
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let column_names: Vec<&str> = (0..columns.len()).map(|i| column_name.value(i)).collect();
+    assert_eq!(column_names, ["Id", "Label"]);
+
+    // --- Bulk ingest into the named schema via `adbc.ingest.target_db_schema` (append into the
+    // existing table) — the schema-qualified mutation path.
+    let ingest_schema = Arc::new(Schema::new(vec![
+        Field::new("Id", DataType::Int64, false),
+        Field::new("Label", DataType::Utf8, true),
+    ]));
+    let ingest_batch = RecordBatch::try_new(
+        ingest_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![3, 4])),
+            Arc::new(StringArray::from(vec!["gamma", "delta"])),
+        ],
+    )
+    .expect("build ingest batch");
+
+    let mut ingest = connection.new_statement().expect("new statement");
+    ingest
+        .set_option(
+            OptionStatement::TargetDbSchema,
+            OptionValue::String("adbc_ns".into()),
+        )
+        .expect("set target_db_schema");
+    ingest
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("Widget".into()),
+        )
+        .expect("set target table");
+    ingest
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .expect("set ingest mode");
+    ingest
+        .bind_stream(Box::new(RecordBatchIterator::new(
+            [Ok(ingest_batch)],
+            ingest_schema,
+        )))
+        .expect("bind ingest stream");
+    assert_eq!(
+        ingest
+            .execute_update()
+            .expect("ingest into the named-schema table"),
+        Some(2)
+    );
+    assert_eq!(
+        count_rows(&mut connection, "adbc_ns.Widget"),
+        4,
+        "the two ingested rows join the two inserted rows"
+    );
+
+    // Clean up the scratch table so a persistent `SPANNER_GCP_DATABASE` re-run stays tidy (the
+    // empty named schema is left in place; the idempotent setup tolerates its presence).
+    let mut cleanup = connection.new_statement().expect("new statement");
+    cleanup
+        .set_sql_query("DROP TABLE IF EXISTS adbc_ns.Widget")
+        .unwrap();
+    cleanup.execute_update().expect("drop named-schema table");
+}
+
 /// Serialize the schema-mutating / DML-heavy tests against each other. Spanner rejects a schema
 /// change while a read-write transaction is in progress on the database, so the DDL-heavy
 /// `query_and_dml_round_trip` cannot run concurrently with the DML-heavy property tests. Each holds
