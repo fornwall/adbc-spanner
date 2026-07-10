@@ -6104,6 +6104,20 @@ fn query_with_trailing_semicolons_returns_rows() {
         .downcast_ref::<StringArray>()
         .unwrap();
     assert_eq!(s.value(0), ";");
+
+    // The same stripping applies on the `execute_schema` PLAN probe, which runs through the same
+    // single-use ExecuteSql surface — introspection callers (dbt, conformance suites) routinely
+    // append a `;`. Without stripping the PLAN probe would return Spanner's raw parse error.
+    // (`execute_partitions` strips identically on its query path, but asserting it needs a
+    // partitionable table set up in `execute_partitions_round_trip`; it shares this exact code.)
+    let mut schema_stmt = connection.new_statement().expect("new statement");
+    schema_stmt.set_sql_query("SELECT 1 AS n;;;").unwrap();
+    let planned = schema_stmt
+        .execute_schema()
+        .expect("execute_schema with trailing semicolons");
+    assert_eq!(planned.fields().len(), 1);
+    assert_eq!(planned.field(0).name(), "n");
+    assert_eq!(planned.field(0).data_type(), &DataType::Int64);
 }
 
 /// The spec `adbc.connection.readonly` option. Covers the four dimensions the review asks for:

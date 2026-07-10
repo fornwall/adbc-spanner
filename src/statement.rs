@@ -1410,6 +1410,11 @@ impl Statement for SpannerStatement {
         self.cancel.reset();
         let sql = self.sql()?;
         check_schema_query(&sql)?;
+        // Query path only (`check_schema_query` rejected DDL/DML): strip any trailing statement
+        // terminator(s), exactly as `execute` does — the PLAN probe runs through the same single-use
+        // ExecuteSql surface, which rejects a trailing `;` ("Expected end of input but got `;`"),
+        // yet introspection callers routinely append one (e.g. `SELECT current_date;`).
+        let sql = crate::sql::strip_trailing_terminators(&sql);
         let client = self.client.clone();
         let bound = self.bound.clone();
         let bind_by_name = self.bind_by_name;
@@ -1472,6 +1477,10 @@ impl Statement for SpannerStatement {
                 "execute_partitions is only valid for queries",
             ));
         }
+        // Query path (not DDL): strip any trailing statement terminator(s), exactly as `execute`
+        // does — both the PLAN probe and `partition_query` run through the same ExecuteSql surface,
+        // which rejects a trailing `;`, yet callers routinely append one.
+        let sql = crate::sql::strip_trailing_terminators(&sql);
         // Probe the schema and create the partitions. The partition query runs inside a batch
         // read-only transaction; each returned partition carries its session, transaction id and
         // partition token and is independently serializable, so it maps directly onto ADBC's opaque
