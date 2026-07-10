@@ -89,7 +89,7 @@ impl Driver for SpannerDriver {
 /// [`Debug`] is hand-written rather than derived so the three credential fields (`keyfile`,
 /// `keyfile_json` — a full service-account private key — and `access_token` — a live OAuth bearer
 /// token) never render in cleartext: each is shown as `Some("<redacted>")` / `None`, exposing only
-/// presence, never the secret. This mirrors [`StaticTokenCredentials`], whose token lives in a
+/// presence, never the secret. This mirrors `StaticTokenCredentials`, whose token lives in a
 /// sensitive `HeaderValue` for the same reason.
 pub struct SpannerDatabase {
     runtime: SharedRuntime,
