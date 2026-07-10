@@ -1289,6 +1289,8 @@ impl Statement for SpannerStatement {
         let sql = self.sql()?;
         if crate::sql::is_ddl(&sql) {
             self.run_ddl(crate::sql::split_statements(&sql))?;
+            // A reused statement handle must not silently re-bind stale rows past a DDL statement.
+            self.bound.clear();
             // DDL has no result set — return an empty reader with an empty schema.
             return Ok(Self::empty_reader());
         }
@@ -1386,6 +1388,8 @@ impl Statement for SpannerStatement {
         let sql = self.sql()?;
         if crate::sql::is_ddl(&sql) {
             self.run_ddl(crate::sql::split_statements(&sql))?;
+            // A reused statement handle must not silently re-bind stale rows past a DDL statement.
+            self.bound.clear();
             // DDL does not report an affected-row count (and is never transactional in Spanner, so
             // it always runs immediately rather than buffering).
             return Ok(None);
