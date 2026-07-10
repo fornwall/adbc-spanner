@@ -107,11 +107,15 @@ tests.
 ```sh
 scripts/run-adbc-validation.sh              # throwaway emulator, the gated CI subset
 scripts/run-adbc-validation.sh --full       # every case (local exploration)
+ADBC_VALIDATION_SANITIZE=address,undefined scripts/run-adbc-validation.sh  # + ASan/UBSan
 ```
 
 The script builds the cdylib and a C++ harness (needs a C++17 compiler, CMake ≥ 3.20 and git) and
 runs the suite. [`adbc-validation.yml`](../.github/workflows/adbc-validation.yml) runs the gated
-subset as a **gating** CI job.
+subset as a **gating** CI job, in two legs: `plain` and `asan-ubsan` (the C++ side built with
+`-fsanitize=address,undefined`, driving the uninstrumented cdylib — its `malloc`/`free`/`memcpy`
+interceptors catch memory bugs on the C-ABI structs at the FFI boundary; see the validation
+README's *Sanitizers* section).
 
 See [`adbc-validation/README.md`](../adbc-validation/README.md) for the exact gated allowlist, what
 each case covers, and the follow-up work on the remaining `StatementTest` cases.

@@ -39,7 +39,27 @@ cd "$REPO_ROOT"
 # Fixed emulator identifiers, matching tests/integration.rs.
 EMULATOR_DATABASE="projects/test-project/instances/test-instance/databases/adbc-test"
 
-BUILD_DIR="${ADBC_VALIDATION_BUILD_DIR:-$REPO_ROOT/.adbc-validation-build}"
+# Optional sanitizers for the C++ side of the suite. Set e.g.
+# ADBC_VALIDATION_SANITIZE=address,undefined to build the harness + arrow-adbc +
+# driver manager with -fsanitize=... The Rust cdylib is loaded uninstrumented (see the
+# note in adbc-validation/CMakeLists.txt); ASan's process-wide malloc/free/memcpy
+# interceptors still catch double-free / overflow / use-after-free on the C-ABI structs
+# the driver hands across the boundary.
+SANITIZE="${ADBC_VALIDATION_SANITIZE:-}"
+
+# Keep sanitized and plain build trees separate so switching between them doesn't force a
+# full arrow-adbc rebuild (and so a cached CI tree can't mix flags). Overridable as before.
+BUILD_DIR="${ADBC_VALIDATION_BUILD_DIR:-$REPO_ROOT/.adbc-validation-build${SANITIZE:+-san}}"
+
+# Under sanitizers, disable LeakSanitizer: the driver's shared Tokio runtime, gRPC connection
+# pools and lazily-initialized globals are intentionally process-lifetime and would otherwise
+# swamp the run with non-actionable "leaks". Memory-error checks (ASan) and UB checks (UBSan)
+# stay fatal so a real bug fails the run. These are exported for both the build (gtest test
+# discovery runs the binary) and the run itself.
+if [ -n "$SANITIZE" ]; then
+  export ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:${ASAN_OPTIONS:-}"
+  export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1:${UBSAN_OPTIONS:-}"
+fi
 
 FULL=0
 CHECK_DRIFT_ONLY=0
@@ -167,8 +187,10 @@ build_harness() {
   cargo build
 
   echo ">> building the ADBC validation harness (fetches arrow-adbc + googletest)"
+  [ -n "$SANITIZE" ] && echo ">> sanitizers: -fsanitize=$SANITIZE (C++ side; cdylib stays uninstrumented)"
   cmake -S "$REPO_ROOT/adbc-validation" -B "$BUILD_DIR" \
-    -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 >/dev/null
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+    -DSPANNER_VALIDATION_SANITIZE="$SANITIZE" >/dev/null
   cmake --build "$BUILD_DIR" --target spanner_validation -j"$(nproc 2>/dev/null || echo 2)"
 }
 

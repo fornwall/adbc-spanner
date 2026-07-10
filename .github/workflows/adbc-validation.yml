@@ -23,7 +23,28 @@ env:
 
 jobs:
   validation:
+    name: validation (${{ matrix.name }})
     runs-on: ubuntu-latest
+
+    # Two legs over the SAME gate/expected-failure/stale checks:
+    #   - plain      — fast, uninstrumented (the original run).
+    #   - asan-ubsan — the whole C++ side built with -fsanitize=address,undefined, driving the
+    #                  (uninstrumented, stable) cdylib. ASan's process-wide malloc/free/memcpy
+    #                  interceptors catch double-free / overflow / use-after-free on the C-ABI
+    #                  structs the driver hands across the FFI boundary (release callbacks,
+    #                  AdbcError private_data), plus UB in the C/C++ code. It is a strict superset
+    #                  of the plain checks, so once it has proven stable the plain leg can be
+    #                  dropped to reclaim CI time; kept for now as the quick signal and to isolate
+    #                  any sanitizer/runtime surprises from the existing gate.
+    # fail-fast: false so one leg failing does not cancel the other.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: plain
+            sanitize: ""
+          - name: asan-ubsan
+            sanitize: address,undefined
 
     # A Spanner emulator to validate against, same as the main CI job.
     services:
@@ -35,6 +56,10 @@ jobs:
 
     env:
       SPANNER_EMULATOR_HOST: localhost:9010
+      # Forwarded to scripts/run-adbc-validation.sh → -DSPANNER_VALIDATION_SANITIZE. Empty for the
+      # plain leg. Distinct build dir per leg so the two flag sets never share a cache/tree.
+      ADBC_VALIDATION_SANITIZE: ${{ matrix.sanitize }}
+      ADBC_VALIDATION_BUILD_DIR: ${{ github.workspace }}/.adbc-validation-build-${{ matrix.name }}
 
     steps:
       - uses: actions/checkout@v7
@@ -62,9 +87,10 @@ jobs:
       # Persist the C++ validation build tree (fetched + compiled arrow-adbc and
       # GoogleTest under .adbc-validation-build, plus our own harness objects) so the
       # slow FetchContent clone + compile is reused across runs. The key is bound to
-      # the runner OS and a hash of adbc-validation/CMakeLists.txt — which carries the
-      # pinned ARROW_ADBC_TAG and every CMake/toolchain flag — so bumping the arrow-adbc
-      # rev (or any build flag) mints a fresh key.
+      # the runner OS, the matrix leg (plain vs asan-ubsan build the same sources with
+      # different flags, so they must NOT share a tree) and a hash of
+      # adbc-validation/CMakeLists.txt — which carries the pinned ARROW_ADBC_TAG and every
+      # CMake/toolchain flag — so bumping the arrow-adbc rev (or any build flag) mints a fresh key.
       #
       # Deliberately NO restore-keys: a partial-key hit would restore a build tree
       # (including its CMakeCache.txt) from a run on the *old* arrow-adbc rev, and
@@ -77,8 +103,8 @@ jobs:
       - name: Cache the ADBC C++ validation build tree
         uses: actions/cache@v6
         with:
-          path: .adbc-validation-build
-          key: adbc-validation-${{ runner.os }}-${{ hashFiles('adbc-validation/CMakeLists.txt') }}
+          path: ${{ env.ADBC_VALIDATION_BUILD_DIR }}
+          key: adbc-validation-${{ runner.os }}-${{ matrix.name }}-${{ hashFiles('adbc-validation/CMakeLists.txt') }}
 
       - name: Run the ADBC C++ validation suite (gated subset)
         run: scripts/run-adbc-validation.sh

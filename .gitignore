@@ -5,3 +5,4 @@
 /fuzz/corpus
 /fuzz/artifacts
 /.adbc-validation-build/
+/.adbc-validation-build-*/
