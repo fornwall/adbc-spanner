@@ -169,6 +169,27 @@ jobs:
       - name: End-to-end tests
         run: python -m pytest python/tests -v
 
+  # Enforce the declared MSRV (Cargo.toml `rust-version`) so a newer-than-pinned
+  # stable API can't slip in and silently break downstream users on that toolchain.
+  # A `cargo check` on the pinned toolchain is enough — a full test run on MSRV
+  # isn't necessary; every other job already builds/tests on stable.
+  msrv:
+    name: MSRV (cargo check on 1.97)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        # Pinned to Cargo.toml's rust-version; bump both together.
+        uses: dtolnay/rust-toolchain@1.97
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check on MSRV
+        # --all-features / --all-targets so tests, examples and feature-gated
+        # modules are all type-checked against the MSRV toolchain.
+        run: cargo check --all-features --all-targets
+
   # Lint the workflow files themselves. The pinned Docker image bundles
   # actionlint plus its shellcheck/pyflakes integrations, so `run:` scripts are
   # checked too.
