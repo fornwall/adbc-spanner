@@ -270,50 +270,68 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # Gate every tag-triggered publish step on the commit's CI run being green. This
-  # workflow (and only this one) triggers on tags, and it runs no tests itself — so
+  # Gate every tag-triggered publish step on the commit's required workflows being green.
+  # This workflow (and only this one) triggers on tags, and it runs no tests itself — so
   # without this job a `cargo release --execute` (which pushes the "Release X.Y.Z"
   # commit and the vX.Y.Z tag together) would attach GitHub Release assets and publish
-  # to PyPI (irreversible) even if that exact commit is red on CI, or before CI has
-  # finished. The branch push that accompanies the tag triggers ci.yml on the same SHA;
-  # here we poll ci.yml's run for github.sha and only succeed once it has concluded
-  # `success`, failing (and thus blocking `release` / `python-publish`) otherwise.
+  # to PyPI (irreversible) even if that exact commit is red, or before the checks have
+  # finished. The branch push that accompanies the tag triggers each of these workflows
+  # on the same SHA (they all run on push to `main` + pull_request); here we poll every
+  # one of them for github.sha and only succeed once ALL have concluded `success`,
+  # failing (and thus blocking `release` / `python-publish`) otherwise. The gate covers
+  # the Rust CI (ci.yml) AND the two ADBC conformance suites that run on the same commit:
+  # the canonical Apache C++ validation (adbc-validation.yml) and the Driver Foundry
+  # coverage harness (foundry-validation.yml) — a tag must not publish while either
+  # conformance suite is red on that exact SHA.
   ci-gate:
-    name: Require CI green on this commit
+    name: Require CI + conformance green on this commit
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: read # read ci.yml's workflow runs via the API.
+      actions: read # read the required workflows' runs via the API.
     steps:
-      - name: Wait for the CI workflow to succeed on this commit
+      - name: Wait for the required workflows to succeed on this commit
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           sha="${{ github.sha }}"
           repo="${{ github.repository }}"
-          # 30-minute budget: the run may not be registered yet when the tag arrives, and
-          # the emulator suites take a few minutes; poll until it completes either way.
+          # Every workflow file that must be green on this commit before the release may
+          # attach assets / publish to PyPI. Each triggers on the push to `main` that
+          # accompanies the tag, so each produces a run for this SHA.
+          required=(ci.yml adbc-validation.yml foundry-validation.yml)
+          # 30-minute budget: a run may not be registered yet when the tag arrives, and
+          # the emulator/C++ suites take a few minutes; poll until all complete either way.
+          # A required workflow that never registers a run keeps `pending` and thus times
+          # out below — i.e. the fail-safe blocks the publish rather than releasing blind.
           deadline=$(( SECONDS + 1800 ))
           while true; do
-            resp="$(gh api \
-              "repos/${repo}/actions/workflows/ci.yml/runs?head_sha=${sha}&per_page=1" \
-              2>/dev/null || true)"
-            status="$(printf '%s' "$resp" | jq -r '.workflow_runs[0].status // "none"' 2>/dev/null || echo none)"
-            conclusion="$(printf '%s' "$resp" | jq -r '.workflow_runs[0].conclusion // "none"' 2>/dev/null || echo none)"
-            echo "ci.yml run for ${sha}: status=${status} conclusion=${conclusion}"
-            if [ "$status" = "completed" ]; then
-              if [ "$conclusion" = "success" ]; then
-                echo "CI is green on ${sha}; allowing the release to proceed."
-                exit 0
+            pending=()
+            for wf in "${required[@]}"; do
+              resp="$(gh api \
+                "repos/${repo}/actions/workflows/${wf}/runs?head_sha=${sha}&per_page=1" \
+                2>/dev/null || true)"
+              status="$(printf '%s' "$resp" | jq -r '.workflow_runs[0].status // "none"' 2>/dev/null || echo none)"
+              conclusion="$(printf '%s' "$resp" | jq -r '.workflow_runs[0].conclusion // "none"' 2>/dev/null || echo none)"
+              echo "${wf} run for ${sha}: status=${status} conclusion=${conclusion}"
+              if [ "$status" = "completed" ]; then
+                if [ "$conclusion" != "success" ]; then
+                  echo "::error::${wf} concluded '${conclusion}' on ${sha}; refusing to publish this tag." >&2
+                  exit 1
+                fi
+              else
+                pending+=("$wf")
               fi
-              echo "::error::CI concluded '${conclusion}' on ${sha}; refusing to publish this tag." >&2
-              exit 1
+            done
+            if [ "${#pending[@]}" -eq 0 ]; then
+              echo "All required workflows are green on ${sha}; allowing the release to proceed."
+              exit 0
             fi
             if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "::error::timed out after 30m waiting for ci.yml to complete on ${sha}" >&2
+              echo "::error::timed out after 30m waiting for these workflows to complete on ${sha}: ${pending[*]}" >&2
               exit 1
             fi
             sleep 20
