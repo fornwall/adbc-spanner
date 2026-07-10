@@ -496,16 +496,15 @@ fn aborted_retry_info_detail_reaches_adbc_error_details() {
 /// (a″) `PERMISSION_DENIED` on `ExecuteStreamingSql` (as a caller lacking a Spanner IAM read
 /// permission gets from real Spanner — the emulator never enforces IAM, so this is the only way to
 /// exercise the path). The driver must surface a clean ADBC error whose message keeps the server's
-/// text *and* gains the actionable IAM hint `src/error.rs`'s `permission_denied_hint` appends: it
-/// echoes the exact `spanner.databases.select` permission the server named and points at the
-/// least-privilege role that grants it (`roles/spanner.databaseReader`), plus the IAM doc link. The
-/// numeric gRPC code (PERMISSION_DENIED = 7) survives in `vendor_code`, and the status is
-/// `Unauthorized`.
+/// text (which already names the missing `spanner.databases.select` permission) *and* gains the
+/// fixed IAM guidance `src/error.rs`'s `PERMISSION_DENIED_GUIDANCE` appends: the predefined Spanner
+/// roles plus the IAM doc link (no permission re-parsing, no role lookup). The numeric gRPC code
+/// (PERMISSION_DENIED = 7) survives in `vendor_code`, and the status is `Unauthorized`.
 #[test]
-fn permission_denied_surfaces_an_iam_hint() {
+fn permission_denied_surfaces_iam_guidance() {
     let _watchdog = Watchdog::arm(
         Duration::from_secs(120),
-        "permission_denied_surfaces_an_iam_hint",
+        "permission_denied_surfaces_iam_guidance",
     );
 
     let server = MockServer::start(|mock| {
@@ -539,23 +538,17 @@ fn permission_denied_surfaces_an_iam_hint() {
         "the server's message must survive, got: {}",
         error.message
     );
-    // ...and the appended IAM hint echoes the exact permission, names the least-privilege role, and
-    // links the docs — this is the whole point of the feature.
-    assert!(
-        error.message.contains("IAM hint:"),
-        "expected an IAM hint, got: {}",
-        error.message
-    );
+    // ...and the fixed IAM guidance is appended: the predefined roles plus the IAM doc link.
     assert!(
         error.message.contains("roles/spanner.databaseReader"),
-        "the read permission must map to databaseReader, got: {}",
+        "expected the appended IAM guidance, got: {}",
         error.message
     );
     assert!(
         error
             .message
             .contains("https://cloud.google.com/spanner/docs/iam"),
-        "the hint must link the Spanner IAM docs, got: {}",
+        "the guidance must link the Spanner IAM docs, got: {}",
         error.message
     );
 }

@@ -89,12 +89,11 @@ pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
                 )
             });
     let mut message = format!("Spanner error: {error}");
-    // On PERMISSION_DENIED, append an actionable IAM hint (see [`permission_denied_hint`]). The hint
-    // is only *appended* — the original message, status, vendor_code and forwarded details are all
-    // left untouched.
+    // On PERMISSION_DENIED, append the fixed IAM guidance (see [`PERMISSION_DENIED_GUIDANCE`]). It is
+    // only *appended* — the original message (which already names the missing permission), status,
+    // vendor_code and forwarded details are all left untouched.
     if code == Some(Code::PermissionDenied) {
-        let hint = permission_denied_hint(&message);
-        message.push_str(&hint);
+        message.push_str(PERMISSION_DENIED_GUIDANCE);
     }
     let mut adbc = err(message, status);
     adbc.vendor_code = vendor_code;
@@ -102,116 +101,25 @@ pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
     adbc
 }
 
-/// Base URL of the Spanner IAM documentation, appended to every permission hint.
-const IAM_DOCS_URL: &str = "https://cloud.google.com/spanner/docs/iam";
-
-/// Build the actionable IAM hint appended to a `PERMISSION_DENIED` error's message.
+/// Fixed IAM guidance appended to every `PERMISSION_DENIED` error message.
 ///
-/// A Spanner `PERMISSION_DENIED` means the caller's principal lacks an IAM permission for the
-/// operation. Cloud Spanner's status message usually already *names* the exact missing permission,
-/// e.g. `... is missing IAM permission: spanner.databases.select on resource ...`. We turn that into
-/// concrete guidance without ever *guessing*:
+/// A Spanner `PERMISSION_DENIED` means the caller's principal lacks the IAM permission the operation
+/// needs. Cloud Spanner's own status message already *names* the missing permission (e.g.
+/// `... is missing IAM permission: spanner.databases.select on resource ...`), which we preserve
+/// verbatim — so rather than re-parse that permission and try to map it to a specific role (which
+/// risks naming the wrong one), we simply append a constant pointer to the predefined Spanner roles
+/// and the IAM docs. This mirrors the ADBC BigQuery driver, which likewise leaves the server's
+/// permission text intact and appends a fixed guidance string (its `reauthGuidance`) rather than
+/// resolving a role.
 ///
-/// - **If the message names a `spanner.<resource>.<verb>` permission** (echo what Spanner itself
-///   reported — the most accurate source), the hint repeats that exact permission and, when it is
-///   one of Spanner's well-known data-plane permissions, points at the *least-privilege* predefined
-///   role that includes it ([`role_for_permission`]) — `roles/spanner.databaseReader` for reads,
-///   `roles/spanner.databaseUser` for writes/DML/DDL, `roles/spanner.databaseAdmin` for database
-///   administration. A permission we don't have a mapping for is still echoed, with a generic "grant
-///   a predefined Spanner role that includes it", so we never assert a role that might be wrong.
-/// - **Otherwise** (the message did not name a permission — this layer cannot see which operation
-///   the failed call was performing, so it cannot infer one), the hint is a still-accurate generic
-///   pointer that enumerates the three common roles by operation kind.
-///
-/// Every hint ends with the [`IAM_DOCS_URL`] doc link. The hint is only ever *appended* to the
-/// existing message — it augments, never replaces, and leaves `vendor_code`/`details` alone. The
-/// emulator does not enforce IAM, so this path is exercised by the unit tests here and by a
-/// mock-server test (`tests/mock_spanner.rs`) that returns a synthetic `PERMISSION_DENIED`, not by
-/// the emulator integration test.
-fn permission_denied_hint(message: &str) -> String {
-    match extract_spanner_permission(message) {
-        Some(permission) => match role_for_permission(permission) {
-            Some(role) => format!(
-                " (IAM hint: the caller is missing the Spanner IAM permission '{permission}'; \
-                 grant a role that includes it, e.g. {role} — see {IAM_DOCS_URL})"
-            ),
-            None => format!(
-                " (IAM hint: the caller is missing the Spanner IAM permission '{permission}'; \
-                 grant a predefined Spanner role that includes it — see {IAM_DOCS_URL})"
-            ),
-        },
-        None => format!(
-            " (IAM hint: this is a Spanner IAM permission error; ensure the caller has a role \
-             granting the permission this operation needs — roles/spanner.databaseReader for reads, \
-             roles/spanner.databaseUser for reads plus writes (DML) and schema changes (DDL), or \
-             roles/spanner.databaseAdmin for database administration — see {IAM_DOCS_URL})"
-        ),
-    }
-}
-
-/// Extract the first `spanner.<resource>.<verb>` IAM-permission token from an error message, if any.
-///
-/// Cloud Spanner's `PERMISSION_DENIED` messages name the missing permission inline (e.g.
-/// `spanner.databases.select`). We split on any character that cannot appear in a permission
-/// identifier (permissions are ASCII-alphanumeric segments joined by dots; verbs are camelCase like
-/// `beginOrRollbackReadWriteTransaction`), trim stray dots, and return the first token shaped like a
-/// Spanner permission. Deliberately dependency-free (no `regex`).
-fn extract_spanner_permission(message: &str) -> Option<&str> {
-    message
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))
-        .map(|token| token.trim_matches('.'))
-        .find(|token| is_spanner_permission(token))
-}
-
-/// Is `token` shaped like a Spanner IAM permission — `spanner.<resource>.<verb>` with at least three
-/// non-empty ASCII-alphanumeric segments (`spanner` plus a resource plus a verb)?
-fn is_spanner_permission(token: &str) -> bool {
-    let mut segments = token.split('.');
-    if segments.next() != Some("spanner") {
-        return false;
-    }
-    let rest: Vec<&str> = segments.collect();
-    rest.len() >= 2
-        && rest.iter().all(|segment| {
-            !segment.is_empty() && segment.chars().all(|c| c.is_ascii_alphanumeric())
-        })
-}
-
-/// Map a well-known Spanner data-plane IAM permission to the *least-privilege* predefined role that
-/// grants it, or `None` for permissions we don't want to assert a role for.
-///
-/// The mapping follows Google's published Spanner IAM permission/role reference
-/// (<https://cloud.google.com/spanner/docs/iam>): reads (SELECT / sessions) → `databaseReader`;
-/// writes (DML), read/write-transaction begin, and DDL (`updateDdl`) → `databaseUser`; database
-/// administration (create / drop / list / get DDL / IAM policy) → `databaseAdmin`. Anything not
-/// listed returns `None` so the hint falls back to the generic "grant a predefined role that
-/// includes it" wording rather than naming a role that might be wrong.
-fn role_for_permission(permission: &str) -> Option<&'static str> {
-    match permission {
-        "spanner.databases.select"
-        | "spanner.databases.read"
-        | "spanner.databases.beginReadOnlyTransaction"
-        | "spanner.databases.partitionQuery"
-        | "spanner.databases.partitionRead"
-        | "spanner.sessions.create"
-        | "spanner.sessions.delete"
-        | "spanner.sessions.get"
-        | "spanner.sessions.list" => Some("roles/spanner.databaseReader"),
-        "spanner.databases.write"
-        | "spanner.databases.beginOrRollbackReadWriteTransaction"
-        | "spanner.databases.beginPartitionedDmlTransaction"
-        | "spanner.databases.updateDdl" => Some("roles/spanner.databaseUser"),
-        "spanner.databases.create"
-        | "spanner.databases.drop"
-        | "spanner.databases.get"
-        | "spanner.databases.getDdl"
-        | "spanner.databases.list"
-        | "spanner.databases.update"
-        | "spanner.databases.getIamPolicy"
-        | "spanner.databases.setIamPolicy" => Some("roles/spanner.databaseAdmin"),
-        _ => None,
-    }
-}
+/// The guidance is only ever *appended* — it augments, never replaces, and leaves the message text,
+/// status, `vendor_code` and forwarded `details` untouched. The emulator does not enforce IAM, so
+/// this path is exercised by the unit tests here and by a mock-server test (`tests/mock_spanner.rs`)
+/// that returns a synthetic `PERMISSION_DENIED`, not by the emulator integration test.
+const PERMISSION_DENIED_GUIDANCE: &str = " (grant the caller an IAM role that includes the required \
+    Spanner permission — roles/spanner.databaseReader for reads, roles/spanner.databaseUser for \
+    reads plus writes (DML) and schema changes (DDL), or roles/spanner.databaseAdmin for database \
+    administration — see https://cloud.google.com/spanner/docs/iam)";
 
 /// Map a gRPC status' `google.rpc.Status` details onto ADBC error details.
 ///
@@ -263,12 +171,11 @@ fn map_detail(detail: &StatusDetails) -> Option<(String, Vec<u8>)> {
 pub(crate) fn from_status_parts(code: i32, message: &str) -> Error {
     let status = status_for_grpc_code(Code::from(code));
     let mut full = format!("Spanner batch-write error: {message}");
-    // A per-group `PERMISSION_DENIED` on the BatchWrite path gets the same actionable IAM hint the
-    // `from_spanner` commit path adds (see [`permission_denied_hint`]); the original message and
+    // A per-group `PERMISSION_DENIED` on the BatchWrite path gets the same fixed IAM guidance the
+    // `from_spanner` commit path adds (see [`PERMISSION_DENIED_GUIDANCE`]); the original message and
     // `vendor_code` are preserved.
     if Code::from(code) == Code::PermissionDenied {
-        let hint = permission_denied_hint(&full);
-        full.push_str(&hint);
+        full.push_str(PERMISSION_DENIED_GUIDANCE);
     }
     let mut adbc = err(full, status);
     adbc.vendor_code = code;
@@ -559,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_denied_echoes_the_named_permission_and_maps_a_role() {
+    fn permission_denied_preserves_the_message_and_appends_iam_guidance() {
         use google_cloud_gax::error::Error as GaxError;
         use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
 
@@ -576,23 +483,20 @@ mod tests {
         assert_eq!(adbc.status, Status::Unauthorized);
         assert_eq!(adbc.vendor_code, Code::PermissionDenied as i32);
         assert_eq!(adbc.vendor_code, 7);
-        // The original message survives verbatim...
+        // The server's original message — which already names the missing permission — survives
+        // verbatim; we neither re-parse it nor resolve a role from it.
         assert!(
             adbc.message
                 .contains("Caller is missing IAM permission spanner.databases.select")
         );
-        // ...and the appended hint echoes the exact permission and names the least-privilege role.
-        assert!(
-            adbc.message.contains("IAM hint:"),
-            "expected an IAM hint, got: {}",
-            adbc.message
-        );
-        assert!(adbc.message.contains("spanner.databases.select"));
+        // ...and the fixed guidance is appended: the predefined roles plus the IAM doc link.
         assert!(
             adbc.message.contains("roles/spanner.databaseReader"),
-            "a read permission must map to databaseReader, got: {}",
+            "expected the appended IAM guidance, got: {}",
             adbc.message
         );
+        assert!(adbc.message.contains("roles/spanner.databaseUser"));
+        assert!(adbc.message.contains("roles/spanner.databaseAdmin"));
         assert!(
             adbc.message
                 .contains("https://cloud.google.com/spanner/docs/iam")
@@ -600,39 +504,12 @@ mod tests {
     }
 
     #[test]
-    fn permission_denied_maps_write_and_ddl_permissions_to_database_user() {
-        // A DML/write permission and the DDL permission both resolve to databaseUser.
-        assert_eq!(
-            role_for_permission("spanner.databases.write"),
-            Some("roles/spanner.databaseUser")
-        );
-        assert_eq!(
-            role_for_permission("spanner.databases.beginOrRollbackReadWriteTransaction"),
-            Some("roles/spanner.databaseUser")
-        );
-        assert_eq!(
-            role_for_permission("spanner.databases.updateDdl"),
-            Some("roles/spanner.databaseUser")
-        );
-        // Reads → databaseReader; database administration → databaseAdmin.
-        assert_eq!(
-            role_for_permission("spanner.databases.select"),
-            Some("roles/spanner.databaseReader")
-        );
-        assert_eq!(
-            role_for_permission("spanner.databases.getDdl"),
-            Some("roles/spanner.databaseAdmin")
-        );
-        // A permission we don't map returns None → the generic wording, never a guessed role.
-        assert_eq!(role_for_permission("spanner.instances.get"), None);
-    }
-
-    #[test]
-    fn permission_denied_without_a_named_permission_uses_the_generic_hint() {
+    fn permission_denied_guidance_is_added_even_without_a_named_permission() {
         use google_cloud_gax::error::Error as GaxError;
         use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
 
-        // Some PERMISSION_DENIED messages don't name a permission token at all.
+        // Some PERMISSION_DENIED messages don't name a permission token at all — the guidance is
+        // appended regardless, keyed only on the code.
         let gax = GaxError::service(
             RpcStatus::default()
                 .set_code(Code::PermissionDenied)
@@ -640,9 +517,6 @@ mod tests {
         );
         let adbc = from_spanner(gax);
         assert_eq!(adbc.status, Status::Unauthorized);
-        assert!(adbc.message.contains("IAM hint:"));
-        // The generic hint enumerates the three common roles and the doc link — accurate without
-        // asserting a single specific permission it can't see.
         assert!(adbc.message.contains("roles/spanner.databaseReader"));
         assert!(adbc.message.contains("roles/spanner.databaseUser"));
         assert!(adbc.message.contains("roles/spanner.databaseAdmin"));
@@ -653,12 +527,12 @@ mod tests {
     }
 
     #[test]
-    fn non_permission_errors_get_no_iam_hint() {
+    fn non_permission_errors_get_no_iam_guidance() {
         use google_cloud_gax::error::Error as GaxError;
         use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
 
-        // A NOT_FOUND that incidentally mentions a spanner.* token must NOT gain an IAM hint —
-        // the hint is gated strictly on the PERMISSION_DENIED code, not on message contents.
+        // A NOT_FOUND that incidentally mentions a spanner.* token must NOT gain IAM guidance —
+        // it is gated strictly on the PERMISSION_DENIED code, not on message contents.
         let gax = GaxError::service(
             RpcStatus::default()
                 .set_code(Code::NotFound)
@@ -667,41 +541,16 @@ mod tests {
         let adbc = from_spanner(gax);
         assert_eq!(adbc.status, Status::NotFound);
         assert!(
-            !adbc.message.contains("IAM hint:"),
-            "only PERMISSION_DENIED should carry the IAM hint, got: {}",
+            !adbc.message.contains("cloud.google.com/spanner/docs/iam"),
+            "only PERMISSION_DENIED should carry the IAM guidance, got: {}",
             adbc.message
         );
     }
 
     #[test]
-    fn extracts_a_spanner_permission_token_ignoring_surrounding_punctuation() {
-        // Trailing punctuation (the sentence's period) must not become part of the token.
-        assert_eq!(
-            extract_spanner_permission("... missing IAM permission: spanner.databases.select."),
-            Some("spanner.databases.select")
-        );
-        // camelCase verbs are preserved intact.
-        assert_eq!(
-            extract_spanner_permission(
-                "needs spanner.databases.beginOrRollbackReadWriteTransaction to proceed"
-            ),
-            Some("spanner.databases.beginOrRollbackReadWriteTransaction")
-        );
-        // A bare `spanner` word (no resource/verb) is not a permission.
-        assert_eq!(
-            extract_spanner_permission("just the word spanner here"),
-            None
-        );
-        assert_eq!(
-            extract_spanner_permission("no permission token at all"),
-            None
-        );
-    }
-
-    #[test]
-    fn from_status_parts_adds_the_iam_hint_on_permission_denied() {
+    fn from_status_parts_adds_iam_guidance_on_permission_denied() {
         // The BatchWrite path surfaces failures as numeric codes; a PERMISSION_DENIED group there
-        // must also carry the hint, while the vendor_code and message are preserved.
+        // must also carry the guidance, while the vendor_code and message are preserved.
         let adbc = from_status_parts(
             Code::PermissionDenied as i32,
             "Caller is missing IAM permission spanner.databases.write on resource d.",
@@ -710,10 +559,17 @@ mod tests {
         assert_eq!(adbc.vendor_code, 7);
         assert!(adbc.message.contains("spanner.databases.write"));
         assert!(adbc.message.contains("roles/spanner.databaseUser"));
-        assert!(adbc.message.contains("IAM hint:"));
-        // A non-permission numeric code stays hint-free.
+        assert!(
+            adbc.message
+                .contains("https://cloud.google.com/spanner/docs/iam")
+        );
+        // A non-permission numeric code stays guidance-free.
         let already = from_status_parts(Code::AlreadyExists as i32, "Row already exists");
-        assert!(!already.message.contains("IAM hint:"));
+        assert!(
+            !already
+                .message
+                .contains("cloud.google.com/spanner/docs/iam")
+        );
     }
 
     #[test]

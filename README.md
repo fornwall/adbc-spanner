@@ -198,12 +198,12 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   interoperate. The reason is that the pinned preview client decodes details into serde-modelled
   types whose only supported encoding is ProtoJSON, with no binary-protobuf path.
   On a `PERMISSION_DENIED` (which maps to `Unauthorized`), the driver additionally *appends* a short
-  IAM hint to the error message: when Spanner's message names the missing permission (e.g.
-  `spanner.databases.select`) it echoes that permission and points at the least-privilege predefined
-  role that grants it — `roles/spanner.databaseReader` for reads, `roles/spanner.databaseUser` for
-  writes (DML) and schema changes (DDL), or `roles/spanner.databaseAdmin` for database administration
-  — otherwise it emits a generic hint listing those roles; either way it links
-  <https://cloud.google.com/spanner/docs/iam>. The hint only augments the message; the status,
+  IAM-guidance string to the error message. Spanner's own message already names the missing permission
+  (e.g. `spanner.databases.select`), which is preserved verbatim, so the driver does not re-parse it
+  or guess a specific role; it appends a fixed pointer to the predefined roles —
+  `roles/spanner.databaseReader` for reads, `roles/spanner.databaseUser` for writes (DML) and schema
+  changes (DDL), or `roles/spanner.databaseAdmin` for database administration — and links
+  <https://cloud.google.com/spanner/docs/iam>. The guidance only augments the message; the status,
   `vendor_code` and forwarded details are unchanged.
 
 Not supported (returns `NotImplemented`, by nature of Spanner): **Substrait** — Spanner executes
