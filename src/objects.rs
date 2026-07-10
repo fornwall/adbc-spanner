@@ -25,7 +25,7 @@ use futures_util::try_join;
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::MultiUseReadOnlyTransaction;
 
-use crate::connection::{like_match, str_col};
+use crate::connection::{LikeMatcher, str_col};
 use crate::conversion::result_set_to_batch;
 use crate::error::{err, from_spanner};
 use crate::nested::{arrow_err, field, list_item, list_of, list_of_nullable, struct_fields};
@@ -287,10 +287,18 @@ pub(crate) fn collect_objects(
         None => HashMap::new(),
     };
 
+    // The `LIKE` patterns are loop-invariant, so compile each once and reuse it across every row.
+    let db_schema_matcher = db_schema.map(LikeMatcher::new);
+    let table_name_matcher = table_name.map(LikeMatcher::new);
+    let column_name_matcher = column_name.map(LikeMatcher::new);
+
     let mut result = Vec::new();
     for i in 0..schema_batch.num_rows() {
         let schema_name = schema_names.value(i);
-        if db_schema.is_some_and(|p| !like_match(p, schema_name)) {
+        if db_schema_matcher
+            .as_ref()
+            .is_some_and(|m| !m.matches(schema_name))
+        {
             continue;
         }
         let mut tables = Vec::new();
@@ -298,7 +306,10 @@ pub(crate) fn collect_objects(
         // schema-only depth — matching the previous `if let Some(&table_batch)` guard.
         for table in tables_by_schema.get(schema_name).into_iter().flatten() {
             let name = table.name;
-            if table_name.is_some_and(|p| !like_match(p, name)) {
+            if table_name_matcher
+                .as_ref()
+                .is_some_and(|m| !m.matches(name))
+            {
                 continue;
             }
             let ttype = table.table_type.to_string();
@@ -310,7 +321,12 @@ pub(crate) fn collect_objects(
             }
             // Empty maps (columns/constraints not populated at this depth) yield empty lists,
             // matching the previous depth-gated `match` arms.
-            let columns = collect_columns(&columns_by_table, schema_name, name, column_name);
+            let columns = collect_columns(
+                &columns_by_table,
+                schema_name,
+                name,
+                column_name_matcher.as_ref(),
+            );
             let constraints = collect_constraints(
                 &constraints_by_table,
                 &key_columns_by_constraint,
@@ -335,7 +351,7 @@ pub(crate) fn collect_objects(
 
 /// Escape an ADBC `LIKE` pattern for GoogleSQL `LIKE`.
 ///
-/// The ADBC pattern contract (implemented client-side by [`like_match`]) has no escape syntax:
+/// The ADBC pattern contract (implemented client-side by [`like_match`](crate::connection::like_match)) has no escape syntax:
 /// `%` and `_` are always wildcards and every other character — including `\` — is a literal.
 /// GoogleSQL `LIKE` agrees on `%`/`_` and case sensitivity, but treats `\` as an escape
 /// character; doubling each backslash turns it back into a literal, making the server-side
@@ -564,11 +580,11 @@ fn collect_columns<'a>(
     columns_by_table: &HashMap<(&'a str, &'a str), Vec<ColumnRow<'a>>>,
     schema: &'a str,
     table: &'a str,
-    filter: Option<&str>,
+    filter: Option<&LikeMatcher>,
 ) -> Vec<Column> {
     let mut columns = Vec::new();
     for column in columns_by_table.get(&(schema, table)).into_iter().flatten() {
-        if filter.is_some_and(|p| !like_match(p, column.name)) {
+        if filter.is_some_and(|m| !m.matches(column.name)) {
             continue;
         }
         columns.push(Column {

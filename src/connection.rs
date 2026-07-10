@@ -623,39 +623,64 @@ pub(crate) fn str_col(batch: &RecordBatch, index: usize) -> Result<&StringArray>
         })
 }
 
-/// Match an ADBC `LIKE` pattern (`%` = any run, `_` = one char) against a value, case-sensitively.
+/// A compiled ADBC `LIKE` pattern (`%` = any run, `_` = one char), matched case-sensitively.
 ///
-/// Iterative with backtrack pointers (O(pattern × value), no recursion) so adversarial patterns
-/// like `%a%a%a…` cannot cause exponential blowup or stack overflow.
-pub(crate) fn like_match(pattern: &str, value: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let v: Vec<char> = value.chars().collect();
-    let (mut pi, mut vi) = (0usize, 0usize);
-    // Position in the pattern/value to backtrack to after the most recent `%`.
-    let mut star: Option<(usize, usize)> = None;
-    while vi < v.len() {
-        // `%` must be tested before the literal/`_` branch: otherwise a `%` in the pattern that
-        // happens to equal the current value char (e.g. both are `%`) would be consumed as a
-        // literal instead of acting as a wildcard.
-        if pi < p.len() && p[pi] == '%' {
-            star = Some((pi, vi));
-            pi += 1;
-        } else if pi < p.len() && (p[pi] == '_' || p[pi] == v[vi]) {
-            pi += 1;
-            vi += 1;
-        } else if let Some((sp, sv)) = star {
-            // Let the last `%` consume one more character and retry.
-            pi = sp + 1;
-            vi = sv + 1;
-            star = Some((sp, sv + 1));
-        } else {
-            return false;
+/// The pattern chars are collected once so a collector can reuse one matcher across every candidate
+/// row (the pattern is loop-invariant) instead of re-collecting it on each call; the free
+/// [`like_match`] helper wraps it for one-off matches.
+///
+/// [`matches`](LikeMatcher::matches) is iterative with backtrack pointers (O(pattern × value), no
+/// recursion) so adversarial patterns like `%a%a%a…` cannot cause exponential blowup or stack
+/// overflow.
+pub(crate) struct LikeMatcher {
+    pattern: Vec<char>,
+}
+
+impl LikeMatcher {
+    pub(crate) fn new(pattern: &str) -> Self {
+        Self {
+            pattern: pattern.chars().collect(),
         }
     }
-    while pi < p.len() && p[pi] == '%' {
-        pi += 1;
+
+    pub(crate) fn matches(&self, value: &str) -> bool {
+        let p = &self.pattern;
+        let v: Vec<char> = value.chars().collect();
+        let (mut pi, mut vi) = (0usize, 0usize);
+        // Position in the pattern/value to backtrack to after the most recent `%`.
+        let mut star: Option<(usize, usize)> = None;
+        while vi < v.len() {
+            // `%` must be tested before the literal/`_` branch: otherwise a `%` in the pattern that
+            // happens to equal the current value char (e.g. both are `%`) would be consumed as a
+            // literal instead of acting as a wildcard.
+            if pi < p.len() && p[pi] == '%' {
+                star = Some((pi, vi));
+                pi += 1;
+            } else if pi < p.len() && (p[pi] == '_' || p[pi] == v[vi]) {
+                pi += 1;
+                vi += 1;
+            } else if let Some((sp, sv)) = star {
+                // Let the last `%` consume one more character and retry.
+                pi = sp + 1;
+                vi = sv + 1;
+                star = Some((sp, sv + 1));
+            } else {
+                return false;
+            }
+        }
+        while pi < p.len() && p[pi] == '%' {
+            pi += 1;
+        }
+        pi == p.len()
     }
-    pi == p.len()
+}
+
+/// Match an ADBC `LIKE` pattern (`%` = any run, `_` = one char) against a value, case-sensitively.
+///
+/// A one-off wrapper over [`LikeMatcher`]; use [`LikeMatcher`] directly to match one pattern against
+/// many values without re-compiling it each time.
+pub(crate) fn like_match(pattern: &str, value: &str) -> bool {
+    LikeMatcher::new(pattern).matches(value)
 }
 
 #[cfg(test)]

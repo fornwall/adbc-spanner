@@ -27,7 +27,7 @@ use futures_util::stream::{self, StreamExt};
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::Statement as SpannerSql;
 
-use crate::connection::{like_match, query_batch, str_col};
+use crate::connection::{LikeMatcher, query_batch, str_col};
 use crate::conversion::result_set_to_batch;
 use crate::error::{err, from_spanner};
 use crate::nested::{arrow_err, dense_union, field, list_item, list_of, struct_fields};
@@ -145,14 +145,23 @@ pub(crate) fn collect_statistics(
     // it, so the output (tables, schemas and their statistics) is identical to the old sequential
     // loop regardless of completion order.
     let bound = read_staleness.timestamp_bound()?;
+    // The `LIKE` patterns are loop-invariant, so compile each once and reuse it across every row.
+    let db_schema_matcher = db_schema.map(LikeMatcher::new);
+    let table_name_matcher = table_name.map(LikeMatcher::new);
     let mut prepared: Vec<PreparedTable> = Vec::new();
     for r in 0..table_batch.num_rows() {
         let schema = ts.value(r);
         let table = tn.value(r);
-        if db_schema.is_some_and(|p| !like_match(p, schema)) {
+        if db_schema_matcher
+            .as_ref()
+            .is_some_and(|m| !m.matches(schema))
+        {
             continue;
         }
-        if table_name.is_some_and(|p| !like_match(p, table)) {
+        if table_name_matcher
+            .as_ref()
+            .is_some_and(|m| !m.matches(table))
+        {
             continue;
         }
         let columns = columns_by_table
@@ -210,16 +219,22 @@ pub(crate) fn collect_statistics(
         }),
     )?;
 
-    // Parse each batch and re-group by schema, in the original deterministic order.
+    // Parse each batch and re-group by schema, in the original deterministic order. `schemas` keeps
+    // first-seen order (so the output ordering is unchanged); `schema_index` maps a schema name to
+    // its slot so the regroup stays O(tables) instead of O(tables × schemas).
     let mut schemas: Vec<SchemaStatistics> = Vec::new();
+    let mut schema_index: HashMap<String, usize> = HashMap::new();
     for (p, batch) in prepared.into_iter().zip(batches) {
         let stats = parse_table_statistics(&batch, &p.table, p.plan)?;
-        match schemas.iter_mut().find(|s| s.db_schema == p.schema) {
-            Some(s) => s.statistics.extend(stats),
-            None => schemas.push(SchemaStatistics {
-                db_schema: p.schema,
-                statistics: stats,
-            }),
+        match schema_index.get(&p.schema) {
+            Some(&idx) => schemas[idx].statistics.extend(stats),
+            None => {
+                schema_index.insert(p.schema.clone(), schemas.len());
+                schemas.push(SchemaStatistics {
+                    db_schema: p.schema,
+                    statistics: stats,
+                });
+            }
         }
     }
     Ok(schemas)
