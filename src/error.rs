@@ -1,7 +1,7 @@
 //! Helpers for producing [`adbc_core`] errors and translating Spanner client errors.
 
 use adbc_core::error::{Error, Status};
-use google_cloud_gax::error::rpc::StatusDetails;
+use google_cloud_gax::error::rpc::{Code, StatusDetails};
 
 /// Build an ADBC error with the given message and status.
 pub(crate) fn err(message: impl Into<String>, status: Status) -> Error {
@@ -74,15 +74,15 @@ pub(crate) fn invalid_argument(message: impl Into<String>) -> Error {
 /// retry policy can still key off `vendor_code == 10`). Errors without a gRPC status, and statuses
 /// without details, leave `details` as `None` (never `Some(vec![])`).
 pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
-    // `Error::status()` yields the structured gRPC status when present. We match on the code's
-    // canonical name (e.g. "NOT_FOUND"), which is derived from the enum by the client itself — this
-    // is not fragile string-parsing of a `Display` message.
+    // `Error::status()` yields the structured gRPC status when present. We map its `Code` enum
+    // directly — no string round-trip, and every mapped arm is compile-checked rather than a
+    // stringly-typed match on a `Display` message.
     let (status, vendor_code, details) =
         error
             .status()
             .map_or((Status::Internal, 0, None), |status| {
                 (
-                    status_for_grpc_code(status.code.name()),
+                    status_for_grpc_code(status.code),
                     status.code as i32,
                     details_for_adbc(&status.details),
                 )
@@ -136,13 +136,12 @@ fn map_detail(detail: &StatusDetails) -> Option<(String, Vec<u8>)> {
 /// `google.rpc.Status` embedded in a streamed `BatchWriteResponse` — a numeric gRPC `code` plus a
 /// `message` — rather than as a `google_cloud_spanner::Error`. This maps that numeric code onto the
 /// closest ADBC [`Status`] through the very same [`status_for_grpc_code`] table [`from_spanner`]
-/// uses (converting the number to its canonical name via [`google_cloud_gax::error::rpc::Code`]) and
-/// keeps the numeric code in `vendor_code`. A duplicate primary key therefore surfaces as
-/// [`Status::AlreadyExists`] exactly as it does on the write-only commit path, so the bulk-ingest
-/// append/create error remaps still fire identically for both ingest transports.
+/// uses (turning the number into a [`Code`] via [`Code::from`]) and keeps the numeric code in
+/// `vendor_code`. A duplicate primary key therefore surfaces as [`Status::AlreadyExists`] exactly as
+/// it does on the write-only commit path, so the bulk-ingest append/create error remaps still fire
+/// identically for both ingest transports.
 pub(crate) fn from_status_parts(code: i32, message: &str) -> Error {
-    use google_cloud_gax::error::rpc::Code;
-    let status = status_for_grpc_code(Code::from(code).name());
+    let status = status_for_grpc_code(Code::from(code));
     let mut adbc = err(format!("Spanner batch-write error: {message}"), status);
     adbc.vendor_code = code;
     adbc
@@ -160,37 +159,39 @@ pub(crate) fn from_builder<E: std::fmt::Display>(error: E) -> Error {
     err(format!("Spanner error: {error}"), Status::Internal)
 }
 
-/// Map a canonical gRPC status code name onto the closest ADBC [`Status`].
+/// Map a canonical gRPC status [`Code`] onto the closest ADBC [`Status`].
 ///
 /// Factored out from [`from_spanner`] as a pure function so the mapping can be unit-tested without
-/// constructing real gax error values. Codes with no closely matching ADBC variant (and the
-/// unexpected `OK`) fall back to [`Status::Internal`].
-fn status_for_grpc_code(code_name: &str) -> Status {
-    match code_name {
-        "NOT_FOUND" => Status::NotFound,
-        "ALREADY_EXISTS" => Status::AlreadyExists,
+/// constructing real gax error values. Matching on the [`Code`] enum (rather than its string name)
+/// makes every arm compile-checked, so a mis-spelled code is a build error rather than a silently
+/// dead arm. Codes with no closely matching ADBC variant (and the unexpected `Ok`) fall back to
+/// [`Status::Internal`]; the `#[non_exhaustive]` enum keeps the wildcard mandatory regardless.
+fn status_for_grpc_code(code: Code) -> Status {
+    match code {
+        Code::NotFound => Status::NotFound,
+        Code::AlreadyExists => Status::AlreadyExists,
         // ADBC distinguishes the two: failed authentication vs. an authenticated-but-forbidden call.
-        "UNAUTHENTICATED" => Status::Unauthenticated,
-        "PERMISSION_DENIED" => Status::Unauthorized,
-        "INVALID_ARGUMENT" | "OUT_OF_RANGE" => Status::InvalidArguments,
+        Code::Unauthenticated => Status::Unauthenticated,
+        Code::PermissionDenied => Status::Unauthorized,
+        Code::InvalidArgument | Code::OutOfRange => Status::InvalidArguments,
         // "The preconditions for the operation are not met" — matches ADBC's InvalidState.
-        "FAILED_PRECONDITION" => Status::InvalidState,
-        "DEADLINE_EXCEEDED" => Status::Timeout,
-        "CANCELLED" => Status::Cancelled,
+        Code::FailedPrecondition => Status::InvalidState,
+        Code::DeadlineExceeded => Status::Timeout,
+        Code::Cancelled => Status::Cancelled,
         // ADBC's IO status documents "a remote service may be unavailable".
-        "UNAVAILABLE" => Status::IO,
+        Code::Unavailable => Status::IO,
         // The operation is not implemented / not supported by the backend — ADBC has a dedicated
         // variant that fits this far better than the "driver bug" Internal fallback.
-        "UNIMPLEMENTED" => Status::NotImplemented,
-        // ABORTED is Spanner's routine "transaction contended, please retry" signal. The client's
+        Code::Unimplemented => Status::NotImplemented,
+        // Aborted is Spanner's routine "transaction contended, please retry" signal. The client's
         // read/write runner retries it internally (indefinitely under the default policy the driver
         // uses), so a DML/commit/ingest caller does not normally see it; it reaches here only in the
         // rare case the runner surfaces it. It is transient and environmental, not a driver or
         // database defect, so it maps to IO rather than Internal (which reads as "driver bug"). ADBC
-        // has no closer variant; the exact code survives in `vendor_code` (ABORTED = 10) for callers
+        // has no closer variant; the exact code survives in `vendor_code` (Aborted = 10) for callers
         // with their own retry logic.
-        "ABORTED" => Status::IO,
-        // RESOURCE_EXHAUSTED, INTERNAL, UNKNOWN, DATA_LOSS, OK and anything unrecognised.
+        Code::Aborted => Status::IO,
+        // ResourceExhausted, Internal, Unknown, DataLoss, Ok and anything unrecognised.
         _ => Status::Internal,
     }
 }
@@ -201,46 +202,54 @@ mod tests {
 
     #[test]
     fn maps_grpc_codes_to_adbc_status() {
-        assert_eq!(status_for_grpc_code("NOT_FOUND"), Status::NotFound);
+        assert_eq!(status_for_grpc_code(Code::NotFound), Status::NotFound);
         assert_eq!(
-            status_for_grpc_code("ALREADY_EXISTS"),
+            status_for_grpc_code(Code::AlreadyExists),
             Status::AlreadyExists
         );
         assert_eq!(
-            status_for_grpc_code("UNAUTHENTICATED"),
+            status_for_grpc_code(Code::Unauthenticated),
             Status::Unauthenticated
         );
         assert_eq!(
-            status_for_grpc_code("PERMISSION_DENIED"),
+            status_for_grpc_code(Code::PermissionDenied),
             Status::Unauthorized
         );
         assert_eq!(
-            status_for_grpc_code("INVALID_ARGUMENT"),
+            status_for_grpc_code(Code::InvalidArgument),
             Status::InvalidArguments
         );
         assert_eq!(
-            status_for_grpc_code("OUT_OF_RANGE"),
+            status_for_grpc_code(Code::OutOfRange),
             Status::InvalidArguments
         );
         assert_eq!(
-            status_for_grpc_code("FAILED_PRECONDITION"),
+            status_for_grpc_code(Code::FailedPrecondition),
             Status::InvalidState
         );
-        assert_eq!(status_for_grpc_code("DEADLINE_EXCEEDED"), Status::Timeout);
-        assert_eq!(status_for_grpc_code("CANCELLED"), Status::Cancelled);
-        assert_eq!(status_for_grpc_code("UNAVAILABLE"), Status::IO);
+        assert_eq!(
+            status_for_grpc_code(Code::DeadlineExceeded),
+            Status::Timeout
+        );
+        assert_eq!(status_for_grpc_code(Code::Cancelled), Status::Cancelled);
+        assert_eq!(status_for_grpc_code(Code::Unavailable), Status::IO);
         // Transient contention, not a driver/database defect: IO, not Internal.
-        assert_eq!(status_for_grpc_code("ABORTED"), Status::IO);
+        assert_eq!(status_for_grpc_code(Code::Aborted), Status::IO);
         // Not-supported operations map to the dedicated NotImplemented, not the Internal fallback.
         assert_eq!(
-            status_for_grpc_code("UNIMPLEMENTED"),
+            status_for_grpc_code(Code::Unimplemented),
             Status::NotImplemented
         );
+        // Codes with no close ADBC match fall through to the Internal wildcard.
+        assert_eq!(
+            status_for_grpc_code(Code::ResourceExhausted),
+            Status::Internal
+        );
+        assert_eq!(status_for_grpc_code(Code::Internal), Status::Internal);
     }
 
     #[test]
     fn from_status_parts_maps_numeric_codes_like_from_spanner() {
-        use google_cloud_gax::error::rpc::Code;
         // A duplicate primary key on the BatchWrite path arrives as a numeric ALREADY_EXISTS (6)
         // and must surface as the same ADBC status the write-only path produces, so the ingest
         // append/create remaps fire identically.
@@ -267,12 +276,13 @@ mod tests {
     #[test]
     fn unmapped_and_unknown_codes_fall_back_to_internal() {
         for code in [
-            "RESOURCE_EXHAUSTED",
-            "INTERNAL",
-            "UNKNOWN",
-            "DATA_LOSS",
-            "OK",
-            "",
+            Code::ResourceExhausted,
+            Code::Internal,
+            Code::Unknown,
+            Code::DataLoss,
+            Code::Ok,
+            // An out-of-range numeric decodes to some non-mapped `Code` and still hits the wildcard.
+            Code::from(9999),
         ] {
             assert_eq!(status_for_grpc_code(code), Status::Internal);
         }
