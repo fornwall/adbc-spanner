@@ -59,7 +59,17 @@ SpannerDriver ──▶ SpannerDatabase ──▶ SpannerConnection ──▶ Sp
   transaction runner retries aborts internally, consuming its `retryDelay`) into `Error.details` —
   key = lowercased proto type name
   (`google.rpc.retryinfo`), value = the detail's ProtoJSON bytes (no `-bin` suffix; the pinned
-  client's detail types have no binary-proto encoding). `from_builder` stays generic over
+  client's detail types have no binary-proto encoding). On a `PERMISSION_DENIED` (gRPC 7 →
+  `Status::Unauthorized`) it also *appends* an actionable IAM hint to the message
+  (`permission_denied_hint`): if Spanner's message names a `spanner.<resource>.<verb>` permission it
+  echoes that exact permission and points at the least-privilege predefined role that grants it
+  (`role_for_permission`: reads → `roles/spanner.databaseReader`, writes/DML/DDL →
+  `roles/spanner.databaseUser`, DB admin → `roles/spanner.databaseAdmin`), else a generic-but-accurate
+  hint listing those three roles; every hint ends with the Spanner IAM doc link. The hint only
+  augments — message text, status, `vendor_code` and forwarded details are all preserved (IAM isn't
+  enforced on the emulator, so it's covered by unit tests plus a `tests/mock_spanner.rs`
+  PERMISSION_DENIED mock; `from_status_parts` adds the same hint on the BatchWrite path).
+  `from_builder` stays generic over
   `Display` for the status-less client-builder errors.
 
 Key design points:
