@@ -155,8 +155,9 @@ touch *every* location for that family in lockstep:
   version-less git dev-dependency before flipping `publish` back on). (There is no `[patch]`
   section.)
 - `deny.toml` `allow-git` — drop the repo URL for each family once it no longer has any git dep.
-- `README.md` — the quickstart `adbc_core = { git = … rev = "198f39a…" }` block and the surrounding
-  "not on crates.io" / *Type mapping* notes that name the pins.
+- `README.md` — the **Note** callout at the end of the *Type mapping* section that explains the
+  crate is "not on crates.io" and names both git pins narratively (no literal `rev = "198f39a…"`
+  string to update there — the revs live only in `Cargo.toml`).
 - `CLAUDE.md` — this section (both the "Temporary git pins" note and this checklist); once *both*
   families are versioned, also re-enable `publish` (below) and revisit the `arrow-array`/`-schema`/
   `-buffer` `>=58, <60` range, which exists only to unify with the git `adbc_core`.
