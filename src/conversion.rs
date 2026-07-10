@@ -713,21 +713,20 @@ fn struct_fields(
 }
 
 fn build_batch(schema: SchemaRef, rows: &[Row]) -> Result<RecordBatch> {
-    // Collect values column-major, then build each column (recursively, for nested lists).
-    let mut columns: Vec<Vec<Option<&Value>>> =
-        vec![Vec::with_capacity(rows.len()); schema.fields().len()];
-    for row in rows {
-        let values = row.raw_values();
-        for (i, column) in columns.iter_mut().enumerate() {
-            column.push(values.get(i));
-        }
-    }
-
+    // Build each top-level column by iterating rows directly, reusing one scratch buffer of
+    // `rows.len()` value pointers rather than materializing the whole O(rows × cols) column
+    // matrix up front. Nested List/Struct columns still gather their own child slices when
+    // `build_array` recurses, but the flat/top-level path allocates only this single buffer.
+    let mut scratch: Vec<Option<&Value>> = Vec::with_capacity(rows.len());
     let arrays: Vec<ArrayRef> = schema
         .fields()
         .iter()
-        .zip(&columns)
-        .map(|(field, values)| build_column(field, values))
+        .enumerate()
+        .map(|(i, field)| {
+            scratch.clear();
+            scratch.extend(rows.iter().map(|row| row.raw_values().get(i)));
+            build_column(field, &scratch)
+        })
         .collect::<Result<_>>()?;
 
     RecordBatch::try_new(schema, arrays).map_err(|e| {
@@ -1067,18 +1066,22 @@ pub(crate) fn parse_numeric_i128(s: &str) -> Option<i128> {
     {
         return None;
     }
-    // Pad/truncate the fractional part to the fixed scale of 9.
-    let mut frac = String::with_capacity(NUMERIC_SCALE as usize);
-    frac.push_str(&frac_part[..frac_part.len().min(NUMERIC_SCALE as usize)]);
-    while frac.len() < NUMERIC_SCALE as usize {
-        frac.push('0');
+    // Pad/truncate the fractional part to the fixed scale of 9, accumulating the unscaled
+    // fractional value directly instead of building a padded string per cell. The first up-to-9
+    // fractional digits (all ASCII digits, validated above) form an integer < 10^9, scaled up by
+    // the number of missing low-order digits.
+    let scale = NUMERIC_SCALE as usize;
+    let frac_digits = &frac_part[..frac_part.len().min(scale)];
+    let mut frac_val: i128 = 0;
+    for &b in frac_digits.as_bytes() {
+        frac_val = frac_val * 10 + i128::from(b - b'0');
     }
+    frac_val *= 10_i128.pow((scale - frac_digits.len()) as u32);
     let int_val: i128 = if int_part.is_empty() {
         0
     } else {
         int_part.parse().ok()?
     };
-    let frac_val: i128 = frac.parse().ok()?;
     let unscaled = int_val.checked_mul(1_000_000_000)?.checked_add(frac_val)?;
     Some(if negative { -unscaled } else { unscaled })
 }

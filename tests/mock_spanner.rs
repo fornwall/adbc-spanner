@@ -41,7 +41,7 @@ use adbc_core::options::{OptionDatabase, OptionStatement, OptionValue};
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_spanner::{SpannerConnection, SpannerDriver};
 use arrow_array::cast::AsArray;
-use arrow_array::{RecordBatch, StringArray};
+use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use prost::Message;
 use spanner_grpc_mock::MockSpanner;
@@ -793,5 +793,113 @@ fn ingest_does_not_bisect_a_non_mutation_limit_error() {
         commits.load(Ordering::SeqCst),
         1,
         "a non-mutation-limit error must not trigger the bisect retry"
+    );
+}
+
+/// (d) Commit-statistics capture: with `spanner.commit_stats=true` the driver must set
+/// `return_commit_stats` on the `CommitRequest` and thread the server's `mutation_count` out of the
+/// `CommitResponse` into `spanner.commit_stats.mutation_count`.
+///
+/// This is the only **gating** coverage that asserts a *positive* mutation count: the emulator
+/// returns `commit_stats = None`, so its integration test (`commit_stats_reports_mutation_count` in
+/// tests/integration.rs) can only assert a positive count against real Spanner — a non-gating,
+/// nightly path. A regression that stopped threading the count would pass every gating check but
+/// this one.
+///
+/// An `append` bulk ingest is the cleanest committing operation to script here: its autocommit
+/// write-only transaction is a plain `BeginTransaction` + `Commit` (no `ExecuteBatchDml` result-set
+/// to script), and an append *success* never probes the target table's existence (the
+/// `table_exists` probe only fires to remap an *error*). The scripted `CommitResponse` carries a
+/// distinctive `mutation_count` the driver could not derive from the two ingested rows, proving it
+/// reads the server's value verbatim rather than counting rows.
+#[test]
+fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "commit_stats_mutation_count_is_captured_from_the_commit_response",
+    );
+
+    // A value the driver cannot infer from the two ingested rows — it must come from the server.
+    const SCRIPTED_MUTATION_COUNT: i64 = 4242;
+
+    // Whether the driver actually asked Spanner to return commit stats (it must, given
+    // `spanner.commit_stats=true`), captured off the CommitRequest the mock receives.
+    let saw_return_commit_stats = Arc::new(AtomicBool::new(false));
+    let flag = saw_return_commit_stats.clone();
+    let server = MockServer::start(move |mock| {
+        // The write-only ingest transaction begins a read/write transaction...
+        mock.expect_begin_transaction().returning(|_| {
+            Ok(tonic::Response::new(v1::Transaction {
+                id: b"mock-txn-1".to_vec(),
+                ..Default::default()
+            }))
+        });
+        // ...then commits the insert mutations. Record whether commit stats were requested, and
+        // return a CommitResponse carrying the scripted mutation count. No precommit token is set,
+        // so the client's write-only path commits exactly once (no precommit-token retry).
+        mock.expect_commit().returning(move |request| {
+            flag.store(request.into_inner().return_commit_stats, Ordering::SeqCst);
+            Ok(tonic::Response::new(v1::CommitResponse {
+                commit_stats: Some(v1::commit_response::CommitStats {
+                    mutation_count: SCRIPTED_MUTATION_COUNT,
+                }),
+                ..Default::default()
+            }))
+        });
+    });
+
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("MockTable".into()),
+        )
+        .expect("set target table");
+    // `append` into a (notionally) pre-existing table: a pure write-only commit, no DDL and no
+    // table_exists probe on the success path.
+    statement
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .expect("set append ingest mode");
+    // Request commit stats: this is what makes the driver call `set_return_commit_stats(true)` and
+    // capture the returned mutation count.
+    statement
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_COMMIT_STATS.into()),
+            OptionValue::String("true".into()),
+        )
+        .expect("enable commit stats");
+
+    let rows = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(vec![1_i64, 2]))],
+    )
+    .expect("build ingest batch");
+    statement.bind(rows).expect("bind ingest rows");
+
+    // The ingest reports the number of rows it applied (the chunk length, 2) — deliberately *not*
+    // the server's mutation count, so the two assertions can't accidentally alias.
+    assert_eq!(
+        statement.execute_update().expect("append ingest"),
+        Some(2),
+        "the ingest reports the number of rows it applied"
+    );
+
+    assert!(
+        saw_return_commit_stats.load(Ordering::SeqCst),
+        "spanner.commit_stats=true must make the driver set return_commit_stats on the CommitRequest"
+    );
+    // The count read back must be exactly what the server put in the CommitResponse.
+    assert_eq!(
+        statement
+            .get_option_int(OptionStatement::Other(
+                adbc_spanner::OPTION_COMMIT_STATS_MUTATION_COUNT.into()
+            ))
+            .expect("mutation count must be readable after a stats-bearing commit"),
+        SCRIPTED_MUTATION_COUNT,
+        "the driver must read back the server's mutation_count verbatim"
     );
 }

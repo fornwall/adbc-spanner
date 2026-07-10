@@ -306,8 +306,8 @@ impl SpannerStatement {
         Ok(Some(statements))
     }
 
-    /// Remap a failed `append`-mode bulk ingest onto the statuses the ADBC bulk-ingest contract
-    /// mandates.
+    /// Remap a failed `append`- or `create_append`-mode bulk ingest onto the statuses the ADBC
+    /// bulk-ingest contract mandates.
     ///
     /// A successful (or, in manual-transaction mode, merely buffered) outcome is returned unchanged.
     /// A failure that already carries [`Status::AlreadyExists`] — a bound row duplicating a primary
@@ -420,16 +420,23 @@ impl SpannerStatement {
     /// on every exit path (success, failed DDL, failed insert) in one place.
     fn run_bound_ingest(&self, table: &str) -> Result<Option<i64>> {
         let ingest_ddl = self.build_ingest_table_ddl(table, self.ingest_mode)?;
-        // `append` is the only mode that inserts into a pre-existing table, so it is the only one
-        // whose failure the ADBC spec wants remapped to NotFound / AlreadyExists.
-        // `build_ingest_table_ddl` returns `None` for exactly that mode.
-        let is_append = ingest_ddl.is_none();
         if let Some(ddl) = ingest_ddl {
             self.run_ddl(ddl)
                 .map_err(|error| self.remap_ingest_create_error(table, error))?;
         }
         let result = self.run_ingest_mutations(table);
-        if is_append {
+        // `append` and `create_append` both insert into a table that may already exist, so the
+        // ADBC spec wants their insert failure remapped to NotFound / AlreadyExists. For
+        // `append` a missing table is NotFound and a present one is a schema mismatch
+        // (AlreadyExists); for `create_append` the `CREATE TABLE IF NOT EXISTS` above guarantees
+        // the table is present, so only the schema-mismatch AlreadyExists side can surface (its
+        // spec contract: "error if the table exists, but the schema does not match"). `create`
+        // and `replace` keep the raw insert error — their DDL step already owns the
+        // table-existence contract (`remap_ingest_create_error`).
+        if matches!(
+            self.ingest_mode,
+            Some(IngestMode::Append) | Some(IngestMode::CreateAppend)
+        ) {
             self.remap_ingest_append_error(table, result)
         } else {
             result
@@ -1390,6 +1397,8 @@ impl Statement for SpannerStatement {
         let sql = self.sql()?;
         if crate::sql::is_ddl(&sql) {
             self.run_ddl(crate::sql::split_statements(&sql))?;
+            // A reused statement handle must not silently re-bind stale rows past a DDL statement.
+            self.bound.clear();
             // DDL has no result set — return an empty reader with an empty schema.
             return Ok(Self::empty_reader());
         }
@@ -1487,6 +1496,8 @@ impl Statement for SpannerStatement {
         let sql = self.sql()?;
         if crate::sql::is_ddl(&sql) {
             self.run_ddl(crate::sql::split_statements(&sql))?;
+            // A reused statement handle must not silently re-bind stale rows past a DDL statement.
+            self.bound.clear();
             // DDL does not report an affected-row count (and is never transactional in Spanner, so
             // it always runs immediately rather than buffering).
             return Ok(None);
@@ -1511,6 +1522,11 @@ impl Statement for SpannerStatement {
         self.cancel.reset();
         let sql = self.sql()?;
         check_schema_query(&sql)?;
+        // Query path only (`check_schema_query` rejected DDL/DML): strip any trailing statement
+        // terminator(s), exactly as `execute` does — the PLAN probe runs through the same single-use
+        // ExecuteSql surface, which rejects a trailing `;` ("Expected end of input but got `;`"),
+        // yet introspection callers routinely append one (e.g. `SELECT current_date;`).
+        let sql = crate::sql::strip_trailing_terminators(&sql);
         let client = self.client.clone();
         let bound = self.bound.clone();
         let bind_by_name = self.bind_by_name;
@@ -1573,6 +1589,10 @@ impl Statement for SpannerStatement {
                 "execute_partitions is only valid for queries",
             ));
         }
+        // Query path (not DDL): strip any trailing statement terminator(s), exactly as `execute`
+        // does — both the PLAN probe and `partition_query` run through the same ExecuteSql surface,
+        // which rejects a trailing `;`, yet callers routinely append one.
+        let sql = crate::sql::strip_trailing_terminators(&sql);
         // Probe the schema and create the partitions. The partition query runs inside a batch
         // read-only transaction; each returned partition carries its session, transaction id and
         // partition token and is independently serializable, so it maps directly onto ADBC's opaque
