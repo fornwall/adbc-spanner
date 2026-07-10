@@ -85,7 +85,12 @@ impl Driver for SpannerDriver {
 ///
 /// Holds the connection parameters (the database path and, optionally, an emulator endpoint) and
 /// mints [`SpannerConnection`]s from them.
-#[derive(Debug)]
+///
+/// [`Debug`] is hand-written rather than derived so the three credential fields (`keyfile`,
+/// `keyfile_json` — a full service-account private key — and `access_token` — a live OAuth bearer
+/// token) never render in cleartext: each is shown as `Some("<redacted>")` / `None`, exposing only
+/// presence, never the secret. This mirrors [`StaticTokenCredentials`], whose token lives in a
+/// sensitive `HeaderValue` for the same reason.
 pub struct SpannerDatabase {
     runtime: SharedRuntime,
     database: Option<String>,
@@ -106,6 +111,31 @@ pub struct SpannerDatabase {
     /// bearer token directly (no refresh); it is mutually exclusive with the keyfile/impersonation
     /// options and with emulator mode.
     access_token: Option<String>,
+}
+
+impl std::fmt::Debug for SpannerDatabase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the three credential fields: show presence (`Some("<redacted>")` / `None`) but
+        // never the secret value (`keyfile_json` is a private key, `access_token` a live bearer
+        // token). Every other field renders normally.
+        let redact = |value: &Option<String>| value.as_ref().map(|_| "<redacted>");
+        f.debug_struct("SpannerDatabase")
+            .field("runtime", &self.runtime)
+            .field("database", &self.database)
+            .field("endpoint", &self.endpoint)
+            .field("emulator", &self.emulator)
+            .field("keyfile", &redact(&self.keyfile))
+            .field("keyfile_json", &redact(&self.keyfile_json))
+            .field(
+                "impersonate_target_principal",
+                &self.impersonate_target_principal,
+            )
+            .field("impersonate_delegates", &self.impersonate_delegates)
+            .field("impersonate_scopes", &self.impersonate_scopes)
+            .field("impersonate_lifetime_secs", &self.impersonate_lifetime_secs)
+            .field("access_token", &redact(&self.access_token))
+            .finish()
+    }
 }
 
 impl SpannerDatabase {
@@ -940,6 +970,65 @@ mod tests {
             "http://localhost:9010"
         );
         assert!(db.emulator);
+    }
+
+    #[test]
+    fn debug_redacts_credential_fields() {
+        let mut db = new_database();
+        db.database = Some("projects/p/instances/i/databases/d".into());
+        db.keyfile = Some("/etc/secret/key.json".into());
+        db.keyfile_json = Some(r#"{"private_key":"SUPER-SECRET-PRIVATE-KEY"}"#.into());
+        db.access_token = Some("ya29.LIVE-BEARER-TOKEN".into());
+
+        let rendered = format!("{db:?}");
+
+        // The secret values never appear in cleartext.
+        assert!(
+            !rendered.contains("SUPER-SECRET-PRIVATE-KEY"),
+            "keyfile_json leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("ya29.LIVE-BEARER-TOKEN"),
+            "access_token leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("/etc/secret/key.json"),
+            "keyfile leaked: {rendered}"
+        );
+
+        // Presence is shown via the redaction placeholder, not the value.
+        assert!(
+            rendered.contains(r#"keyfile: Some("<redacted>")"#),
+            "keyfile presence not shown: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"keyfile_json: Some("<redacted>")"#),
+            "keyfile_json presence not shown: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"access_token: Some("<redacted>")"#),
+            "access_token presence not shown: {rendered}"
+        );
+
+        // Non-secret fields render normally.
+        assert!(
+            rendered.contains("projects/p/instances/i/databases/d"),
+            "database not shown: {rendered}"
+        );
+    }
+
+    #[test]
+    fn debug_shows_none_for_absent_credentials() {
+        let db = new_database();
+        let rendered = format!("{db:?}");
+        assert!(
+            rendered.contains("keyfile: None"),
+            "absent keyfile not shown: {rendered}"
+        );
+        assert!(
+            rendered.contains("access_token: None"),
+            "absent access_token not shown: {rendered}"
+        );
     }
 
     #[test]
