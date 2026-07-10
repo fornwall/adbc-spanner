@@ -127,11 +127,12 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   rows into that table. Rows are shipped as native Spanner **insert mutations** (the `Commit` RPC's
   write format) rather than per-row `INSERT` DML, so nothing is SQL-parsed or query-planned per row —
   the fast path for bulk loads, with unchanged `INSERT` semantics (a duplicate primary key still
-  fails with `AlreadyExists`). The ingest commits in one transaction when it fits Spanner's
-  per-commit limits (~80,000 mutations, counted roughly as rows × columns, and ~100 MB). A larger
-  ingest is automatically split into chunks that stay well under those limits, each committed in its
-  own transaction, so it is **not atomic as a whole**: a mid-ingest failure leaves earlier chunks
-  committed. (An ingest that large could not have committed as one transaction anyway.) In a manual
+  fails with `AlreadyExists`). The ingest is split into commit chunks sized to the driver's
+  per-chunk budget (~20,000 mutations, counted roughly as rows × columns, and ~4 MiB) — kept well
+  under Spanner's ~80,000-mutation / ~100 MB commit caps to leave headroom for secondary-index
+  entries the driver cannot see. An ingest that fits in a single chunk commits in one transaction; a
+  larger one is split across chunks, each committed in its own transaction, so it is **not atomic as
+  a whole**: a mid-ingest failure leaves earlier chunks committed. In a manual
   transaction (`adbc.connection.autocommit=false`) the mutations are buffered — unchunked — and
   committed atomically with any buffered DML on `commit`; Spanner applies buffered mutations at
   commit time, after the transaction's DML has executed. All four `adbc.ingest.mode` values are
