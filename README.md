@@ -131,7 +131,12 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   per-commit limits (~80,000 mutations, counted roughly as rows × columns, and ~100 MB). A larger
   ingest is automatically split into chunks that stay well under those limits, each committed in its
   own transaction, so it is **not atomic as a whole**: a mid-ingest failure leaves earlier chunks
-  committed. (An ingest that large could not have committed as one transaction anyway.) In a manual
+  committed. (An ingest that large could not have committed as one transaction anyway.) Because the
+  rows × columns estimate can't see the secondary-index entries that also count toward the mutation
+  cap, an autocommit chunk that overshoots the limit anyway is transparently bisected and its halves
+  retried down to a single row, so a heavily-indexed table still ingests without any manual
+  chunk-size tuning (a bisected chunk is likewise not atomic as a whole; every other failure — a
+  duplicate key, a bad value — still surfaces unchanged). In a manual
   transaction (`adbc.connection.autocommit=false`) the mutations are buffered — unchunked — and
   committed atomically with any buffered DML on `commit`; Spanner applies buffered mutations at
   commit time, after the transaction's DML has executed. All four `adbc.ingest.mode` values are
