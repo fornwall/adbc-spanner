@@ -1052,6 +1052,13 @@ pub(crate) fn parse_timestamp_micros(s: &str) -> Option<i64> {
 
 /// Parse a Spanner `NUMERIC` (decimal string) into an unscaled `i128` at scale 9 (Arrow
 /// `Decimal128(38, 9)`). Returns `None` on malformed input or i128 overflow.
+///
+/// The driver targets GoogleSQL `NUMERIC`, whose fixed scale is 9, so every legitimate value
+/// decodes exactly. A value carrying **more than 9 significant fractional digits** — which
+/// GoogleSQL never produces but a higher-precision dialect (e.g. Spanner PostgreSQL `PG.NUMERIC`)
+/// could — cannot be represented at scale 9; rather than silently truncate and corrupt the value,
+/// this returns `None` (surfaced as a [`decode_error`]). Trailing *zero* fractional digits beyond
+/// scale 9 lose nothing and are accepted.
 pub(crate) fn parse_numeric_i128(s: &str) -> Option<i128> {
     let s = s.trim();
     let (negative, digits) = match s.strip_prefix('-') {
@@ -1067,7 +1074,18 @@ pub(crate) fn parse_numeric_i128(s: &str) -> Option<i128> {
     {
         return None;
     }
-    // Pad/truncate the fractional part to the fixed scale of 9.
+    // Reject values with more fractional precision than the fixed scale of 9 can represent: any
+    // non-zero digit beyond position 9 would be lost, so truncating it would silently corrupt the
+    // value (trailing zeros lose nothing and are fine to drop).
+    if frac_part.len() > NUMERIC_SCALE as usize
+        && frac_part
+            .bytes()
+            .skip(NUMERIC_SCALE as usize)
+            .any(|b| b != b'0')
+    {
+        return None;
+    }
+    // Pad/truncate the fractional part to the fixed scale of 9 (any dropped digits are zeros).
     let mut frac = String::with_capacity(NUMERIC_SCALE as usize);
     frac.push_str(&frac_part[..frac_part.len().min(NUMERIC_SCALE as usize)]);
     while frac.len() < NUMERIC_SCALE as usize {
@@ -1321,10 +1339,35 @@ mod tests {
         assert_eq!(parse_numeric_i128("-2.25"), Some(-2_250_000_000));
         assert_eq!(parse_numeric_i128("0.000000001"), Some(1));
         assert_eq!(parse_numeric_i128("+3"), Some(3_000_000_000));
-        // More than 9 fractional digits: extra precision is truncated.
-        assert_eq!(parse_numeric_i128("0.0000000019"), Some(1));
         assert_eq!(parse_numeric_i128("abc"), None);
         assert_eq!(parse_numeric_i128(""), None);
+    }
+
+    #[test]
+    fn numeric_scale_9_decodes_exactly() {
+        // A full-precision GoogleSQL NUMERIC (exactly 9 fractional digits) round-trips exactly.
+        assert_eq!(parse_numeric_i128("1.123456789"), Some(1_123_456_789));
+        assert_eq!(parse_numeric_i128("-1.123456789"), Some(-1_123_456_789));
+        assert_eq!(parse_numeric_i128("0.999999999"), Some(999_999_999));
+    }
+
+    #[test]
+    fn numeric_trailing_zeros_beyond_scale_9_are_accepted() {
+        // Extra fractional digits that are all zero lose nothing, so they still decode exactly.
+        assert_eq!(parse_numeric_i128("1.1234567890"), Some(1_123_456_789));
+        assert_eq!(parse_numeric_i128("0.0000000010000"), Some(1));
+        assert_eq!(parse_numeric_i128("2.5000000000000"), Some(2_500_000_000));
+    }
+
+    #[test]
+    fn numeric_excess_fractional_precision_is_a_decode_error_not_truncation() {
+        // More than 9 *significant* fractional digits cannot be represented at scale 9. Previously
+        // this silently truncated (e.g. "0.0000000019" → 1); now it is rejected so the otherwise
+        // strict decode path never silently loses data. Higher-precision dialects (PG.NUMERIC) can
+        // produce such values.
+        assert_eq!(parse_numeric_i128("0.0000000019"), None);
+        assert_eq!(parse_numeric_i128("1.1234567891"), None);
+        assert_eq!(parse_numeric_i128("-0.0000000001000001"), None);
     }
 
     /// The chunk byte-budget estimate: strings count their UTF-8 length, SQL NULLs contribute
