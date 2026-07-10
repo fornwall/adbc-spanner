@@ -7,7 +7,7 @@ An [ADBC](https://arrow.apache.org/adbc/) (Arrow Database Connectivity) driver f
 [Google Cloud Spanner](https://cloud.google.com/spanner), available as:
 
 - A [python package](https://pypi.org/project/adbc-driver-spanner/)
-- A [rust crate](https://crates.io/crates/adbc-spanner).
+- A Rust crate (not yet published to crates.io).
 - A [loadable shared library driver](#shared-library-loadable-driver)
 
 ## Status
