@@ -181,6 +181,7 @@ jobs:
 
       - name: Install Rust toolchain
         # Pinned to Cargo.toml's rust-version; bump both together.
+        id: toolchain
         uses: dtolnay/rust-toolchain@1.97
 
       - uses: Swatinem/rust-cache@v2
@@ -188,7 +189,14 @@ jobs:
       - name: Check on MSRV
         # --all-features / --all-targets so tests, examples and feature-gated
         # modules are all type-checked against the MSRV toolchain.
-        run: cargo check --all-features --all-targets
+        #
+        # `cargo +<toolchain>` is required: the repo ships a rust-toolchain.toml
+        # (channel = "stable") that, as a directory override, otherwise wins over
+        # the `rustup default` this action sets — so a bare `cargo check` would
+        # run on the runner's preinstalled stable (which lags the just-released
+        # 1.97) instead of MSRV. Pinning to the installed toolchain by name
+        # (dtolnay's documented `outputs.name`, e.g. "1.97.0") overrides the file.
+        run: cargo +${{ steps.toolchain.outputs.name }} check --all-features --all-targets
 
   # Lint the workflow files themselves. The pinned Docker image bundles
   # actionlint plus its shellcheck/pyflakes integrations, so `run:` scripts are
