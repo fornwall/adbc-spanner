@@ -16,7 +16,8 @@
 //! | `FLOAT32`                                   | `Float32`                         |
 //! | `DATE`                                      | `Date32`                          |
 //! | `TIMESTAMP`                                 | `Timestamp(Nanosecond, "UTC")` (default) or `Timestamp(Microsecond, "UTC")` |
-//! | `NUMERIC`                                   | `Decimal128(38, 9)`               |
+//! | `NUMERIC` (GoogleSQL)                        | `Decimal128(38, 9)`               |
+//! | `PG.NUMERIC` (PostgreSQL dialect)           | *(rejected — `NotImplemented`)*   |
 //! | `BYTES`                                     | `Binary`                          |
 //! | `STRING`/`UUID`/`INTERVAL`                   | `Utf8`                            |
 //! | `JSON`                                      | `Utf8` + `arrow.json` extension   |
@@ -38,7 +39,10 @@
 //! message / a bare enum number as a string — so, rather than silently mis-decode them into a
 //! `Utf8` stand-in the caller could mistake for real text, such a column is rejected loudly with a
 //! `NotImplemented` error naming the column and type (see `unsupported_type_error`), consistent
-//! with the strict-decode policy of the value path.
+//! with the strict-decode policy of the value path. The PostgreSQL-dialect `PG.NUMERIC` (a `NUMERIC`
+//! type code carrying the `PG_NUMERIC` annotation) is rejected the same way: it is
+//! arbitrary-precision and admits `NaN`, so the fixed `Decimal128(38, 9)` mapping the driver uses
+//! for GoogleSQL `NUMERIC` cannot represent it (see `is_pg_numeric`).
 //!
 //! The `TIMESTAMP` mapping is selected by [`TimestampPrecision`] (the
 //! `spanner.max_timestamp_precision` option): the default keeps the wire's full nanosecond
@@ -618,6 +622,23 @@ fn unsupported_type_error(type_name: &str) -> adbc_core::error::Error {
     )
 }
 
+/// Whether a `NUMERIC`-coded [`Type`] carries the PostgreSQL `PG_NUMERIC` type annotation.
+///
+/// Spanner's PostgreSQL dialect reuses the `NUMERIC` type code for `PG.NUMERIC`, distinguishing it
+/// only by this annotation. Unlike GoogleSQL `NUMERIC` (fixed precision/scale 38/9), `PG.NUMERIC`
+/// is arbitrary-precision and admits the special value `NaN`, so it cannot be faithfully
+/// represented as `Decimal128(38, 9)`. This driver targets GoogleSQL, so [`arrow_type`] rejects
+/// such a column rather than silently truncate or mis-decode its values.
+///
+/// The pinned client's [`Type`] exposes no public annotation accessor, but its inner
+/// [`model::Type`](google_cloud_spanner::model::Type) — reachable via the public `From` conversion —
+/// carries the annotation.
+fn is_pg_numeric(ty: &Type) -> bool {
+    use google_cloud_spanner::model;
+    let annotated: model::Type = ty.clone().into();
+    annotated.type_annotation == model::TypeAnnotationCode::PgNumeric
+}
+
 /// Whether an Arrow [`Field`] carries the canonical `arrow.json` extension on a string storage
 /// type — the tag this driver writes via [`json_extension_metadata`] and what other producers
 /// (pyarrow, polars) emit for logical JSON. The bind path uses this to send such values as
@@ -661,6 +682,10 @@ fn arrow_type(ty: &Type, precision: TimestampPrecision) -> Result<DataType> {
         TypeCode::Timestamp => {
             DataType::Timestamp(precision.time_unit(), Some(TIMESTAMP_TZ.into()))
         }
+        // GoogleSQL NUMERIC is fixed 38/9 and maps to Decimal128; the PostgreSQL-dialect
+        // `PG.NUMERIC` shares this type code but is arbitrary-precision (and admits `NaN`), so it
+        // has no faithful fixed-scale Arrow mapping — reject it loudly rather than mis-decode.
+        TypeCode::Numeric if is_pg_numeric(ty) => return Err(unsupported_type_error("PG.NUMERIC")),
         TypeCode::Numeric => DataType::Decimal128(NUMERIC_PRECISION, NUMERIC_SCALE),
         TypeCode::Struct => struct_arrow_type(ty, precision)?,
         TypeCode::Array => match ty.array_element_type() {
@@ -1211,6 +1236,39 @@ mod tests {
                 err.message
             );
         }
+    }
+
+    #[test]
+    fn pg_numeric_columns_are_rejected_cleanly() {
+        // `PG.NUMERIC` shares the NUMERIC type code with GoogleSQL NUMERIC, differing only by its
+        // `PG_NUMERIC` type annotation. It is arbitrary-precision (and admits `NaN`), so mapping it
+        // to `Decimal128(38, 9)` would silently truncate/mis-decode — reject it loudly instead.
+        let ty = google_cloud_spanner::types::pg_numeric();
+        let err = arrow_field("amount", &ty, true, TimestampPrecision::default()).unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented);
+        assert!(
+            err.message.contains("PG.NUMERIC"),
+            "message should name PG.NUMERIC: {:?}",
+            err.message
+        );
+
+        // The rejection also propagates through the recursive element type of an ARRAY<PG.NUMERIC>.
+        let array_ty =
+            google_cloud_spanner::types::array(google_cloud_spanner::types::pg_numeric());
+        let err = arrow_field("arr", &array_ty, true, TimestampPrecision::default()).unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented, "ARRAY<PG.NUMERIC>");
+        assert!(
+            err.message.contains("PG.NUMERIC"),
+            "ARRAY<PG.NUMERIC> message should name PG.NUMERIC: {:?}",
+            err.message
+        );
+
+        // A plain GoogleSQL NUMERIC (no annotation) still maps to Decimal128(38, 9) as before.
+        let gsql = google_cloud_spanner::types::numeric();
+        assert_eq!(
+            arrow_type(&gsql, TimestampPrecision::default()).unwrap(),
+            DataType::Decimal128(NUMERIC_PRECISION, NUMERIC_SCALE),
+        );
     }
 
     #[test]
