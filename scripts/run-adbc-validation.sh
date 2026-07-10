@@ -84,15 +84,24 @@ EXCLUDED=(
   # `ddl_implicit_commit_txn` quirk makes it self-skip, which the gate tolerates —
   # no expected-failure bookkeeping needed.
 
-  # --- Bucket 2: ingest readback (and non-applicable ingest variants) ---------
+  # --- Bucket 2: ingest readback ----------------------------------------------
   # Create-mode ingest is supported (synthetic adbc_ingest_key UUID PK), so these
   # now *run* instead of skipping, but they read back via a hardcoded double-quoted
   # `SELECT * FROM "bulk_ingest" ...` (not GoogleSQL, no quirks hook), and `SELECT *`
   # would also surface the synthetic key column, breaking the single-column
-  # assertions. The type/temp/target variants that Spanner does not model (float16,
-  # temporary tables, ...) self-skip; either way they are not gated.
-  # (SqlIngest{Table,Column}Escaping are NOT here: they create-mode ingest with no
-  # readback, so with the create default they pass cleanly and are gate-enforced;
+  # assertions. This includes the view-type variants SqlIngest{BinaryView,StringView}:
+  # the driver supports those inputs (the quirks declare it), so they run and fail
+  # on the same readback as the rest — an expected failure that flips to passing
+  # once the readback is fixed, guarded here.
+  #
+  # NOT here (self-skip via a quirk, and the gate tolerates skips, so no bookkeeping):
+  # SqlIngestFloat16 (Spanner has no float16 type) and SqlIngestTemporary{,Append,
+  # Replace,Exclusive} (Spanner has no temporary tables).
+  # (SqlIngest{TargetCatalog,TargetSchema,TargetCatalogSchema} are NOT here: their
+  # quirks are declared true, but the cases only ingest and never read back, so with
+  # the create default they pass cleanly and are gate-enforced.)
+  # (SqlIngest{Table,Column}Escaping are NOT here either: they create-mode ingest with
+  # no readback, so with the create default they pass cleanly and are gate-enforced;
   # identifier-escaping is additionally covered natively in tests/integration.rs.)
   # (SqlIngestErrors is NOT here: it exercises only the ingest error paths, with no
   # readback and no non-Spanner DDL, so it passes cleanly and is enforced by the gate.)
@@ -104,7 +113,6 @@ EXCLUDED=(
   'SpannerStatementTest.SqlIngestDate32'
   'SpannerStatementTest.SqlIngestDuration'
   'SpannerStatementTest.SqlIngestFixedSizeBinary'
-  'SpannerStatementTest.SqlIngestFloat16'
   'SpannerStatementTest.SqlIngestFloat32'
   'SpannerStatementTest.SqlIngestFloat64'
   'SpannerStatementTest.SqlIngestInt16'
@@ -123,13 +131,6 @@ EXCLUDED=(
   'SpannerStatementTest.SqlIngestString'
   'SpannerStatementTest.SqlIngestStringDictionary'
   'SpannerStatementTest.SqlIngestStringView'
-  'SpannerStatementTest.SqlIngestTargetCatalog'
-  'SpannerStatementTest.SqlIngestTargetCatalogSchema'
-  'SpannerStatementTest.SqlIngestTargetSchema'
-  'SpannerStatementTest.SqlIngestTemporary'
-  'SpannerStatementTest.SqlIngestTemporaryAppend'
-  'SpannerStatementTest.SqlIngestTemporaryExclusive'
-  'SpannerStatementTest.SqlIngestTemporaryReplace'
   'SpannerStatementTest.SqlIngestTimestamp'
   'SpannerStatementTest.SqlIngestTimestampTz'
   'SpannerStatementTest.SqlIngestUInt16'
