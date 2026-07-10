@@ -306,8 +306,8 @@ impl SpannerStatement {
         Ok(Some(statements))
     }
 
-    /// Remap a failed `append`-mode bulk ingest onto the statuses the ADBC bulk-ingest contract
-    /// mandates.
+    /// Remap a failed `append`- or `create_append`-mode bulk ingest onto the statuses the ADBC
+    /// bulk-ingest contract mandates.
     ///
     /// A successful (or, in manual-transaction mode, merely buffered) outcome is returned unchanged.
     /// A failure that already carries [`Status::AlreadyExists`] — a bound row duplicating a primary
@@ -420,16 +420,23 @@ impl SpannerStatement {
     /// on every exit path (success, failed DDL, failed insert) in one place.
     fn run_bound_ingest(&self, table: &str) -> Result<Option<i64>> {
         let ingest_ddl = self.build_ingest_table_ddl(table, self.ingest_mode)?;
-        // `append` is the only mode that inserts into a pre-existing table, so it is the only one
-        // whose failure the ADBC spec wants remapped to NotFound / AlreadyExists.
-        // `build_ingest_table_ddl` returns `None` for exactly that mode.
-        let is_append = ingest_ddl.is_none();
         if let Some(ddl) = ingest_ddl {
             self.run_ddl(ddl)
                 .map_err(|error| self.remap_ingest_create_error(table, error))?;
         }
         let result = self.run_ingest_mutations(table);
-        if is_append {
+        // `append` and `create_append` both insert into a table that may already exist, so the
+        // ADBC spec wants their insert failure remapped to NotFound / AlreadyExists. For
+        // `append` a missing table is NotFound and a present one is a schema mismatch
+        // (AlreadyExists); for `create_append` the `CREATE TABLE IF NOT EXISTS` above guarantees
+        // the table is present, so only the schema-mismatch AlreadyExists side can surface (its
+        // spec contract: "error if the table exists, but the schema does not match"). `create`
+        // and `replace` keep the raw insert error — their DDL step already owns the
+        // table-existence contract (`remap_ingest_create_error`).
+        if matches!(
+            self.ingest_mode,
+            Some(IngestMode::Append) | Some(IngestMode::CreateAppend)
+        ) {
             self.remap_ingest_append_error(table, result)
         } else {
             result
