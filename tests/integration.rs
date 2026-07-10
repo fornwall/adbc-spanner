@@ -3746,6 +3746,77 @@ fn prop_temporal_round_trip() {
     });
 }
 
+/// Regression guard: bound rows must not survive a DDL statement on a reused statement handle.
+///
+/// The DDL branches of `execute`/`execute_update` used to return after `run_ddl(...)` without
+/// clearing `self.bound`, so a handle that had been bound, then ran a DDL statement, would silently
+/// feed those stale rows to the next parameterized DML — `bind(rows)` → `CREATE TABLE …` → set an
+/// `INSERT … VALUES(@id)` query without rebinding would insert the stale rows. The fix clears
+/// `self.bound` in both DDL branches. This test binds two `@id` rows, runs a `CREATE TABLE` through
+/// the same handle, then reuses it for a parameterized `INSERT` without rebinding and asserts that
+/// nothing was written: on the fixed code `self.bound` is empty so the unbound `@id` INSERT is a
+/// no-op error, while the buggy code would have leaked the two stale rows.
+#[test]
+fn ddl_execute_clears_stale_bound_rows() {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set — skipping ddl_execute_clears_stale_bound_rows");
+        return;
+    };
+
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_path()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    // Start from a clean slate so the COUNT begins at 0 even on a persistent `SPANNER_GCP_DATABASE`.
+    let mut drop_stale = connection.new_statement().expect("new statement");
+    drop_stale
+        .set_sql_query("DROP TABLE IF EXISTS BoundLeak")
+        .unwrap();
+    drop_stale.execute_update().expect("drop stale BoundLeak");
+
+    // One reused statement handle: bind two distinct `@id` rows, then run a DDL statement through it.
+    let mut stmt = connection.new_statement().expect("new statement");
+    let bound = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(vec![900001_i64, 900002]))],
+    )
+    .unwrap();
+    stmt.bind(bound).expect("bind two stale @id rows");
+
+    // DDL through the SAME handle — this is where the fix clears `self.bound`.
+    stmt.set_sql_query("CREATE TABLE BoundLeak (id INT64) PRIMARY KEY (id)")
+        .unwrap();
+    stmt.execute_update()
+        .expect("create BoundLeak via the bound handle");
+
+    // Without rebinding, reuse the handle for a parameterized INSERT. On the fixed code `self.bound`
+    // is empty, so this errors on the unbound `@id`; on the buggy code it would insert the two stale
+    // rows. Either outcome is tolerated here — the assertion below is what actually guards the fix.
+    stmt.set_sql_query("INSERT INTO BoundLeak (id) VALUES (@id)")
+        .unwrap();
+    let _ = stmt.execute_update();
+
+    // The regression guard: the stale 900001/900002 rows must NOT have leaked into the INSERT.
+    assert_eq!(
+        count_rows(&mut connection, "BoundLeak"),
+        0,
+        "stale bound rows leaked past a DDL statement into the next parameterized DML"
+    );
+
+    // Clean up the scratch table like every other section.
+    let mut drop_stmt = connection.new_statement().expect("new statement");
+    drop_stmt.set_sql_query("DROP TABLE BoundLeak").unwrap();
+    drop_stmt.execute_update().expect("drop BoundLeak");
+}
+
 /// Locate the built `cdylib` (`libadbc_spanner.so` / `.dylib` / `.dll`) next to the test binary.
 fn cdylib_path() -> Option<std::path::PathBuf> {
     // The test binary lives in `target/<profile>/deps/`; the cdylib is in `target/<profile>/`.
