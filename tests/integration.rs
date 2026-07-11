@@ -7974,8 +7974,8 @@ fn change_stream_via_plain_sql() {
     run(&mut connection, "DROP TABLE AdbcChangeStream");
 }
 
-/// Opt-in **end-to-end auth** tests: drive the `spanner.keyfile` and
-/// `spanner.impersonate.target_principal` credential paths against a **real** Cloud Spanner database
+/// Opt-in **end-to-end auth** tests: drive the `spanner.auth.keyfile` and
+/// `spanner.auth.impersonate.target_principal` credential paths against a **real** Cloud Spanner database
 /// and prove each one authenticates by running a trivial `SELECT 1`.
 ///
 /// The offline unit tests in `src/driver.rs` only assert option parsing / mutual-exclusion / the
@@ -8046,7 +8046,7 @@ mod auth_end_to_end {
         assert_eq!(ones.value(0), 1);
     }
 
-    /// Authenticate with a service-account key file (`spanner.keyfile`) and run `SELECT 1`.
+    /// Authenticate with a service-account key file (`spanner.auth.keyfile`) and run `SELECT 1`.
     ///
     /// Skips unless both `SPANNER_GCP_DATABASE` and `SPANNER_TEST_KEYFILE` are set.
     #[test]
@@ -8081,7 +8081,7 @@ mod auth_end_to_end {
         assert_select_one(&mut connection);
     }
 
-    /// Authenticate via service-account impersonation (`spanner.impersonate.target_principal`,
+    /// Authenticate via service-account impersonation (`spanner.auth.impersonate.target_principal`,
     /// layered on ADC base credentials) and run `SELECT 1`.
     ///
     /// Skips unless both `SPANNER_GCP_DATABASE` and `SPANNER_TEST_IMPERSONATE_TARGET_PRINCIPAL` are

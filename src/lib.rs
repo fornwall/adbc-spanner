@@ -389,13 +389,13 @@ pub const OPTION_EMULATOR: &str = "spanner.emulator";
 
 /// Driver-specific database option: path to a service-account JSON key file to authenticate with
 /// (dbt's `keyfile`). Overridden by [`OPTION_KEYFILE_JSON`] if both are set.
-pub const OPTION_KEYFILE: &str = "spanner.keyfile";
+pub const OPTION_KEYFILE: &str = "spanner.auth.keyfile";
 
 /// Driver-specific database option: an inline service-account JSON key (dbt's `keyfile_json`).
 ///
 /// When neither this nor [`OPTION_KEYFILE`] is set (and not connecting to an emulator), the driver
 /// falls back to Application Default Credentials.
-pub const OPTION_KEYFILE_JSON: &str = "spanner.keyfile_json";
+pub const OPTION_KEYFILE_JSON: &str = "spanner.auth.keyfile_json";
 
 /// Driver-specific database option: the service-account email to impersonate. Setting this **enables
 /// service-account impersonation** — the base credentials (ADC, keyfile, …) are used to mint a
@@ -404,23 +404,23 @@ pub const OPTION_KEYFILE_JSON: &str = "spanner.keyfile_json";
 /// impersonation happens and authentication is unchanged.
 ///
 /// Follows gcloud's `--impersonate-service-account` / `google-cloud-auth`'s `impersonated` builder.
-pub const OPTION_IMPERSONATE_TARGET_PRINCIPAL: &str = "spanner.impersonate.target_principal";
+pub const OPTION_IMPERSONATE_TARGET_PRINCIPAL: &str = "spanner.auth.impersonate.target_principal";
 
 /// Driver-specific database option: an optional delegation chain for impersonation — a
 /// comma-separated list of service-account emails, each of which must have the *Token Creator* role
 /// on the next, with the last granting it on [`OPTION_IMPERSONATE_TARGET_PRINCIPAL`]. Only used when
 /// a target principal is set. Follows gcloud's `--impersonate-service-account` delegation chain.
-pub const OPTION_IMPERSONATE_DELEGATES: &str = "spanner.impersonate.delegates";
+pub const OPTION_IMPERSONATE_DELEGATES: &str = "spanner.auth.impersonate.delegates";
 
 /// Driver-specific database option: optional OAuth 2.0 scopes for the impersonated token, as a
 /// comma-separated list. Defaults to the `cloud-platform` scope when unset. Only used when a target
 /// principal is set. Follows the `google-cloud-auth` `impersonated` builder's `scopes`.
-pub const OPTION_IMPERSONATE_SCOPES: &str = "spanner.impersonate.scopes";
+pub const OPTION_IMPERSONATE_SCOPES: &str = "spanner.auth.impersonate.scopes";
 
 /// Driver-specific database option: the lifetime (in seconds) of the impersonated access token.
 /// Defaults to 3600 (one hour) when unset. Only used when a target principal is set. Follows the
 /// `google-cloud-auth` `impersonated` builder's `lifetime` (and gcloud's `--lifetime`).
-pub const OPTION_IMPERSONATE_LIFETIME: &str = "spanner.impersonate.lifetime";
+pub const OPTION_IMPERSONATE_LIFETIME: &str = "spanner.auth.impersonate.lifetime";
 
 /// Driver-specific database option: a caller-supplied OAuth 2.0 access token (a bearer token) to
 /// authenticate with directly.
@@ -435,7 +435,7 @@ pub const OPTION_IMPERSONATE_LIFETIME: &str = "spanner.impersonate.lifetime";
 /// combining it with any of them is refused at connect time with
 /// [`Status::InvalidState`](adbc_core::error::Status::InvalidState). Like the keyfile options, it
 /// also conflicts with emulator mode (which forces anonymous credentials).
-pub const OPTION_ACCESS_TOKEN: &str = "spanner.access_token";
+pub const OPTION_ACCESS_TOKEN: &str = "spanner.auth.access_token";
 
 /// Driver-specific database option: the **quota / billing project** charged for Spanner API usage,
 /// decoupled from the project that owns the data.

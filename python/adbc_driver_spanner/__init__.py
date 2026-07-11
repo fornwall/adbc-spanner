@@ -62,24 +62,24 @@ def option_kwargs(
     if emulator:
         options["spanner.emulator"] = "true"
     if keyfile is not None:
-        options["spanner.keyfile"] = keyfile
+        options["spanner.auth.keyfile"] = keyfile
     if keyfile_json is not None:
-        options["spanner.keyfile_json"] = keyfile_json
+        options["spanner.auth.keyfile_json"] = keyfile_json
     # Service-account impersonation (layered on top of the base credentials above);
     # enabled only when a target principal is set. delegates/scopes accept either a
     # comma-separated string or a sequence of strings.
     if impersonate_target_principal is not None:
-        options["spanner.impersonate.target_principal"] = impersonate_target_principal
+        options["spanner.auth.impersonate.target_principal"] = impersonate_target_principal
     if impersonate_delegates is not None:
-        options["spanner.impersonate.delegates"] = _as_csv(impersonate_delegates)
+        options["spanner.auth.impersonate.delegates"] = _as_csv(impersonate_delegates)
     if impersonate_scopes is not None:
-        options["spanner.impersonate.scopes"] = _as_csv(impersonate_scopes)
+        options["spanner.auth.impersonate.scopes"] = _as_csv(impersonate_scopes)
     if impersonate_lifetime is not None:
-        options["spanner.impersonate.lifetime"] = str(impersonate_lifetime)
+        options["spanner.auth.impersonate.lifetime"] = str(impersonate_lifetime)
     # A caller-supplied OAuth 2.0 bearer token, sent verbatim with no refresh; mutually
     # exclusive with the keyfile/impersonation options above.
     if access_token is not None:
-        options["spanner.access_token"] = access_token
+        options["spanner.auth.access_token"] = access_token
     if db_kwargs:
         options.update(db_kwargs)
     return options

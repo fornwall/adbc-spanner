@@ -187,7 +187,7 @@ is cross-compiled, off the universal Apple toolchain) and installs NASM only on 
     re-run against a persistent database. No driver change was needed — `SpannerDatabase::connect`
     already falls back to ADC when there is no emulator host and no keyfile.
 - **Opt-in end-to-end auth tests** (`auth_end_to_end` module in `tests/integration.rs`) exercise the
-  `spanner.keyfile` and `spanner.impersonate.target_principal` credential paths against a **real**
+  `spanner.auth.keyfile` and `spanner.auth.impersonate.target_principal` credential paths against a **real**
   database (the emulator refuses these credentials) with a trivial `SELECT 1`. They self-skip cleanly
   when their env vars are unset, so `cargo test` stays green without credentials. They read
   `SPANNER_GCP_DATABASE` (the real target, reused) plus `SPANNER_TEST_KEYFILE` (path to a
@@ -368,13 +368,13 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   a streamed result still cancels the next fetch — until the object's next operation resets it),
   keyfile/keyfile_json auth (credential-type auto-detected
   from the JSON `"type"`), OAuth access-token auth
-  (`spanner.access_token` — a caller-supplied bearer token sent verbatim with no refresh via a
+  (`spanner.auth.access_token` — a caller-supplied bearer token sent verbatim with no refresh via a
   minimal custom `google-cloud-auth` `CredentialsProvider`, `StaticTokenCredentials` in
   `src/driver.rs`; mutually exclusive with keyfile/impersonation and refused in emulator mode, the
   keyfile-guard pattern), and service-account impersonation
-  (`spanner.impersonate.target_principal` enables it; optional `spanner.impersonate.delegates`
-  [comma-separated chain], `spanner.impersonate.scopes` [comma-separated, defaults to
-  cloud-platform], `spanner.impersonate.lifetime` [seconds, default 3600] — layered on top of the
+  (`spanner.auth.impersonate.target_principal` enables it; optional `spanner.auth.impersonate.delegates`
+  [comma-separated chain], `spanner.auth.impersonate.scopes` [comma-separated, defaults to
+  cloud-platform], `spanner.auth.impersonate.lifetime` [seconds, default 3600] — layered on top of the
   base credentials via `google-cloud-auth`'s `impersonated::Builder::from_source_credentials`,
   the `impersonate.*` naming following gcloud's `--impersonate-service-account` / that builder — NOT
   the ADBC BigQuery driver, which has no impersonation options), quota / billing project
