@@ -61,6 +61,7 @@ use crate::conversion::{TimestampPrecision, result_set_to_batch, stream_query};
 use crate::directed_read::DirectedRead;
 use crate::driver::Connected;
 use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
+use crate::options::impl_shared_option_dispatch;
 use crate::query_options::QueryOptionsConfig;
 use crate::request::{CommitStats, RequestConfig};
 use crate::retry::RetryConfig;
@@ -274,6 +275,11 @@ pub struct SpannerConnection {
 }
 
 impl SpannerConnection {
+    // Shared `set_shared_option` / `shared_option_string` for the "staleness-pattern" options
+    // (request priority/tag, directed read, max_commit_delay, commit_stats, query optimizer opts,
+    // RPC timeouts, retry tuning, …) that the connection and statement dispatch identically.
+    impl_shared_option_dispatch!();
+
     pub(crate) fn new(runtime: SharedRuntime, connected: Connected) -> Self {
         Self {
             runtime,
@@ -745,59 +751,22 @@ impl Optionable for SpannerConnection {
                 self.read_only.store(parse_bool(value)?, Ordering::Release)
             }
             OptionConnection::IsolationLevel => self.isolation = parse_isolation_level(value)?,
-            OptionConnection::Other(k) if k == crate::OPTION_READ_STALENESS => {
-                self.read_staleness.set_staleness(value)?;
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_REQUEST_PRIORITY => {
-                self.request.set_priority(value)?;
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_REQUEST_TAG => {
-                self.request.set_request_tag(value)?;
-            }
+            // Connection-only: the transaction tag applies to the whole read/write transaction, so
+            // it is not a per-statement option (not in the shared dispatch below).
             OptionConnection::Other(k) if k == crate::OPTION_TRANSACTION_TAG => {
                 self.request.set_transaction_tag(value)?;
             }
-            OptionConnection::Other(k) if k == crate::OPTION_DIRECTED_READ => {
-                self.directed_read.set(value)?;
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => {
-                self.request.set_max_commit_delay(value)?;
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_COMMIT_STATS => {
-                self.request.set_commit_stats(value)?;
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_VERSION => {
-                self.query_options.set_optimizer_version(value)?;
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
-                self.query_options.set_optimizer_statistics_package(value)?;
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {
-                self.timestamp_precision = TimestampPrecision::parse_option(value)?;
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_RPC_TIMEOUT_QUERY => {
-                self.timeouts.set_query(value)?;
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_RPC_TIMEOUT_UPDATE => {
-                self.timeouts.set_update(value)?;
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_RPC_TIMEOUT_FETCH => {
-                self.timeouts.set_fetch(value)?;
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_RETRY_MAX_ATTEMPTS => {
-                self.retry.set_max_attempts(value)?;
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
-                self.retry.set_max_elapsed_seconds(value)?;
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS => {
-                self.retry.set_backoff_initial_seconds(value)?;
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_RETRY_BACKOFF_MAX_SECONDS => {
-                self.retry.set_backoff_max_seconds(value)?;
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_RETRY_BACKOFF_MULTIPLIER => {
-                self.retry.set_backoff_multiplier(value)?;
+            // Every other `spanner.*` option the connection and statement dispatch identically —
+            // request priority/tag, directed read, staleness, max_commit_delay, commit_stats, query
+            // optimizer opts, RPC timeouts, retry tuning — goes through the shared table. An
+            // unrecognised key returns `None`, mapped to the same `NotImplemented` as before.
+            OptionConnection::Other(k) => {
+                if self.set_shared_option(k, value)?.is_none() {
+                    return Err(not_implemented(&format!(
+                        "unsupported Spanner connection option: {}",
+                        connection_option_name(&key)
+                    )));
+                }
             }
             // A Spanner database exposes a single, unnamed catalog and (default) schema — both `""`,
             // which is what the `get_option` side always reports — and neither can be switched. So
@@ -826,36 +795,7 @@ impl Optionable for SpannerConnection {
             OptionConnection::IsolationLevel => {
                 Ok(isolation_to_adbc_string(&self.isolation).to_string())
             }
-            OptionConnection::Other(k) if k == crate::OPTION_READ_STALENESS => self
-                .read_staleness
-                .staleness_string()
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    err(
-                        format!("option {} is not set", crate::OPTION_READ_STALENESS),
-                        Status::NotFound,
-                    )
-                }),
-            OptionConnection::Other(k) if k == crate::OPTION_REQUEST_PRIORITY => self
-                .request
-                .priority_string()
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    err(
-                        format!("option {} is not set", crate::OPTION_REQUEST_PRIORITY),
-                        Status::NotFound,
-                    )
-                }),
-            OptionConnection::Other(k) if k == crate::OPTION_REQUEST_TAG => self
-                .request
-                .request_tag_string()
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    err(
-                        format!("option {} is not set", crate::OPTION_REQUEST_TAG),
-                        Status::NotFound,
-                    )
-                }),
+            // Connection-only (see the setter): reports the transaction tag, or NotFound when unset.
             OptionConnection::Other(k) if k == crate::OPTION_TRANSACTION_TAG => self
                 .request
                 .transaction_tag_string()
@@ -866,152 +806,10 @@ impl Optionable for SpannerConnection {
                         Status::NotFound,
                     )
                 }),
-            OptionConnection::Other(k) if k == crate::OPTION_DIRECTED_READ => self
-                .directed_read
-                .option_string()
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    err(
-                        format!("option {} is not set", crate::OPTION_DIRECTED_READ),
-                        Status::NotFound,
-                    )
-                }),
-            OptionConnection::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => self
-                .request
-                .max_commit_delay_string()
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    err(
-                        format!("option {} is not set", crate::OPTION_MAX_COMMIT_DELAY),
-                        Status::NotFound,
-                    )
-                }),
-            // A plain boolean; always reports the effective value ("true"/"false", default "false").
-            OptionConnection::Other(k) if k == crate::OPTION_COMMIT_STATS => {
-                Ok(self.request.commit_stats_string().to_string())
-            }
-            // The captured mutation count from the connection's most recent manual-mode commit that
-            // requested commit stats; NotFound until such a commit has run.
-            OptionConnection::Other(k) if k == crate::OPTION_COMMIT_STATS_MUTATION_COUNT => self
-                .commit_stats
-                .mutation_count()
-                .map(|n| n.to_string())
-                .ok_or_else(|| {
-                    err(
-                        format!(
-                            "option {} is not set",
-                            crate::OPTION_COMMIT_STATS_MUTATION_COUNT
-                        ),
-                        Status::NotFound,
-                    )
-                }),
-            OptionConnection::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_VERSION => self
-                .query_options
-                .optimizer_version_string()
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    err(
-                        format!(
-                            "option {} is not set",
-                            crate::OPTION_QUERY_OPTIMIZER_VERSION
-                        ),
-                        Status::NotFound,
-                    )
-                }),
-            OptionConnection::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
-                self.query_options
-                    .optimizer_statistics_package_string()
-                    .map(str::to_string)
-                    .ok_or_else(|| {
-                        err(
-                            format!(
-                                "option {} is not set",
-                                crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE
-                            ),
-                            Status::NotFound,
-                        )
-                    })
-            }
-            // Always set (there is a default mode), so the effective value is always reported.
-            OptionConnection::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {
-                Ok(self.timestamp_precision.as_str().to_string())
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_RPC_TIMEOUT_QUERY => {
-                self.timeouts.query_string().ok_or_else(|| {
-                    err(
-                        format!("option {} is not set", crate::OPTION_RPC_TIMEOUT_QUERY),
-                        Status::NotFound,
-                    )
-                })
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_RPC_TIMEOUT_UPDATE => {
-                self.timeouts.update_string().ok_or_else(|| {
-                    err(
-                        format!("option {} is not set", crate::OPTION_RPC_TIMEOUT_UPDATE),
-                        Status::NotFound,
-                    )
-                })
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_RPC_TIMEOUT_FETCH => {
-                self.timeouts.fetch_string().ok_or_else(|| {
-                    err(
-                        format!("option {} is not set", crate::OPTION_RPC_TIMEOUT_FETCH),
-                        Status::NotFound,
-                    )
-                })
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_RETRY_MAX_ATTEMPTS => {
-                self.retry.max_attempts_string().ok_or_else(|| {
-                    err(
-                        format!("option {} is not set", crate::OPTION_RETRY_MAX_ATTEMPTS),
-                        Status::NotFound,
-                    )
-                })
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
-                self.retry.max_elapsed_seconds_string().ok_or_else(|| {
-                    err(
-                        format!(
-                            "option {} is not set",
-                            crate::OPTION_RETRY_MAX_ELAPSED_SECONDS
-                        ),
-                        Status::NotFound,
-                    )
-                })
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS => {
-                self.retry.backoff_initial_seconds_string().ok_or_else(|| {
-                    err(
-                        format!(
-                            "option {} is not set",
-                            crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS
-                        ),
-                        Status::NotFound,
-                    )
-                })
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_RETRY_BACKOFF_MAX_SECONDS => {
-                self.retry.backoff_max_seconds_string().ok_or_else(|| {
-                    err(
-                        format!(
-                            "option {} is not set",
-                            crate::OPTION_RETRY_BACKOFF_MAX_SECONDS
-                        ),
-                        Status::NotFound,
-                    )
-                })
-            }
-            OptionConnection::Other(k) if k == crate::OPTION_RETRY_BACKOFF_MULTIPLIER => {
-                self.retry.backoff_multiplier_string().ok_or_else(|| {
-                    err(
-                        format!(
-                            "option {} is not set",
-                            crate::OPTION_RETRY_BACKOFF_MULTIPLIER
-                        ),
-                        Status::NotFound,
-                    )
-                })
-            }
+            // Every other `spanner.*` option the connection and statement report identically —
+            // including `spanner.commit_stats.mutation_count` — goes through the shared table, which
+            // returns the same `NotFound` for an unset (or unknown) key.
+            OptionConnection::Other(k) => self.shared_option_string(k),
             // A Spanner database has a single, unnamed catalog and (default) schema — both the empty
             // string in INFORMATION_SCHEMA, which is what `get_objects` reports — so the "current"
             // catalog/schema are reported as "". (They can't be switched; setting them is unsupported.)
