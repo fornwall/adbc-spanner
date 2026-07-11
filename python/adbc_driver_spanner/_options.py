@@ -46,19 +46,19 @@ class DatabaseOptions(enum.Enum):
     #: ``"true"`` to connect with anonymous credentials (emulator mode).
     EMULATOR = "spanner.emulator"
     #: Path to a service-account / credential JSON file.
-    KEYFILE = "spanner.keyfile"
+    KEYFILE = "spanner.auth.keyfile"
     #: The same credential JSON passed inline as a string.
-    KEYFILE_JSON = "spanner.keyfile_json"
+    KEYFILE_JSON = "spanner.auth.keyfile_json"
     #: A caller-supplied OAuth 2.0 bearer token, sent verbatim (no refresh).
-    ACCESS_TOKEN = "spanner.access_token"
+    ACCESS_TOKEN = "spanner.auth.access_token"
     #: Service account to impersonate; setting it enables impersonation.
-    IMPERSONATE_TARGET_PRINCIPAL = "spanner.impersonate.target_principal"
+    IMPERSONATE_TARGET_PRINCIPAL = "spanner.auth.impersonate.target_principal"
     #: Optional impersonation delegation chain (comma-separated emails).
-    IMPERSONATE_DELEGATES = "spanner.impersonate.delegates"
+    IMPERSONATE_DELEGATES = "spanner.auth.impersonate.delegates"
     #: Optional OAuth scopes for the impersonated token (comma-separated).
-    IMPERSONATE_SCOPES = "spanner.impersonate.scopes"
+    IMPERSONATE_SCOPES = "spanner.auth.impersonate.scopes"
     #: Optional impersonated-token lifetime, in seconds (default ``3600``).
-    IMPERSONATE_LIFETIME = "spanner.impersonate.lifetime"
+    IMPERSONATE_LIFETIME = "spanner.auth.impersonate.lifetime"
 
 
 class ConnectionOptions(enum.Enum):

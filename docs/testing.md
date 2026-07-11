@@ -68,7 +68,7 @@ The target is `project.instance.database`; the instance must already exist, and 
 best-effort creates the database and its scratch tables and cleans up after itself.
 
 **Opt-in auth end-to-end tests** (the `auth_end_to_end` module) additionally exercise the
-`spanner.keyfile` and `spanner.impersonate.target_principal` credential paths against a real database
+`spanner.auth.keyfile` and `spanner.auth.impersonate.target_principal` credential paths against a real database
 (the emulator refuses these credentials). They self-skip unless `SPANNER_GCP_DATABASE` plus
 `SPANNER_TEST_KEYFILE` and/or `SPANNER_TEST_IMPERSONATE_TARGET_PRINCIPAL` are set.
 

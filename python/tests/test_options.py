@@ -30,15 +30,15 @@ def test_option_kwargs_maps_credentials():
         impersonate_lifetime=1800,
     )
     assert opts["spanner.database"] == "projects/p/instances/i/databases/d"
-    assert opts["spanner.keyfile"] == "/k.json"
-    assert opts["spanner.access_token"] == "ya29.tok"
-    assert opts["spanner.impersonate.target_principal"] == "sa@p.iam.gserviceaccount.com"
+    assert opts["spanner.auth.keyfile"] == "/k.json"
+    assert opts["spanner.auth.access_token"] == "ya29.tok"
+    assert opts["spanner.auth.impersonate.target_principal"] == "sa@p.iam.gserviceaccount.com"
     # A sequence of delegates/scopes is rendered as a comma-separated string.
-    assert opts["spanner.impersonate.delegates"] == "a@p.iam,b@p.iam"
-    assert opts["spanner.impersonate.scopes"] == (
+    assert opts["spanner.auth.impersonate.delegates"] == "a@p.iam,b@p.iam"
+    assert opts["spanner.auth.impersonate.scopes"] == (
         "https://www.googleapis.com/auth/cloud-platform"
     )
-    assert opts["spanner.impersonate.lifetime"] == "1800"
+    assert opts["spanner.auth.impersonate.lifetime"] == "1800"
 
 
 def test_option_enums_are_exported_and_well_formed():
@@ -52,6 +52,6 @@ def test_option_enums_are_exported_and_well_formed():
 
 def test_option_enum_values_are_usable_as_kwargs_keys():
     # The whole point of the enums: .value is the raw string db_kwargs expects.
-    assert DatabaseOptions.ACCESS_TOKEN.value == "spanner.access_token"
+    assert DatabaseOptions.ACCESS_TOKEN.value == "spanner.auth.access_token"
     assert ConnectionOptions.READ_STALENESS.value == "spanner.read.staleness"
     assert StatementOptions.ROWS_PER_BATCH.value == "spanner.rows_per_batch"

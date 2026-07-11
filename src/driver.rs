@@ -250,7 +250,7 @@ impl SpannerDatabase {
     /// (e.g. the
     /// `GOOGLE_APPLICATION_CREDENTIALS` environment variable or a gcloud login) are deliberately
     /// *not* reported — they are the environment's business, not an explicit driver option, and
-    /// must not prevent emulator use. The remaining `spanner.impersonate.*` options are inert
+    /// must not prevent emulator use. The remaining `spanner.auth.impersonate.*` options are inert
     /// without a target principal, so they do not count either.
     fn explicit_credential_option(&self) -> Option<&'static str> {
         if self.keyfile_json.is_some() {
@@ -782,7 +782,7 @@ const SUPPORTED_CREDENTIAL_TYPES: &str =
 /// The underlying `google-cloud-auth` top-level `Builder` already dispatches on this field, but only
 /// for credentials it loads itself from the environment (the `GOOGLE_APPLICATION_CREDENTIALS` var or
 /// the well-known ADC file). It offers no entry point that takes inline JSON, so the dispatch has to
-/// happen here for the JSON supplied through the `spanner.keyfile` / `spanner.keyfile_json`
+/// happen here for the JSON supplied through the `spanner.auth.keyfile` / `spanner.auth.keyfile_json`
 /// options. Previously every keyfile was forced through the `service_account` builder, which failed
 /// (or misbehaved) for any other credential type.
 ///
@@ -1526,7 +1526,7 @@ mod tests {
 
     // Only explicit driver options count as credentials: a fresh database (which would fall back to
     // ambient ADC, e.g. GOOGLE_APPLICATION_CREDENTIALS) reports none, so plain emulator use — the
-    // integration-test path — is not refused. Inert `spanner.impersonate.*` options (no target
+    // integration-test path — is not refused. Inert `spanner.auth.impersonate.*` options (no target
     // principal) do not count either.
     #[test]
     fn ambient_adc_and_inert_impersonation_options_do_not_trip_the_emulator_guard() {
@@ -1919,13 +1919,13 @@ mod tests {
             &mut db,
             &format!(
                 "spanner:///{DB_PATH}\
-                 ?spanner.keyfile=/path/key.json\
-                 &spanner.keyfile_json=%7B%22type%22%3A%22service_account%22%7D\
-                 &spanner.impersonate.target_principal=target%40p.iam.gserviceaccount.com\
-                 &spanner.impersonate.delegates=a%40p.iam.gserviceaccount.com,b%40p.iam.gserviceaccount.com\
-                 &spanner.impersonate.scopes=https://www.googleapis.com/auth/cloud-platform\
-                 &spanner.impersonate.lifetime=900\
-                 &spanner.access_token=ya29.uri-token"
+                 ?spanner.auth.keyfile=/path/key.json\
+                 &spanner.auth.keyfile_json=%7B%22type%22%3A%22service_account%22%7D\
+                 &spanner.auth.impersonate.target_principal=target%40p.iam.gserviceaccount.com\
+                 &spanner.auth.impersonate.delegates=a%40p.iam.gserviceaccount.com,b%40p.iam.gserviceaccount.com\
+                 &spanner.auth.impersonate.scopes=https://www.googleapis.com/auth/cloud-platform\
+                 &spanner.auth.impersonate.lifetime=900\
+                 &spanner.auth.access_token=ya29.uri-token"
             ),
         )
         .unwrap();
@@ -2046,7 +2046,7 @@ mod tests {
             // A bad *value* for a known key must also leave everything untouched (it is validated
             // against a scratch instance before any field is mutated).
             "spanner:///projects/p2/instances/i2/databases/d2?spanner.emulator=maybe".to_string(),
-            "spanner://host:9010/projects/p2/instances/i2/databases/d2?spanner.keyfile=%G1"
+            "spanner://host:9010/projects/p2/instances/i2/databases/d2?spanner.auth.keyfile=%G1"
                 .to_string(),
         ] {
             let error = set_uri(&mut db, &bad).unwrap_err();

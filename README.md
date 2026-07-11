@@ -246,43 +246,43 @@ Credentials are resolved in this order:
 
 1. **Emulator** — if `SPANNER_EMULATOR_HOST` is set (or `spanner.emulator` is `true`), anonymous
    credentials are used and the endpoint is taken from the environment. Combining emulator mode
-   with explicit credentials (`spanner.keyfile`, `spanner.keyfile_json`,
-   `spanner.impersonate.target_principal`, or `spanner.access_token`) is refused at connect time
+   with explicit credentials (`spanner.auth.keyfile`, `spanner.auth.keyfile_json`,
+   `spanner.auth.impersonate.target_principal`, or `spanner.auth.access_token`) is refused at connect time
    rather than silently ignoring them; ambient ADC (e.g. `GOOGLE_APPLICATION_CREDENTIALS`) does not
    conflict.
-2. **Access token** — a caller-supplied OAuth 2.0 bearer token via `spanner.access_token` (see
+2. **Access token** — a caller-supplied OAuth 2.0 bearer token via `spanner.auth.access_token` (see
    below).
-3. **Service account** — a key supplied inline via `spanner.keyfile_json` or read from the path
-   in `spanner.keyfile`.
+3. **Service account** — a key supplied inline via `spanner.auth.keyfile_json` or read from the path
+   in `spanner.auth.keyfile`.
 4. **[Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)**
    otherwise (e.g. `GOOGLE_APPLICATION_CREDENTIALS`, gcloud login, or the metadata server).
 
 #### OAuth access token
 
-Setting `spanner.access_token` authenticates with a bearer token you have already obtained out of
+Setting `spanner.auth.access_token` authenticates with a bearer token you have already obtained out of
 band — for example from `gcloud auth print-access-token`, a Workload Identity exchange, or another
 auth library. The token is sent verbatim as the `Authorization: Bearer <token>` header on every
 request and is **never refreshed**, so you are responsible for supplying a valid, unexpired token
 (and re-connecting once it expires). Because it is a complete credential on its own, it is mutually
-exclusive with `spanner.keyfile`, `spanner.keyfile_json`, and
-`spanner.impersonate.target_principal` — combining them is refused at connect time.
+exclusive with `spanner.auth.keyfile`, `spanner.auth.keyfile_json`, and
+`spanner.auth.impersonate.target_principal` — combining them is refused at connect time.
 
 #### Service-account impersonation
 
-Setting `spanner.impersonate.target_principal` layers
+Setting `spanner.auth.impersonate.target_principal` layers
 [service-account impersonation](https://cloud.google.com/iam/docs/service-account-impersonation) on
 top of whichever base credentials above are in effect: the base credentials call the IAM Credentials
 `generateAccessToken` API to mint a short-lived token for the target service account, and the driver
 authenticates as that target. The option group follows gcloud's `--impersonate-service-account`
 (and `google-cloud-auth`'s `impersonated` builder) naming:
 
-- `spanner.impersonate.target_principal` — the target service-account email (**required** to enable
+- `spanner.auth.impersonate.target_principal` — the target service-account email (**required** to enable
   impersonation; when unset, authentication is unchanged).
-- `spanner.impersonate.delegates` — an optional delegation chain (comma-separated), where each
+- `spanner.auth.impersonate.delegates` — an optional delegation chain (comma-separated), where each
   service account has the *Token Creator* role on the next and the last on the target.
-- `spanner.impersonate.scopes` — optional OAuth scopes (comma-separated); defaults to the
+- `spanner.auth.impersonate.scopes` — optional OAuth scopes (comma-separated); defaults to the
   `cloud-platform` scope.
-- `spanner.impersonate.lifetime` — optional token lifetime in seconds; defaults to `3600` (one hour).
+- `spanner.auth.impersonate.lifetime` — optional token lifetime in seconds; defaults to `3600` (one hour).
 
 #### Quota / billing project
 
@@ -293,7 +293,7 @@ resource-sharing setups; the caller must hold `serviceusage.services.use` on the
 mirrors the BigQuery ADBC driver's `bigquery.auth.quota_project` (and gcloud's `--billing-project`).
 
 The value is attached to whichever credentials are in effect (Application Default Credentials,
-`spanner.keyfile`/`spanner.keyfile_json`, impersonation, or `spanner.access_token`), so it composes
+`spanner.auth.keyfile`/`spanner.auth.keyfile_json`, impersonation, or `spanner.auth.access_token`), so it composes
 with every credential path. It is a bare project id — not a secret — so it round-trips through
 `get_option`, and `""` unsets it. It is refused in emulator mode (which forces anonymous credentials
 and ignores billing), like the credential options. If the `GOOGLE_CLOUD_QUOTA_PROJECT` environment

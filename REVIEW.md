@@ -628,9 +628,9 @@ plaintext `http://`, overriding configured keyfiles — an env-controlled downgr
 consider refusing (or warning) when explicit credentials were also configured
 (`src/driver.rs:150-187`)~~ (**Fixed.** `connect()` now refuses with `InvalidState` when emulator
 mode — via `SPANNER_EMULATOR_HOST` *or* `spanner.emulator` — is combined with explicit driver
-credentials (`spanner.keyfile`, `spanner.keyfile_json`, or
-`spanner.impersonate.target_principal`); the error names the offending option and what enabled
-emulator mode. Ambient ADC (e.g. `GOOGLE_APPLICATION_CREDENTIALS`) and inert `spanner.impersonate.*`
+credentials (`spanner.auth.keyfile`, `spanner.auth.keyfile_json`, or
+`spanner.auth.impersonate.target_principal`); the error names the offending option and what enabled
+emulator mode. Ambient ADC (e.g. `GOOGLE_APPLICATION_CREDENTIALS`) and inert `spanner.auth.impersonate.*`
 options without a target do not trip the guard, so the plain emulator path — the integration-test
 path — is unchanged. Offline unit tests in `src/driver.rs`
 (`emulator_mode_with_an_explicit_keyfile_is_refused` and siblings) cover keyfile / keyfile_json /
@@ -708,8 +708,8 @@ the unit tests, and the docs step runs `cargo doc --no-deps --all-features` to m
 ~~keyfile/impersonation auth is offline-unit-tested only, never exercised end-to-end~~
 (**Fixed.** An opt-in `auth_end_to_end` test module in `tests/integration.rs` now drives both
 credential paths against a **real** Cloud Spanner database and proves each authenticates with a
-trivial `SELECT 1`: `keyfile_auth_end_to_end` connects via `spanner.keyfile`, and
-`impersonation_auth_end_to_end` connects via `spanner.impersonate.target_principal` (layered on ADC).
+trivial `SELECT 1`: `keyfile_auth_end_to_end` connects via `spanner.auth.keyfile`, and
+`impersonation_auth_end_to_end` connects via `spanner.auth.impersonate.target_principal` (layered on ADC).
 Both **self-skip cleanly** — green, no failure, like the existing `SPANNER_GCP_DATABASE` tests — when
 their env vars are unset, so a plain `cargo test` stays green with no credentials. They read
 `SPANNER_GCP_DATABASE` (the real target, reused; the emulator refuses these credentials so it is
@@ -786,15 +786,15 @@ clear error~~ (**wontfix** — not worth the effort. Reliable dialect detection 
 `spanner.databases.get`), and the payoff — a slightly clearer error on the rare PostgreSQL-dialect
 database — doesn't justify the extra connect-time RPC and complexity. PR #167 closed unmerged.);
 ~~OAuth access-token auth (needs a small custom credentials impl — the auth crate has
-no static-token builder)~~ (**Fixed.** New `spanner.access_token` database option authenticates
+no static-token builder)~~ (**Fixed.** New `spanner.auth.access_token` database option authenticates
 with a caller-supplied OAuth 2.0 bearer token. The pinned `google-cloud-auth` crate indeed ships no
 static-token builder, so the driver implements the public `CredentialsProvider` trait directly with
 `StaticTokenCredentials` in `src/driver.rs` — a minimal, refresh-free credential that returns a
 pre-built, sensitive `Authorization: Bearer <token>` header on every request (built via
 `build_static_token_credentials`, which validates the token as a header value up front and never
 interpolates it into an error, upholding the `scrub_credential_error` no-leak discipline). It is a
-complete credential, so it is mutually exclusive with `spanner.keyfile` / `spanner.keyfile_json` /
-`spanner.impersonate.target_principal` (combining them is refused at connect time with
+complete credential, so it is mutually exclusive with `spanner.auth.keyfile` / `spanner.auth.keyfile_json` /
+`spanner.auth.impersonate.target_principal` (combining them is refused at connect time with
 `InvalidState`, naming the conflict) and trips the same emulator-mode-vs-explicit-credentials guard
 as the keyfiles; it round-trips through `get_option` verbatim (matching the `keyfile_json`
 convention) and is accepted as a `spanner:` connection-URI query parameter. Wired through the
@@ -1032,7 +1032,7 @@ and "not an integer" reported as `NotFound`)~~ (**Fixed.** All three levels' `ge
 `src/options.rs` (`int_from_stored_string` / `double_from_stored_string`): unset/unknown options
 keep the string getter's `NotFound` unchanged, while a set-but-non-integer value is
 `InvalidArguments` naming the option and value — `NotFound` again means only "option unset". As a
-bonus, integer-valued options (`spanner.impersonate.lifetime`, `spanner.rows_per_batch`,
+bonus, integer-valued options (`spanner.auth.impersonate.lifetime`, `spanner.rows_per_batch`,
 `spanner.max_partitions`) are now gettable as ints at every level that stores them; covered by
 offline unit tests in `src/options.rs` and `src/driver.rs`), ~~SQL-text helpers scattered across
 three modules~~ (**Fixed.** The GoogleSQL-lexer module `src/ddl.rs` was renamed to `src/sql.rs` — the

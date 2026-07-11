@@ -132,7 +132,7 @@ futures-util = "0.3"
 serde_json = { version = "1", features = ["float_roundtrip"] }
 base64 = "0.22"
 # Build the `Authorization: Bearer <token>` header for the static-token credential backing the
-# `spanner.access_token` option (a minimal `google-cloud-auth` `CredentialsProvider`). Same `http`
+# `spanner.auth.access_token` option (a minimal `google-cloud-auth` `CredentialsProvider`). Same `http`
 # major version the google-cloud-auth family uses, so `HeaderMap` / `Extensions` unify across crates.
 http = "1"
 # Parsing Spanner's string-encoded DATE / TIMESTAMP values into Arrow Date32 / Timestamp, and

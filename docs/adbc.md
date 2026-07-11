@@ -192,7 +192,7 @@ spanner:///projects/p/instances/i/databases/d?spanner.emulator=true
 The database object is **pure configuration** — no network happens yet. It just holds the path,
 the credentials configuration, the endpoint, and any inherited options. Credentials can come from
 Application Default Credentials (the usual GCP path), a service-account key file
-(`spanner.keyfile`), an OAuth access token, or impersonation; or, for local development, you point
+(`spanner.auth.keyfile`), an OAuth access token, or impersonation; or, for local development, you point
 at a **Spanner emulator** and use anonymous credentials. All of this is option plumbing on the
 database object, handled in [`src/driver.rs`](../src/driver.rs).
 
