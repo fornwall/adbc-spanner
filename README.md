@@ -170,7 +170,7 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
 - Partitioned execution: `execute_partitions()` splits a query into independently executable
   partitions via Spanner's `PartitionQuery` API, each serialized as a self-contained opaque ADBC
   descriptor, and `Connection::read_partition()` streams one partition's rows back as Arrow.
-  `spanner.data_boost_enabled` bakes [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview)
+  `spanner.data_boost` bakes [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview)
   into the descriptors; `spanner.max_partitions` hints the partition count.
 - [Change streams](https://cloud.google.com/spanner/docs/change-streams) work through the driver's
   ordinary SQL paths — no dedicated support is needed. `CREATE CHANGE STREAM … FOR <table>` /

@@ -155,7 +155,7 @@ pub struct SpannerStatement {
     bind_by_name: bool,
     /// Rows converted into each streamed Arrow batch by `execute` (`spanner.rows_per_batch`).
     rows_per_batch: usize,
-    /// Enable Data Boost for partitioned execution (`spanner.data_boost_enabled`).
+    /// Enable Data Boost for partitioned execution (`spanner.data_boost`).
     data_boost: bool,
     /// Maximum number of partitions to request from `execute_partitions`
     /// (`spanner.max_partitions`); `None` lets Spanner choose.

@@ -122,7 +122,7 @@ def test_execute_partitions_round_trip(emulator_database):
         with conn.cursor() as cur:
             cur.adbc_statement.set_options(
                 **{
-                    "spanner.data_boost_enabled": "true",
+                    "spanner.data_boost": "true",
                     "spanner.max_partitions": "4",
                 }
             )
