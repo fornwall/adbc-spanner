@@ -119,8 +119,12 @@ subset as a **gating** CI job, in three legs: `plain`; `asan-ubsan` (the C++ sid
 interceptors catch memory bugs on the C-ABI structs at the FFI boundary); and `rust-asan` (the
 **cdylib itself** built with nightly `-Zsanitizer=address` + `-Zbuild-std`, driven by a clang
 `-fsanitize=address` C++ side so both share one compiler-rt ASan runtime — catching memory bugs
-*inside* Rust that never reach a C-side interceptor). See the validation README's *Sanitizers*
-section.
+*inside* Rust that never reach a C-side interceptor). The `rust-asan` leg carries a **cross-boundary
+ASan canary**: before the suite runs it builds the cdylib with `--cfg asan_canary` (a test-only
+intentionally-out-of-bounds symbol, absent from every normal build) and calls it from a clang
+`-fsanitize=address` program against a C++-allocated buffer, asserting ASan reports the
+`heap-buffer-overflow` — so a silently-disarmed instrumentation makes the leg go red instead of
+passing as a no-op. See the validation README's *Sanitizers* section.
 
 See [`adbc-validation/README.md`](../adbc-validation/README.md) for the exact gated allowlist, what
 each case covers, and the follow-up work on the remaining `StatementTest` cases.

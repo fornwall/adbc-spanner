@@ -149,7 +149,10 @@ google-cloud-gax = { git = "https://github.com/fornwall/google-cloud-rust", rev 
 
 # Lints applied in local dev too (CI additionally runs `clippy -D warnings`).
 [lints.rust]
-unexpected_cfgs = "warn"
+# `asan_canary` is the ADBC-validation `rust-asan` leg's tripwire cfg (src/asan_canary.rs, set only
+# by scripts/run-adbc-validation.sh). Declare it so `clippy -D warnings` stays clean everywhere it
+# is NOT set (including `--all-features`, which does not set a bare `--cfg`).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(asan_canary)'] }
 missing_docs = "warn"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"

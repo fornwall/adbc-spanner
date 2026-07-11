@@ -43,6 +43,12 @@ jobs:
     #                  two ASan runtimes must match in one process; UBSan is dropped on this leg's C++
     #                  side (no -Zsanitizer=undefined cdylib equivalent, and the asan-ubsan leg already
     #                  carries full C-side UB coverage), keeping the runtime match to just ASan.
+    #                  This leg additionally runs a cross-boundary ASan CANARY before the suite (the
+    #                  run script builds the cdylib with --cfg asan_canary and calls an intentionally-
+    #                  out-of-bounds Rust symbol from a clang -fsanitize=address program against a
+    #                  C++-allocated buffer): if ASan does NOT report the heap-buffer-overflow the
+    #                  instrumentation is disarmed and the leg fails loudly, so a silent
+    #                  -Zsanitizer=address regression can't leave it green as a no-op.
     # fail-fast: false so one leg failing does not cancel the others.
     strategy:
       fail-fast: false

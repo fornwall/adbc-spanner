@@ -91,6 +91,18 @@ script resolves for you. Only `address` is supported — Rust has no `-Zsanitize
 equivalent, so this leg's C++ side carries just `address` (the `asan-ubsan` leg keeps full C-side
 UBSan coverage).
 
+**Canary (positive control).** A passing `rust-asan` leg on its own does not prove the Rust
+instrumentation is actually armed — a silent `-Zsanitizer=address` / `-Zbuild-std` regression would
+leave the suite green and give false confidence. So this mode also builds the cdylib with
+`--cfg asan_canary` (enabling `adbc_spanner_asan_canary`, an intentionally-out-of-bounds symbol in
+`src/asan_canary.rs`, present in no other build — a bare `--cfg` is not set by `cargo build` or even
+`--all-features`) and, before running the suite, compiles `asan_canary.cc` with clang
+`-fsanitize=address` and calls that symbol against a **C++-allocated** buffer: instrumented Rust
+writing one byte past C++-allocated heap. ASan must report a cross-boundary `heap-buffer-overflow`
+attributed to the Rust frame; if it does **not**, the cdylib is not ASan-armed and the run script
+**fails loudly** rather than passing as a no-op. The check runs right after the cdylib build (before
+the slow arrow-adbc build), so a disarmed leg fails fast.
+
 Notes:
 - **LeakSanitizer is disabled** (`ASAN_OPTIONS=detect_leaks=0`, set by the script): the driver's
   shared Tokio runtime, gRPC connection pools and lazy globals are intentionally process-lifetime
@@ -105,7 +117,8 @@ Notes:
 CI runs three legs — `plain`, `asan-ubsan` and `rust-asan` — (see
 `.github/workflows/adbc-validation.yml`) over the identical gate/expected-failure/stale checks. The
 `asan-ubsan` leg is a strict superset of `plain`; `rust-asan` adds the in-Rust memory-error coverage
-the C-side-only legs cannot provide.
+the C-side-only legs cannot provide, guarded by the cross-boundary ASan canary above so a
+silently-disarmed `rust-asan` leg goes red instead of green.
 
 ## What CI gates on
 

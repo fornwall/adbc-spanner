@@ -29,6 +29,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # `-fsanitize=address` to share the SAME LLVM compiler-rt ASan runtime as the instrumented cdylib
 # (a gcc libasan build would abort at startup when mixed). This CMakeLists needs no special handling
 # for that — it just honours SPANNER_VALIDATION_SANITIZE below; the compiler choice comes from CC/CXX.
+#
+# That rust-asan path also carries a positive control (a canary/tripwire): the run script additionally
+# builds the cdylib with `--cfg asan_canary` (enabling an intentionally-out-of-bounds Rust symbol,
+# src/asan_canary.rs) and, via adbc-validation/asan_canary.cc, calls it from a clang
+# `-fsanitize=address` program against a C++-allocated buffer — instrumented Rust writing one byte
+# past C++-allocated heap — asserting ASan reports the cross-boundary heap-buffer-overflow. If it does
+# NOT fire, the cdylib is not ASan-armed and the leg fails loudly instead of passing as a no-op. That
+# canary is an ad-hoc clang compile in the run script, deliberately NOT a CMake target here, so it
+# never perturbs this cached arrow-adbc build tree or its cache key.
 set(SPANNER_VALIDATION_SANITIZE ""
     CACHE STRING "comma-separated -fsanitize list for the C++ suite (e.g. address,undefined)")
 if(SPANNER_VALIDATION_SANITIZE)

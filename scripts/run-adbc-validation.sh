@@ -218,13 +218,60 @@ EXCLUDED_FILTER="$(IFS=:; printf '%s' "${EXCLUDED[*]}")"
 
 # ---------------------------------------------------------------------------
 
+# Cross-boundary ASan canary (rust-asan leg only). A *passing* rust-asan leg is no proof the Rust
+# instrumentation is armed: if the -Zsanitizer=address / -Zbuild-std wiring silently regressed (a
+# flag typo, a toolchain skew, an ABI mismatch that disarms rather than aborts) the suite would
+# still go green and give false confidence. So, before running the suite, call an
+# intentionally-out-of-bounds Rust symbol (adbc_spanner_asan_canary, compiled only under
+# --cfg asan_canary) from a clang -fsanitize=address C++ program against a buffer the C++ side
+# allocated — i.e. instrumented Rust writing one byte past C++-allocated heap, the exact
+# cross-boundary shape this leg exists to cover. ASan MUST report a heap-buffer-overflow; if it does
+# NOT, the cdylib is not ASan-armed and the whole leg is a no-op, so we fail loudly and go red.
+run_rust_asan_canary() {
+  local lib="$REPO_ROOT/target/$RUST_TARGET/debug/libadbc_spanner.so"
+  local src="$REPO_ROOT/adbc-validation/asan_canary.cc"
+  local bin="$BUILD_DIR/asan_canary"
+  mkdir -p "$BUILD_DIR"
+
+  echo ">> ASan canary: compiling the cross-boundary tripwire (${CXX:-clang++} -fsanitize=address)"
+  "${CXX:-clang++}" -std=c++17 -g -O0 -fsanitize=address -fno-omit-frame-pointer \
+    "$src" -o "$bin" -ldl
+
+  echo ">> ASan canary: running it against $lib (expecting a heap-buffer-overflow)"
+  # ASAN_OPTIONS carries abort_on_error=1, so a detected overflow aborts the process (non-zero
+  # exit); capture that rather than letting `set -e` kill the script before we can assert on it.
+  local out rc=0
+  out="$("$bin" "$lib" 2>&1)" || rc=$?
+
+  if [ "$rc" -ne 0 ] \
+      && printf '%s' "$out" | grep -q 'AddressSanitizer' \
+      && printf '%s' "$out" | grep -q 'heap-buffer-overflow'; then
+    echo ">> ASan canary OK: cross-boundary heap-buffer-overflow reported (exit $rc) — the cdylib IS ASan-armed"
+    printf '%s\n' "$out" | grep -E 'heap-buffer-overflow|adbc_spanner_asan_canary' | head -n 4 \
+      | sed 's/^/     /'
+    return 0
+  fi
+
+  echo "!! ASan canary did NOT trip — the Rust cdylib is not ASan-armed; the rust-asan leg is a no-op" >&2
+  echo "!! (a -Zsanitizer=address / -Zbuild-std regression would let real in-Rust memory bugs pass silently)" >&2
+  echo "!! canary exit=$rc; full output follows:" >&2
+  printf '%s\n' "$out" | sed 's/^/     /' >&2
+  return 1
+}
+
 build_harness() {
   if [ -n "$RUST_SANITIZE" ]; then
     # Nightly + build-std so the cdylib AND std are instrumented; the artifact lands under
-    # target/<triple>/debug/ because -Zbuild-std forces an explicit --target.
-    echo ">> building the adbc-spanner cdylib with -Zsanitizer=$RUST_SANITIZE (nightly, -Zbuild-std, --target $RUST_TARGET)"
-    RUSTFLAGS="-Zsanitizer=$RUST_SANITIZE ${RUSTFLAGS:-}" \
+    # target/<triple>/debug/ because -Zbuild-std forces an explicit --target. `--cfg asan_canary`
+    # additionally compiles the test-only ASan tripwire (src/asan_canary.rs) into THIS build only —
+    # a bare --cfg is set nowhere else (not by `cargo build`, not by `--all-features`), so the
+    # intentionally-out-of-bounds symbol never leaks into a shipped cdylib.
+    echo ">> building the adbc-spanner cdylib with -Zsanitizer=$RUST_SANITIZE (nightly, -Zbuild-std, --target $RUST_TARGET, --cfg asan_canary)"
+    RUSTFLAGS="-Zsanitizer=$RUST_SANITIZE --cfg asan_canary ${RUSTFLAGS:-}" \
       cargo +nightly build -Zbuild-std --target "$RUST_TARGET"
+    # Positive control: prove the freshly-built cdylib is ACTUALLY ASan-armed before running the
+    # (slow) suite, so a silently-disarmed leg fails fast here instead of going green as a no-op.
+    run_rust_asan_canary
   else
     echo ">> building the adbc-spanner cdylib"
     cargo build
