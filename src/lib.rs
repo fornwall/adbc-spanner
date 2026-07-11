@@ -474,7 +474,7 @@ pub const OPTION_ROWS_PER_BATCH: &str = "spanner.rows_per_batch";
 /// provisioned instance). The flag is baked into every partition descriptor, so a partition read
 /// back with [`Connection::read_partition`](adbc_core::Connection::read_partition) — on any
 /// connection or worker — honours it. Accepts a boolean; defaults to `false`.
-pub const OPTION_DATA_BOOST: &str = "spanner.data_boost_enabled";
+pub const OPTION_DATA_BOOST: &str = "spanner.data_boost";
 
 /// Driver-specific statement option: the maximum number of partitions to request from
 /// [`Statement::execute_partitions`](adbc_core::Statement::execute_partitions). This is a hint —

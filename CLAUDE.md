@@ -478,7 +478,7 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   `Partition::execute` on the connection's client, streaming rows to Arrow via the same
   `stream_query` path as `execute`. This works because the client's session is **multiplexed** and
   `Arc`-shared across the connection's cloned `DatabaseClient`s, so a descriptor stays valid after
-  the producing statement is gone. `spanner.data_boost_enabled` (statement option) bakes Data
+  the producing statement is gone. `spanner.data_boost` (statement option) bakes Data
   Boost into each descriptor; `spanner.max_partitions` hints the partition count. The emulator
   supports the Partition RPCs (it ignores Data Boost) — covered by `execute_partitions_round_trip` in
   `tests/integration.rs`. **Security caveat:** a descriptor is opaque but *executable* — its serde

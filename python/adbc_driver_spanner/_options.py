@@ -112,7 +112,7 @@ class StatementOptions(enum.Enum):
     #: Rows converted into each streamed Arrow ``RecordBatch`` (default ``8192``).
     ROWS_PER_BATCH = "spanner.rows_per_batch"
     #: ``"true"`` runs ``execute_partitions`` partitions on Data Boost.
-    DATA_BOOST_ENABLED = "spanner.data_boost_enabled"
+    DATA_BOOST = "spanner.data_boost"
     #: Hint for the maximum number of partitions from ``execute_partitions``.
     MAX_PARTITIONS = "spanner.max_partitions"
     #: Per-statement override of :attr:`ConnectionOptions.READ_STALENESS`.
