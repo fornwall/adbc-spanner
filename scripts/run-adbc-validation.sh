@@ -13,6 +13,12 @@
 #   SPANNER_EMULATOR_HOST=localhost:9010 scripts/run-adbc-validation.sh
 #   SPANNER_GCP_DATABASE=proj.inst.db scripts/run-adbc-validation.sh
 #
+# Two sanitizer knobs (see the SANITIZE / RUST_SANITIZE block below):
+#   ADBC_VALIDATION_SANITIZE=address,undefined scripts/run-adbc-validation.sh  # C++ side only
+#   ADBC_VALIDATION_SANITIZE=address ADBC_VALIDATION_RUST_SANITIZE=address \
+#     scripts/run-adbc-validation.sh   # + the Rust cdylib itself (nightly -Zsanitizer=address,
+#                                      #   C++ side auto-built with clang to match the runtime)
+#
 # The default (CI) path is driven by a single EXCLUDED list of the cases that are
 # known-not-passing / not-applicable to Spanner (documented in
 # adbc-validation/README.md), and runs three checks against it:
@@ -41,22 +47,52 @@ EMULATOR_DATABASE="projects/test-project/instances/test-instance/databases/adbc-
 
 # Optional sanitizers for the C++ side of the suite. Set e.g.
 # ADBC_VALIDATION_SANITIZE=address,undefined to build the harness + arrow-adbc +
-# driver manager with -fsanitize=... The Rust cdylib is loaded uninstrumented (see the
-# note in adbc-validation/CMakeLists.txt); ASan's process-wide malloc/free/memcpy
+# driver manager with -fsanitize=... By default the Rust cdylib is loaded uninstrumented (see
+# the note in adbc-validation/CMakeLists.txt); ASan's process-wide malloc/free/memcpy
 # interceptors still catch double-free / overflow / use-after-free on the C-ABI structs
 # the driver hands across the boundary.
 SANITIZE="${ADBC_VALIDATION_SANITIZE:-}"
 
+# Optionally instrument the Rust cdylib ITSELF with a sanitizer. Set
+# ADBC_VALIDATION_RUST_SANITIZE=address to build the cdylib with nightly Rust's
+# `-Zsanitizer=address` (plus `-Zbuild-std`, so the standard library is instrumented too —
+# otherwise ASan misreports std allocations), catching memory bugs *inside* Rust — out-of-bounds
+# stores, use-after-free on Rust-owned heap — that the C-side-only ASan above cannot see. Only
+# `address` is supported (Rust has no `-Zsanitizer=undefined` cdylib story). This REQUIRES
+# ADBC_VALIDATION_SANITIZE to include `address` too: the main C++ test executable must own the ASan
+# runtime, and both sides must share the SAME runtime — Rust's `-Zsanitizer=address` uses LLVM
+# compiler-rt ASan, so the C++ side must be compiled with clang (gcc's libasan is a different,
+# incompatible runtime that aborts at startup when mixed). We therefore default CC/CXX to clang
+# below when this is set (honouring an explicit CC/CXX if you export your own).
+RUST_SANITIZE="${ADBC_VALIDATION_RUST_SANITIZE:-}"
+
+# Host target triple. `-Zbuild-std` needs an explicit --target, which relocates the cdylib to
+# target/<triple>/debug/; resolved once here and reused for both the build and the library path.
+RUST_TARGET="$(rustc -vV | sed -n 's/host: //p')"
+
+# When instrumenting the Rust side, compile the C++ side with clang so both link the SAME
+# compiler-rt ASan runtime (mixing gcc's libasan with compiler-rt ASan in one process is unsound
+# and aborts at startup). Only default these — respect a caller-provided CC/CXX.
+if [ -n "$RUST_SANITIZE" ]; then
+  export CC="${CC:-clang}"
+  export CXX="${CXX:-clang++}"
+fi
+
 # Keep sanitized and plain build trees separate so switching between them doesn't force a
-# full arrow-adbc rebuild (and so a cached CI tree can't mix flags). Overridable as before.
-BUILD_DIR="${ADBC_VALIDATION_BUILD_DIR:-$REPO_ROOT/.adbc-validation-build${SANITIZE:+-san}}"
+# full arrow-adbc rebuild (and so a cached CI tree can't mix flags). The Rust-instrumented leg
+# additionally compiles the C++ side with a different compiler (clang vs gcc), so it needs its
+# own tree distinct from the C-side-only `-san` one. Overridable as before.
+build_suffix=""
+[ -n "$SANITIZE" ] && build_suffix="-san"
+[ -n "$RUST_SANITIZE" ] && build_suffix="-rustsan"
+BUILD_DIR="${ADBC_VALIDATION_BUILD_DIR:-$REPO_ROOT/.adbc-validation-build$build_suffix}"
 
 # Under sanitizers, disable LeakSanitizer: the driver's shared Tokio runtime, gRPC connection
 # pools and lazily-initialized globals are intentionally process-lifetime and would otherwise
-# swamp the run with non-actionable "leaks". Memory-error checks (ASan) and UB checks (UBSan)
-# stay fatal so a real bug fails the run. These are exported for both the build (gtest test
-# discovery runs the binary) and the run itself.
-if [ -n "$SANITIZE" ]; then
+# swamp the run with non-actionable "leaks" — even more so once the Rust side is instrumented too.
+# Memory-error checks (ASan) and UB checks (UBSan) stay fatal so a real bug fails the run. These
+# are exported for both the build (gtest test discovery runs the binary) and the run itself.
+if [ -n "$SANITIZE" ] || [ -n "$RUST_SANITIZE" ]; then
   export ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:${ASAN_OPTIONS:-}"
   export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1:${UBSAN_OPTIONS:-}"
 fi
@@ -182,12 +218,68 @@ EXCLUDED_FILTER="$(IFS=:; printf '%s' "${EXCLUDED[*]}")"
 
 # ---------------------------------------------------------------------------
 
+# Cross-boundary ASan canary (rust-asan leg only). A *passing* rust-asan leg is no proof the Rust
+# instrumentation is armed: if the -Zsanitizer=address / -Zbuild-std wiring silently regressed (a
+# flag typo, a toolchain skew, an ABI mismatch that disarms rather than aborts) the suite would
+# still go green and give false confidence. So, before running the suite, call an
+# intentionally-out-of-bounds Rust symbol (adbc_spanner_asan_canary, compiled only under
+# --cfg asan_canary) from a clang -fsanitize=address C++ program against a buffer the C++ side
+# allocated — i.e. instrumented Rust writing one byte past C++-allocated heap, the exact
+# cross-boundary shape this leg exists to cover. ASan MUST report a heap-buffer-overflow; if it does
+# NOT, the cdylib is not ASan-armed and the whole leg is a no-op, so we fail loudly and go red.
+run_rust_asan_canary() {
+  local lib="$REPO_ROOT/target/$RUST_TARGET/debug/libadbc_spanner.so"
+  local src="$REPO_ROOT/adbc-validation/asan_canary.cc"
+  local bin="$BUILD_DIR/asan_canary"
+  mkdir -p "$BUILD_DIR"
+
+  echo ">> ASan canary: compiling the cross-boundary tripwire (${CXX:-clang++} -fsanitize=address)"
+  "${CXX:-clang++}" -std=c++17 -g -O0 -fsanitize=address -fno-omit-frame-pointer \
+    "$src" -o "$bin" -ldl
+
+  echo ">> ASan canary: running it against $lib (expecting a heap-buffer-overflow)"
+  # ASAN_OPTIONS carries abort_on_error=1, so a detected overflow aborts the process (non-zero
+  # exit); capture that rather than letting `set -e` kill the script before we can assert on it.
+  local out rc=0
+  out="$("$bin" "$lib" 2>&1)" || rc=$?
+
+  if [ "$rc" -ne 0 ] \
+      && printf '%s' "$out" | grep -q 'AddressSanitizer' \
+      && printf '%s' "$out" | grep -q 'heap-buffer-overflow'; then
+    echo ">> ASan canary OK: cross-boundary heap-buffer-overflow reported (exit $rc) — the cdylib IS ASan-armed"
+    printf '%s\n' "$out" | grep -E 'heap-buffer-overflow|adbc_spanner_asan_canary' | head -n 4 \
+      | sed 's/^/     /'
+    return 0
+  fi
+
+  echo "!! ASan canary did NOT trip — the Rust cdylib is not ASan-armed; the rust-asan leg is a no-op" >&2
+  echo "!! (a -Zsanitizer=address / -Zbuild-std regression would let real in-Rust memory bugs pass silently)" >&2
+  echo "!! canary exit=$rc; full output follows:" >&2
+  printf '%s\n' "$out" | sed 's/^/     /' >&2
+  return 1
+}
+
 build_harness() {
-  echo ">> building the adbc-spanner cdylib"
-  cargo build
+  if [ -n "$RUST_SANITIZE" ]; then
+    # Nightly + build-std so the cdylib AND std are instrumented; the artifact lands under
+    # target/<triple>/debug/ because -Zbuild-std forces an explicit --target. `--cfg asan_canary`
+    # additionally compiles the test-only ASan tripwire (src/asan_canary.rs) into THIS build only —
+    # a bare --cfg is set nowhere else (not by `cargo build`, not by `--all-features`), so the
+    # intentionally-out-of-bounds symbol never leaks into a shipped cdylib.
+    echo ">> building the adbc-spanner cdylib with -Zsanitizer=$RUST_SANITIZE (nightly, -Zbuild-std, --target $RUST_TARGET, --cfg asan_canary)"
+    RUSTFLAGS="-Zsanitizer=$RUST_SANITIZE --cfg asan_canary ${RUSTFLAGS:-}" \
+      cargo +nightly build -Zbuild-std --target "$RUST_TARGET"
+    # Positive control: prove the freshly-built cdylib is ACTUALLY ASan-armed before running the
+    # (slow) suite, so a silently-disarmed leg fails fast here instead of going green as a no-op.
+    run_rust_asan_canary
+  else
+    echo ">> building the adbc-spanner cdylib"
+    cargo build
+  fi
 
   echo ">> building the ADBC validation harness (fetches arrow-adbc + googletest)"
-  [ -n "$SANITIZE" ] && echo ">> sanitizers: -fsanitize=$SANITIZE (C++ side; cdylib stays uninstrumented)"
+  [ -n "$SANITIZE" ] && echo ">> sanitizers: -fsanitize=$SANITIZE (C++ side${CC:+, CC=$CC CXX=$CXX})"
+  [ -n "$RUST_SANITIZE" ] && echo ">> cdylib is ASan-instrumented (Rust -Zsanitizer=$RUST_SANITIZE); C++ side shares its compiler-rt runtime"
   cmake -S "$REPO_ROOT/adbc-validation" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DSPANNER_VALIDATION_SANITIZE="$SANITIZE" >/dev/null
@@ -356,8 +448,14 @@ else
   export ADBC_SPANNER_DATABASE="projects/$p/instances/$i/databases/$d"
 fi
 
-export ADBC_SPANNER_LIBRARY="$REPO_ROOT/target/debug/libadbc_spanner.so"
-[ -f "$ADBC_SPANNER_LIBRARY" ] || ADBC_SPANNER_LIBRARY="$REPO_ROOT/target/debug/libadbc_spanner.dylib"
+# The instrumented leg builds with an explicit --target, so its artifact lives under
+# target/<triple>/debug/ rather than target/debug/.
+if [ -n "$RUST_SANITIZE" ]; then
+  export ADBC_SPANNER_LIBRARY="$REPO_ROOT/target/$RUST_TARGET/debug/libadbc_spanner.so"
+else
+  export ADBC_SPANNER_LIBRARY="$REPO_ROOT/target/debug/libadbc_spanner.so"
+  [ -f "$ADBC_SPANNER_LIBRARY" ] || ADBC_SPANNER_LIBRARY="$REPO_ROOT/target/debug/libadbc_spanner.dylib"
+fi
 
 echo ">> ADBC_SPANNER_LIBRARY=$ADBC_SPANNER_LIBRARY"
 echo ">> ADBC_SPANNER_DATABASE=$ADBC_SPANNER_DATABASE"

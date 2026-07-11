@@ -26,25 +26,46 @@ jobs:
     name: validation (${{ matrix.name }})
     runs-on: ubuntu-latest
 
-    # Two legs over the SAME gate/expected-failure/stale checks:
+    # Three legs over the SAME gate/expected-failure/stale checks:
     #   - plain      — fast, uninstrumented (the original run).
-    #   - asan-ubsan — the whole C++ side built with -fsanitize=address,undefined, driving the
+    #   - asan-ubsan — the whole C++ side built with gcc -fsanitize=address,undefined, driving the
     #                  (uninstrumented, stable) cdylib. ASan's process-wide malloc/free/memcpy
     #                  interceptors catch double-free / overflow / use-after-free on the C-ABI
     #                  structs the driver hands across the FFI boundary (release callbacks,
-    #                  AdbcError private_data), plus UB in the C/C++ code. It is a strict superset
-    #                  of the plain checks, so once it has proven stable the plain leg can be
-    #                  dropped to reclaim CI time; kept for now as the quick signal and to isolate
-    #                  any sanitizer/runtime surprises from the existing gate.
-    # fail-fast: false so one leg failing does not cancel the other.
+    #                  AdbcError private_data), plus UB in the C/C++ code. This catches only bugs
+    #                  that reach a libc-allocator interceptor at the boundary.
+    #   - rust-asan  — the cdylib ITSELF built with nightly Rust's -Zsanitizer=address (+ -Zbuild-std
+    #                  so std is instrumented too), driven by a clang -fsanitize=address C++ side.
+    #                  This is the piece the asan-ubsan leg cannot do: it catches memory bugs *inside*
+    #                  Rust (out-of-bounds store, use-after-free on Rust-owned heap) that never touch
+    #                  a malloc/free interceptor. The C++ side is built with clang (not the gcc
+    #                  default) because Rust's -Zsanitizer=address uses LLVM compiler-rt ASan and the
+    #                  two ASan runtimes must match in one process; UBSan is dropped on this leg's C++
+    #                  side (no -Zsanitizer=undefined cdylib equivalent, and the asan-ubsan leg already
+    #                  carries full C-side UB coverage), keeping the runtime match to just ASan.
+    #                  This leg additionally runs a cross-boundary ASan CANARY before the suite (the
+    #                  run script builds the cdylib with --cfg asan_canary and calls an intentionally-
+    #                  out-of-bounds Rust symbol from a clang -fsanitize=address program against a
+    #                  C++-allocated buffer): if ASan does NOT report the heap-buffer-overflow the
+    #                  instrumentation is disarmed and the leg fails loudly, so a silent
+    #                  -Zsanitizer=address regression can't leave it green as a no-op.
+    # fail-fast: false so one leg failing does not cancel the others.
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: plain
             sanitize: ""
+            rust-sanitize: ""
+            toolchain: stable
           - name: asan-ubsan
             sanitize: address,undefined
+            rust-sanitize: ""
+            toolchain: stable
+          - name: rust-asan
+            sanitize: address
+            rust-sanitize: address
+            toolchain: nightly
 
     # A Spanner emulator to validate against, same as the main CI job.
     services:
@@ -56,22 +77,44 @@ jobs:
 
     env:
       SPANNER_EMULATOR_HOST: localhost:9010
-      # Forwarded to scripts/run-adbc-validation.sh → -DSPANNER_VALIDATION_SANITIZE. Empty for the
-      # plain leg. Distinct build dir per leg so the two flag sets never share a cache/tree.
+      # Forwarded to scripts/run-adbc-validation.sh → -DSPANNER_VALIDATION_SANITIZE (C++ side).
+      # Empty for the plain leg. Distinct build dir per leg so the flag sets never share a cache/tree.
       ADBC_VALIDATION_SANITIZE: ${{ matrix.sanitize }}
+      # Non-empty (address) only on the rust-asan leg: instruments the cdylib itself via nightly
+      # -Zsanitizer=address, and makes the script build the C++ side with clang for runtime matching.
+      ADBC_VALIDATION_RUST_SANITIZE: ${{ matrix.rust-sanitize }}
       ADBC_VALIDATION_BUILD_DIR: ${{ github.workspace }}/.adbc-validation-build-${{ matrix.name }}
 
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust toolchain
-        # Third-party actions are pinned to a commit SHA (first-party actions/* stay on their
-        # major tag) — a hijacked mutable tag would otherwise run in CI with repo read access.
-        # dtolnay/rust-toolchain reads the toolchain from its ref name, so pinning the SHA
-        # requires selecting the toolchain explicitly below.
+      # Two toolchain steps, one per matrix leg, so each can pin its OWN dtolnay/rust-toolchain
+      # SHA (the action reads the toolchain from its ref name, so the SHA and the requested
+      # toolchain must agree). Third-party actions are pinned to a commit SHA (first-party
+      # actions/* stay on their major tag) — a hijacked mutable tag would otherwise run in CI
+      # with repo read access. Expressions are deliberately NOT used in `uses:` (support is
+      # patchy); a plain `if:` per leg keeps the SHA a literal.
+      - name: Install Rust toolchain (stable)
+        if: matrix.toolchain == 'stable'
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch, 2026-06-30
         with:
           toolchain: stable
+
+      - name: Install Rust toolchain (nightly, for the -Zsanitizer=address cdylib)
+        # The rust-asan leg needs nightly for -Zsanitizer=address / -Zbuild-std, plus the rust-src
+        # component so build-std can recompile+instrument the standard library.
+        if: matrix.toolchain == 'nightly'
+        uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae # nightly branch, 2026-07-10
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      # Rust's -Zsanitizer=address links LLVM compiler-rt ASan; the C++ side must therefore be
+      # built with clang so both share ONE runtime (gcc's libasan would abort at startup when
+      # mixed). The run script defaults CC/CXX to clang when ADBC_VALIDATION_RUST_SANITIZE is set.
+      - name: Install clang (compiler-rt ASan, to match the instrumented cdylib)
+        if: matrix.rust-sanitize != ''
+        run: sudo apt-get update && sudo apt-get install -y clang
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
@@ -93,8 +136,9 @@ jobs:
       # Persist the C++ validation build tree (fetched + compiled arrow-adbc and
       # GoogleTest under .adbc-validation-build, plus our own harness objects) so the
       # slow FetchContent clone + compile is reused across runs. The key is bound to
-      # the runner OS, the matrix leg (plain vs asan-ubsan build the same sources with
-      # different flags, so they must NOT share a tree) and a hash of
+      # the runner OS, the matrix leg (plain / asan-ubsan / rust-asan build the same sources
+      # with different flags — and rust-asan with a different compiler, clang vs gcc — so they
+      # must NOT share a tree) and a hash of
       # adbc-validation/CMakeLists.txt — which carries the pinned ARROW_ADBC_TAG and every
       # CMake/toolchain flag — so bumping the arrow-adbc rev (or any build flag) mints a fresh key.
       #

@@ -102,6 +102,11 @@
 #![deny(unsafe_code)]
 #![cfg_attr(not(feature = "ffi"), forbid(unsafe_code))]
 
+// Test-only ASan tripwire, compiled ONLY under `--cfg asan_canary` (the validation suite's
+// `rust-asan` leg). Absent from every normal build — see the module docs.
+#[cfg(asan_canary)]
+mod asan_canary;
+
 mod bind;
 mod connection;
 mod conversion;

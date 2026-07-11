@@ -16,15 +16,28 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ADBC_VALIDATION_SANITIZE). The flags are added *before* FetchContent below so the fetched
 # arrow-adbc sources inherit them too.
 #
-# The Rust cdylib itself is NOT instrumented — it is built separately by cargo (stable) and
-# dlopen-loaded by the driver manager. That still catches the memory bugs that matter at the C
-# ABI boundary: ASan's malloc/free/memcpy interceptors are process-wide, and Rust's default
+# In the common case the Rust cdylib itself is NOT instrumented — it is built separately by cargo
+# (stable) and dlopen-loaded by the driver manager. That still catches the memory bugs that matter
+# at the C ABI boundary: ASan's malloc/free/memcpy interceptors are process-wide, and Rust's default
 # allocator is libc malloc, so double-free / heap-overflow / use-after-free on the C-ABI structs
 # shared across the boundary (ArrowArray/ArrowSchema release callbacks, AdbcError private_data)
 # are reported — with symbolized Rust frames — even though the cdylib is uninstrumented. Errors
-# that never touch an interceptor (a plain out-of-bounds store inside Rust) would need a nightly
-# `-Zsanitizer=address` cdylib build, which is out of scope here (cargo-fuzz already ASan-covers
-# the offline parser paths).
+# that never touch an interceptor (a plain out-of-bounds store inside Rust) are NOT visible this way.
+#
+# The run script's rust-asan path closes that gap: it builds the cdylib itself with nightly Rust's
+# `-Zsanitizer=address` (+ `-Zbuild-std`), so this CMake side is compiled with clang (CC/CXX) and
+# `-fsanitize=address` to share the SAME LLVM compiler-rt ASan runtime as the instrumented cdylib
+# (a gcc libasan build would abort at startup when mixed). This CMakeLists needs no special handling
+# for that — it just honours SPANNER_VALIDATION_SANITIZE below; the compiler choice comes from CC/CXX.
+#
+# That rust-asan path also carries a positive control (a canary/tripwire): the run script additionally
+# builds the cdylib with `--cfg asan_canary` (enabling an intentionally-out-of-bounds Rust symbol,
+# src/asan_canary.rs) and, via adbc-validation/asan_canary.cc, calls it from a clang
+# `-fsanitize=address` program against a C++-allocated buffer — instrumented Rust writing one byte
+# past C++-allocated heap — asserting ASan reports the cross-boundary heap-buffer-overflow. If it does
+# NOT fire, the cdylib is not ASan-armed and the leg fails loudly instead of passing as a no-op. That
+# canary is an ad-hoc clang compile in the run script, deliberately NOT a CMake target here, so it
+# never perturbs this cached arrow-adbc build tree or its cache key.
 set(SPANNER_VALIDATION_SANITIZE ""
     CACHE STRING "comma-separated -fsanitize list for the C++ suite (e.g. address,undefined)")
 if(SPANNER_VALIDATION_SANITIZE)
