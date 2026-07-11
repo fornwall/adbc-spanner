@@ -338,7 +338,7 @@ Everything tunable is an **option** — a string key/value set on one of the fou
   `adbc.connection.readonly`, `adbc.statement.bind_by_name`. These mean the same thing on every
   ADBC driver.
 - **Spanner-specific options** use the `spanner.*` prefix — e.g. `spanner.read.staleness`,
-  `spanner.request.priority`, `spanner.max_commit_delay`.
+  `spanner.request.priority`, `spanner.commit.max_delay`.
 - Options set on a higher object are inherited as **defaults** by lower ones (connection → statement),
   and can be overridden lower down. Setting an option to `""` typically unsets it.
 - Most options **round-trip**: `get_option` reads back what you set.

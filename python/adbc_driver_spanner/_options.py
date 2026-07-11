@@ -89,7 +89,7 @@ class ConnectionOptions(enum.Enum):
     #: Query optimizer statistics package.
     QUERY_OPTIMIZER_STATISTICS_PACKAGE = "spanner.query.optimizer_statistics_package"
     #: Maximum commit delay (``0..=500ms``) Spanner may add to batch commits.
-    MAX_COMMIT_DELAY = "spanner.max_commit_delay"
+    MAX_COMMIT_DELAY = "spanner.commit.max_delay"
     #: Overall deadline (seconds) on a query's initial execution; ``0`` disables.
     RPC_TIMEOUT_QUERY = "spanner.rpc.timeout_seconds.query"
     #: Overall deadline (seconds) on each write operation; ``0`` disables.
@@ -114,7 +114,7 @@ class StatementOptions(enum.Enum):
     #: ``"true"`` runs ``execute_partitions`` partitions on Data Boost.
     DATA_BOOST = "spanner.data_boost"
     #: Hint for the maximum number of partitions from ``execute_partitions``.
-    MAX_PARTITIONS = "spanner.max_partitions"
+    MAX_PARTITIONS = "spanner.partition.max_count"
     #: Per-statement override of :attr:`ConnectionOptions.READ_STALENESS`.
     READ_STALENESS = "spanner.read.staleness"
     #: Per-statement override of :attr:`ConnectionOptions.READ_TIMESTAMP`.
@@ -128,7 +128,7 @@ class StatementOptions(enum.Enum):
     #: Per-statement override of :attr:`ConnectionOptions.DIRECTED_READ`.
     DIRECTED_READ = "spanner.directed_read"
     #: Per-statement override of :attr:`ConnectionOptions.MAX_COMMIT_DELAY`.
-    MAX_COMMIT_DELAY = "spanner.max_commit_delay"
+    MAX_COMMIT_DELAY = "spanner.commit.max_delay"
     #: Per-statement override of :attr:`ConnectionOptions.QUERY_OPTIMIZER_VERSION`.
     QUERY_OPTIMIZER_VERSION = "spanner.query.optimizer_version"
     #: Per-statement override of :attr:`ConnectionOptions.QUERY_OPTIMIZER_STATISTICS_PACKAGE`.

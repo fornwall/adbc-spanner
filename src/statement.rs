@@ -158,7 +158,7 @@ pub struct SpannerStatement {
     /// Enable Data Boost for partitioned execution (`spanner.data_boost`).
     data_boost: bool,
     /// Maximum number of partitions to request from `execute_partitions`
-    /// (`spanner.max_partitions`); `None` lets Spanner choose.
+    /// (`spanner.partition.max_count`); `None` lets Spanner choose.
     max_partitions: Option<i64>,
     /// Read staleness / timestamp bound for this statement's read-only queries
     /// (`spanner.read.staleness` / `spanner.read.timestamp`), inherited from the connection at
@@ -759,7 +759,7 @@ impl SpannerStatement {
     /// already-committed-rows annotation by the caller ([`run_ingest_mutations`](Self::run_ingest_mutations)).
     ///
     /// BatchWrite carries no per-request commit options and its response has no commit statistics,
-    /// so `spanner.request.priority` / `spanner.request.tag` / `spanner.max_commit_delay` /
+    /// so `spanner.request.priority` / `spanner.request.tag` / `spanner.commit.max_delay` /
     /// `spanner.commit_stats` do not apply on this path (documented on
     /// [`OPTION_INGEST_BATCH_WRITE`](crate::OPTION_INGEST_BATCH_WRITE)).
     fn batch_write_chunk(&self, mutations: Vec<Mutation>) -> Result<i64> {

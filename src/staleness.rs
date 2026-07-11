@@ -248,7 +248,7 @@ pub(crate) fn parse_timestamp(value: &str) -> Result<ReadBound> {
 }
 
 /// Parse a non-negative duration with an optional unit suffix (`s` default, `ms`, `us`/`µs`, `ns`,
-/// `m`, `h`). Shared with the `spanner.max_commit_delay` option (see [`crate::request`]).
+/// `m`, `h`). Shared with the `spanner.commit.max_delay` option (see [`crate::request`]).
 pub(crate) fn parse_duration(value: &str) -> Result<Duration> {
     let bad = || invalid_argument(format!("invalid staleness duration {value:?}"));
     // Order matters: check the two-letter suffixes before the single-letter ones.

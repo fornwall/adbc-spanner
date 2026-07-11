@@ -479,7 +479,7 @@ pub const OPTION_DATA_BOOST: &str = "spanner.data_boost";
 /// Driver-specific statement option: the maximum number of partitions to request from
 /// [`Statement::execute_partitions`](adbc_core::Statement::execute_partitions). This is a hint —
 /// Spanner may return fewer. Accepts a positive integer; unset lets Spanner choose.
-pub const OPTION_MAX_PARTITIONS: &str = "spanner.max_partitions";
+pub const OPTION_MAX_PARTITIONS: &str = "spanner.partition.max_count";
 
 /// Statement option controlling how bound Arrow columns pair with the query's `@name` parameters,
 /// following the ADBC SQLite reference driver's `bind_by_name` convention
@@ -530,7 +530,7 @@ pub const OPTION_INGEST_PRIMARY_KEY: &str = "spanner.ingest.primary_key";
 /// Only affects **autocommit** ingests. In manual-transaction mode ingests buffer their mutations
 /// and commit atomically with the surrounding transaction, so BatchWrite does not apply there and
 /// this flag is ignored. Because `BatchWrite` takes no per-request commit options, the
-/// `spanner.request.priority` / `spanner.request.tag` / `spanner.max_commit_delay` /
+/// `spanner.request.priority` / `spanner.request.tag` / `spanner.commit.max_delay` /
 /// `spanner.commit_stats` settings are **not** applied on this path (and `spanner.commit_stats`
 /// consequently reports no `mutation_count` for a BatchWrite ingest).
 ///
@@ -772,7 +772,7 @@ pub const OPTION_TRANSACTION_TAG: &str = "spanner.transaction.tag";
 /// with [`Status::InvalidArguments`](adbc_core::error::Status::InvalidArguments)). `0` means no
 /// delay; an empty string unsets it. Round-trips through `get_option`. Set on a connection it
 /// becomes the default for statements it creates; a statement may override it.
-pub const OPTION_MAX_COMMIT_DELAY: &str = "spanner.max_commit_delay";
+pub const OPTION_MAX_COMMIT_DELAY: &str = "spanner.commit.max_delay";
 
 /// Driver-specific connection **and** statement option: whether to request Spanner return **commit
 /// statistics** for the read/write commits the driver builds (see Spanner's
