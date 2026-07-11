@@ -43,7 +43,8 @@
 /// performs an out-of-bounds write at offset `len`, which is undefined behaviour by construction —
 /// that is the whole point of the tripwire, and why it is quarantined behind `--cfg asan_canary`.
 #[unsafe(no_mangle)]
-#[allow(unsafe_code)] // Deliberate out-of-bounds write; the crate-wide deny is overridden here only.
+#[allow(unsafe_code)]
+// Deliberate out-of-bounds write; the crate-wide deny is overridden here only.
 // Exported as a C symbol via `#[no_mangle]`, so `pub` is required even though the module is private
 // and the lint cannot see the FFI export.
 #[allow(unreachable_pub)]
