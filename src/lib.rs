@@ -437,6 +437,30 @@ pub const OPTION_IMPERSONATE_LIFETIME: &str = "spanner.impersonate.lifetime";
 /// also conflicts with emulator mode (which forces anonymous credentials).
 pub const OPTION_ACCESS_TOKEN: &str = "spanner.access_token";
 
+/// Driver-specific database option: the **quota / billing project** charged for Spanner API usage,
+/// decoupled from the project that owns the data.
+///
+/// On Google Cloud, the project billed for API quota (sent as the `x-goog-user-project` request
+/// header) can differ from the project that owns the resource. This is needed when a credential's
+/// home project differs from the target project, or in resource-sharing setups; the caller must hold
+/// `serviceusage.services.use` on the quota project. Mirrors the BigQuery ADBC driver's
+/// `bigquery.auth.quota_project` (and gcloud's `--billing-project`).
+///
+/// The value is attached to whichever credentials are in effect via
+/// `google-cloud-auth`'s `with_quota_project_id` (for the Application Default Credentials, keyfile,
+/// and impersonation paths) or as the `x-goog-user-project` header directly (for the
+/// [`OPTION_ACCESS_TOKEN`] path), so it composes with every non-emulator credential source. It is
+/// **not** a secret (a bare project id), so it round-trips through `get_option` verbatim, and `""`
+/// unsets it.
+///
+/// It is refused in emulator mode (which forces anonymous credentials and would silently ignore it),
+/// like the keyfile / access-token / impersonation options. End-to-end billing behaviour can only be
+/// observed against a real project, not the emulator.
+///
+/// Note: if the `GOOGLE_CLOUD_QUOTA_PROJECT` environment variable is set, the underlying auth library
+/// gives it precedence over this option.
+pub const OPTION_QUOTA_PROJECT: &str = "spanner.auth.quota_project";
+
 /// Driver-specific statement option: the number of rows converted into each Arrow
 /// [`RecordBatch`](arrow_array::RecordBatch) streamed by
 /// [`Statement::execute`](adbc_core::Statement::execute). Larger batches trade memory for fewer
@@ -832,6 +856,8 @@ mod options_doc_tests {
             crate::OPTION_IMPERSONATE_DELEGATES,
             crate::OPTION_IMPERSONATE_SCOPES,
             crate::OPTION_IMPERSONATE_LIFETIME,
+            crate::OPTION_ACCESS_TOKEN,
+            crate::OPTION_QUOTA_PROJECT,
             crate::OPTION_ROWS_PER_BATCH,
             crate::OPTION_DATA_BOOST,
             crate::OPTION_MAX_PARTITIONS,

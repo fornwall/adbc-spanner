@@ -284,6 +284,22 @@ authenticates as that target. The option group follows gcloud's `--impersonate-s
   `cloud-platform` scope.
 - `spanner.impersonate.lifetime` — optional token lifetime in seconds; defaults to `3600` (one hour).
 
+#### Quota / billing project
+
+Setting `spanner.auth.quota_project` charges the named project for Spanner API quota — sent as the
+`x-goog-user-project` request header — while the data stays owned by whatever project the database
+path names. This is needed when the credential's home project differs from the target project, or in
+resource-sharing setups; the caller must hold `serviceusage.services.use` on the quota project. It
+mirrors the BigQuery ADBC driver's `bigquery.auth.quota_project` (and gcloud's `--billing-project`).
+
+The value is attached to whichever credentials are in effect (Application Default Credentials,
+`spanner.keyfile`/`spanner.keyfile_json`, impersonation, or `spanner.access_token`), so it composes
+with every credential path. It is a bare project id — not a secret — so it round-trips through
+`get_option`, and `""` unsets it. It is refused in emulator mode (which forces anonymous credentials
+and ignores billing), like the credential options. If the `GOOGLE_CLOUD_QUOTA_PROJECT` environment
+variable is set, the underlying auth library gives it precedence over this option. End-to-end billing
+behaviour can only be observed against a real project, not the emulator.
+
 ## Type mapping
 
 | Spanner type                                | Arrow type                        |

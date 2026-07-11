@@ -377,7 +377,17 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   cloud-platform], `spanner.impersonate.lifetime` [seconds, default 3600] — layered on top of the
   base credentials via `google-cloud-auth`'s `impersonated::Builder::from_source_credentials`,
   the `impersonate.*` naming following gcloud's `--impersonate-service-account` / that builder — NOT
-  the ADBC BigQuery driver, which has no impersonation options), and request priority / tags
+  the ADBC BigQuery driver, which has no impersonation options), quota / billing project
+  (`spanner.auth.quota_project` — a database-level option decoupling the project charged for API
+  quota [the `x-goog-user-project` header] from the data-owning project, mirroring BigQuery's
+  `bigquery.auth.quota_project` / gcloud's `--billing-project`; `""` unsets, round-trips via
+  `get_option`, rendered un-redacted in `Debug` [a project id, not a secret]; attached via
+  `google-cloud-auth`'s `with_quota_project_id` on the ADC / keyfile / impersonation credential
+  builders [the impersonated builder wins over its source] and as the `x-goog-user-project` header
+  directly on the `StaticTokenCredentials` access-token path, so it composes with every non-emulator
+  credential source; refused in emulator mode like the credential options [the keyfile-guard
+  pattern]; `GOOGLE_CLOUD_QUOTA_PROJECT` env var takes precedence in the auth lib; end-to-end billing
+  only observable against a real project, not the emulator), and request priority / tags
   (`spanner.request.priority` [`low`/`medium`/`high`] and `spanner.request.tag` at connection +
   statement level [statement inherits, then overrides; `""` unsets — the staleness pattern],
   `spanner.transaction.tag` connection-only; parsed/applied via `RequestConfig` in `src/request.rs`
