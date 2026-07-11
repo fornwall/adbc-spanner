@@ -18,7 +18,7 @@
 //! - [`OPTION_TRANSACTION_TAG`](crate::OPTION_TRANSACTION_TAG) (`spanner.transaction.tag`) — a
 //!   free-form per-transaction tag, applied wherever a read/write transaction runner is built
 //!   (autocommit DML, the manual-mode commit, ingest commits). Connection level only.
-//! - [`OPTION_MAX_COMMIT_DELAY`](crate::OPTION_MAX_COMMIT_DELAY) (`spanner.max_commit_delay`) — the
+//! - [`OPTION_MAX_COMMIT_DELAY`](crate::OPTION_MAX_COMMIT_DELAY) (`spanner.commit.max_delay`) — the
 //!   maximum amount of time Spanner may delay a **commit** to batch it with others (a
 //!   throughput-for-latency trade-off). A duration in `0..=500ms`, applied at every read/write
 //!   commit site the runner / write-only builders cover (autocommit DML, the `ExecuteBatchDml`
@@ -111,7 +111,7 @@ pub(crate) struct RequestConfig {
     request_tag: Option<String>,
     /// Raw `spanner.transaction.tag` value, when set (connection-level only).
     transaction_tag: Option<String>,
-    /// Parsed `spanner.max_commit_delay`, with the raw option string kept for `get_option`
+    /// Parsed `spanner.commit.max_delay`, with the raw option string kept for `get_option`
     /// round-trip. Applied as the commit delay wherever a read/write commit is built.
     max_commit_delay: Option<(String, Duration)>,
     /// `spanner.commit_stats`: whether to request Spanner return commit statistics on the read/write
@@ -144,7 +144,7 @@ impl RequestConfig {
         Ok(())
     }
 
-    /// Handle a `set_option` for `spanner.max_commit_delay`. An empty value unsets it; a malformed
+    /// Handle a `set_option` for `spanner.commit.max_delay`. An empty value unsets it; a malformed
     /// value or one outside `0..=500ms` is rejected with `InvalidArguments`.
     pub(crate) fn set_max_commit_delay(&mut self, value: OptionValue) -> Result<()> {
         let raw = as_string(value)?;
@@ -197,7 +197,7 @@ impl RequestConfig {
         self.transaction_tag.as_deref()
     }
 
-    /// The raw `spanner.max_commit_delay` value, for `get_option` round-trip.
+    /// The raw `spanner.commit.max_delay` value, for `get_option` round-trip.
     pub(crate) fn max_commit_delay_string(&self) -> Option<&str> {
         self.max_commit_delay.as_ref().map(|(raw, _)| raw.as_str())
     }
@@ -304,13 +304,13 @@ impl CommitStats {
     }
 }
 
-/// Parse a `spanner.max_commit_delay` value: a duration (the staleness duration grammar — `s`
+/// Parse a `spanner.commit.max_delay` value: a duration (the staleness duration grammar — `s`
 /// default, `ms`, `us`/`µs`, `ns`, `m`, `h`) that must fall within Spanner's `0..=500ms` range.
 pub(crate) fn parse_max_commit_delay(value: &str) -> Result<Duration> {
     let duration = parse_duration(value)?;
     if duration > MAX_COMMIT_DELAY_CAP {
         return Err(invalid_argument(format!(
-            "spanner.max_commit_delay {value:?} exceeds Spanner's maximum of 500ms"
+            "spanner.commit.max_delay {value:?} exceeds Spanner's maximum of 500ms"
         )));
     }
     Ok(duration)

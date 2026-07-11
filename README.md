@@ -64,7 +64,7 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   `<location>`, `<location>:<type>` or `:<type>` (`<type>` is `read_write`/`read_only`/`any`), plus an
   optional `;auto_failover_disabled` on `include`. E.g. `include:us-east1:read_only,us-east4`. Applies
   to queries only (Spanner rejects directed reads on writes); see [docs/options.md](docs/options.md#directed-reads).
-- Commit batching: `spanner.max_commit_delay` sets the [maximum commit delay](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions)
+- Commit batching: `spanner.commit.max_delay` sets the [maximum commit delay](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions)
   Spanner may add to a read/write commit so it can batch it with others (trading a little latency for
   throughput). It applies at every read/write commit the driver builds — autocommit DML, the
   `ExecuteBatchDml` batch runner, the manual-mode commit, and the bulk-ingest write-only transaction
@@ -75,7 +75,7 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   `get_option`.
 - Commit statistics: `spanner.commit_stats` (a boolean, default `false`) requests Spanner return
   [commit statistics](https://docs.cloud.google.com/spanner/docs/commit-statistics) on the read/write
-  commits the driver builds (the same four sites as `spanner.max_commit_delay`). When enabled, the
+  commits the driver builds (the same four sites as `spanner.commit.max_delay`). When enabled, the
   **mutation count** of the most recent commit is captured and read back via
   `spanner.commit_stats.mutation_count` (`get_option` / `get_option_int`) — on the statement for
   autocommit DML and bulk ingest, on the connection for a manual-mode commit; it is `NotFound` until
@@ -156,7 +156,7 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   transaction (insert/count/error semantics and chunking preserved; BatchWrite applies its mutation
   groups non-atomically). It only affects autocommit ingests — a manual transaction ignores it and
   still buffers and commits atomically — and, since BatchWrite carries no per-request commit options,
-  the priority / request-tag / `max_commit_delay` / `commit_stats` options do not apply on that path.
+  the priority / request-tag / `commit.max_delay` / `commit_stats` options do not apply on that path.
 - Metadata: `get_table_types()`, `get_table_schema()`, and `get_objects()` (catalog/schema/table/
   column introspection from `INFORMATION_SCHEMA`; columns report the Spanner-native type, e.g.
   `STRING(MAX)`, as `xdbc_type_name`).
@@ -171,7 +171,7 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   partitions via Spanner's `PartitionQuery` API, each serialized as a self-contained opaque ADBC
   descriptor, and `Connection::read_partition()` streams one partition's rows back as Arrow.
   `spanner.data_boost` bakes [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview)
-  into the descriptors; `spanner.max_partitions` hints the partition count.
+  into the descriptors; `spanner.partition.max_count` hints the partition count.
 - [Change streams](https://cloud.google.com/spanner/docs/change-streams) work through the driver's
   ordinary SQL paths — no dedicated support is needed. `CREATE CHANGE STREAM … FOR <table>` /
   `DROP CHANGE STREAM` run through the DDL path like any other DDL; the stream is introspectable via

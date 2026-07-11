@@ -123,7 +123,7 @@ def test_execute_partitions_round_trip(emulator_database):
             cur.adbc_statement.set_options(
                 **{
                     "spanner.data_boost": "true",
-                    "spanner.max_partitions": "4",
+                    "spanner.partition.max_count": "4",
                 }
             )
             # A single-table scan is partitionable (no ORDER BY: not partitionable).

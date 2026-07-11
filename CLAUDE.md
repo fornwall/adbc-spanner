@@ -146,7 +146,7 @@ touch *every* location for that family in lockstep:
   `google-cloud-spanner`, `google-cloud-auth`, `google-cloud-lro`, `google-cloud-gax` (this last
   names `rpc::StatusDetails` so `from_spanner` can forward `google.rpc.Status` details),
   `google-cloud-wkt` (names the `Duration` type `set_max_commit_delay` takes for
-  `spanner.max_commit_delay`).
+  `spanner.commit.max_delay`).
 - `Cargo.toml` `[dev-dependencies]` — arrow-adbc: `adbc_driver_manager`; google-cloud:
   `google-cloud-spanner-admin-instance-v1`, `google-cloud-spanner-admin-database-v1`,
   `spanner-grpc-mock` (the mock-server harness of `tests/mock_spanner.rs`;
@@ -404,7 +404,7 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   reads] feeds the main `execute` query, the bound-query path, `execute_partitions`, and the
   `execute_schema` PLAN probe; DML/DDL keep the plain `sql_builder` since Spanner rejects directed
   reads on a read/write transaction), commit
-  batching (`spanner.max_commit_delay` at connection + statement level [statement inherits, then
+  batching (`spanner.commit.max_delay` at connection + statement level [statement inherits, then
   overrides; `""` unsets — the staleness pattern; a duration in `0..=500ms` parsed with the shared
   `staleness::parse_duration` grammar, out-of-range/malformed → `InvalidArguments`; round-trips via
   `get_option`] — stored on `RequestConfig` in `src/request.rs` and applied as the client's
@@ -479,7 +479,7 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   `stream_query` path as `execute`. This works because the client's session is **multiplexed** and
   `Arc`-shared across the connection's cloned `DatabaseClient`s, so a descriptor stays valid after
   the producing statement is gone. `spanner.data_boost` (statement option) bakes Data
-  Boost into each descriptor; `spanner.max_partitions` hints the partition count. The emulator
+  Boost into each descriptor; `spanner.partition.max_count` hints the partition count. The emulator
   supports the Partition RPCs (it ignores Data Boost) — covered by `execute_partitions_round_trip` in
   `tests/integration.rs`. **Security caveat:** a descriptor is opaque but *executable* — its serde
   JSON carries the SQL text plus session/transaction identity, so `read_partition` runs whatever it

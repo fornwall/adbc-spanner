@@ -115,7 +115,7 @@ are handy from Python:
 | `adbc.connection.readonly` | connection | `"true"` rejects all writes on the connection (see below); queries still run.                 |
 | `spanner.read.staleness`   | conn/stmt  | Serve reads from a bounded-stale snapshot, e.g. `"max:10s"` or `"exact:5s"`, for lower latency. |
 | `spanner.directed_read`    | conn/stmt  | Steer read-only queries to specific replicas, e.g. `"include:us-east1:read_only"` or `"exclude:us-central1"`. |
-| `spanner.max_commit_delay` | conn/stmt  | Max delay Spanner may add to a read/write commit to batch it with others, e.g. `"100ms"` (a duration in `0..=500ms`) — trades a little latency for throughput. |
+| `spanner.commit.max_delay` | conn/stmt  | Max delay Spanner may add to a read/write commit to batch it with others, e.g. `"100ms"` (a duration in `0..=500ms`) — trades a little latency for throughput. |
 | `spanner.commit_stats`     | conn/stmt  | `"true"` requests commit statistics on read/write commits; read the mutation count of the most recent commit back with `get_option_int("spanner.commit_stats.mutation_count")` (on the statement for autocommit DML / bulk ingest, on the connection for a manual-mode commit). |
 | `spanner.query.optimizer_version` | conn/stmt | Pin the query optimizer version, e.g. `"6"` or `"latest"` (also `spanner.query.optimizer_statistics_package`). |
 | `spanner.rows_per_batch`   | statement  | Rows per streamed Arrow batch (default `8192`); lower it to cap peak memory.                   |
@@ -324,7 +324,7 @@ with spanner.connect(
         # Optional statement options, set on the underlying ADBC statement:
         cur.adbc_statement.set_options(**{
             "spanner.data_boost": "true",  # run on Data Boost
-            "spanner.max_partitions": "8",          # cap the partition count
+            "spanner.partition.max_count": "8",     # cap the partition count
         })
         partitions, schema = cur.adbc_execute_partitions("SELECT SingerId FROM Singers")
 
