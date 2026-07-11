@@ -77,8 +77,7 @@ path, not the original URI.
 | `adbc.connection.autocommit` | boolean | `true` | yes, always (`true`/`false`) | **Standard ADBC.** `false` enters manual transaction mode: DML is **buffered** and applied atomically in one read/write transaction on `commit` (`rollback` discards it); `execute_update` returns an unknown row count until then, and queries/DDL still run immediately, so there is **no read-your-writes** and DML/DDL can reorder — see [README § Status](../README.md#status) for the full caveats. Setting it back to `true` commits any buffered transaction (on failure the buffer is restored and the error returned). |
 | `adbc.connection.readonly` | boolean | `false` | yes, always (`true`/`false`) | **Standard ADBC.** Reject all writes on this connection: DML, DDL and bulk ingest fail with `InvalidState`; queries still run. The flag is live — statements read it at execution time, so toggling it immediately affects statements that already exist. |
 | `adbc.connection.transaction.isolation_level` | one of `adbc.connection.transaction.isolation.default`, `…isolation.serializable`, `…isolation.repeatable_read` | `adbc.connection.transaction.isolation.default` (the database default) | yes, always (the canonical spec string) | **Standard ADBC.** Isolation level for read/write (DML) transactions. `serializable` and `repeatable_read` map to Spanner's isolation levels; `default` leaves the database default. The other spec levels (`read_uncommitted`, `read_committed`, `snapshot`, `linearizable`) are rejected with `NotImplemented`; unknown strings with `InvalidArguments`. |
-| `spanner.read.staleness` | `exact:<duration>` or `max:<duration>` (see [Stale reads](#stale-reads)); `""` unsets | unset (strong read) | yes, when set (the raw, trimmed value) | Stale-read bound for read-only queries. Becomes the default for statements this connection creates (statements may override). Mutually exclusive with `spanner.read.timestamp`. |
-| `spanner.read.timestamp` | RFC 3339 timestamp, optionally prefixed `read:` or `min:` (see [Stale reads](#stale-reads)); `""` unsets | unset (strong read) | yes, when set (the raw, trimmed value) | Absolute read timestamp for read-only queries. Same inheritance and mutual exclusion as `spanner.read.staleness`. |
+| `spanner.read.staleness` | `exact:<duration>`, `max:<duration>`, `read:<rfc3339>` or `min:<rfc3339>` (see [Stale reads](#stale-reads)); `""` unsets | unset (strong read) | yes, when set (the raw, trimmed value) | Read bound for read-only queries. Becomes the default for statements this connection creates (statements may override). One value at a time; setting a new value replaces the old. |
 | `spanner.max_timestamp_precision` | `nanoseconds_error_on_overflow` or `microseconds` (see [Timestamp precision](#timestamp-precision)); `""` resets to the default | `nanoseconds_error_on_overflow` | yes, always (the effective mode) | How `TIMESTAMP` columns map to Arrow: `Timestamp(Nanosecond, "UTC")` with a loud error on instants outside ~1677–2262 (the default), or `Timestamp(Microsecond, "UTC")` covering Spanner's full 0001–9999 range (sub-microsecond digits truncate toward negative infinity). Becomes the default for statements this connection creates (statements may override); also governs `get_table_schema` and `read_partition`, which have no statement. |
 | `spanner.request.priority` | `low`, `medium` or `high` (case-insensitive); `""` unsets | unset (service default, high) | yes, when set (the canonical lowercase form) | [Request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions) applied to every query/DML statement the driver builds, and the commit priority of every read/write transaction. Becomes the default for statements this connection creates (statements may override). |
 | `spanner.request.tag` | free-form string; `""` unsets | unset | yes, when set | [Request tag](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags) attached to every query/DML request the driver builds (surfaced in query/transaction statistics). Becomes the default for statements this connection creates (statements may override). Driver-internal metadata queries stay untagged. |
@@ -109,8 +108,7 @@ has a single, unnamed catalog and default schema — and cannot be set.
 | `spanner.rows_per_batch` | positive integer | `8192` | yes, always (also via `get_option_int`) | Number of rows converted into each Arrow `RecordBatch` streamed by `execute`. Larger batches trade memory for fewer per-batch conversions; smaller batches lower first-batch latency and peak memory. |
 | `spanner.data_boost` | boolean | `false` | yes, always (`true`/`false`) | Run `execute_partitions` partitions on [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview) (Spanner's serverless, workload-isolated compute). Baked into every partition descriptor, so `read_partition` honours it on any connection. |
 | `spanner.partition.max_count` | positive integer | unset (Spanner chooses) | yes, when set (also via `get_option_int`) | Hint for the maximum number of partitions returned by `execute_partitions`; Spanner may return fewer. |
-| `spanner.read.staleness` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement stale-read override. Set `""` to clear a bound inherited from the connection (i.e. force a strong read). Mutually exclusive with `spanner.read.timestamp`. |
-| `spanner.read.timestamp` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement read-timestamp override; same semantics as above. |
+| `spanner.read.staleness` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement read-bound override. Set `""` to clear a bound inherited from the connection (i.e. force a strong read). |
 | `spanner.max_timestamp_precision` | as the connection option; `""` resets to the **driver** default | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement timestamp-precision override (see [Timestamp precision](#timestamp-precision)). Note `""` resets to the driver default (`nanoseconds_error_on_overflow`), not to the connection's value. |
 | `spanner.request.priority` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement request-priority override. |
 | `spanner.request.tag` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement request-tag override. |
@@ -139,34 +137,29 @@ has a single, unnamed catalog and default schema — and cannot be set.
 
 ## Stale reads
 
-Read-only queries default to a **strong** bound. `spanner.read.staleness` and
-`spanner.read.timestamp` — available at connection *and* statement level — request a stale read
-instead (cheaper and lock-free; ideal for analytics):
+Read-only queries default to a **strong** bound. The single `spanner.read.staleness` option —
+available at connection *and* statement level — requests a stale read instead (cheaper and
+lock-free; ideal for analytics). Its value is one of four prefixed forms — two *relative* (a
+duration) and two *absolute* (an RFC 3339 timestamp):
 
-- `spanner.read.staleness` is a *relative* bound, `"<kind>:<duration>"`:
-  - `exact:<duration>` — read exactly `<duration>` in the past (a single, repeatable timestamp).
-  - `max:<duration>` — read at any timestamp within `<duration>` of now (bounded staleness; the
-    server picks — single-use reads only).
+- `exact:<duration>` — read exactly `<duration>` in the past (a single, repeatable timestamp).
+- `max:<duration>` — read at any timestamp within `<duration>` of now (bounded staleness; the
+  server picks — single-use reads only).
+- `read:<rfc3339>` (or a bare `<rfc3339>`) — read exactly as of that timestamp.
+- `min:<rfc3339>` — read at that timestamp or later (bounded staleness; single-use reads only).
 
-  `<duration>` is a non-negative number with an optional unit suffix: `s` (seconds, the default),
-  `ms`, `us`/`µs`, `ns`, `m` (minutes) or `h` (hours). Examples: `exact:10`, `exact:2.5s`,
-  `max:500ms`, `max:1m`.
+`<duration>` is a non-negative number with an optional unit suffix: `s` (seconds, the default),
+`ms`, `us`/`µs`, `ns`, `m` (minutes) or `h` (hours). Examples: `exact:10`, `exact:2.5s`,
+`max:500ms`, `max:1m`, `read:2026-07-07T00:00:00Z`, `min:2026-07-07T00:00:00+02:00`.
 
-- `spanner.read.timestamp` is an *absolute* bound — an RFC 3339 timestamp, optionally prefixed to
-  select the mode:
-  - `read:<rfc3339>` (or a bare `<rfc3339>`) — read exactly as of that timestamp.
-  - `min:<rfc3339>` — read at that timestamp or later (bounded staleness; single-use reads only).
-
-  Examples: `2026-07-07T00:00:00Z`, `read:2026-07-07T00:00:00Z`, `min:2026-07-07T00:00:00+02:00`.
-
-The two options are **mutually exclusive** — only one read bound can apply to a query. Setting one
-while the other is set fails with `InvalidArguments`; set the other to an empty string (`""`) first
-to unset it. Values are trimmed before parsing; malformed values fail with `InvalidArguments`. A
-statement inherits the connection's bound at creation and may override it (including clearing it
-with `""`). Because Spanner accepts the bounded-staleness kinds (`max:` / `min:`) only on
-single-use transactions, contexts that need a multi-use read-only transaction (a bound query over
-several parameter rows, `execute_partitions`) pin them to their most-stale legal equivalent
-(`max:<d>` → exact staleness `<d>`, `min:<t>` → read timestamp `<t>`).
+The four prefixes are distinct, so a value is unambiguous. The option holds one bound at a time;
+setting a new value replaces the old, and `""` unsets it. Values are trimmed before parsing;
+malformed values fail with `InvalidArguments`. A statement inherits the connection's bound at
+creation and may override it (including clearing it with `""`). Because Spanner accepts the
+bounded-staleness kinds (`max:` / `min:`) only on single-use transactions, contexts that need a
+multi-use read-only transaction (a bound query over several parameter rows, `execute_partitions`)
+pin them to their most-stale legal equivalent (`max:<d>` → exact staleness `<d>`, `min:<t>` → read
+timestamp `<t>`).
 
 ## Directed reads
 

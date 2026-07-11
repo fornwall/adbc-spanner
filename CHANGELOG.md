@@ -20,8 +20,9 @@ The bulk of this release lands the fixes from the multi-aspect repo review (`REV
 
 ### Added
 
-- Stale reads: `spanner.read.staleness` (`exact:`/`max:`) and `spanner.read.timestamp`
-  (`read:`/`min:`) options at connection and statement level.
+- Stale reads: a single `spanner.read.staleness` option at connection and statement level, whose
+  value is one of four prefixes — `exact:<duration>` / `max:<duration>` / `read:<rfc3339>` /
+  `min:<rfc3339>`.
 - Request priority / request tags / transaction tags
   (`spanner.request.priority`, `spanner.request.tag`, `spanner.transaction.tag`).
 - RPC timeouts: `spanner.rpc.timeout_seconds.{query,update,fetch}` as overall per-operation

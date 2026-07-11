@@ -86,18 +86,20 @@ Key design points:
   option (default `false`) makes a connection reject all writes — DML/DDL/ingest fail with
   `InvalidState`, queries still run; the flag is a shared `Arc<AtomicBool>` that statements read at
   execution time, so toggling it on the connection immediately affects existing statements too.
-- **Stale reads.** Read-only queries default to a strong bound. `spanner.read.staleness`
-  (`exact:<duration>` / `max:<duration>`) and `spanner.read.timestamp` (RFC3339, optionally prefixed
-  `read:` / `min:`) request a non-strong `TimestampBound` — parsed in `src/staleness.rs` (`ReadBound`
-  / `ReadStaleness`, unit-tested offline) and applied at the `single_use()` query sites plus the
-  partition batch read-only transaction via `staleness::single_use`. A bound (parameterized) query
-  over several bound rows runs all its per-row statements in **one** multi-use read-only
-  transaction pinned at the same bound (streaming via `BoundQueryBatchReader` in
-  `src/conversion.rs`); since Spanner accepts the bounded-staleness kinds only on single-use
-  transactions, `max:`/`min:` are pinned there to their most-stale legal equivalent
-  (`ReadBound::pinned_for_multi_use`). Both options exist at connection
-  **and** statement level (statement inherits the connection's, then overrides); they are mutually
-  exclusive (set one to `""` to unset), and round-trip through `get_option`.
+- **Stale reads.** Read-only queries default to a strong bound. A single `spanner.read.staleness`
+  option requests a non-strong `TimestampBound`; its value is one of four distinct prefixes —
+  `exact:<duration>` / `max:<duration>` (relative) and `read:<rfc3339>` / `min:<rfc3339>` (absolute;
+  a bare RFC3339 is also accepted as `read:`) — parsed by the single `parse_read_bound` entry point
+  in `src/staleness.rs` (`ReadBound` / `ReadStaleness`, unit-tested offline) and applied at the
+  `single_use()` query sites plus the partition batch read-only transaction via
+  `staleness::single_use`. A bound (parameterized) query over several bound rows runs all its per-row
+  statements in **one** multi-use read-only transaction pinned at the same bound (streaming via
+  `BoundQueryBatchReader` in `src/conversion.rs`); since Spanner accepts the bounded-staleness kinds
+  only on single-use transactions, `max:`/`min:` are pinned there to their most-stale legal
+  equivalent (`ReadBound::pinned_for_multi_use`). The option exists at connection **and** statement
+  level (statement inherits the connection's, then overrides); it holds one bound at a time (a new
+  value replaces the old, `""` unsets), and round-trips through `get_option`. (There is deliberately
+  no separate `spanner.read.timestamp` key — the timestamp forms live under the one staleness key.)
 - **Arrow version.** `arrow-array`/`arrow-schema`/`arrow-buffer` are pinned to the range the (git)
   `adbc_core` allows (`>=58, <60`) so the `RecordBatch`/`Schema`/`RecordBatchReader` types unify
   across crates.

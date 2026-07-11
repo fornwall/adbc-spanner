@@ -160,9 +160,8 @@ pub struct SpannerStatement {
     /// Maximum number of partitions to request from `execute_partitions`
     /// (`spanner.partition.max_count`); `None` lets Spanner choose.
     max_partitions: Option<i64>,
-    /// Read staleness / timestamp bound for this statement's read-only queries
-    /// (`spanner.read.staleness` / `spanner.read.timestamp`), inherited from the connection at
-    /// creation time and overridable per statement. Default is a strong read.
+    /// Read bound for this statement's read-only queries (`spanner.read.staleness`), inherited from
+    /// the connection at creation time and overridable per statement. Default is a strong read.
     read_staleness: ReadStaleness,
     /// Request priority and request/transaction tags (`spanner.request.priority` /
     /// `spanner.request.tag`), inherited from the connection at creation time; the priority and
@@ -1232,9 +1231,6 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) if k == crate::OPTION_READ_STALENESS => {
                 self.read_staleness.set_staleness(value)?;
             }
-            OptionStatement::Other(k) if k == crate::OPTION_READ_TIMESTAMP => {
-                self.read_staleness.set_timestamp(value)?;
-            }
             OptionStatement::Other(k) if k == crate::OPTION_REQUEST_PRIORITY => {
                 self.request.set_priority(value)?;
             }
@@ -1331,9 +1327,6 @@ impl Optionable for SpannerStatement {
             }
             OptionStatement::Other(k) if k == crate::OPTION_READ_STALENESS => {
                 self.read_staleness.staleness_string().map(str::to_string)
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_READ_TIMESTAMP => {
-                self.read_staleness.timestamp_string().map(str::to_string)
             }
             // The effective value: the connection's, unless overridden on this statement.
             OptionStatement::Other(k) if k == crate::OPTION_REQUEST_PRIORITY => {
