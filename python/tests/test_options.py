@@ -2,6 +2,8 @@
 
 import inspect
 
+import pytest
+
 import adbc_driver_spanner
 import adbc_driver_spanner.dbapi
 from adbc_driver_spanner import (
@@ -39,6 +41,36 @@ def test_option_kwargs_maps_credentials():
         "https://www.googleapis.com/auth/cloud-platform"
     )
     assert opts["spanner.auth.impersonate.lifetime"] == "1800"
+
+
+def test_db_kwargs_merges_keys_without_a_friendly_argument():
+    # The escape hatch's actual job: reach an option key that has no friendly
+    # keyword argument. It merges in cleanly, no conflict.
+    opts = option_kwargs(
+        "projects/p/instances/i/databases/d",
+        db_kwargs={"spanner.commit.max_delay": "100ms"},
+    )
+    assert opts["spanner.database"] == "projects/p/instances/i/databases/d"
+    assert opts["spanner.commit.max_delay"] == "100ms"
+
+
+def test_db_kwargs_same_key_collision_raises():
+    # Same literal key set both as a friendly kwarg and via db_kwargs.
+    with pytest.raises(ValueError, match="spanner.auth.keyfile"):
+        option_kwargs(
+            "projects/p/instances/i/databases/d",
+            keyfile="/a.json",
+            db_kwargs={"spanner.auth.keyfile": "/b.json"},
+        )
+
+
+def test_db_kwargs_alias_collision_raises():
+    # Different key, same slot: `uri` is an alias of `database=`'s spanner.database.
+    with pytest.raises(ValueError, match="uri"):
+        option_kwargs(
+            "projects/p/instances/i/databases/A",
+            db_kwargs={"uri": "projects/p/instances/i/databases/B"},
+        )
 
 
 def test_option_enums_are_exported_and_well_formed():

@@ -32,6 +32,15 @@ __all__ = [
 #: C entrypoint exported by the shared library (see src/ffi.rs).
 ENTRYPOINT = "AdbcSpannerInit"
 
+#: Option keys that name the same underlying setting. ``database=`` populates
+#: ``spanner.database``, but the standard ADBC ``uri`` option is a documented alias
+#: of it (see :attr:`DatabaseOptions.URI`), so a ``db_kwargs`` entry for either one
+#: collides with a ``database=`` argument even though the key strings differ.
+_OPTION_ALIASES = {
+    "spanner.database": "uri",
+    "uri": "spanner.database",
+}
+
 
 def option_kwargs(
     database: typing.Optional[str] = None,
@@ -51,7 +60,12 @@ def option_kwargs(
 
     Shared by :func:`connect` and :func:`adbc_driver_spanner.dbapi.connect` so the
     two entry points map parameters identically. ``db_kwargs`` is an escape hatch
-    for raw option keys and is merged last.
+    for raw option keys that have no friendly keyword argument; it is merged last.
+
+    A ``db_kwargs`` entry that targets a setting an explicit keyword argument already
+    populated — the same key, or an alias such as ``uri`` for ``database=`` — raises
+    :class:`ValueError` rather than silently overriding one value with the other. Keys
+    with no friendly counterpart merge in unchanged.
     """
     options: typing.Dict[str, str] = {}
     # Friendly kwargs -> the driver's option keys (see src/lib.rs).
@@ -80,9 +94,32 @@ def option_kwargs(
     # exclusive with the keyfile/impersonation options above.
     if access_token is not None:
         options["spanner.auth.access_token"] = access_token
-    if db_kwargs:
-        options.update(db_kwargs)
+    _merge_db_kwargs(options, db_kwargs)
     return options
+
+
+def _merge_db_kwargs(
+    options: typing.Dict[str, str],
+    db_kwargs: typing.Optional[typing.Mapping[str, str]],
+) -> None:
+    """Merge the raw ``db_kwargs`` escape hatch into the friendly-kwarg ``options``.
+
+    Raises :class:`ValueError` if a ``db_kwargs`` key targets a setting a friendly
+    keyword argument already populated — either the same key, or an alias of it (see
+    :data:`_OPTION_ALIASES`) — so a value is never silently overridden. Keys with no
+    friendly counterpart merge in.
+    """
+    if not db_kwargs:
+        return
+    friendly = set(options)
+    for key, value in db_kwargs.items():
+        clash = key if key in friendly else _OPTION_ALIASES.get(key)
+        if clash in friendly:
+            raise ValueError(
+                f"{key!r} in db_kwargs conflicts with a keyword argument that "
+                f"already set {clash!r}; pass it only one way"
+            )
+        options[key] = value
 
 
 def _as_csv(value: typing.Union[str, typing.Sequence[str]]) -> str:
@@ -139,7 +176,10 @@ def connect(
         A caller-supplied OAuth 2.0 bearer token, sent verbatim with no refresh.
         Mutually exclusive with the keyfile/impersonation options above.
     db_kwargs:
-        Escape hatch for raw ``spanner.*`` option keys, merged last.
+        Escape hatch for raw ``spanner.*`` option keys with no friendly keyword
+        argument, merged last. A key that duplicates a setting an explicit keyword
+        argument already populated (the same key, or ``uri`` versus ``database=``)
+        raises :class:`ValueError` instead of silently overriding it.
 
     For a DBAPI 2.0 connection, prefer :func:`adbc_driver_spanner.dbapi.connect`.
     """
