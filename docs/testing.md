@@ -107,15 +107,20 @@ tests.
 ```sh
 scripts/run-adbc-validation.sh              # throwaway emulator, the gated CI subset
 scripts/run-adbc-validation.sh --full       # every case (local exploration)
-ADBC_VALIDATION_SANITIZE=address,undefined scripts/run-adbc-validation.sh  # + ASan/UBSan
+ADBC_VALIDATION_SANITIZE=address,undefined scripts/run-adbc-validation.sh  # + C-side ASan/UBSan
+ADBC_VALIDATION_SANITIZE=address ADBC_VALIDATION_RUST_SANITIZE=address \
+  scripts/run-adbc-validation.sh            # + the cdylib itself, ASan-instrumented (nightly)
 ```
 
 The script builds the cdylib and a C++ harness (needs a C++17 compiler, CMake ≥ 3.20 and git) and
 runs the suite. [`adbc-validation.yml`](../.github/workflows/adbc-validation.yml) runs the gated
-subset as a **gating** CI job, in two legs: `plain` and `asan-ubsan` (the C++ side built with
+subset as a **gating** CI job, in three legs: `plain`; `asan-ubsan` (the C++ side built with
 `-fsanitize=address,undefined`, driving the uninstrumented cdylib — its `malloc`/`free`/`memcpy`
-interceptors catch memory bugs on the C-ABI structs at the FFI boundary; see the validation
-README's *Sanitizers* section).
+interceptors catch memory bugs on the C-ABI structs at the FFI boundary); and `rust-asan` (the
+**cdylib itself** built with nightly `-Zsanitizer=address` + `-Zbuild-std`, driven by a clang
+`-fsanitize=address` C++ side so both share one compiler-rt ASan runtime — catching memory bugs
+*inside* Rust that never reach a C-side interceptor). See the validation README's *Sanitizers*
+section.
 
 See [`adbc-validation/README.md`](../adbc-validation/README.md) for the exact gated allowlist, what
 each case covers, and the follow-up work on the remaining `StatementTest` cases.

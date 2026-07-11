@@ -58,29 +58,54 @@ fetched arrow-adbc driver manager + `adbc_validation`, and the vendored nanoarro
 ADBC_VALIDATION_SANITIZE=address,undefined scripts/run-adbc-validation.sh
 ```
 
-The **cdylib stays uninstrumented** — it is built by `cargo` (stable) and `dlopen`-loaded by the
-driver manager, exactly as in production. This still finds the memory bugs that matter at the C
+By default the **cdylib stays uninstrumented** — it is built by `cargo` (stable) and `dlopen`-loaded
+by the driver manager, exactly as in production. This still finds the memory bugs that matter at the C
 ABI boundary: AddressSanitizer's `malloc`/`free`/`memcpy` interceptors are process-wide, and
 Rust's default allocator *is* libc `malloc`, so a double-free / heap-overflow / use-after-free on
 the C-ABI structs the driver hands across the boundary — `ArrowArray`/`ArrowSchema` release
 callbacks, `AdbcError` `private_data` lifecycle — is reported **with symbolized Rust frames**,
 even though the cdylib itself carries no instrumentation. UBSan additionally covers UB in the
-C/C++ code. (A memory error that never reaches an interceptor — e.g. a plain out-of-bounds store
-*inside* Rust — would need a nightly `-Zsanitizer=address` cdylib build, which is out of scope
-here; `cargo-fuzz` already runs the offline parser paths under ASan.)
+C/C++ code. A memory error that never reaches an interceptor — e.g. a plain out-of-bounds store
+*inside* Rust — is invisible this way; that gap is closed by the instrumented-cdylib mode below
+(and `cargo-fuzz` additionally runs the offline parser paths under ASan).
+
+### Instrumenting the Rust cdylib itself
+
+Set `ADBC_VALIDATION_RUST_SANITIZE=address` (alongside `ADBC_VALIDATION_SANITIZE=address`) to build
+the **cdylib itself** with nightly Rust's `-Zsanitizer=address`, catching memory bugs *inside* Rust
+that the C-side interceptors above cannot see:
+
+```sh
+ADBC_VALIDATION_SANITIZE=address ADBC_VALIDATION_RUST_SANITIZE=address \
+  scripts/run-adbc-validation.sh
+```
+
+This needs the **nightly** toolchain with the `rust-src` component (the script uses `-Zbuild-std`
+so the standard library is instrumented too — otherwise ASan misreports std allocations), and it
+compiles the **C++ side with clang**: Rust's `-Zsanitizer=address` links LLVM **compiler-rt** ASan,
+which must be the *same* runtime the main test executable links, so mixing it with gcc's `libasan`
+is unsound and aborts at startup. The script therefore defaults `CC`/`CXX` to `clang`/`clang++`
+when this is set (export your own to override). The instrumented artifact lands under
+`target/<host-triple>/debug/` (an explicit `--target` is required by `-Zbuild-std`), which the
+script resolves for you. Only `address` is supported — Rust has no `-Zsanitizer=undefined` cdylib
+equivalent, so this leg's C++ side carries just `address` (the `asan-ubsan` leg keeps full C-side
+UBSan coverage).
 
 Notes:
 - **LeakSanitizer is disabled** (`ASAN_OPTIONS=detect_leaks=0`, set by the script): the driver's
   shared Tokio runtime, gRPC connection pools and lazy globals are intentionally process-lifetime
-  and would otherwise drown the run in non-actionable "leaks". Memory-error (ASan) and UB (UBSan)
-  checks stay fatal.
+  and would otherwise drown the run in non-actionable "leaks" — even more so with the Rust side
+  instrumented. Memory-error (ASan) and UB (UBSan) checks stay fatal.
 - aws-lc-rs' C/assembly TLS code is not instrumented (the `cc`-built C keeps its own flags and
   assembly is never instrumented); ASan tolerates this. This is also why MSan is not offered.
-- Sanitized and plain builds use separate trees (`.adbc-validation-build-san`) so switching does
+- Each mode uses a separate build tree (`.adbc-validation-build-san` for the C-side-only mode,
+  `-rustsan` for the instrumented-cdylib mode, which also differs by compiler) so switching does
   not force an arrow-adbc rebuild.
 
-CI runs both a `plain` and an `asan-ubsan` leg (see `.github/workflows/adbc-validation.yml`) over
-the identical gate/expected-failure/stale checks — the sanitized leg is a strict superset.
+CI runs three legs — `plain`, `asan-ubsan` and `rust-asan` — (see
+`.github/workflows/adbc-validation.yml`) over the identical gate/expected-failure/stale checks. The
+`asan-ubsan` leg is a strict superset of `plain`; `rust-asan` adds the in-Rust memory-error coverage
+the C-side-only legs cannot provide.
 
 ## What CI gates on
 
