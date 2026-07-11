@@ -497,9 +497,10 @@ fn aborted_retry_info_detail_reaches_adbc_error_details() {
 /// permission gets from real Spanner — the emulator never enforces IAM, so this is the only way to
 /// exercise the path). The driver must surface a clean ADBC error whose message keeps the server's
 /// text (which already names the missing `spanner.databases.select` permission) *and* gains the
-/// fixed IAM guidance `src/error.rs`'s `PERMISSION_DENIED_GUIDANCE` appends: the predefined Spanner
-/// roles plus the IAM doc link (no permission re-parsing, no role lookup). The numeric gRPC code
-/// (PERMISSION_DENIED = 7) survives in `vendor_code`, and the status is `Unauthorized`.
+/// fixed IAM guidance `src/error.rs`'s `PERMISSION_DENIED_GUIDANCE` appends: a generic "grant a role
+/// that includes it" hint plus the IAM doc link (no permission re-parsing, no role lookup, and — for
+/// BigQuery-driver parity — no specific role names). The numeric gRPC code (PERMISSION_DENIED = 7)
+/// survives in `vendor_code`, and the status is `Unauthorized`.
 #[test]
 fn permission_denied_surfaces_iam_guidance() {
     let _watchdog = Watchdog::arm(
@@ -538,9 +539,9 @@ fn permission_denied_surfaces_iam_guidance() {
         "the server's message must survive, got: {}",
         error.message
     );
-    // ...and the fixed IAM guidance is appended: the predefined roles plus the IAM doc link.
+    // ...and the fixed IAM guidance is appended: a generic role hint plus the IAM doc link.
     assert!(
-        error.message.contains("roles/spanner.databaseReader"),
+        error.message.contains("grant an IAM role that includes it"),
         "expected the appended IAM guidance, got: {}",
         error.message
     );
@@ -549,6 +550,12 @@ fn permission_denied_surfaces_iam_guidance() {
             .message
             .contains("https://cloud.google.com/spanner/docs/iam"),
         "the guidance must link the Spanner IAM docs, got: {}",
+        error.message
+    );
+    // No specific role is named (BigQuery-driver parity).
+    assert!(
+        !error.message.contains("roles/spanner."),
+        "guidance must name no specific IAM role, got: {}",
         error.message
     );
 }

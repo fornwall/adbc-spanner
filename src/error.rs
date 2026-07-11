@@ -106,20 +106,20 @@ pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
 /// A Spanner `PERMISSION_DENIED` means the caller's principal lacks the IAM permission the operation
 /// needs. Cloud Spanner's own status message already *names* the missing permission (e.g.
 /// `... is missing IAM permission: spanner.databases.select on resource ...`), which we preserve
-/// verbatim — so rather than re-parse that permission and try to map it to a specific role (which
-/// risks naming the wrong one), we simply append a constant pointer to the predefined Spanner roles
-/// and the IAM docs. This mirrors the ADBC BigQuery driver, which likewise leaves the server's
-/// permission text intact and appends a fixed guidance string (its `reauthGuidance`) rather than
-/// resolving a role.
+/// verbatim — so rather than re-parse that permission, we simply append a constant hint that a role
+/// including it must be granted, plus the IAM docs link. We deliberately name **no specific roles**:
+/// this mirrors the ADBC BigQuery driver, whose only fixed auth guidance (`reauthGuidance`, a RAPT
+/// re-authentication hint plus a support-doc link) likewise leaves the server's message intact and
+/// names no IAM roles — its access-denied path just maps to `Unauthorized` and preserves the
+/// verbatim server text. Enumerating roles here risks steering the caller to an over-broad or
+/// wrong-scoped role, so we point at the docs and let them pick.
 ///
 /// The guidance is only ever *appended* — it augments, never replaces, and leaves the message text,
 /// status, `vendor_code` and forwarded `details` untouched. The emulator does not enforce IAM, so
 /// this path is exercised by the unit tests here and by a mock-server test (`tests/mock_spanner.rs`)
 /// that returns a synthetic `PERMISSION_DENIED`, not by the emulator integration test.
-const PERMISSION_DENIED_GUIDANCE: &str = " (grant the caller an IAM role that includes the required \
-    Spanner permission — roles/spanner.databaseReader for reads, roles/spanner.databaseUser for \
-    reads plus writes (DML) and schema changes (DDL), or roles/spanner.databaseAdmin for database \
-    administration — see https://cloud.google.com/spanner/docs/iam)";
+const PERMISSION_DENIED_GUIDANCE: &str = " (the caller lacks the required Spanner IAM permission; \
+    grant an IAM role that includes it — see https://cloud.google.com/spanner/docs/iam)";
 
 /// Map a gRPC status' `google.rpc.Status` details onto ADBC error details.
 ///
@@ -489,17 +489,22 @@ mod tests {
             adbc.message
                 .contains("Caller is missing IAM permission spanner.databases.select")
         );
-        // ...and the fixed guidance is appended: the predefined roles plus the IAM doc link.
+        // ...and the fixed guidance is appended: a generic "grant a role that includes it" hint
+        // plus the IAM doc link — no specific role is named (BigQuery-driver parity).
         assert!(
-            adbc.message.contains("roles/spanner.databaseReader"),
+            adbc.message.contains("grant an IAM role that includes it"),
             "expected the appended IAM guidance, got: {}",
             adbc.message
         );
-        assert!(adbc.message.contains("roles/spanner.databaseUser"));
-        assert!(adbc.message.contains("roles/spanner.databaseAdmin"));
         assert!(
             adbc.message
                 .contains("https://cloud.google.com/spanner/docs/iam")
+        );
+        // The role enumeration was intentionally dropped: no predefined role names leak through.
+        assert!(
+            !adbc.message.contains("roles/spanner."),
+            "guidance must name no specific IAM role, got: {}",
+            adbc.message
         );
     }
 
@@ -517,13 +522,12 @@ mod tests {
         );
         let adbc = from_spanner(gax);
         assert_eq!(adbc.status, Status::Unauthorized);
-        assert!(adbc.message.contains("roles/spanner.databaseReader"));
-        assert!(adbc.message.contains("roles/spanner.databaseUser"));
-        assert!(adbc.message.contains("roles/spanner.databaseAdmin"));
+        assert!(adbc.message.contains("grant an IAM role that includes it"));
         assert!(
             adbc.message
                 .contains("https://cloud.google.com/spanner/docs/iam")
         );
+        assert!(!adbc.message.contains("roles/spanner."));
     }
 
     #[test]
@@ -558,11 +562,12 @@ mod tests {
         assert_eq!(adbc.status, Status::Unauthorized);
         assert_eq!(adbc.vendor_code, 7);
         assert!(adbc.message.contains("spanner.databases.write"));
-        assert!(adbc.message.contains("roles/spanner.databaseUser"));
+        assert!(adbc.message.contains("grant an IAM role that includes it"));
         assert!(
             adbc.message
                 .contains("https://cloud.google.com/spanner/docs/iam")
         );
+        assert!(!adbc.message.contains("roles/spanner."));
         // A non-permission numeric code stays guidance-free.
         let already = from_status_parts(Code::AlreadyExists as i32, "Row already exists");
         assert!(

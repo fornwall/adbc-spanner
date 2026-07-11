@@ -63,9 +63,11 @@ SpannerDriver ──▶ SpannerDatabase ──▶ SpannerConnection ──▶ Sp
   `Status::Unauthorized`) it also *appends* a fixed IAM-guidance string to the message
   (`PERMISSION_DENIED_GUIDANCE`): Spanner's own message already names the missing permission (kept
   verbatim), so — like the ADBC BigQuery driver's `reauthGuidance` — the driver does **not** re-parse
-  it or map it to a specific role; it just appends a constant pointer to the predefined Spanner roles
-  (`roles/spanner.databaseReader` for reads, `roles/spanner.databaseUser` for writes (DML)/DDL,
-  `roles/spanner.databaseAdmin` for DB admin) and the Spanner IAM doc link. The guidance only
+  it or map it to a specific role; it just appends a constant hint to grant an IAM role that includes
+  the missing permission plus the Spanner IAM doc link, and — matching the BigQuery driver, whose only
+  fixed auth guidance is a RAPT re-auth hint + doc link and names no roles — deliberately names **no
+  predefined role** (an earlier version enumerated `roles/spanner.databaseReader`/`databaseUser`/
+  `databaseAdmin`; the enumeration was dropped for BigQuery-driver parity). The guidance only
   augments — message text, status, `vendor_code` and forwarded details are all preserved (IAM isn't
   enforced on the emulator, so it's covered by unit tests plus a `tests/mock_spanner.rs`
   PERMISSION_DENIED mock; `from_status_parts` adds the same guidance on the BatchWrite path).

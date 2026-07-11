@@ -200,10 +200,10 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   On a `PERMISSION_DENIED` (which maps to `Unauthorized`), the driver additionally *appends* a short
   IAM-guidance string to the error message. Spanner's own message already names the missing permission
   (e.g. `spanner.databases.select`), which is preserved verbatim, so the driver does not re-parse it
-  or guess a specific role; it appends a fixed pointer to the predefined roles —
-  `roles/spanner.databaseReader` for reads, `roles/spanner.databaseUser` for writes (DML) and schema
-  changes (DDL), or `roles/spanner.databaseAdmin` for database administration — and links
-  <https://cloud.google.com/spanner/docs/iam>. The guidance only augments the message; the status,
+  or name a specific role; it appends a fixed hint to grant an IAM role that includes the missing
+  permission and links <https://cloud.google.com/spanner/docs/iam>. (No predefined role is named —
+  matching the ADBC BigQuery driver, whose only fixed auth guidance is a re-authentication hint plus a
+  doc link and names no roles either.) The guidance only augments the message; the status,
   `vendor_code` and forwarded details are unchanged.
 
 Not supported (returns `NotImplemented`, by nature of Spanner): **Substrait** — Spanner executes
