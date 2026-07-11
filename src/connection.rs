@@ -231,9 +231,8 @@ pub struct SpannerConnection {
     /// set via the standard ADBC `adbc.connection.transaction.isolation_level` option.
     /// [`IsolationLevel::Unspecified`] (the default) leaves the client/database default in place.
     isolation: IsolationLevel,
-    /// Read staleness / timestamp bound for read-only queries (`spanner.read.staleness` /
-    /// `spanner.read.timestamp`). The default is a strong read; this becomes the default for
-    /// statements created on the connection, which may override it.
+    /// Read bound for read-only queries (`spanner.read.staleness`). The default is a strong read;
+    /// this becomes the default for statements created on the connection, which may override it.
     read_staleness: ReadStaleness,
     /// Request priority and request/transaction tags (`spanner.request.priority` /
     /// `spanner.request.tag` / `spanner.transaction.tag`). Unset by default; becomes the default
@@ -749,9 +748,6 @@ impl Optionable for SpannerConnection {
             OptionConnection::Other(k) if k == crate::OPTION_READ_STALENESS => {
                 self.read_staleness.set_staleness(value)?;
             }
-            OptionConnection::Other(k) if k == crate::OPTION_READ_TIMESTAMP => {
-                self.read_staleness.set_timestamp(value)?;
-            }
             OptionConnection::Other(k) if k == crate::OPTION_REQUEST_PRIORITY => {
                 self.request.set_priority(value)?;
             }
@@ -837,16 +833,6 @@ impl Optionable for SpannerConnection {
                 .ok_or_else(|| {
                     err(
                         format!("option {} is not set", crate::OPTION_READ_STALENESS),
-                        Status::NotFound,
-                    )
-                }),
-            OptionConnection::Other(k) if k == crate::OPTION_READ_TIMESTAMP => self
-                .read_staleness
-                .timestamp_string()
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    err(
-                        format!("option {} is not set", crate::OPTION_READ_TIMESTAMP),
                         Status::NotFound,
                     )
                 }),

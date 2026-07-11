@@ -70,10 +70,9 @@ class ConnectionOptions(enum.Enum):
     READONLY = "adbc.connection.readonly"
     #: Standard ADBC. Isolation level for read/write transactions.
     ISOLATION_LEVEL = "adbc.connection.transaction.isolation_level"
-    #: Stale-read bound, ``exact:<duration>`` / ``max:<duration>``.
+    #: Read bound: one of ``exact:<duration>`` / ``max:<duration>`` / ``read:<rfc3339>`` /
+    #: ``min:<rfc3339>``.
     READ_STALENESS = "spanner.read.staleness"
-    #: Absolute read timestamp (RFC 3339, optional ``read:`` / ``min:`` prefix).
-    READ_TIMESTAMP = "spanner.read.timestamp"
     #: How ``TIMESTAMP`` maps to Arrow (``nanoseconds_error_on_overflow`` / ``microseconds``).
     MAX_TIMESTAMP_PRECISION = "spanner.max_timestamp_precision"
     #: Request priority (``low`` / ``medium`` / ``high``).
@@ -117,8 +116,6 @@ class StatementOptions(enum.Enum):
     MAX_PARTITIONS = "spanner.partition.max_count"
     #: Per-statement override of :attr:`ConnectionOptions.READ_STALENESS`.
     READ_STALENESS = "spanner.read.staleness"
-    #: Per-statement override of :attr:`ConnectionOptions.READ_TIMESTAMP`.
-    READ_TIMESTAMP = "spanner.read.timestamp"
     #: Per-statement override of :attr:`ConnectionOptions.MAX_TIMESTAMP_PRECISION`.
     MAX_TIMESTAMP_PRECISION = "spanner.max_timestamp_precision"
     #: Per-statement override of :attr:`ConnectionOptions.REQUEST_PRIORITY`.

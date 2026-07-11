@@ -543,37 +543,28 @@ pub const OPTION_INGEST_PRIMARY_KEY: &str = "spanner.ingest.primary_key";
 /// effective value as `"true"`/`"false"`.
 pub const OPTION_INGEST_BATCH_WRITE: &str = "spanner.ingest.batch_write";
 
-/// Driver-specific connection **and** statement option: the **read staleness** for read-only
-/// queries, as `"exact:<duration>"` or `"max:<duration>"`.
+/// Driver-specific connection **and** statement option: the **read bound** for read-only queries.
+///
+/// The value is one of four prefixed forms — two *relative* (a duration in the past) and two
+/// *absolute* (an RFC 3339 timestamp):
 ///
 /// - `exact:<duration>` reads exactly `<duration>` in the past
 ///   ([`TimestampBound::exact_staleness`](https://docs.cloud.google.com/spanner/docs/timestamp-bounds#exact_staleness)) —
 ///   a single, repeatable timestamp, cheaper and lock-free.
 /// - `max:<duration>` reads at any timestamp within `<duration>` of now (bounded staleness; the
 ///   server picks — single-use reads only).
-///
-/// `<duration>` is a non-negative number with an optional unit suffix: `s` (seconds, the default),
-/// `ms`, `us`/`µs`, `ns`, `m` (minutes) or `h` (hours). Examples: `exact:10`, `exact:2.5s`,
-/// `max:500ms`, `max:1m`.
-///
-/// Mutually exclusive with [`OPTION_READ_TIMESTAMP`]; set the other to an empty string to unset it.
-/// Set on a connection it becomes the default for statements it creates; a statement may override
-/// it. Unset (the default) means a **strong** read.
-pub const OPTION_READ_STALENESS: &str = "spanner.read.staleness";
-
-/// Driver-specific connection **and** statement option: an **absolute read timestamp** for
-/// read-only queries — an RFC 3339 timestamp, optionally prefixed to select the mode:
-///
 /// - `read:<rfc3339>` (or a bare `<rfc3339>`) reads exactly as of that timestamp
 ///   ([`TimestampBound::read_timestamp`](https://docs.cloud.google.com/spanner/docs/timestamp-bounds#exact_staleness)).
 /// - `min:<rfc3339>` reads at that timestamp or later (bounded staleness; single-use reads only).
 ///
-/// Examples: `2026-07-07T00:00:00Z`, `read:2026-07-07T00:00:00Z`, `min:2026-07-07T00:00:00+02:00`.
+/// `<duration>` is a non-negative number with an optional unit suffix: `s` (seconds, the default),
+/// `ms`, `us`/`µs`, `ns`, `m` (minutes) or `h` (hours). Examples: `exact:10`, `exact:2.5s`,
+/// `max:500ms`, `max:1m`, `read:2026-07-07T00:00:00Z`, `min:2026-07-07T00:00:00+02:00`. The four
+/// prefixes are distinct, so a value is unambiguous.
 ///
-/// Mutually exclusive with [`OPTION_READ_STALENESS`]; set the other to an empty string to unset it.
 /// Set on a connection it becomes the default for statements it creates; a statement may override
-/// it. Unset (the default) means a **strong** read.
-pub const OPTION_READ_TIMESTAMP: &str = "spanner.read.timestamp";
+/// it. Set an empty string to unset it; unset (the default) means a **strong** read.
+pub const OPTION_READ_STALENESS: &str = "spanner.read.staleness";
 
 /// Driver-specific connection **and** statement option: the **request priority** Spanner's
 /// scheduler uses to arbitrate CPU between workloads — `low`, `medium` or `high`
@@ -868,7 +859,6 @@ mod options_doc_tests {
             crate::OPTION_MAX_PARTITIONS,
             crate::OPTION_INGEST_PRIMARY_KEY,
             crate::OPTION_READ_STALENESS,
-            crate::OPTION_READ_TIMESTAMP,
             crate::OPTION_REQUEST_PRIORITY,
             crate::OPTION_REQUEST_TAG,
             crate::OPTION_DIRECTED_READ,

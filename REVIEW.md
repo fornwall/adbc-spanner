@@ -129,14 +129,13 @@ synthetic `adbc_ingest_key` UUID primary key the create modes add (and that it a
 
 ### ~~7. Stale reads / timestamp bounds are unexposed~~ (fixed)
 
-**Fixed.** Two options — `spanner.read.staleness` and `spanner.read.timestamp` — are now honoured at
-both connection and statement level (a statement inherits the connection's bound and may override
-it). `spanner.read.staleness` is `exact:<duration>` / `max:<duration>` (duration with an optional
-`s`/`ms`/`us`/`ns`/`m`/`h` suffix) → `TimestampBound::{exact,max}_staleness`; `spanner.read.timestamp`
-is an RFC 3339 timestamp, optionally prefixed `read:` (default) or `min:` →
-`TimestampBound::{read,min_read}_timestamp`. The two are mutually exclusive — setting one while the
-other is active is rejected with `InvalidArgument` (unset the other with an empty value first) — and
-both round-trip through `get_option` (NotFound when unset). The bound is applied at the read-only
+**Fixed.** A single option — `spanner.read.staleness` — is now honoured at both connection and
+statement level (a statement inherits the connection's bound and may override it). Its value is one
+of four prefixed forms: `exact:<duration>` / `max:<duration>` (a duration with an optional
+`s`/`ms`/`us`/`ns`/`m`/`h` suffix) → `TimestampBound::{exact,max}_staleness`, and `read:<rfc3339>` /
+`min:<rfc3339>` (an RFC 3339 timestamp) → `TimestampBound::{read,min_read}_timestamp`. The four
+prefixes are distinct, so a value is unambiguous; the option holds one bound at a time (a new value
+replaces the old) and round-trips through `get_option` (NotFound when unset). The bound is applied at the read-only
 query `single_use()` sites (`execute`, bound queries, the `execute_partitions` PLAN probe, and the
 connection's `get_table_schema` / statistics table scans) and, for partitioned reads, baked into the
 batch read-only transaction so every partition executes at that bound. Parsing lives in

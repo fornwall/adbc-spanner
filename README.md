@@ -45,13 +45,13 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   `get_option`. The flag is live: statements check it at execution time, so toggling it on the
   connection immediately applies to existing statements as well as new ones.
 - [Stale reads](https://cloud.google.com/spanner/docs/timestamp-bounds): queries read at a **strong**
-  bound by default, but the `spanner.read.staleness` and `spanner.read.timestamp` options (settable on
-  a connection — where they become the default for its statements — or per statement) request a
-  cheaper, lock-free stale read. `spanner.read.staleness` is `exact:<duration>` (read exactly that far
-  in the past) or `max:<duration>` (bounded staleness), where `<duration>` is a number with an
-  optional unit suffix (`s` default, `ms`, `us`, `ns`, `m`, `h`); `spanner.read.timestamp` is an RFC
-  3339 timestamp, optionally prefixed `read:` (exact, the default) or `min:` (bounded). The two are
-  mutually exclusive. The staleness/timestamp is also baked into `execute_partitions()` descriptors.
+  bound by default, but the single `spanner.read.staleness` option (settable on a connection — where
+  it becomes the default for its statements — or per statement) requests a cheaper, lock-free stale
+  read. Its value is one of four prefixed forms: `exact:<duration>` (read exactly that far in the
+  past) or `max:<duration>` (bounded staleness), where `<duration>` is a number with an optional unit
+  suffix (`s` default, `ms`, `us`, `ns`, `m`, `h`); or `read:<rfc3339>` (read exactly as of that RFC
+  3339 timestamp) or `min:<rfc3339>` (bounded). The four prefixes are distinct, so a value is
+  unambiguous; `""` unsets. The bound is also baked into `execute_partitions()` descriptors.
 - Request priority and tags: `spanner.request.priority` (`low`/`medium`/`high`, applied to every
   query/DML request and as the commit priority of read/write transactions) and `spanner.request.tag`
   are settable on a connection — where they become the default for its statements — or per statement;

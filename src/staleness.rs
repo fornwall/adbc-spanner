@@ -1,38 +1,30 @@
-//! Read staleness / timestamp-bound options for read-only queries.
+//! The read-bound option for read-only queries.
 //!
 //! By default every query reads at a **strong** bound (`TimestampBound::strong`) — it sees the
 //! effects of every transaction that committed before the read started. Spanner also supports
 //! **stale reads**, which pick an older read timestamp so the read can be served locally without a
-//! cross-replica quorum: cheaper and lock-free, ideal for analytics. This module parses the two
-//! driver options that request a non-strong bound and maps them onto the client's
-//! [`TimestampBound`].
+//! cross-replica quorum: cheaper and lock-free, ideal for analytics. This module parses the single
+//! driver option that requests a non-strong bound and maps it onto the client's [`TimestampBound`].
 //!
-//! The two options are **mutually exclusive** — only one read bound can apply to a query:
+//! [`OPTION_READ_STALENESS`](crate::OPTION_READ_STALENESS) (`spanner.read.staleness`) selects the
+//! bound. Its value is one of four prefixed forms — two *relative* (a duration) and two *absolute*
+//! (an RFC 3339 timestamp):
 //!
-//! - [`OPTION_READ_STALENESS`](crate::OPTION_READ_STALENESS) (`spanner.read.staleness`) — a
-//!   *relative* bound, `"<kind>:<duration>"`:
-//!   - `exact:<duration>` → [`TimestampBound::exact_staleness`]: read exactly `<duration>` in the
-//!     past (a single, repeatable timestamp).
-//!   - `max:<duration>` → [`TimestampBound::max_staleness`]: read at any timestamp within
-//!     `<duration>` of now (bounded staleness; the server picks, single-use reads only).
+//! - `exact:<duration>` → [`TimestampBound::exact_staleness`]: read exactly `<duration>` in the
+//!   past (a single, repeatable timestamp).
+//! - `max:<duration>` → [`TimestampBound::max_staleness`]: read at any timestamp within
+//!   `<duration>` of now (bounded staleness; the server picks, single-use reads only).
+//! - `read:<rfc3339>` → [`TimestampBound::read_timestamp`]: read exactly as of that timestamp.
+//! - `min:<rfc3339>` → [`TimestampBound::min_read_timestamp`]: read at that timestamp or later
+//!   (bounded staleness; single-use reads only).
 //!
-//!   `<duration>` is a non-negative number optionally suffixed with a unit — `s` (seconds,
-//!   the default), `ms`, `us`/`µs`, `ns`, `m` (minutes) or `h` (hours). Examples: `exact:10`,
-//!   `exact:2.5s`, `max:500ms`, `max:1m`.
+//! `<duration>` is a non-negative number optionally suffixed with a unit — `s` (seconds, the
+//! default), `ms`, `us`/`µs`, `ns`, `m` (minutes) or `h` (hours). Examples: `exact:10`, `exact:2.5s`,
+//! `max:500ms`, `max:1m`, `read:2026-07-07T00:00:00Z`, `min:2026-07-07T00:00:00+02:00`.
 //!
-//! - [`OPTION_READ_TIMESTAMP`](crate::OPTION_READ_TIMESTAMP) (`spanner.read.timestamp`) — an
-//!   *absolute* bound, an RFC 3339 timestamp optionally prefixed to select the mode:
-//!   - `read:<rfc3339>` (or bare `<rfc3339>`) → [`TimestampBound::read_timestamp`]: read exactly as
-//!     of that timestamp.
-//!   - `min:<rfc3339>` → [`TimestampBound::min_read_timestamp`]: read at that timestamp or later
-//!     (bounded staleness; single-use reads only).
-//!
-//!   Examples: `2026-07-07T00:00:00Z`, `read:2026-07-07T00:00:00Z`, `min:2026-07-07T00:00:00+02:00`.
-//!
-//! Malformed values are rejected with `InvalidArgument`. Because the two options are mutually
-//! exclusive, setting one while the other is already set is rejected as a conflict; set the other to
-//! an empty string first to unset it (which is also how a statement clears a bound inherited from
-//! its connection).
+//! The four prefixes are distinct, so a single value is unambiguous. Malformed values are rejected
+//! with `InvalidArgument`. Set the option to an empty string to unset it (which is also how a
+//! statement clears a bound inherited from its connection).
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -56,10 +48,6 @@ pub(crate) fn single_use(
         None => builder.build(),
     }
 }
-
-/// Message used when both read-bound options would be set at once.
-const CONFLICT_MSG: &str = "spanner.read.staleness and spanner.read.timestamp are mutually \
-     exclusive (only one read bound can apply); unset the other with an empty value first";
 
 /// A parsed read bound, before it is turned into a client [`TimestampBound`]. Kept as a small,
 /// pure value so the option parsing can be unit-tested offline.
@@ -109,24 +97,21 @@ impl ReadBound {
     }
 }
 
-/// The read staleness/timestamp configuration held by a connection or statement.
+/// The read-bound configuration held by a connection or statement.
 ///
-/// Stores the raw option strings (so `get_option` round-trips exactly what was set) alongside the
-/// parsed bound. The two options are mutually exclusive, so at most one of `staleness`/`timestamp`
-/// is ever `Some`, and `bound` mirrors whichever it is.
+/// Stores the raw option string (so `get_option` round-trips exactly what was set) alongside the
+/// parsed bound. `bound` mirrors the raw string: both are `Some` together or `None` together.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReadStaleness {
     /// Raw `spanner.read.staleness` value, when set.
     staleness: Option<String>,
-    /// Raw `spanner.read.timestamp` value, when set.
-    timestamp: Option<String>,
     /// The parsed bound (`None` means a strong read).
     bound: Option<ReadBound>,
 }
 
 impl ReadStaleness {
-    /// Handle a `set_option` for `spanner.read.staleness`. An empty value unsets it; a non-empty
-    /// value is rejected if `spanner.read.timestamp` is already set (see [`CONFLICT_MSG`]).
+    /// Handle a `set_option` for `spanner.read.staleness`. An empty value unsets it (a strong
+    /// read); any non-empty value replaces the current bound.
     pub(crate) fn set_staleness(&mut self, value: OptionValue) -> Result<()> {
         let raw = as_string(value)?;
         let trimmed = raw.trim();
@@ -135,30 +120,8 @@ impl ReadStaleness {
             self.bound = None;
             return Ok(());
         }
-        if self.timestamp.is_some() {
-            return Err(invalid_argument(CONFLICT_MSG));
-        }
-        let bound = parse_staleness(trimmed)?;
+        let bound = parse_read_bound(trimmed)?;
         self.staleness = Some(trimmed.to_string());
-        self.bound = Some(bound);
-        Ok(())
-    }
-
-    /// Handle a `set_option` for `spanner.read.timestamp`. An empty value unsets it; a non-empty
-    /// value is rejected if `spanner.read.staleness` is already set (see [`CONFLICT_MSG`]).
-    pub(crate) fn set_timestamp(&mut self, value: OptionValue) -> Result<()> {
-        let raw = as_string(value)?;
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            self.timestamp = None;
-            self.bound = None;
-            return Ok(());
-        }
-        if self.staleness.is_some() {
-            return Err(invalid_argument(CONFLICT_MSG));
-        }
-        let bound = parse_timestamp(trimmed)?;
-        self.timestamp = Some(trimmed.to_string());
         self.bound = Some(bound);
         Ok(())
     }
@@ -166,11 +129,6 @@ impl ReadStaleness {
     /// The raw `spanner.read.staleness` value, for `get_option` round-trip.
     pub(crate) fn staleness_string(&self) -> Option<&str> {
         self.staleness.as_deref()
-    }
-
-    /// The raw `spanner.read.timestamp` value, for `get_option` round-trip.
-    pub(crate) fn timestamp_string(&self) -> Option<&str> {
-        self.timestamp.as_deref()
     }
 
     /// The client [`TimestampBound`] to apply, or `None` for a strong read.
@@ -197,54 +155,46 @@ fn as_string(value: OptionValue) -> Result<String> {
     match value {
         OptionValue::String(s) => Ok(s),
         _ => Err(invalid_argument(
-            "read staleness/timestamp options require a string value",
+            "spanner.read.staleness requires a string value",
         )),
     }
 }
 
-/// Parse a `spanner.read.staleness` value: `"exact:<duration>"` or `"max:<duration>"`.
-pub(crate) fn parse_staleness(value: &str) -> Result<ReadBound> {
-    let (kind, arg) = value.split_once(':').ok_or_else(|| {
-        invalid_argument(
-            "spanner.read.staleness must be \"exact:<duration>\" or \"max:<duration>\" \
-             (e.g. \"exact:10s\", \"max:500ms\")",
-        )
-    })?;
-    let duration = parse_duration(arg.trim())?;
-    match kind.trim().to_ascii_lowercase().as_str() {
-        "exact" => Ok(ReadBound::ExactStaleness(duration)),
-        "max" => Ok(ReadBound::MaxStaleness(duration)),
-        other => Err(invalid_argument(format!(
-            "unknown staleness kind {other:?}; expected \"exact\" or \"max\""
-        ))),
+/// Error describing the accepted `spanner.read.staleness` grammar.
+const GRAMMAR_MSG: &str = "spanner.read.staleness must be one of \"exact:<duration>\", \
+     \"max:<duration>\", \"read:<rfc3339>\" or \"min:<rfc3339>\" (e.g. \"exact:10s\", \
+     \"max:500ms\", \"read:2026-07-07T00:00:00Z\", \"min:2026-07-07T00:00:00+02:00\")";
+
+/// Parse a `spanner.read.staleness` value into a [`ReadBound`]. Accepts the four prefixed forms —
+/// the *relative* `exact:<duration>` / `max:<duration>` and the *absolute* `read:<rfc3339>` /
+/// `min:<rfc3339>` — plus a bare `<rfc3339>` (equivalent to `read:`). The four prefixes are
+/// distinct, so the value is unambiguous.
+pub(crate) fn parse_read_bound(value: &str) -> Result<ReadBound> {
+    // RFC 3339 timestamps themselves contain colons, so the `read:`/`min:` prefixes are matched
+    // literally (not via `split_once(':')`) before the duration kinds.
+    if let Some(rest) = value.strip_prefix("read:") {
+        return Ok(ReadBound::ReadTimestamp(parse_rfc3339(rest.trim())?));
     }
+    if let Some(rest) = value.strip_prefix("min:") {
+        return Ok(ReadBound::MinReadTimestamp(parse_rfc3339(rest.trim())?));
+    }
+    if let Some((kind, arg)) = value.split_once(':') {
+        match kind.trim().to_ascii_lowercase().as_str() {
+            "exact" => return Ok(ReadBound::ExactStaleness(parse_duration(arg.trim())?)),
+            "max" => return Ok(ReadBound::MaxStaleness(parse_duration(arg.trim())?)),
+            // Not a duration kind — fall through and try a bare RFC 3339 timestamp (which also
+            // contains colons), else report the grammar error.
+            _ => {}
+        }
+    }
+    parse_rfc3339(value).map(ReadBound::ReadTimestamp)
 }
 
-/// Parse a `spanner.read.timestamp` value: an RFC 3339 timestamp optionally prefixed `read:`
-/// (exact, the default) or `min:` (minimum / bounded staleness).
-pub(crate) fn parse_timestamp(value: &str) -> Result<ReadBound> {
-    // RFC 3339 timestamps themselves contain colons, so only a leading `read:`/`min:` prefix is
-    // treated specially — never a plain `split_once(':')`.
-    let (min, rest) = if let Some(r) = value.strip_prefix("min:") {
-        (true, r.trim())
-    } else if let Some(r) = value.strip_prefix("read:") {
-        (false, r.trim())
-    } else {
-        (false, value)
-    };
-    let dt = DateTime::parse_from_rfc3339(rest)
-        .map_err(|e| {
-            invalid_argument(format!(
-                "spanner.read.timestamp must be an RFC 3339 timestamp, optionally prefixed \
-                 \"read:\" or \"min:\": {e}"
-            ))
-        })?
-        .with_timezone(&Utc);
-    Ok(if min {
-        ReadBound::MinReadTimestamp(dt)
-    } else {
-        ReadBound::ReadTimestamp(dt)
-    })
+/// Parse an RFC 3339 timestamp into a UTC [`DateTime`].
+fn parse_rfc3339(value: &str) -> Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(value)
+        .map_err(|e| invalid_argument(format!("{GRAMMAR_MSG}: {e}")))?
+        .with_timezone(&Utc))
 }
 
 /// Parse a non-negative duration with an optional unit suffix (`s` default, `ms`, `us`/`µs`, `ns`,
@@ -301,66 +251,67 @@ mod tests {
     #[test]
     fn parses_exact_and_max_staleness_with_units() {
         assert_eq!(
-            parse_staleness("exact:10").unwrap(),
+            parse_read_bound("exact:10").unwrap(),
             ReadBound::ExactStaleness(Duration::from_secs(10))
         );
         assert_eq!(
-            parse_staleness("exact:2.5s").unwrap(),
+            parse_read_bound("exact:2.5s").unwrap(),
             ReadBound::ExactStaleness(Duration::from_secs_f64(2.5))
         );
         assert_eq!(
-            parse_staleness("max:500ms").unwrap(),
+            parse_read_bound("max:500ms").unwrap(),
             ReadBound::MaxStaleness(Duration::from_millis(500))
         );
         assert_eq!(
-            parse_staleness("MAX:1m").unwrap(),
+            parse_read_bound("MAX:1m").unwrap(),
             ReadBound::MaxStaleness(Duration::from_secs(60))
         );
         assert_eq!(
-            parse_staleness(" exact : 1h ").unwrap(),
+            parse_read_bound(" exact : 1h ").unwrap(),
             ReadBound::ExactStaleness(Duration::from_secs(3600))
         );
     }
 
     #[test]
-    fn rejects_bad_staleness() {
-        for bad in [
-            "10s",       // no kind
-            "exact:",    // no duration
-            "exact:abc", // non-numeric
-            "exact:-5",  // negative
-            "soon:10s",  // unknown kind
-            "exact:1x",  // unknown unit (parsed as number "1x" → error)
-        ] {
-            assert!(parse_staleness(bad).is_err(), "expected error for {bad:?}");
-        }
-    }
-
-    #[test]
     fn parses_read_and_min_timestamp() {
+        // Bare RFC 3339 is accepted as an exact read timestamp (equivalent to `read:`).
         assert_eq!(
-            parse_timestamp("2026-07-07T00:00:00Z").unwrap(),
+            parse_read_bound("2026-07-07T00:00:00Z").unwrap(),
             ReadBound::ReadTimestamp(dt("2026-07-07T00:00:00Z"))
         );
         assert_eq!(
-            parse_timestamp("read:2026-07-07T00:00:00Z").unwrap(),
+            parse_read_bound("read:2026-07-07T00:00:00Z").unwrap(),
             ReadBound::ReadTimestamp(dt("2026-07-07T00:00:00Z"))
         );
         assert_eq!(
-            parse_timestamp("min:2026-07-07T00:00:00+02:00").unwrap(),
+            parse_read_bound("min:2026-07-07T00:00:00+02:00").unwrap(),
             ReadBound::MinReadTimestamp(dt("2026-07-07T00:00:00+02:00"))
         );
     }
 
+    /// All four prefixes plus the bare form dispatch to the right kind through the one entry point.
     #[test]
-    fn rejects_bad_timestamp() {
-        for bad in ["not-a-timestamp", "read:", "2026-07-07", "min:12345"] {
-            assert!(parse_timestamp(bad).is_err(), "expected error for {bad:?}");
+    fn rejects_bad_read_bound() {
+        for bad in [
+            "10s",        // no kind, not a timestamp
+            "exact:",     // no duration
+            "exact:abc",  // non-numeric duration
+            "exact:-5",   // negative duration
+            "soon:10s",   // unknown duration kind
+            "exact:1x",   // unknown unit (parsed as number "1x" → error)
+            "not-a-time", // not a timestamp
+            "read:",      // empty timestamp
+            "2026-07-07", // date only, not a full RFC 3339 timestamp
+            "min:12345",  // not a timestamp
+        ] {
+            assert!(parse_read_bound(bad).is_err(), "expected error for {bad:?}");
         }
     }
 
+    /// A single option holds one bound at a time; setting a new value replaces the old, and an
+    /// empty value clears it. All four kinds round-trip through the one `spanner.read.staleness` key.
     #[test]
-    fn mutually_exclusive_options_conflict_and_can_be_switched() {
+    fn single_option_holds_one_bound_and_can_be_replaced() {
         let mut s = ReadStaleness::default();
         assert!(s.timestamp_bound().unwrap().is_none());
 
@@ -369,20 +320,16 @@ mod tests {
         assert_eq!(s.staleness_string(), Some("exact:10s"));
         assert!(s.timestamp_bound().unwrap().is_some());
 
-        // Setting the other bound while one is active is rejected.
-        let err = s
-            .set_timestamp(OptionValue::String("2026-07-07T00:00:00Z".into()))
-            .unwrap_err();
-        assert_eq!(err.status, adbc_core::error::Status::InvalidArguments);
+        // Setting a timestamp value on the same key replaces the staleness bound (no conflict).
+        s.set_staleness(OptionValue::String("read:2026-07-07T00:00:00Z".into()))
+            .unwrap();
+        assert_eq!(s.staleness_string(), Some("read:2026-07-07T00:00:00Z"));
+        assert!(s.timestamp_bound().unwrap().is_some());
 
-        // Unset the staleness, then the timestamp is accepted.
+        // An empty value clears the bound (a strong read again).
         s.set_staleness(OptionValue::String(String::new())).unwrap();
         assert_eq!(s.staleness_string(), None);
         assert!(s.timestamp_bound().unwrap().is_none());
-        s.set_timestamp(OptionValue::String("2026-07-07T00:00:00Z".into()))
-            .unwrap();
-        assert_eq!(s.timestamp_string(), Some("2026-07-07T00:00:00Z"));
-        assert!(s.timestamp_bound().unwrap().is_some());
     }
 
     /// Pinning for a multi-use read-only transaction: the exact kinds pass through unchanged,
