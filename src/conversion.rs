@@ -20,7 +20,8 @@
 //! | `BYTES`                                     | `Binary`                          |
 //! | `STRING`/`UUID`/`INTERVAL`                   | `Utf8`                            |
 //! | `JSON`                                      | `Utf8` + `arrow.json` extension   |
-//! | `PROTO`/`ENUM`                               | *(rejected — `NotImplemented`)*   |
+//! | `ENUM`                                      | `Int64` (integer ordinal)         |
+//! | `PROTO`                                     | `Binary` (raw serialized bytes)   |
 //! | `ARRAY<T>`                                  | `List<T>`                         |
 //! | `STRUCT<..>`                                | `Struct<..>`                      |
 //!
@@ -34,11 +35,12 @@
 //! the [`Field`], not the [`DataType`]; for `ARRAY<JSON>` it sits on the list's child (`item`)
 //! field. The other Utf8-backed codes stay plain, untagged `Utf8`.
 //!
-//! `PROTO` and `ENUM` have no faithful Arrow mapping — their wire form is a base64-serialized proto
-//! message / a bare enum number as a string — so, rather than silently mis-decode them into a
-//! `Utf8` stand-in the caller could mistake for real text, such a column is rejected loudly with a
-//! `NotImplemented` error naming the column and type (see `unsupported_type_error`), consistent
-//! with the strict-decode policy of the value path.
+//! `ENUM` maps to `Int64` (its integer ordinal) and `PROTO` to `Binary` (its raw serialized proto2
+//! wire bytes, delivered base64-encoded like `BYTES`) — both lossless primitive mappings. The
+//! *structure* behind them (enum member names, proto field layout) lives only in the database's
+//! proto descriptor bundle, not in the query metadata, so the driver hands back the faithful
+//! primitive rather than a decoded `Dictionary`/`Struct`; a caller who wants the decoded form can
+//! `CAST(col AS STRING)` in SQL.
 //!
 //! The `TIMESTAMP` mapping is selected by [`TimestampPrecision`] (the
 //! `spanner.max_timestamp_precision` option): the default keeps the wire's full nanosecond
@@ -560,9 +562,9 @@ impl RecordBatchReader for BoundQueryBatchReader {
 /// Build the Arrow schema for a result set from Spanner's column metadata, falling back to
 /// all-`Utf8` columns inferred from the first row's width when metadata is unavailable.
 ///
-/// Fails with [`Status::NotImplemented`] if any column has a type this driver does not map to Arrow
-/// (currently `PROTO`/`ENUM`; see [`arrow_type`]/[`unsupported_type_error`]) — the error names the
-/// offending column and its type rather than silently emitting a mis-decoded stand-in column.
+/// Returns `Result` (and prefixes the offending column name on error) so an unmappable type can be
+/// rejected cleanly; today every Spanner type maps to some Arrow type, so this does not fail in
+/// practice — see [`arrow_type`].
 pub(crate) fn build_schema(
     metadata: Option<&ResultSetMetadata>,
     first_row: Option<&Row>,
@@ -576,8 +578,8 @@ pub(crate) fn build_schema(
                 .iter()
                 .enumerate()
                 .map(|(i, name)| match types.get(i) {
-                    // Prefix the column name (as `build_column` does on the value path) so a
-                    // rejected PROTO/ENUM names the failing column in a wide result set.
+                    // Prefix the column name (as `build_column` does on the value path) so any
+                    // future type-mapping rejection names the failing column in a wide result set.
                     Some(ty) => arrow_field(name, ty, true, precision).map_err(|mut e| {
                         e.message = format!("column {name:?}: {}", e.message);
                         e
@@ -604,9 +606,9 @@ pub(crate) fn build_schema(
 /// recognize it while others still read plain strings. Only `TypeCode::Json` is tagged — the other
 /// Utf8-backed codes (`STRING`, `UUID`, `INTERVAL`) stay untagged.
 ///
-/// Fails with [`Status::NotImplemented`] if `ty` (or, recursively, an `ARRAY` element / `STRUCT`
-/// field type) is a `PROTO` the driver does not map to Arrow — see [`unsupported_type_error`].
-/// (`ENUM` maps to `Int64`; only `PROTO` is rejected.)
+/// Never fails today (every Spanner type maps to some Arrow type — `ENUM` → `Int64`, `PROTO` →
+/// `Binary`), but stays fallible so a future unmappable type can be rejected here without a
+/// signature change rippling through the schema-build path.
 fn arrow_field(
     name: impl Into<String>,
     ty: &Type,
@@ -619,24 +621,6 @@ fn arrow_field(
     } else {
         field
     })
-}
-
-/// The error for a Spanner column whose type this driver does not map to Arrow — currently only
-/// `PROTO`.
-///
-/// Its wire encoding (a base64-serialized proto message) has no faithful Arrow representation, so —
-/// consistent with the strict-decode policy of the value path — such a column is rejected with a
-/// clean [`Status::NotImplemented`] naming the unsupported type, never silently mapped to a `Utf8`
-/// stand-in the caller could mistake for real string data. (`ENUM` is *not* rejected: it maps to
-/// `Int64`, its integer ordinal — see [`arrow_type`].)
-fn unsupported_type_error(type_name: &str) -> adbc_core::error::Error {
-    err(
-        format!(
-            "Spanner {type_name} columns are not supported by this driver (no faithful Arrow \
-             mapping)"
-        ),
-        Status::NotImplemented,
-    )
 }
 
 /// Whether an Arrow [`Field`] carries the canonical `arrow.json` extension on a string storage
@@ -687,32 +671,32 @@ fn arrow_type(ty: &Type, precision: TimestampPrecision) -> Result<DataType> {
         TypeCode::Array => match ty.array_element_type() {
             // ARRAY<T> → Arrow List<T> (recursively; T may itself be a STRUCT). The element field is
             // built via `arrow_field`, so an `ARRAY<JSON>` carries the `arrow.json` extension on the
-            // list's child (`item`) field, not the top-level List. A PROTO element is rejected by the
-            // recursive `arrow_field`, so `ARRAY<PROTO>` fails loudly; an `ARRAY<ENUM>` maps to
-            // `List<Int64>` the same as a scalar ENUM. Spanner does not allow arrays of arrays; fall
-            // back to JSON text for anything else.
+            // list's child (`item`) field, not the top-level List. Element types recurse the same as
+            // scalars: `ARRAY<ENUM>` → `List<Int64>`, `ARRAY<PROTO>` → `List<Binary>`. Spanner does
+            // not allow arrays of arrays; fall back to JSON text for anything else.
             Some(element) if !matches!(element.code(), TypeCode::Array | TypeCode::Unspecified) => {
                 DataType::List(Arc::new(arrow_field(LIST_ITEM, &element, true, precision)?))
             }
             _ => DataType::Utf8,
         },
         // ENUM maps to its integer ordinal: the wire value is a bare enum number (delivered as a
-        // decimal string, like INT64), so `Int64` is a lossless, honest mapping. The enum's member
-        // *names* live only in the proto descriptor, which the result metadata does not ship and the
-        // pinned client does not expose (no `proto_type_fqn` accessor), so a faithful string/label
-        // `Dictionary` is not reachable here; callers who want labels can `CAST(col AS STRING)` in
-        // SQL. PROTO stays rejected — its wire form is a base64-serialized proto message with no
-        // faithful Arrow mapping (see `unsupported_type_error`).
+        // decimal string, like INT64), so `Int64` is a lossless, honest mapping. PROTO maps to its
+        // raw serialized message bytes (delivered base64-encoded, exactly like BYTES) as `Binary` —
+        // also lossless: the caller gets the precise proto2 wire bytes and can decode them with their
+        // own compiled `.proto`. Neither type's *structure* (enum member names / proto field layout)
+        // travels in the query metadata — it lives only in the database's proto descriptor bundle,
+        // reachable via the admin `GetDatabaseDdl` RPC, not the data-plane read — so a faithful
+        // label `Dictionary` / decoded `Struct` is not reachable here; callers who want them can
+        // `CAST(col AS STRING)` in SQL (enum member name / proto text format) instead.
         TypeCode::Enum => DataType::Int64,
-        TypeCode::Proto => return Err(unsupported_type_error("PROTO")),
+        TypeCode::Proto => DataType::Binary,
         // STRING, JSON, UUID, INTERVAL and any future/unknown code are UTF-8 text.
         _ => DataType::Utf8,
     })
 }
 
 /// Map a Spanner `STRUCT` type to an Arrow `Struct`, using the field names and types from the
-/// result metadata. Falls back to `Utf8` if the struct type is somehow unavailable, and propagates
-/// an [`unsupported_type_error`] from a `PROTO` field.
+/// result metadata. Falls back to `Utf8` if the struct type is somehow unavailable.
 fn struct_arrow_type(ty: &Type, precision: TimestampPrecision) -> Result<DataType> {
     match ty.struct_type() {
         Some(st) => Ok(DataType::Struct(struct_fields(st, precision)?)),
@@ -1289,34 +1273,37 @@ mod tests {
     }
 
     #[test]
-    fn proto_columns_are_rejected_cleanly() {
+    fn proto_columns_map_to_binary() {
         use google_cloud_spanner::model;
 
         // The pinned client exposes no public constructor for PROTO types, so build one straight
         // from the generated model type and wrap it.
         let ty: Type = model::Type::new().set_code(model::TypeCode::Proto).into();
 
-        // A PROTO column is rejected with a clean NotImplemented naming the type — never silently
-        // mapped to a Utf8 stand-in that would mis-decode the base64 proto blob into what looks
-        // like real string data.
-        let err = arrow_field("payload", &ty, true, TimestampPrecision::default()).unwrap_err();
-        assert_eq!(err.status, Status::NotImplemented);
-        assert!(
-            err.message.contains("PROTO"),
-            "message should name PROTO: {:?}",
-            err.message
-        );
+        // A scalar PROTO maps to its raw serialized bytes: Binary, no extension metadata.
+        let field = arrow_field("payload", &ty, true, TimestampPrecision::default()).unwrap();
+        assert_eq!(field.data_type(), &DataType::Binary);
+        assert_eq!(extension_name(&field), None);
 
-        // The rejection also flows through the recursive element type of an ARRAY<PROTO>, so that
-        // fails loudly too rather than yielding a List<Utf8>.
+        // ARRAY<PROTO> maps to List<Binary> the same way, recursively.
         let array_ty = google_cloud_spanner::types::array(ty);
-        let err = arrow_field("arr", &array_ty, true, TimestampPrecision::default()).unwrap_err();
-        assert_eq!(err.status, Status::NotImplemented);
-        assert!(
-            err.message.contains("PROTO"),
-            "ARRAY<PROTO> message should name PROTO: {:?}",
-            err.message
-        );
+        let field =
+            arrow_field("payloads", &array_ty, true, TimestampPrecision::default()).unwrap();
+        let DataType::List(item) = field.data_type() else {
+            panic!("expected a List data type, got {:?}", field.data_type());
+        };
+        assert_eq!(item.data_type(), &DataType::Binary);
+
+        // The wire value is the serialized proto message base64-encoded (like BYTES); it decodes to
+        // those exact bytes. "AQID" is base64 for [1, 2, 3].
+        let value = "AQID".to_value();
+        let array = build_array(&DataType::Binary, &[Some(&value)]).unwrap();
+        let bytes = array
+            .as_any()
+            .downcast_ref::<arrow_array::BinaryArray>()
+            .unwrap();
+        assert_eq!(bytes.len(), 1);
+        assert_eq!(bytes.value(0), &[1u8, 2, 3]);
     }
 
     #[test]
