@@ -14,9 +14,8 @@ An [ADBC](https://arrow.apache.org/adbc/) (Arrow Database Connectivity) driver f
 
 Early but working and tested end-to-end against the Spanner emulator.
 
-## Supported Spanner functionality
+## Supported ADBC functionality
 
-- Connecting to production Spanner or a [Spanner emulator](https://docs.cloud.google.com/spanner/docs/emulator).
 - SQL queries (`execute`) are streamed back as typed Arrow `RecordBatch`es. Spanner does not support returning
   columnar results directly - rows are pulled from Spanner and converted to Arrow in bounded chunks (with configurable
   size) as the reader is iterated, so a large result set is never fully materialised in memory.
@@ -39,92 +38,12 @@ Early but working and tested end-to-end against the Spanner emulator.
   a [`THEN RETURN`](https://cloud.google.com/spanner/docs/dml-returning) clause returns its rows:
   `execute()` yields them as an Arrow result (autocommit mode only — buffered manual transactions
   cannot produce them).
-- [Timestamp bounds](https://cloud.google.com/spanner/docs/timestamp-bounds): Queries read at a
-  [strong](https://docs.cloud.google.com/spanner/docs/timestamp-bounds#strong) bound by default.
-  Bounded or exact staleness can be achieved through ADBC options.  
-- [Request priorities](https://cloud.google.com/blog/topics/developers-practitioners/introducing-request-priorities-cloud-spanner-apis)
-  are supported through ADBC options. Default is high priority.
-- [Request and transaction tags](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags)
-  are supported through ADBC options.
-- [Directed reads](https://cloud.google.com/spanner/docs/directed-reads): `spanner.directed_read`
-  (connection- or statement-level) steers **read-only queries** to specific replicas — `include:<sel>`
-  (an ordered preference list) or `exclude:<sel>` (replicas to avoid), where each `<sel>` is
-  `<location>`, `<location>:<type>` or `:<type>` (`<type>` is `read_write`/`read_only`/`any`), plus an
-  optional `;auto_failover_disabled` on `include`. E.g. `include:us-east1:read_only,us-east4`. Applies
-  to queries only (Spanner rejects directed reads on writes); see [docs/options.md](docs/options.md#directed-reads).
-- Commit batching: `spanner.commit.max_delay` sets the [maximum commit delay](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions)
-  Spanner may add to a read/write commit so it can batch it with others (trading a little latency for
-  throughput). It applies at every read/write commit the driver builds — autocommit DML, the
-  `ExecuteBatchDml` batch runner, the manual-mode commit, and the bulk-ingest write-only transaction
-  — and is settable on a connection (where it becomes the default for its statements) or per
-  statement. The value is a duration in `0..=500ms` (the staleness duration grammar: a number with
-  an optional `s`/`ms`/`us`/`ns`/`m`/`h` suffix, e.g. `100ms`, `0.2s`); values above 500ms or
-  malformed ones are rejected with `InvalidArguments`, `""` unsets, and it round-trips via
-  `get_option`.
-- Commit statistics: `spanner.commit_stats` (a boolean, default `false`) requests Spanner return
-  [commit statistics](https://docs.cloud.google.com/spanner/docs/commit-statistics) on the read/write
-  commits the driver builds (the same four sites as `spanner.commit.max_delay`). When enabled, the
-  **mutation count** of the most recent commit is captured and read back via
-  `spanner.commit_stats.mutation_count` (`get_option` / `get_option_int`) — on the statement for
-  autocommit DML and bulk ingest, on the connection for a manual-mode commit; it is `NotFound` until
-  such a commit has run. Settable on a connection (becomes the default for its statements) or per
-  statement, `""` unsets, and the flag round-trips via `get_option`.
-- RPC timeouts: `spanner.rpc.timeout_seconds.query` (a query's initial execution, through the first
-  chunk of its streamed result — also the driver-internal metadata reads: `get_objects`,
-  `get_statistics`, `get_table_schema`, the ingest table-exists probe),
-  `spanner.rpc.timeout_seconds.fetch` (each subsequent chunk fetch, enforced inside the background
-  prefetch task) and `spanner.rpc.timeout_seconds.update` (DML / batch DML, the manual-mode commit,
-  each bulk-ingest commit chunk, and DDL — the admin `UpdateDatabaseDdl` call **and** its
-  long-running-operation poll loop) — settable on a connection (where they become the default for
-  its statements) or per statement, named in parallel with the Flight SQL driver's
-  `adbc.flight.sql.rpc.timeout_seconds.*`. Values are seconds (fractions allowed; must be finite and
-  non-negative; `0` disables, `""` unsets; round-trip via `get_option` and `get_option_double`).
-  Each is an overall deadline on the driver-side operation (including the client's internal
-  retries); expiry fails with ADBC `Timeout` status. Unset means no deadline — the pre-existing
-  behaviour, where only `cancel` can interrupt a hung call.
-- Retry tuning: `spanner.retry.max_attempts` (a positive integer; `1` disables retrying) and
-  `spanner.retry.max_elapsed_seconds` (finite, strictly positive) bound the Spanner client's
-  *per-attempt* retry loop — settable on a connection (where they become the default for its
-  statements) or per statement, mirroring gax's attempt-count / elapsed-time knobs. Unset (the
-  default) leaves the client's own policy, which has no cap; setting either bounds it while
-  preserving its transport-error-on-idempotent retrying, and the two combine (whichever limit fires
-  first wins). `""` unsets; they round-trip via `get_option`/`get_option_int`/`get_option_double`.
-  Three further knobs tune the *delay between* attempts (the client's exponential backoff):
-  `spanner.retry.backoff.initial_seconds`, `spanner.retry.backoff.max_seconds` and
-  `spanner.retry.backoff.multiplier` (each finite, strictly positive; client defaults 1s / 60s / ×2).
-  Setting any one replaces the client's default backoff (unset knobs take the defaults, clamped to
-  the gax recommended ranges); they are independent of the attempt / elapsed-time caps, `""` unsets,
-  and they round-trip via `get_option`/`get_option_double`.
-  This complements the *overall* per-operation `spanner.rpc.timeout_seconds.*` deadlines.
-- Parameter binding: `bind`/`bind_stream` an Arrow batch whose columns become Spanner named
-  parameters; each bound row runs the statement once. How columns pair with the query's `@name`
-  parameters is set by the `adbc.statement.bind_by_name` statement option (the [SQLite reference
-  driver's convention](https://github.com/apache/arrow-adbc/issues/3362)), a boolean defaulting to
-  `false`: **positional** (the default) binds the *i*-th bound column to the *i*-th distinct
-  parameter in query order, ignoring column names — the ADBC ordinal contract that positional
-  clients and validation suites rely on; **`true`** is strict by-name (a column `id` binds `@id`,
-  order-independent), where a bound column that names no query parameter fails with
-  `InvalidArguments` naming the missing parameter — for clients whose column names are authoritative
-  and may not match the parameters' textual order. A bound *query*
-  over several rows executes all of them in one shared read-only snapshot (a multi-use read-only
-  transaction at the configured staleness bound), so the per-row results are mutually consistent,
-  and its results stream in `spanner.rows_per_batch` chunks like any other query. Because Spanner
-  accepts the bounded-staleness kinds only on single-use transactions, a `max:<d>`/`min:<t>` bound
-  is pinned there to its most-stale legal equivalent (exact staleness `<d>` / read timestamp `<t>`).
-- Bulk ingest: set `adbc.ingest.target_table`, bind an Arrow batch, and `execute_update` inserts the
-  rows into that table. Rows are shipped as native Spanner **insert mutations** (the `Commit` RPC's
-  write format) rather than per-row `INSERT` DML, so nothing is SQL-parsed or query-planned per row —
-  the fast path for bulk loads, with unchanged `INSERT` semantics (a duplicate primary key still
-  fails with `AlreadyExists`). The ingest commits in one transaction when it fits Spanner's
-  per-commit limits (~80,000 mutations, counted roughly as rows × columns, and ~100 MB). A larger
-  ingest is automatically split into chunks that stay well under those limits, each committed in its
-  own transaction, so it is **not atomic as a whole**: a mid-ingest failure leaves earlier chunks
-  committed. (An ingest that large could not have committed as one transaction anyway.) Because the
-  rows × columns estimate can't see the secondary-index entries that also count toward the mutation
-  cap, an autocommit chunk that overshoots the limit anyway is transparently bisected and its halves
-  retried down to a single row, so a heavily-indexed table still ingests without any manual
-  chunk-size tuning (a bisected chunk is likewise not atomic as a whole; every other failure — a
-  duplicate key, a bad value — still surfaces unchanged). In a manual
+- [Bulk ingestion](https://arrow.apache.org/adbc/current/format/specification.html#bulk-ingestion)
+  are supported through [insert mutations](https://docs.cloud.google.com/spanner/docs/modify-mutation-api).
+  The ingest commits in one transaction when it fits Spanner's
+  [per-commit limits](https://docs.cloud.google.com/spanner/quotas#limits-for). A larger ingest is
+  automatically split into chunks that fits those limits, in which case the ingestion is
+  **not atomic as a whole**: a mid-ingest failure leaves earlier chunks committed. In a manual
   transaction (`adbc.connection.autocommit=false`) the mutations are buffered — unchunked — and
   committed atomically with any buffered DML on `commit`; Spanner applies buffered mutations at
   commit time, after the transaction's DML has executed. All four `adbc.ingest.mode` values are
@@ -145,6 +64,23 @@ Early but working and tested end-to-end against the Spanner emulator.
   groups non-atomically). It only affects autocommit ingests — a manual transaction ignores it and
   still buffers and commits atomically — and, since BatchWrite carries no per-request commit options,
   the priority / request-tag / `commit.max_delay` / `commit_stats` options do not apply on that path.
+  TODO: Move BatchWrite to section below. perhaps a dedicated bulk ingestion explaining everything around
+  that - supported moves, BatchWrite, transaction splitting, transaction behaviour, etc.
+- Parameter binding: `bind`/`bind_stream` an Arrow batch whose columns become Spanner named
+  parameters; each bound row runs the statement once. How columns pair with the query's `@name`
+  parameters is set by the `adbc.statement.bind_by_name` statement option (the [SQLite reference
+  driver's convention](https://github.com/apache/arrow-adbc/issues/3362)), a boolean defaulting to
+  `false`: **positional** (the default) binds the *i*-th bound column to the *i*-th distinct
+  parameter in query order, ignoring column names — the ADBC ordinal contract that positional
+  clients and validation suites rely on; **`true`** is strict by-name (a column `id` binds `@id`,
+  order-independent), where a bound column that names no query parameter fails with
+  `InvalidArguments` naming the missing parameter — for clients whose column names are authoritative
+  and may not match the parameters' textual order. A bound *query*
+  over several rows executes all of them in one shared read-only snapshot (a multi-use read-only
+  transaction at the configured staleness bound), so the per-row results are mutually consistent,
+  and its results stream in `spanner.rows_per_batch` chunks like any other query. Because Spanner
+  accepts the bounded-staleness kinds only on single-use transactions, a `max:<d>`/`min:<t>` bound
+  is pinned there to its most-stale legal equivalent (exact staleness `<d>` / read timestamp `<t>`).
 - Metadata: `get_table_types()`, `get_table_schema()`, and `get_objects()` (catalog/schema/table/
   column introspection from `INFORMATION_SCHEMA`; columns report the Spanner-native type, e.g.
   `STRING(MAX)`, as `xdbc_type_name`).
@@ -160,6 +96,33 @@ Early but working and tested end-to-end against the Spanner emulator.
   descriptor, and `Connection::read_partition()` streams one partition's rows back as Arrow.
   `spanner.data_boost` bakes [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview)
   into the descriptors; `spanner.partition.max_count` hints the partition count.
+
+## Supported Spanner functionality
+
+- Connecting to production Spanner or a [Spanner emulator](https://docs.cloud.google.com/spanner/docs/emulator).
+- [Timestamp bounds](https://cloud.google.com/spanner/docs/timestamp-bounds): Queries read at a
+  [strong](https://docs.cloud.google.com/spanner/docs/timestamp-bounds#strong) bound by default.
+  Bounded or exact staleness can be achieved through ADBC options.  
+- [Request priorities](https://cloud.google.com/blog/topics/developers-practitioners/introducing-request-priorities-cloud-spanner-apis)
+  are supported through ADBC options. Default is high priority.
+- [Request and transaction tags](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags)
+  are supported through ADBC options.
+- [Directed reads](https://cloud.google.com/spanner/docs/directed-reads) are supported through ADBC options.
+- [Commit statistics](https://docs.cloud.google.com/spanner/docs/commit-statistics) are supported
+  through ADBC options.
+- [Custom timeouts](https://docs.cloud.google.com/spanner/docs/custom-timeout-and-retry) are
+  supported through ADBC options.
+- [Retry policies](https://docs.cloud.google.com/spanner/docs/custom-timeout-and-retry)
+  are supported through ADBC options.
+- Commit batching: `spanner.commit.max_delay` sets the [maximum commit delay](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions)
+  Spanner may add to a read/write commit so it can batch it with others (trading a little latency for
+  throughput). It applies at every read/write commit the driver builds — autocommit DML, the
+  `ExecuteBatchDml` batch runner, the manual-mode commit, and the bulk-ingest write-only transaction
+  — and is settable on a connection (where it becomes the default for its statements) or per
+  statement. The value is a duration in `0..=500ms` (the staleness duration grammar: a number with
+  an optional `s`/`ms`/`us`/`ns`/`m`/`h` suffix, e.g. `100ms`, `0.2s`); values above 500ms or
+  malformed ones are rejected with `InvalidArguments`, `""` unsets, and it round-trips via
+  `get_option`.
 - [Change streams](https://cloud.google.com/spanner/docs/change-streams) work through the driver's
   ordinary SQL paths — no dedicated support is needed. `CREATE CHANGE STREAM … FOR <table>` /
   `DROP CHANGE STREAM` run through the DDL path like any other DDL; the stream is introspectable via
