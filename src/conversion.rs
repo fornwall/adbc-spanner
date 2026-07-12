@@ -605,7 +605,8 @@ pub(crate) fn build_schema(
 /// Utf8-backed codes (`STRING`, `UUID`, `INTERVAL`) stay untagged.
 ///
 /// Fails with [`Status::NotImplemented`] if `ty` (or, recursively, an `ARRAY` element / `STRUCT`
-/// field type) is a `PROTO`/`ENUM` the driver does not map to Arrow — see [`unsupported_type_error`].
+/// field type) is a `PROTO` the driver does not map to Arrow — see [`unsupported_type_error`].
+/// (`ENUM` maps to `Int64`; only `PROTO` is rejected.)
 fn arrow_field(
     name: impl Into<String>,
     ty: &Type,
@@ -620,13 +621,14 @@ fn arrow_field(
     })
 }
 
-/// The error for a Spanner column whose type this driver does not map to Arrow — currently `PROTO`
-/// and `ENUM`.
+/// The error for a Spanner column whose type this driver does not map to Arrow — currently only
+/// `PROTO`.
 ///
-/// Their wire encodings (a base64-serialized proto message; a bare enum number as a string) have no
-/// faithful Arrow representation, so — consistent with the strict-decode policy of the value path —
-/// such a column is rejected with a clean [`Status::NotImplemented`] naming the unsupported type,
-/// never silently mapped to a `Utf8` stand-in the caller could mistake for real string data.
+/// Its wire encoding (a base64-serialized proto message) has no faithful Arrow representation, so —
+/// consistent with the strict-decode policy of the value path — such a column is rejected with a
+/// clean [`Status::NotImplemented`] naming the unsupported type, never silently mapped to a `Utf8`
+/// stand-in the caller could mistake for real string data. (`ENUM` is *not* rejected: it maps to
+/// `Int64`, its integer ordinal — see [`arrow_type`].)
 fn unsupported_type_error(type_name: &str) -> adbc_core::error::Error {
     err(
         format!(
@@ -685,18 +687,24 @@ fn arrow_type(ty: &Type, precision: TimestampPrecision) -> Result<DataType> {
         TypeCode::Array => match ty.array_element_type() {
             // ARRAY<T> → Arrow List<T> (recursively; T may itself be a STRUCT). The element field is
             // built via `arrow_field`, so an `ARRAY<JSON>` carries the `arrow.json` extension on the
-            // list's child (`item`) field, not the top-level List. A PROTO/ENUM element is rejected
-            // by the recursive `arrow_field`, so `ARRAY<PROTO>`/`ARRAY<ENUM>` fail loudly too.
-            // Spanner does not allow arrays of arrays; fall back to JSON text for anything else.
+            // list's child (`item`) field, not the top-level List. A PROTO element is rejected by the
+            // recursive `arrow_field`, so `ARRAY<PROTO>` fails loudly; an `ARRAY<ENUM>` maps to
+            // `List<Int64>` the same as a scalar ENUM. Spanner does not allow arrays of arrays; fall
+            // back to JSON text for anything else.
             Some(element) if !matches!(element.code(), TypeCode::Array | TypeCode::Unspecified) => {
                 DataType::List(Arc::new(arrow_field(LIST_ITEM, &element, true, precision)?))
             }
             _ => DataType::Utf8,
         },
-        // PROTO/ENUM have no faithful Arrow mapping; reject the column loudly instead of
-        // mis-decoding it to a Utf8 stand-in (see `unsupported_type_error`).
+        // ENUM maps to its integer ordinal: the wire value is a bare enum number (delivered as a
+        // decimal string, like INT64), so `Int64` is a lossless, honest mapping. The enum's member
+        // *names* live only in the proto descriptor, which the result metadata does not ship and the
+        // pinned client does not expose (no `proto_type_fqn` accessor), so a faithful string/label
+        // `Dictionary` is not reachable here; callers who want labels can `CAST(col AS STRING)` in
+        // SQL. PROTO stays rejected — its wire form is a base64-serialized proto message with no
+        // faithful Arrow mapping (see `unsupported_type_error`).
+        TypeCode::Enum => DataType::Int64,
         TypeCode::Proto => return Err(unsupported_type_error("PROTO")),
-        TypeCode::Enum => return Err(unsupported_type_error("ENUM")),
         // STRING, JSON, UUID, INTERVAL and any future/unknown code are UTF-8 text.
         _ => DataType::Utf8,
     })
@@ -704,7 +712,7 @@ fn arrow_type(ty: &Type, precision: TimestampPrecision) -> Result<DataType> {
 
 /// Map a Spanner `STRUCT` type to an Arrow `Struct`, using the field names and types from the
 /// result metadata. Falls back to `Utf8` if the struct type is somehow unavailable, and propagates
-/// an [`unsupported_type_error`] from a `PROTO`/`ENUM` field.
+/// an [`unsupported_type_error`] from a `PROTO` field.
 fn struct_arrow_type(ty: &Type, precision: TimestampPrecision) -> Result<DataType> {
     match ty.struct_type() {
         Some(st) => Ok(DataType::Struct(struct_fields(st, precision)?)),
@@ -1281,40 +1289,66 @@ mod tests {
     }
 
     #[test]
-    fn proto_and_enum_columns_are_rejected_cleanly() {
+    fn proto_columns_are_rejected_cleanly() {
         use google_cloud_spanner::model;
 
-        // The pinned client exposes no public constructor for PROTO/ENUM types, so build them
-        // straight from the generated model type and wrap it.
-        for (code, name) in [
-            (model::TypeCode::Proto, "PROTO"),
-            (model::TypeCode::Enum, "ENUM"),
-        ] {
-            let ty: Type = model::Type::new().set_code(code).into();
+        // The pinned client exposes no public constructor for PROTO types, so build one straight
+        // from the generated model type and wrap it.
+        let ty: Type = model::Type::new().set_code(model::TypeCode::Proto).into();
 
-            // A PROTO/ENUM column is rejected with a clean NotImplemented naming the type — never
-            // silently mapped to a Utf8 stand-in that would mis-decode the base64 proto blob / bare
-            // enum number into what looks like real string data.
-            let err = arrow_field("payload", &ty, true, TimestampPrecision::default()).unwrap_err();
-            assert_eq!(err.status, Status::NotImplemented, "{name}");
-            assert!(
-                err.message.contains(name),
-                "message should name {name}: {:?}",
-                err.message
-            );
+        // A PROTO column is rejected with a clean NotImplemented naming the type — never silently
+        // mapped to a Utf8 stand-in that would mis-decode the base64 proto blob into what looks
+        // like real string data.
+        let err = arrow_field("payload", &ty, true, TimestampPrecision::default()).unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented);
+        assert!(
+            err.message.contains("PROTO"),
+            "message should name PROTO: {:?}",
+            err.message
+        );
 
-            // The rejection also flows through the recursive element type of an ARRAY<PROTO> /
-            // ARRAY<ENUM>, so those fail loudly too rather than yielding a List<Utf8>.
-            let array_ty = google_cloud_spanner::types::array(ty);
-            let err =
-                arrow_field("arr", &array_ty, true, TimestampPrecision::default()).unwrap_err();
-            assert_eq!(err.status, Status::NotImplemented, "ARRAY<{name}>");
-            assert!(
-                err.message.contains(name),
-                "ARRAY<{name}> message should name {name}: {:?}",
-                err.message
-            );
-        }
+        // The rejection also flows through the recursive element type of an ARRAY<PROTO>, so that
+        // fails loudly too rather than yielding a List<Utf8>.
+        let array_ty = google_cloud_spanner::types::array(ty);
+        let err = arrow_field("arr", &array_ty, true, TimestampPrecision::default()).unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented);
+        assert!(
+            err.message.contains("PROTO"),
+            "ARRAY<PROTO> message should name PROTO: {:?}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn enum_columns_map_to_int64_ordinal() {
+        use google_cloud_spanner::model;
+
+        // The pinned client exposes no public constructor for ENUM types, so build one straight
+        // from the generated model type and wrap it.
+        let ty: Type = model::Type::new().set_code(model::TypeCode::Enum).into();
+
+        // A scalar ENUM maps to its integer ordinal: Int64, no extension metadata.
+        let field = arrow_field("color", &ty, true, TimestampPrecision::default()).unwrap();
+        assert_eq!(field.data_type(), &DataType::Int64);
+        assert_eq!(extension_name(&field), None);
+
+        // ARRAY<ENUM> maps to List<Int64> the same way, recursively.
+        let array_ty = google_cloud_spanner::types::array(ty);
+        let field = arrow_field("colors", &array_ty, true, TimestampPrecision::default()).unwrap();
+        let DataType::List(item) = field.data_type() else {
+            panic!("expected a List data type, got {:?}", field.data_type());
+        };
+        assert_eq!(item.data_type(), &DataType::Int64);
+
+        // The wire value is the ordinal as a decimal string (like INT64); it decodes to that i64.
+        let value = "2".to_value();
+        let array = build_array(&DataType::Int64, &[Some(&value)]).unwrap();
+        let ints = array
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap();
+        assert_eq!(ints.len(), 1);
+        assert_eq!(ints.value(0), 2);
     }
 
     #[test]
