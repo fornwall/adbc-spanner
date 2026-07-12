@@ -4,7 +4,7 @@
 // environment (set by scripts/run-adbc-validation.sh):
 //
 //   ADBC_SPANNER_LIBRARY   path to the built cdylib (libadbc_spanner.so)
-//   ADBC_SPANNER_DATABASE  projects/<p>/instances/<i>/databases/<d>
+//   ADBC_SPANNER_URI       spanner:///projects/<p>/instances/<i>/databases/<d>
 //   SPANNER_EMULATOR_HOST  (read by the driver itself) selects the emulator
 //
 // `SpannerQuirks` describes Spanner's capabilities to the suite so tests that do
@@ -39,7 +39,7 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
     RAISE_ADBC(
         AdbcDatabaseSetOption(database, "entrypoint", "AdbcSpannerInit", error));
     RAISE_ADBC(AdbcDatabaseSetOption(database, "uri",
-                                     EnvOr("ADBC_SPANNER_DATABASE", "").c_str(), error));
+                                     EnvOr("ADBC_SPANNER_URI", "").c_str(), error));
     return ADBC_STATUS_OK;
   }
 

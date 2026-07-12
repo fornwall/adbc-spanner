@@ -412,7 +412,7 @@ fi
 
 # Resolve the target database, creating it on the emulator (which starts empty).
 if [ -n "${SPANNER_EMULATOR_HOST:-}" ]; then
-  export ADBC_SPANNER_DATABASE="$EMULATOR_DATABASE"
+  export ADBC_SPANNER_URI="spanner:///$EMULATOR_DATABASE"
   rest_host="${SPANNER_EMULATOR_HOST%:*}"
   rest="http://${rest_host}:${SPANNER_EMULATOR_REST_PORT:-9020}"
   echo ">> creating emulator instance/database via the admin REST API ($rest)"
@@ -445,7 +445,7 @@ if [ -n "${SPANNER_EMULATOR_HOST:-}" ]; then
 else
   # Real Cloud Spanner target: project.instance.database -> the driver's URI form.
   IFS='.' read -r p i d <<<"$SPANNER_GCP_DATABASE"
-  export ADBC_SPANNER_DATABASE="projects/$p/instances/$i/databases/$d"
+  export ADBC_SPANNER_URI="spanner:///projects/$p/instances/$i/databases/$d"
 fi
 
 # The instrumented leg builds with an explicit --target, so its artifact lives under
@@ -458,7 +458,7 @@ else
 fi
 
 echo ">> ADBC_SPANNER_LIBRARY=$ADBC_SPANNER_LIBRARY"
-echo ">> ADBC_SPANNER_DATABASE=$ADBC_SPANNER_DATABASE"
+echo ">> ADBC_SPANNER_URI=$ADBC_SPANNER_URI"
 
 if [ "$FULL" -eq 1 ]; then
   echo ">> running the FULL validation suite (expect Spanner-specific failures/skips)"

@@ -61,7 +61,7 @@ fi
 
 # Resolve the target database, creating it on the emulator (which starts empty).
 if [ -n "${SPANNER_EMULATOR_HOST:-}" ]; then
-  export ADBC_SPANNER_DATABASE="$EMULATOR_DATABASE"
+  export ADBC_SPANNER_URI="spanner:///$EMULATOR_DATABASE"
   rest="http://${SPANNER_EMULATOR_HOST%:*}:${SPANNER_EMULATOR_REST_PORT:-9020}"
   echo ">> creating emulator instance/database via the admin REST API ($rest)"
   curl -sf -X POST "$rest/v1/projects/test-project/instances" \
@@ -91,10 +91,10 @@ if [ -n "${SPANNER_EMULATOR_HOST:-}" ]; then
   fi
 else
   IFS='.' read -r p i d <<<"$SPANNER_GCP_DATABASE"
-  export ADBC_SPANNER_DATABASE="projects/$p/instances/$i/databases/$d"
+  export ADBC_SPANNER_URI="spanner:///projects/$p/instances/$i/databases/$d"
 fi
 
-echo ">> ADBC_SPANNER_DATABASE=$ADBC_SPANNER_DATABASE"
+echo ">> ADBC_SPANNER_URI=$ADBC_SPANNER_URI"
 echo ">> running the Foundry validation suite"
 cd "$REPO_ROOT/foundry-validation"
 exec "$PYTHON" -m pytest -p no:cacheprovider "$@"
