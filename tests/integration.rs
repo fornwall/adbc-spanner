@@ -8125,3 +8125,214 @@ mod auth_end_to_end {
         assert_select_one(&mut connection);
     }
 }
+
+/// End-to-end check that a Spanner `ENUM` column maps to Arrow `Int64` (its integer ordinal), that
+/// `ARRAY<ENUM>` maps to `List<Int64>`, and that the documented label workaround
+/// (`CAST(col AS STRING)`) yields the member names as `Utf8`.
+///
+/// An `ENUM` column cannot be created with plain SQL DDL: it requires a `CREATE PROTO BUNDLE` naming
+/// an enum whose definition is supplied out of band as a serialized `FileDescriptorSet` in the admin
+/// `UpdateDatabaseDdl` request's `proto_descriptors`. The driver's DDL path (routed through the same
+/// admin API) has no way to carry those descriptor bytes, so this test builds the descriptor set and
+/// the enum-typed table with the admin client directly, then queries through the driver under test.
+///
+/// This is the emulator counterpart to the `enum_columns_map_to_int64_ordinal` unit test in
+/// `src/conversion.rs`, which covers the same mapping without a live database.
+#[test]
+fn enum_columns_round_trip_as_int64_ordinals() {
+    let Some(target) = test_target() else {
+        eprintln!(
+            "neither SPANNER_EMULATOR_HOST nor SPANNER_GCP_DATABASE set — \
+             skipping Spanner integration test"
+        );
+        return;
+    };
+
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    // A minimal proto3 `FileDescriptorSet` defining `adbc.test.Color { UNSPECIFIED=0, RED=1,
+    // GREEN=2, BLUE=3 }`. This is what a real client would extract from its compiled `.proto`; here
+    // we hand-build it so the test needs no protoc / codegen step.
+    use prost::Message as _;
+    use prost_types::{
+        EnumDescriptorProto, EnumValueDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+    };
+    let enum_value = |name: &str, number: i32| EnumValueDescriptorProto {
+        name: Some(name.to_string()),
+        number: Some(number),
+        options: None,
+    };
+    let file_descriptor_set = FileDescriptorSet {
+        file: vec![FileDescriptorProto {
+            name: Some("adbc_enum.proto".to_string()),
+            package: Some("adbc.test".to_string()),
+            syntax: Some("proto3".to_string()),
+            enum_type: vec![EnumDescriptorProto {
+                name: Some("Color".to_string()),
+                value: vec![
+                    enum_value("COLOR_UNSPECIFIED", 0),
+                    enum_value("RED", 1),
+                    enum_value("GREEN", 2),
+                    enum_value("BLUE", 3),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let mut proto_descriptors = Vec::new();
+    file_descriptor_set.encode(&mut proto_descriptors).unwrap();
+
+    // Register the enum (proto bundle) and (re)create the enum-typed table via the admin DDL API,
+    // supplying the descriptor bytes. The bundle create is best-effort so a re-run against a
+    // persistent database (where it already exists) is a no-op; the table is dropped and recreated
+    // so the test always starts from an empty, known state.
+    tokio::runtime::Runtime::new()
+        .expect("failed to build setup runtime")
+        .block_on(async {
+            let spanner = google_cloud_spanner::client::Spanner::builder()
+                .build()
+                .await
+                .expect("failed to build Spanner client for enum setup");
+            let database_admin = spanner
+                .database_admin_builder()
+                .build()
+                .await
+                .expect("failed to build database admin client");
+
+            let _ = database_admin
+                .update_database_ddl()
+                .set_database(target.database_path())
+                .set_statements(vec!["CREATE PROTO BUNDLE (`adbc.test.Color`)".to_string()])
+                .set_proto_descriptors(proto_descriptors)
+                .poller()
+                .until_done()
+                .await;
+
+            database_admin
+                .update_database_ddl()
+                .set_database(target.database_path())
+                .set_statements(vec![
+                    "DROP TABLE IF EXISTS AdbcEnum".to_string(),
+                    "CREATE TABLE AdbcEnum (\
+                         Id INT64, \
+                         Fav `adbc.test.Color`, \
+                         Faves ARRAY<`adbc.test.Color`>\
+                     ) PRIMARY KEY (Id)"
+                        .to_string(),
+                ])
+                .poller()
+                .until_done()
+                .await
+                .expect("create enum table");
+        });
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_uri()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    // Row 1 has a scalar enum GREEN(2) and an array [RED(1), BLUE(3)]; row 2 has a NULL scalar enum
+    // and a single-element array [GREEN(2)]. Enum literals are written as `CAST(<ordinal> AS <FQN>)`.
+    let mut insert = connection.new_statement().expect("new statement");
+    insert
+        .set_sql_query(
+            "INSERT INTO AdbcEnum (Id, Fav, Faves) VALUES \
+             (1, CAST(2 AS `adbc.test.Color`), \
+                 [CAST(1 AS `adbc.test.Color`), CAST(3 AS `adbc.test.Color`)]), \
+             (2, CAST(NULL AS `adbc.test.Color`), [CAST(2 AS `adbc.test.Color`)])",
+        )
+        .unwrap();
+    assert_eq!(insert.execute_update().expect("insert enum rows"), Some(2));
+
+    // --- scalar ENUM → Int64 ordinal (NULL stays a null slot) ---
+    let mut query = connection.new_statement().expect("new statement");
+    query
+        .set_sql_query("SELECT Fav FROM AdbcEnum ORDER BY Id")
+        .unwrap();
+    let reader = query.execute().expect("query scalar enum");
+    let schema = reader.schema();
+    assert_eq!(
+        schema.field(0).data_type(),
+        &DataType::Int64,
+        "a scalar ENUM column should map to Arrow Int64"
+    );
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect scalar enum");
+    let fav = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("enum column downcasts to Int64Array");
+    assert_eq!(fav.len(), 2);
+    assert_eq!(fav.value(0), 2, "GREEN has ordinal 2");
+    assert!(fav.is_null(1), "a NULL enum is a null slot, not 0");
+
+    // --- ARRAY<ENUM> → List<Int64> ---
+    let mut array_query = connection.new_statement().expect("new statement");
+    array_query
+        .set_sql_query("SELECT Faves FROM AdbcEnum WHERE Id = 1")
+        .unwrap();
+    let reader = array_query.execute().expect("query array enum");
+    let DataType::List(item) = reader.schema().field(0).data_type().clone() else {
+        panic!(
+            "ARRAY<ENUM> should map to a List data type, got {:?}",
+            reader.schema().field(0).data_type()
+        );
+    };
+    assert_eq!(
+        item.data_type(),
+        &DataType::Int64,
+        "ARRAY<ENUM> should map to List<Int64>"
+    );
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect array enum");
+    let list = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("array column downcasts to ListArray");
+    let elems = list.value(0);
+    let elems = elems
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("ARRAY<ENUM> elements are Int64");
+    assert_eq!(
+        (0..elems.len()).map(|i| elems.value(i)).collect::<Vec<_>>(),
+        vec![1, 3],
+        "[RED, BLUE] are ordinals [1, 3]"
+    );
+
+    // --- documented label workaround: CAST(col AS STRING) returns the member names as Utf8 ---
+    let mut label_query = connection.new_statement().expect("new statement");
+    label_query
+        .set_sql_query("SELECT CAST(Fav AS STRING) AS FavName FROM AdbcEnum ORDER BY Id")
+        .unwrap();
+    let reader = label_query.execute().expect("query enum labels");
+    assert_eq!(
+        reader.schema().field(0).data_type(),
+        &DataType::Utf8,
+        "CAST(enum AS STRING) is a plain STRING column"
+    );
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect enum labels");
+    let names = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("label column downcasts to StringArray");
+    assert_eq!(
+        names.value(0),
+        "GREEN",
+        "ordinal 2 casts to the label GREEN"
+    );
+    assert!(names.is_null(1), "a NULL enum casts to a NULL label");
+}

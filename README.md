@@ -304,7 +304,8 @@ behaviour can only be observed against a real project, not the emulator.
 | `JSON`                                      | `Utf8` + `arrow.json` extension   |
 | `ARRAY<T>`                                  | `List<T>` (recursive)             |
 | `STRUCT<..>`                                | `Struct<..>` (recursive)          |
-| `PROTO` / `ENUM`                             | *unsupported — clean `NotImplemented` error* |
+| `ENUM`                                      | `Int64` (the integer ordinal)     |
+| `PROTO`                                     | *unsupported — clean `NotImplemented` error* |
 
 `NULL`s are represented as null slots in the corresponding Arrow array. Decoding is strict: a
 present (non-`NULL`) wire value that cannot be decoded as its column's type surfaces an
@@ -313,12 +314,17 @@ null slot the caller could mistake for a genuine SQL `NULL`. `ARRAY` and `STRUCT
 native Arrow `List`/`Struct` recursively, so nested shapes like `ARRAY<STRUCT<..>>` round-trip with
 full type fidelity.
 
-`PROTO` and `ENUM` columns have no faithful Arrow mapping (their wire form is a base64-serialized
-proto message / a bare enum number), so a query selecting one is rejected with a clean
-`NotImplemented` error naming the column and type — in the same spirit as strict decoding, the
-driver never mis-decodes them into a `Utf8` stand-in the caller could mistake for real string data.
-This applies recursively, so an `ARRAY<PROTO>`/`ARRAY<ENUM>` (or a struct with such a field) is
-rejected too.
+`ENUM` columns map to `Int64` — the wire value is the enum's integer ordinal (delivered as a decimal
+string, like `INT64`), so `Int64` is a lossless mapping. The enum member *names* live only in the
+proto descriptor, which Spanner does not ship in the result metadata, so the driver cannot render
+string labels; if you want the labels, `CAST(col AS STRING)` in your query and Spanner returns them
+server-side (as a `STRING` → `Utf8` column). `ARRAY<ENUM>` maps to `List<Int64>` the same way.
+
+`PROTO` columns have no faithful Arrow mapping (their wire form is a base64-serialized proto
+message), so a query selecting one is rejected with a clean `NotImplemented` error naming the column
+and type — in the same spirit as strict decoding, the driver never mis-decodes them into a `Utf8`
+stand-in the caller could mistake for real string data. This applies recursively, so an
+`ARRAY<PROTO>` (or a struct with such a field) is rejected too.
 
 `JSON` columns keep `Utf8` storage (the value bytes are the JSON text) but carry the canonical
 [`arrow.json`](https://arrow.apache.org/docs/format/CanonicalExtensions.html#json) extension type as
