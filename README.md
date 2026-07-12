@@ -12,24 +12,21 @@ An [ADBC](https://arrow.apache.org/adbc/) (Arrow Database Connectivity) driver f
 
 ## Status
 
-Early but working and tested end-to-end against the Spanner emulator. Supported today:
+Early but working and tested end-to-end against the Spanner emulator.
 
-- Connecting to production Spanner or a Spanner emulator.
-- SQL queries (`execute`), streamed back as typed Arrow `RecordBatch`es: rows are pulled from Spanner
-  and converted to Arrow in bounded chunks as the reader is iterated, so a large result set is never
-  fully materialised in memory. The chunk size is tunable via the `spanner.rows_per_batch`
-  statement option (default 8192).
-- DML (`execute_update`), returning the affected-row count. A `;`-separated batch (e.g. dbt's
-  `DELETE; INSERT`) runs atomically in one read/write transaction via `ExecuteBatchDml`. DML with
-  a [`THEN RETURN`](https://cloud.google.com/spanner/docs/dml-returning) clause returns its rows:
-  `execute()` yields them as an Arrow result (autocommit mode only — buffered manual transactions
-  cannot produce them).
-- DDL (`CREATE`/`ALTER`/`DROP`/`RENAME`/…), routed to the Database Admin `UpdateDatabaseDdl` API. A
-  `;`-separated batch is submitted as a single schema change, so multi-step changes (e.g. dbt's
-  intermediate-table build then rename swap) are near-atomic.
-- Transactions: autocommit by default, or manual multi-statement transactions (set
-  `adbc.connection.autocommit` to `false`, then `commit`/`rollback`). In manual mode DML — and any
-  bulk ingest's insert mutations — is buffered
+## Supported Spanner functionality
+
+- Connecting to production Spanner or a [Spanner emulator](https://docs.cloud.google.com/spanner/docs/emulator).
+- SQL queries (`execute`) are streamed back as typed Arrow `RecordBatch`es. Spanner does not support returning
+  columnar results directly - rows are pulled from Spanner and converted to Arrow in bounded chunks (with configurable
+  size) as the reader is iterated, so a large result set is never fully materialised in memory.
+- DML: A `;`-separated batch (e.g. `DELETE; INSERT`) runs atomically in one read/write transaction using
+  [batch DML](https://docs.cloud.google.com/spanner/docs/samples/spanner-dml-batch-update).
+- DDL (`CREATE`/`ALTER`/`DROP`/`RENAME`/…): Routed to the Database Admin `UpdateDatabaseDdl` API. A
+  `;`-separated batch (e.g. a intermediate-table build then rename swap) is submitted as a single
+  [schema change](https://docs.cloud.google.com/spanner/docs/schema-updates) near-atomic (but not
+  truly atomic, as Spanner does not support atomic DDL) operation.
+- Transactions: In manual mode DML — and any bulk ingest's insert mutations — is buffered
   and applied atomically in one read/write transaction on commit, so `execute_update` returns `None`
   rather than an affected-row count — the count is unknown until the buffered batch commits (queries
   and DDL still run immediately). Because only writes are buffered, a manual transaction has **no
@@ -38,26 +35,17 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   **DML and DDL reorder**: DDL issued after buffered DML executes before it (Spanner DDL is never
   transactional). Commit first if a statement needs to see earlier writes. This follows from the
   preview client exposing read/write transactions only through a closure-based runner; it will be
-  fixed properly once the client exposes begin/commit handles.
-- Read-only connections: set the standard `adbc.connection.readonly` connection option to `true` to
-  reject all writes on that connection — DML, DDL and bulk ingest fail with an `InvalidState` error,
-  while queries still run. Accepts `true`/`false` (default `false`) and round-trips through
-  `get_option`. The flag is live: statements check it at execution time, so toggling it on the
-  connection immediately applies to existing statements as well as new ones.
-- [Stale reads](https://cloud.google.com/spanner/docs/timestamp-bounds): queries read at a **strong**
-  bound by default, but the single `spanner.read.staleness` option (settable on a connection — where
-  it becomes the default for its statements — or per statement) requests a cheaper, lock-free stale
-  read. Its value is one of four prefixed forms: `exact:<duration>` (read exactly that far in the
-  past) or `max:<duration>` (bounded staleness), where `<duration>` is a number with an optional unit
-  suffix (`s` default, `ms`, `us`, `ns`, `m`, `h`); or `read:<rfc3339>` (read exactly as of that RFC
-  3339 timestamp) or `min:<rfc3339>` (bounded). The four prefixes are distinct, so a value is
-  unambiguous; `""` unsets. The bound is also baked into `execute_partitions()` descriptors.
-- Request priority and tags: `spanner.request.priority` (`low`/`medium`/`high`, applied to every
-  query/DML request and as the commit priority of read/write transactions) and `spanner.request.tag`
-  are settable on a connection — where they become the default for its statements — or per statement;
-  `spanner.transaction.tag` (connection-level) tags every read/write transaction the driver builds.
-  See [troubleshooting with tags](https://cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags).
-  Driver-internal metadata queries (`get_objects`, schema probes, …) are not tagged/prioritised.
+  fixed properly once the client exposes begin/commit handles. DML with
+  a [`THEN RETURN`](https://cloud.google.com/spanner/docs/dml-returning) clause returns its rows:
+  `execute()` yields them as an Arrow result (autocommit mode only — buffered manual transactions
+  cannot produce them).
+- [Timestamp bounds](https://cloud.google.com/spanner/docs/timestamp-bounds): Queries read at a
+  [strong](https://docs.cloud.google.com/spanner/docs/timestamp-bounds#strong) bound by default.
+  Bounded or exact staleness can be achieved through ADBC options.  
+- [Request priorities](https://cloud.google.com/blog/topics/developers-practitioners/introducing-request-priorities-cloud-spanner-apis)
+  are supported through ADBC options. Default is high priority.
+- [Request and transaction tags](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags)
+  are supported through ADBC options.
 - [Directed reads](https://cloud.google.com/spanner/docs/directed-reads): `spanner.directed_read`
   (connection- or statement-level) steers **read-only queries** to specific replicas — `include:<sel>`
   (an ordered preference list) or `exclude:<sel>` (replicas to avoid), where each `<sel>` is
