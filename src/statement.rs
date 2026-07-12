@@ -40,6 +40,7 @@ use crate::error::{
     err, from_builder, from_spanner, from_status_parts, invalid_argument, invalid_state,
     not_implemented,
 };
+use crate::options::impl_shared_option_dispatch;
 use crate::query_options::QueryOptionsConfig;
 use crate::request::{CommitStats, RequestConfig};
 use crate::retry::RetryConfig;
@@ -201,6 +202,11 @@ pub struct SpannerStatement {
 }
 
 impl SpannerStatement {
+    // Shared `set_shared_option` / `shared_option_string` for the "staleness-pattern" options
+    // (request priority/tag, directed read, max_commit_delay, commit_stats, query optimizer opts,
+    // RPC timeouts, retry tuning, …) that the statement and connection dispatch identically.
+    impl_shared_option_dispatch!();
+
     #[allow(clippy::too_many_arguments)] // constructor threads the connection's config verbatim
     pub(crate) fn new(
         runtime: SharedRuntime,
@@ -1228,58 +1234,16 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) if k == crate::OPTION_MAX_PARTITIONS => {
                 self.max_partitions = Some(max_partitions_option(value)?);
             }
-            OptionStatement::Other(k) if k == crate::OPTION_READ_STALENESS => {
-                self.read_staleness.set_staleness(value)?;
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_REQUEST_PRIORITY => {
-                self.request.set_priority(value)?;
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_REQUEST_TAG => {
-                self.request.set_request_tag(value)?;
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_DIRECTED_READ => {
-                self.directed_read.set(value)?;
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => {
-                self.request.set_max_commit_delay(value)?;
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_COMMIT_STATS => {
-                self.request.set_commit_stats(value)?;
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_VERSION => {
-                self.query_options.set_optimizer_version(value)?;
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
-                self.query_options.set_optimizer_statistics_package(value)?;
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {
-                // `""` resets to the driver default (nanoseconds), not to the connection's value —
-                // the same unset semantics as the staleness options.
-                self.timestamp_precision = TimestampPrecision::parse_option(value)?;
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_RPC_TIMEOUT_QUERY => {
-                self.timeouts.set_query(value)?;
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_RPC_TIMEOUT_UPDATE => {
-                self.timeouts.set_update(value)?;
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_RPC_TIMEOUT_FETCH => {
-                self.timeouts.set_fetch(value)?;
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_RETRY_MAX_ATTEMPTS => {
-                self.retry.set_max_attempts(value)?;
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
-                self.retry.set_max_elapsed_seconds(value)?;
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS => {
-                self.retry.set_backoff_initial_seconds(value)?;
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_RETRY_BACKOFF_MAX_SECONDS => {
-                self.retry.set_backoff_max_seconds(value)?;
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_RETRY_BACKOFF_MULTIPLIER => {
-                self.retry.set_backoff_multiplier(value)?;
+            // Every remaining `spanner.*` option the statement and connection dispatch identically —
+            // staleness, request priority/tag, directed read, max_commit_delay, commit_stats, query
+            // optimizer opts, `spanner.max_timestamp_precision` (`""` resets to the driver default),
+            // RPC timeouts, retry tuning — goes through the shared table. An unrecognised key returns
+            // `None`, mapped to the same `NotImplemented` as before (so the connection-only
+            // `spanner.transaction.tag`, absent from the shared table, stays unsupported here).
+            OptionStatement::Other(k) => {
+                if self.set_shared_option(k, value)?.is_none() {
+                    return Err(not_implemented(&format!("statement option {k}")));
+                }
             }
             other => {
                 return Err(not_implemented(&format!(
@@ -1325,69 +1289,13 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) if k == crate::OPTION_MAX_PARTITIONS => {
                 self.max_partitions.map(|n| n.to_string())
             }
-            OptionStatement::Other(k) if k == crate::OPTION_READ_STALENESS => {
-                self.read_staleness.staleness_string().map(str::to_string)
-            }
-            // The effective value: the connection's, unless overridden on this statement.
-            OptionStatement::Other(k) if k == crate::OPTION_REQUEST_PRIORITY => {
-                self.request.priority_string().map(str::to_string)
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_REQUEST_TAG => {
-                self.request.request_tag_string().map(str::to_string)
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_DIRECTED_READ => {
-                self.directed_read.option_string().map(str::to_string)
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_MAX_COMMIT_DELAY => {
-                self.request.max_commit_delay_string().map(str::to_string)
-            }
-            // A plain boolean; always reports the effective value ("true"/"false", default "false").
-            OptionStatement::Other(k) if k == crate::OPTION_COMMIT_STATS => {
-                Some(self.request.commit_stats_string().to_string())
-            }
-            // The captured mutation count from this statement's most recent commit (autocommit DML
-            // or bulk ingest) that requested commit stats; None → NotFound below.
-            OptionStatement::Other(k) if k == crate::OPTION_COMMIT_STATS_MUTATION_COUNT => {
-                self.commit_stats.mutation_count().map(|n| n.to_string())
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_VERSION => self
-                .query_options
-                .optimizer_version_string()
-                .map(str::to_string),
-            OptionStatement::Other(k) if k == crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
-                self.query_options
-                    .optimizer_statistics_package_string()
-                    .map(str::to_string)
-            }
-            // The effective mode: inherited from the connection at creation unless overridden.
-            OptionStatement::Other(k) if k == crate::OPTION_MAX_TIMESTAMP_PRECISION => {
-                Some(self.timestamp_precision.as_str().to_string())
-            }
-            // The effective values: the connection's, unless overridden on this statement.
-            OptionStatement::Other(k) if k == crate::OPTION_RPC_TIMEOUT_QUERY => {
-                self.timeouts.query_string()
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_RPC_TIMEOUT_UPDATE => {
-                self.timeouts.update_string()
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_RPC_TIMEOUT_FETCH => {
-                self.timeouts.fetch_string()
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_RETRY_MAX_ATTEMPTS => {
-                self.retry.max_attempts_string()
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
-                self.retry.max_elapsed_seconds_string()
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS => {
-                self.retry.backoff_initial_seconds_string()
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_RETRY_BACKOFF_MAX_SECONDS => {
-                self.retry.backoff_max_seconds_string()
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_RETRY_BACKOFF_MULTIPLIER => {
-                self.retry.backoff_multiplier_string()
-            }
+            // Every remaining `spanner.*` option the statement and connection report identically —
+            // staleness, request priority/tag, directed read, max_commit_delay,
+            // commit_stats(.mutation_count), query optimizer opts, max_timestamp_precision, RPC
+            // timeouts, retry tuning (each the effective value: the connection's, unless overridden
+            // on this statement) — goes through the shared table, which returns the same `NotFound`
+            // for an unset (or unknown) key that the fall-through below would.
+            OptionStatement::Other(k) => return self.shared_option_string(k),
             _ => None,
         };
         value.ok_or_else(|| {

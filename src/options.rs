@@ -83,6 +83,124 @@ pub(crate) fn double_from_stored_string(stored: Result<String>, what: &str) -> R
         .map_err(|_| invalid_argument(format!("{what} value {value:?} is not a double")))
 }
 
+/// Generate the two shared option-dispatch helpers that `SpannerConnection` and `SpannerStatement`
+/// share verbatim.
+///
+/// Both objects carry the same "staleness-pattern" config fields (`read_staleness`, `request`,
+/// `directed_read`, `query_options`, `timestamp_precision`, `timeouts`, `retry`, `commit_stats`)
+/// with identical setters/getters, so the key→setter and key→getter dispatch for those options was
+/// duplicated as ~20 near-identical `Other(k) if k == OPTION_X => …` match arms in each of
+/// `connection.rs` and `statement.rs`. This macro emits that dispatch once as two inherent methods:
+///
+/// - `set_shared_option(key, value)` applies a shared option, returning `Ok(Some(()))` when the key
+///   was handled and `Ok(None)` when it is not a shared key (so the caller can fall through to its
+///   own options / error). The value's own parse errors propagate unchanged.
+/// - `shared_option_string(key)` reports a shared option's canonical string, returning the
+///   `NotFound` error for an unset (or non-shared) key exactly as the hand-written arms did.
+///
+/// Object-specific options (ingest/bind/batch on the statement, `transaction.tag` on the
+/// connection, catalog/schema, autocommit, …) stay as explicit arms in each caller; only the
+/// mechanical glue lives here. The
+/// referenced names (`TimestampPrecision`, `err`, `Status`, `OptionValue`, `Result`) resolve at the
+/// expansion site, where both callers already import them, so the generated bodies read exactly like
+/// the arms they replace.
+macro_rules! impl_shared_option_dispatch {
+    () => {
+        /// Apply one of the shared "staleness-pattern" options. `Ok(Some(()))` = handled;
+        /// `Ok(None)` = `key` is not a shared option. See [`impl_shared_option_dispatch`].
+        fn set_shared_option(&mut self, key: &str, value: OptionValue) -> Result<Option<()>> {
+            match key {
+                crate::OPTION_READ_STALENESS => self.read_staleness.set_staleness(value)?,
+                crate::OPTION_REQUEST_PRIORITY => self.request.set_priority(value)?,
+                crate::OPTION_REQUEST_TAG => self.request.set_request_tag(value)?,
+                crate::OPTION_DIRECTED_READ => self.directed_read.set(value)?,
+                crate::OPTION_MAX_COMMIT_DELAY => self.request.set_max_commit_delay(value)?,
+                crate::OPTION_COMMIT_STATS => self.request.set_commit_stats(value)?,
+                crate::OPTION_QUERY_OPTIMIZER_VERSION => {
+                    self.query_options.set_optimizer_version(value)?
+                }
+                crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
+                    self.query_options.set_optimizer_statistics_package(value)?
+                }
+                crate::OPTION_MAX_TIMESTAMP_PRECISION => {
+                    self.timestamp_precision = TimestampPrecision::parse_option(value)?
+                }
+                crate::OPTION_RPC_TIMEOUT_QUERY => self.timeouts.set_query(value)?,
+                crate::OPTION_RPC_TIMEOUT_UPDATE => self.timeouts.set_update(value)?,
+                crate::OPTION_RPC_TIMEOUT_FETCH => self.timeouts.set_fetch(value)?,
+                crate::OPTION_RETRY_MAX_ATTEMPTS => self.retry.set_max_attempts(value)?,
+                crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
+                    self.retry.set_max_elapsed_seconds(value)?
+                }
+                crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS => {
+                    self.retry.set_backoff_initial_seconds(value)?
+                }
+                crate::OPTION_RETRY_BACKOFF_MAX_SECONDS => {
+                    self.retry.set_backoff_max_seconds(value)?
+                }
+                crate::OPTION_RETRY_BACKOFF_MULTIPLIER => {
+                    self.retry.set_backoff_multiplier(value)?
+                }
+                _ => return Ok(None),
+            }
+            Ok(Some(()))
+        }
+
+        /// Report a shared option's canonical string, or a `NotFound` error when it is unset or not
+        /// a shared option. See [`impl_shared_option_dispatch`].
+        fn shared_option_string(&self, key: &str) -> Result<String> {
+            let value: Option<String> = match key {
+                crate::OPTION_READ_STALENESS => {
+                    self.read_staleness.staleness_string().map(str::to_string)
+                }
+                crate::OPTION_REQUEST_PRIORITY => {
+                    self.request.priority_string().map(str::to_string)
+                }
+                crate::OPTION_REQUEST_TAG => self.request.request_tag_string().map(str::to_string),
+                crate::OPTION_DIRECTED_READ => {
+                    self.directed_read.option_string().map(str::to_string)
+                }
+                crate::OPTION_MAX_COMMIT_DELAY => {
+                    self.request.max_commit_delay_string().map(str::to_string)
+                }
+                // A plain boolean; always reports the effective value ("true"/"false", default
+                // "false").
+                crate::OPTION_COMMIT_STATS => Some(self.request.commit_stats_string().to_string()),
+                // The captured mutation count from the most recent commit that requested commit
+                // stats; None → NotFound below.
+                crate::OPTION_COMMIT_STATS_MUTATION_COUNT => {
+                    self.commit_stats.mutation_count().map(|n| n.to_string())
+                }
+                crate::OPTION_QUERY_OPTIMIZER_VERSION => self
+                    .query_options
+                    .optimizer_version_string()
+                    .map(str::to_string),
+                crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => self
+                    .query_options
+                    .optimizer_statistics_package_string()
+                    .map(str::to_string),
+                // Always set (there is a default mode), so the effective value is always reported.
+                crate::OPTION_MAX_TIMESTAMP_PRECISION => {
+                    Some(self.timestamp_precision.as_str().to_string())
+                }
+                crate::OPTION_RPC_TIMEOUT_QUERY => self.timeouts.query_string(),
+                crate::OPTION_RPC_TIMEOUT_UPDATE => self.timeouts.update_string(),
+                crate::OPTION_RPC_TIMEOUT_FETCH => self.timeouts.fetch_string(),
+                crate::OPTION_RETRY_MAX_ATTEMPTS => self.retry.max_attempts_string(),
+                crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => self.retry.max_elapsed_seconds_string(),
+                crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS => {
+                    self.retry.backoff_initial_seconds_string()
+                }
+                crate::OPTION_RETRY_BACKOFF_MAX_SECONDS => self.retry.backoff_max_seconds_string(),
+                crate::OPTION_RETRY_BACKOFF_MULTIPLIER => self.retry.backoff_multiplier_string(),
+                _ => None,
+            };
+            value.ok_or_else(|| err(format!("option {key} is not set"), Status::NotFound))
+        }
+    };
+}
+pub(crate) use impl_shared_option_dispatch;
+
 #[cfg(test)]
 mod tests {
     use super::*;
