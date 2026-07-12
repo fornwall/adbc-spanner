@@ -114,15 +114,8 @@ Early but working and tested end-to-end against the Spanner emulator.
   supported through ADBC options.
 - [Retry policies](https://docs.cloud.google.com/spanner/docs/custom-timeout-and-retry)
   are supported through ADBC options.
-- Commit batching: `spanner.commit.max_delay` sets the [maximum commit delay](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions)
-  Spanner may add to a read/write commit so it can batch it with others (trading a little latency for
-  throughput). It applies at every read/write commit the driver builds — autocommit DML, the
-  `ExecuteBatchDml` batch runner, the manual-mode commit, and the bulk-ingest write-only transaction
-  — and is settable on a connection (where it becomes the default for its statements) or per
-  statement. The value is a duration in `0..=500ms` (the staleness duration grammar: a number with
-  an optional `s`/`ms`/`us`/`ns`/`m`/`h` suffix, e.g. `100ms`, `0.2s`); values above 500ms or
-  malformed ones are rejected with `InvalidArguments`, `""` unsets, and it round-trips via
-  `get_option`.
+- [Throughput optimized writes](https://docs.cloud.google.com/spanner/docs/throughput-optimized-writes)
+  are supported through ADBC options.
 - [Change streams](https://cloud.google.com/spanner/docs/change-streams) work through the driver's
   ordinary SQL paths — no dedicated support is needed. `CREATE CHANGE STREAM … FOR <table>` /
   `DROP CHANGE STREAM` run through the DDL path like any other DDL; the stream is introspectable via
