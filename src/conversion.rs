@@ -1034,10 +1034,92 @@ fn parse_f64(value: &Value) -> Option<f64> {
 }
 
 /// Parse a Spanner `DATE` (`YYYY-MM-DD`) into days since the Unix epoch (Arrow `Date32`).
+///
+/// Spanner always sends a `DATE` as the fixed-width canonical `YYYY-MM-DD` (year zero-padded to four
+/// digits, 0001–9999), so this reads the three integer fields directly at fixed byte offsets rather
+/// than running chrono's general strftime interpreter, which re-tokenizes the `"%Y-%m-%d"` format
+/// string and resolves a general `Parsed` struct on *every* call — over half the temporal conversion
+/// path in profiling.
+///
+/// Only the canonical shape is accepted: anything that is not exactly ten bytes of `dddd-dd-dd`
+/// returns `None`, and a well-formed but calendar-invalid date (e.g. `2024-13-01`) is rejected by
+/// `from_ymd_opt`. Spanner's wire format never deviates from that shape, so there is no fallback to
+/// the general parser.
 pub(crate) fn parse_date_days(s: &str) -> Option<i32> {
-    let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let digit = |i: usize| -> Option<u32> {
+        let d = b[i].wrapping_sub(b'0');
+        (d < 10).then_some(u32::from(d))
+    };
+    let year = digit(0)? * 1000 + digit(1)? * 100 + digit(2)? * 10 + digit(3)?;
+    let month = digit(5)? * 10 + digit(6)?;
+    let day = digit(8)? * 10 + digit(9)?;
+    let date = chrono::NaiveDate::from_ymd_opt(year as i32, month, day)?;
     let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?;
     i32::try_from((date - epoch).num_days()).ok()
+}
+
+/// Read two ASCII digits at `off` as a number, or `None` if either byte is not `0`–`9`.
+fn two_digits(b: &[u8], off: usize) -> Option<u32> {
+    let hi = b[off].wrapping_sub(b'0');
+    let lo = b[off + 1].wrapping_sub(b'0');
+    (hi < 10 && lo < 10).then(|| u32::from(hi) * 10 + u32::from(lo))
+}
+
+/// Scan a Spanner `TIMESTAMP` in its canonical UTC RFC 3339 form —
+/// `YYYY-MM-DDTHH:MM:SS[.fraction]Z`, 1–9 fractional digits — into a [`chrono::NaiveDateTime`],
+/// reading each field at a fixed byte offset instead of running chrono's general RFC 3339 parser
+/// (which additionally scans the fraction and resolves a timezone offset per row). Only the calendar
+/// arithmetic is delegated to chrono (`from_ymd_opt`/`and_hms_nano_opt`), which validates the fields.
+///
+/// Spanner always emits this exact shape (UTC, `Z` suffix), so any deviation — a non-`Z` offset, a
+/// missing field, >9 fractional digits — returns `None`. Callers turn the naive UTC datetime into an
+/// epoch instant, preserving the chrono-based range/overflow checks they already relied on.
+fn scan_timestamp_utc(s: &str) -> Option<chrono::NaiveDateTime> {
+    let b = s.as_bytes();
+    // Shortest legal form is `YYYY-MM-DDTHH:MM:SSZ` (20 bytes); the separators are fixed.
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let year = two_digits(b, 0)? * 100 + two_digits(b, 2)?;
+    let month = two_digits(b, 5)?;
+    let day = two_digits(b, 8)?;
+    let hour = two_digits(b, 11)?;
+    let min = two_digits(b, 14)?;
+    let sec = two_digits(b, 17)?;
+    // After the seconds: either `Z` (no fraction) or `.<1..=9 digits>Z`.
+    let nanos = match b[19] {
+        b'Z' if b.len() == 20 => 0,
+        b'.' => {
+            // Fractional digits run from offset 20 up to the trailing `Z`.
+            let frac = &b[20..b.len() - 1];
+            if b[b.len() - 1] != b'Z' || frac.is_empty() || frac.len() > 9 {
+                return None;
+            }
+            let mut nanos: u32 = 0;
+            for &d in frac {
+                let d = d.wrapping_sub(b'0');
+                if d >= 10 {
+                    return None;
+                }
+                nanos = nanos * 10 + u32::from(d);
+            }
+            // Scale the parsed fraction up to nanosecond resolution (e.g. `.789` → 789_000_000).
+            nanos * 10u32.pow(9 - frac.len() as u32)
+        }
+        _ => return None,
+    };
+    chrono::NaiveDate::from_ymd_opt(year as i32, month, day)?
+        .and_hms_nano_opt(hour, min, sec, nanos)
 }
 
 /// Parse a Spanner `TIMESTAMP` (RFC 3339, e.g. `2024-01-15T12:34:56.789012345Z`) into nanoseconds
@@ -1047,9 +1129,7 @@ pub(crate) fn parse_date_days(s: &str) -> Option<i32> {
 /// any otherwise-valid instant outside the representable range (~1677-09-21 to 2262-04-11), via
 /// chrono's non-panicking [`DateTime::timestamp_nanos_opt`].
 pub(crate) fn parse_timestamp_nanos(s: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .and_then(|dt| dt.timestamp_nanos_opt())
+    scan_timestamp_utc(s)?.and_utc().timestamp_nanos_opt()
 }
 
 /// Parse a Spanner `TIMESTAMP` (RFC 3339) into microseconds since the Unix epoch (Arrow
@@ -1062,7 +1142,7 @@ pub(crate) fn parse_timestamp_nanos(s: &str) -> Option<i64> {
 /// 9999-12-31) is representable — i64 microseconds span ~±292,000 years — so the checked
 /// arithmetic only guards against hypothetical far-out-of-range inputs, never real Spanner data.
 pub(crate) fn parse_timestamp_micros(s: &str) -> Option<i64> {
-    let dt = chrono::DateTime::parse_from_rfc3339(s).ok()?;
+    let dt = scan_timestamp_utc(s)?.and_utc();
     dt.timestamp()
         .checked_mul(1_000_000)?
         .checked_add(i64::from(dt.timestamp_subsec_micros()))
@@ -1071,36 +1151,42 @@ pub(crate) fn parse_timestamp_micros(s: &str) -> Option<i64> {
 /// Parse a Spanner `NUMERIC` (decimal string) into an unscaled `i128` at scale 9 (Arrow
 /// `Decimal128(38, 9)`). Returns `None` on malformed input or i128 overflow.
 pub(crate) fn parse_numeric_i128(s: &str) -> Option<i128> {
-    let s = s.trim();
-    let (negative, digits) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    // Spanner emits NUMERIC in one canonical shape: a bare decimal `[-]digits[.digits]` with fixed
+    // scale 9 — no leading `+`, no surrounding whitespace, at most nine fractional digits. Scan the
+    // bytes directly (rather than `.trim()` + a `char`-pattern `split_once('.')`, which dominated
+    // NUMERIC decoding in profiling) and reject anything outside that shape.
+    let (negative, bytes) = match s.as_bytes().split_first() {
+        Some((b'-', rest)) => (true, rest),
+        _ => (false, s.as_bytes()),
     };
-    let (int_part, frac_part) = digits.split_once('.').unwrap_or((digits, ""));
-    if int_part.is_empty() && frac_part.is_empty() {
+    // Integer / fractional split at the first '.' (a byte search, not a `char` pattern scan).
+    let (int_part, frac_part) = match bytes.iter().position(|&b| b == b'.') {
+        Some(i) => (&bytes[..i], &bytes[i + 1..]),
+        None => (bytes, &bytes[bytes.len()..]),
+    };
+    if (int_part.is_empty() && frac_part.is_empty()) || frac_part.len() > NUMERIC_SCALE as usize {
         return None;
     }
-    if !int_part.bytes().all(|b| b.is_ascii_digit())
-        || !frac_part.bytes().all(|b| b.is_ascii_digit())
-    {
-        return None;
+    // Accumulate the integer part, validating each byte; `checked_*` yields `None` on i128 overflow.
+    let mut int_val: i128 = 0;
+    for &b in int_part {
+        let d = b.wrapping_sub(b'0');
+        if d >= 10 {
+            return None;
+        }
+        int_val = int_val.checked_mul(10)?.checked_add(i128::from(d))?;
     }
-    // Pad/truncate the fractional part to the fixed scale of 9, accumulating the unscaled
-    // fractional value directly instead of building a padded string per cell. The first up-to-9
-    // fractional digits (all ASCII digits, validated above) form an integer < 10^9, scaled up by
-    // the number of missing low-order digits.
-    let scale = NUMERIC_SCALE as usize;
-    let frac_digits = &frac_part[..frac_part.len().min(scale)];
+    // The fractional digits (at most `NUMERIC_SCALE`, checked above) form the unscaled fraction,
+    // scaled up by the number of missing low-order digits (e.g. `.25` -> 250_000_000).
     let mut frac_val: i128 = 0;
-    for &b in frac_digits.as_bytes() {
-        frac_val = frac_val * 10 + i128::from(b - b'0');
+    for &b in frac_part {
+        let d = b.wrapping_sub(b'0');
+        if d >= 10 {
+            return None;
+        }
+        frac_val = frac_val * 10 + i128::from(d);
     }
-    frac_val *= 10_i128.pow((scale - frac_digits.len()) as u32);
-    let int_val: i128 = if int_part.is_empty() {
-        0
-    } else {
-        int_part.parse().ok()?
-    };
+    frac_val *= 10_i128.pow(NUMERIC_SCALE as u32 - frac_part.len() as u32);
     let unscaled = int_val.checked_mul(1_000_000_000)?.checked_add(frac_val)?;
     Some(if negative { -unscaled } else { unscaled })
 }
@@ -1279,6 +1365,17 @@ mod tests {
         assert_eq!(parse_date_days("1969-12-31"), Some(-1));
         assert_eq!(parse_date_days("2024-01-15"), Some(19737));
         assert_eq!(parse_date_days("not-a-date"), None);
+        // Spanner's DATE range endpoints, via the fixed-offset fast path.
+        assert_eq!(parse_date_days("0001-01-01"), Some(-719162));
+        assert_eq!(parse_date_days("9999-12-31"), Some(2932896));
+        // Malformed canonical-width inputs the fast path must reject (not misparse).
+        assert_eq!(parse_date_days("2024-13-01"), None); // month out of range
+        assert_eq!(parse_date_days("2024-02-30"), None); // day out of range for month
+        assert_eq!(parse_date_days("2024-0x-15"), None); // non-digit in a field
+        assert_eq!(parse_date_days("2024/01/15"), None); // wrong separators
+        // Canonical-only: non-canonical widths (which Spanner never emits) are rejected outright.
+        assert_eq!(parse_date_days("2024-1-15"), None); // single-digit month
+        assert_eq!(parse_date_days("2024-01-15 "), None); // trailing byte
     }
 
     #[test]
@@ -1307,6 +1404,44 @@ mod tests {
         // rather than a wrapped/panicking value.
         assert_eq!(parse_timestamp_nanos("3000-01-01T00:00:00Z"), None);
         assert_eq!(parse_timestamp_nanos("1000-01-01T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn timestamp_scanner_matches_chrono_on_canonical_utc() {
+        // The hand-rolled scanner must return exactly what chrono's RFC 3339 parser did, for every
+        // canonical UTC shape Spanner emits — across fractional-digit counts and pre/post epoch.
+        for s in [
+            "1970-01-01T00:00:00Z",
+            "2024-01-15T12:34:56Z",
+            "2024-01-15T12:34:56.7Z",
+            "2024-01-15T12:34:56.789Z",
+            "2024-01-15T12:34:56.789012Z",
+            "2024-01-15T12:34:56.789012345Z",
+            "1969-12-31T23:59:59.999999999Z",
+            "2000-02-29T00:00:00Z", // leap day
+        ] {
+            let expected = chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .timestamp_nanos_opt();
+            assert_eq!(parse_timestamp_nanos(s), expected, "mismatch for {s}");
+        }
+    }
+
+    #[test]
+    fn timestamp_scanner_rejects_noncanonical() {
+        // Spanner always emits UTC with a `Z` suffix; the scanner accepts only that exact shape.
+        for s in [
+            "2024-01-15T12:34:56+02:00",       // non-Z offset
+            "2024-01-15t12:34:56Z",            // lowercase 'T'
+            "2024-01-15T12:34:56z",            // lowercase 'z'
+            "2024-01-15T12:34:56",             // missing 'Z'
+            "2024-01-15T12:34:56.Z",           // empty fraction
+            "2024-01-15T12:34:56.1234567890Z", // >9 fractional digits
+            "2024-13-15T00:00:00Z",            // month out of range
+            "2024-01-15T25:00:00Z",            // hour out of range
+        ] {
+            assert_eq!(parse_timestamp_nanos(s), None, "should reject {s}");
+        }
     }
 
     #[test]
@@ -1342,11 +1477,13 @@ mod tests {
         assert_eq!(parse_numeric_i128("1.5"), Some(1_500_000_000));
         assert_eq!(parse_numeric_i128("-2.25"), Some(-2_250_000_000));
         assert_eq!(parse_numeric_i128("0.000000001"), Some(1));
-        assert_eq!(parse_numeric_i128("+3"), Some(3_000_000_000));
-        // More than 9 fractional digits: extra precision is truncated.
-        assert_eq!(parse_numeric_i128("0.0000000019"), Some(1));
+        assert_eq!(parse_numeric_i128("9"), Some(9_000_000_000));
         assert_eq!(parse_numeric_i128("abc"), None);
         assert_eq!(parse_numeric_i128(""), None);
+        // Strict canonical-only: Spanner never emits these, so they are rejected outright.
+        assert_eq!(parse_numeric_i128("+3"), None); // leading '+'
+        assert_eq!(parse_numeric_i128("0.0000000019"), None); // >9 fractional digits (scale is 9)
+        assert_eq!(parse_numeric_i128(" 1"), None); // surrounding whitespace
     }
 
     /// The chunk byte-budget estimate: strings count their UTF-8 length, SQL NULLs contribute

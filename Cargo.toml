@@ -189,6 +189,14 @@ strip = true
 lto = "thin"
 codegen-units = 1
 
+# Profiling profile for `cargo flamegraph` / `perf`: release-optimized code but with
+# debug symbols kept (release strips them, which would leave the flamegraph with no
+# function names). Use via `cargo flamegraph --profile profiling ...`.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = true
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync"] }
 # Property-based round-trip testing of the driver against the emulator (integration test only).
