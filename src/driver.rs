@@ -22,9 +22,9 @@ use crate::error::{
 };
 use crate::runtime::{SharedRuntime, new_runtime};
 use crate::{
-    OPTION_ACCESS_TOKEN, OPTION_DATABASE, OPTION_EMULATOR, OPTION_ENDPOINT,
-    OPTION_IMPERSONATE_DELEGATES, OPTION_IMPERSONATE_LIFETIME, OPTION_IMPERSONATE_SCOPES,
-    OPTION_IMPERSONATE_TARGET_PRINCIPAL, OPTION_KEYFILE, OPTION_KEYFILE_JSON, OPTION_QUOTA_PROJECT,
+    OPTION_ACCESS_TOKEN, OPTION_EMULATOR, OPTION_ENDPOINT, OPTION_IMPERSONATE_DELEGATES,
+    OPTION_IMPERSONATE_LIFETIME, OPTION_IMPERSONATE_SCOPES, OPTION_IMPERSONATE_TARGET_PRINCIPAL,
+    OPTION_KEYFILE, OPTION_KEYFILE_JSON, OPTION_QUOTA_PROJECT,
 };
 use std::time::Duration;
 
@@ -167,7 +167,7 @@ impl SpannerDatabase {
         }
     }
 
-    /// Handle a value set through the standard `uri` option or its [`OPTION_DATABASE`] alias.
+    /// Handle a value set through the standard `uri` option.
     ///
     /// Two forms are accepted:
     ///
@@ -289,8 +289,8 @@ impl SpannerDatabase {
     pub(crate) fn connect(&self) -> Result<Connected> {
         let database = self.database.clone().ok_or_else(|| {
             invalid_state(
-                "Spanner database path is not set; provide the `uri` or \
-                 `spanner.database` option (projects/<p>/instances/<i>/databases/<d>)",
+                "Spanner database path is not set; provide the `uri` option \
+                 (projects/<p>/instances/<i>/databases/<d>)",
             )
         })?;
 
@@ -466,10 +466,6 @@ impl Optionable for SpannerDatabase {
                 let value = string_value(&key, value)?;
                 self.set_database_or_uri(value)?
             }
-            OptionDatabase::Other(name) if name == OPTION_DATABASE => {
-                let value = string_value(&key, value)?;
-                self.set_database_or_uri(value)?
-            }
             OptionDatabase::Other(name) if name == OPTION_ENDPOINT => {
                 self.endpoint = Some(string_value(&key, value)?)
             }
@@ -515,7 +511,6 @@ impl Optionable for SpannerDatabase {
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
         let value = match &key {
             OptionDatabase::Uri => self.database.clone(),
-            OptionDatabase::Other(name) if name == OPTION_DATABASE => self.database.clone(),
             OptionDatabase::Other(name) if name == OPTION_ENDPOINT => self.endpoint.clone(),
             OptionDatabase::Other(name) if name == OPTION_EMULATOR => {
                 Some(self.emulator.to_string())
@@ -601,8 +596,8 @@ pub(crate) fn ensure_scheme(host: &str) -> String {
 /// The database-level option names a connection URI may carry as query parameters.
 ///
 /// Exactly the options that configure a [`SpannerDatabase`] besides the database path itself; the
-/// path aliases (`uri` / [`OPTION_DATABASE`]) are deliberately absent — the URI's path component is
-/// the one way to name the database. Unknown keys are rejected with `InvalidArguments`.
+/// path key (`uri`) is deliberately absent — the URI's path component is the one way to name the
+/// database. Unknown keys are rejected with `InvalidArguments`.
 const URI_QUERY_OPTIONS: [&str; 10] = [
     OPTION_ENDPOINT,
     OPTION_EMULATOR,
@@ -1175,20 +1170,6 @@ mod tests {
         );
         let error = db.get_option_double(OptionDatabase::Uri).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
-    }
-
-    #[test]
-    fn the_database_option_is_an_alias_for_uri() {
-        let mut db = new_database();
-        db.set_option(
-            OptionDatabase::Other(OPTION_DATABASE.into()),
-            OptionValue::String("projects/p/instances/i/databases/d".into()),
-        )
-        .unwrap();
-        assert_eq!(
-            db.get_option_string(OptionDatabase::Uri).unwrap(),
-            "projects/p/instances/i/databases/d"
-        );
     }
 
     #[test]
@@ -2023,13 +2004,11 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
         assert!(error.message.contains("spanner.databoost"));
-        // The database-path aliases are not query parameters either — the URI path is the one way
-        // to name the database.
-        for alias in ["uri", OPTION_DATABASE] {
-            let error = set_uri(&mut db, &format!("spanner:///{DB_PATH}?{alias}=x")).unwrap_err();
-            assert_eq!(error.status, Status::InvalidArguments);
-            assert!(error.message.contains(alias));
-        }
+        // The database-path key is not a query parameter either — the URI path is the one way to
+        // name the database.
+        let error = set_uri(&mut db, &format!("spanner:///{DB_PATH}?uri=x")).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("uri"));
     }
 
     #[test]
@@ -2120,11 +2099,6 @@ mod tests {
         .unwrap();
         assert_eq!(db.get_option_string(OptionDatabase::Uri).unwrap(), DB_PATH);
         assert_eq!(
-            db.get_option_string(OptionDatabase::Other(OPTION_DATABASE.into()))
-                .unwrap(),
-            DB_PATH
-        );
-        assert_eq!(
             db.get_option_string(OptionDatabase::Other(OPTION_ENDPOINT.into()))
                 .unwrap(),
             "http://localhost:9010"
@@ -2134,18 +2108,6 @@ mod tests {
                 .unwrap(),
             "true"
         );
-    }
-
-    #[test]
-    fn the_database_alias_also_accepts_a_connection_uri() {
-        let mut db = new_database();
-        db.set_option(
-            OptionDatabase::Other(OPTION_DATABASE.into()),
-            OptionValue::String(format!("spanner:///{DB_PATH}?spanner.emulator=1")),
-        )
-        .unwrap();
-        assert_eq!(db.database.as_deref(), Some(DB_PATH));
-        assert!(db.emulator);
     }
 
     #[test]

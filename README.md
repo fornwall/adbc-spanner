@@ -230,7 +230,7 @@ level, bulk ingest, and so on — are accepted alongside them.
 **[docs/options.md](docs/options.md) is the complete, authoritative reference**: every option, at
 each level, with its exact type and allowed values, default, and `get_option` round-trip behaviour.
 
-Instead of a bare database path, `uri` / `spanner.database` also accept a **connection URI** with
+Instead of a bare database path, `uri` also accepts a **connection URI** with
 the `spanner:` scheme whose query parameters are database-level options (see
 [docs/options.md](docs/options.md#connection-uris)):
 

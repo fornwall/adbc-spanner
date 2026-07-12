@@ -181,8 +181,7 @@ required option is the **database path**:
 projects/<project>/instances/<instance>/databases/<database>
 ```
 
-supplied either as the standard `uri` option or the driver-specific `spanner.database` key (they
-are the same value). You can also pass a `spanner:`-scheme **connection URI** that packs the path,
+supplied as the standard `uri` option. You can also pass a `spanner:`-scheme **connection URI** that packs the path,
 endpoint, and options into one string:
 
 ```

@@ -19,9 +19,9 @@
 //! `get_option` round-trip behaviour — is
 //! [docs/options.md](https://github.com/fornwall/adbc-spanner/blob/main/docs/options.md).
 //!
-//! A database is configured through ADBC options. The Spanner database path is required and can be
-//! supplied either through the standard [`OptionDatabase::Uri`](adbc_core::options::OptionDatabase::Uri)
-//! option or the driver-specific [`OPTION_DATABASE`] key:
+//! A database is configured through ADBC options. The Spanner database path is required and is
+//! supplied through the standard [`OptionDatabase::Uri`](adbc_core::options::OptionDatabase::Uri)
+//! option:
 //!
 //! ```text
 //! projects/<project>/instances/<instance>/databases/<database>
@@ -70,13 +70,13 @@
 //! ```no_run
 //! use adbc_core::{Driver, Database, Connection, Statement};
 //! use adbc_core::options::{OptionDatabase, OptionValue};
-//! use adbc_spanner::{SpannerDriver, OPTION_DATABASE};
+//! use adbc_spanner::SpannerDriver;
 //! use arrow_array::RecordBatchReader;
 //!
 //! # fn main() -> adbc_core::error::Result<()> {
 //! let mut driver = SpannerDriver::try_new()?;
 //! let database = driver.new_database_with_opts([(
-//!     OptionDatabase::Other(OPTION_DATABASE.into()),
+//!     OptionDatabase::Uri,
 //!     OptionValue::String("projects/p/instances/i/databases/d".into()),
 //! )])?;
 //! let mut connection = database.new_connection()?;
@@ -371,14 +371,6 @@ pub mod bench_support {
         crate::conversion::build_array(data_type, values)
     }
 }
-
-/// Driver-specific database option: the fully-qualified Spanner database path,
-/// `projects/<project>/instances/<instance>/databases/<database>`, or a `spanner:` **connection
-/// URI** carrying that path plus database-level options as query parameters (see the
-/// [crate-level Configuration docs](crate#configuration)).
-///
-/// Equivalent to setting [`OptionDatabase::Uri`](adbc_core::options::OptionDatabase::Uri).
-pub const OPTION_DATABASE: &str = "spanner.database";
 
 /// Driver-specific database option: an explicit gRPC endpoint (for example the address of a
 /// Spanner emulator, `http://localhost:9010`). When unset the client connects to the production
@@ -843,7 +835,6 @@ mod options_doc_tests {
         let doc = include_str!("../docs/options.md");
         let keys: &[&str] = &[
             // Driver-specific options (this crate's OPTION_* constants).
-            crate::OPTION_DATABASE,
             crate::OPTION_ENDPOINT,
             crate::OPTION_EMULATOR,
             crate::OPTION_KEYFILE,

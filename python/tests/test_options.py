@@ -29,7 +29,7 @@ def test_option_kwargs_maps_credentials():
         impersonate_scopes="https://www.googleapis.com/auth/cloud-platform",
         impersonate_lifetime=1800,
     )
-    assert opts["spanner.database"] == "projects/p/instances/i/databases/d"
+    assert opts["uri"] == "projects/p/instances/i/databases/d"
     assert opts["spanner.auth.keyfile"] == "/k.json"
     assert opts["spanner.auth.access_token"] == "ya29.tok"
     assert opts["spanner.auth.impersonate.target_principal"] == "sa@p.iam.gserviceaccount.com"

@@ -56,7 +56,7 @@ def option_kwargs(
     options: typing.Dict[str, str] = {}
     # Friendly kwargs -> the driver's option keys (see src/lib.rs).
     if database is not None:
-        options["spanner.database"] = database
+        options["uri"] = database
     if endpoint is not None:
         options["spanner.endpoint"] = endpoint
     if emulator:
