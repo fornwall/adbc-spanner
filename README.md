@@ -305,7 +305,7 @@ behaviour can only be observed against a real project, not the emulator.
 | `ARRAY<T>`                                  | `List<T>` (recursive)             |
 | `STRUCT<..>`                                | `Struct<..>` (recursive)          |
 | `ENUM`                                      | `Int64` (the integer ordinal)     |
-| `PROTO`                                     | *unsupported — clean `NotImplemented` error* |
+| `PROTO`                                     | `Binary` (the raw serialized bytes) |
 
 `NULL`s are represented as null slots in the corresponding Arrow array. Decoding is strict: a
 present (non-`NULL`) wire value that cannot be decoded as its column's type surfaces an
@@ -314,17 +314,18 @@ null slot the caller could mistake for a genuine SQL `NULL`. `ARRAY` and `STRUCT
 native Arrow `List`/`Struct` recursively, so nested shapes like `ARRAY<STRUCT<..>>` round-trip with
 full type fidelity.
 
-`ENUM` columns map to `Int64` — the wire value is the enum's integer ordinal (delivered as a decimal
-string, like `INT64`), so `Int64` is a lossless mapping. The enum member *names* live only in the
-proto descriptor, which Spanner does not ship in the result metadata, so the driver cannot render
-string labels; if you want the labels, `CAST(col AS STRING)` in your query and Spanner returns them
-server-side (as a `STRING` → `Utf8` column). `ARRAY<ENUM>` maps to `List<Int64>` the same way.
+`ENUM` and `PROTO` columns map to lossless primitives: `ENUM` → `Int64` (the enum's integer
+ordinal, delivered as a decimal string like `INT64`) and `PROTO` → `Binary` (the message's raw
+serialized proto2 wire bytes, delivered base64-encoded like `BYTES`). `ARRAY<ENUM>` and
+`ARRAY<PROTO>` map to `List<Int64>` / `List<Binary>` the same way, recursively.
 
-`PROTO` columns have no faithful Arrow mapping (their wire form is a base64-serialized proto
-message), so a query selecting one is rejected with a clean `NotImplemented` error naming the column
-and type — in the same spirit as strict decoding, the driver never mis-decodes them into a `Utf8`
-stand-in the caller could mistake for real string data. This applies recursively, so an
-`ARRAY<PROTO>` (or a struct with such a field) is rejected too.
+Neither type's *structure* — the enum's member names, or the proto's field layout — travels in the
+query result metadata; it lives only in the database's proto descriptor bundle (reachable via the
+admin `GetDatabaseDdl` RPC, not the data-plane read). So the driver hands back the faithful
+primitive (the ordinal / the serialized bytes) rather than a decoded `Dictionary` or `Struct`, and
+you decode a `PROTO` value with your own compiled `.proto`. If you want the decoded form directly,
+`CAST(col AS STRING)` in your query and Spanner returns it server-side (the enum member name, or the
+proto text format) as a `STRING` → `Utf8` column.
 
 `JSON` columns keep `Utf8` storage (the value bytes are the JSON text) but carry the canonical
 [`arrow.json`](https://arrow.apache.org/docs/format/CanonicalExtensions.html#json) extension type as
