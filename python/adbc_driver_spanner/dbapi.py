@@ -43,13 +43,16 @@ def connect(
     Parameters
     ----------
     db_kwargs:
-        Raw database-level driver options (see src/lib.rs / docs/options.md),
-        e.g. ``{"uri": "spanner:///projects/<p>/instances/<i>/databases/<d>"}``.
-        The ``uri`` option requires the ``spanner://`` scheme; a bare database path
-        is rejected. Credentials, the emulator, endpoint overrides, and every other
-        setting are passed here as their raw ``spanner.*`` keys.
+        Database-level driver options, keyed by their raw option strings — best
+        written with the :class:`DatabaseOptions` constants, e.g.
+        ``{DatabaseOptions.URI.value: "spanner:///projects/<p>/instances/<i>/databases/<d>"}``
+        (see src/lib.rs / docs/options.md). The ``uri`` option requires the
+        ``spanner://`` scheme; a bare database path is rejected. Credentials, the
+        emulator, endpoint overrides, and every other setting are passed here as
+        their raw keys.
     conn_kwargs:
-        Raw connection-level options (``adbc.connection.*`` / ``spanner.*``).
+        Connection-level options, keyed with the :class:`ConnectionOptions`
+        constants (``adbc.connection.*`` / ``spanner.*``).
     autocommit:
         Toggles PEP 249 autocommit; ``False`` (the default) puts the driver into
         its buffer-and-commit manual-transaction mode.

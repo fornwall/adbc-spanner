@@ -32,9 +32,13 @@ def main() -> int:
     bp.setup_table(database, N, 20000)
 
     import adbc_driver_spanner.dbapi as spanner_adbc
+    from adbc_driver_spanner import DatabaseOptions
 
     conn = spanner_adbc.connect(
-        db_kwargs={"uri": f"spanner:///{database}", "spanner.emulator": "true"},
+        db_kwargs={
+            DatabaseOptions.URI.value: f"spanner:///{database}",
+            DatabaseOptions.EMULATOR.value: "true",
+        },
         autocommit=True,
     )
     try:

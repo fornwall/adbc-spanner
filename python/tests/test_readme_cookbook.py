@@ -42,9 +42,13 @@ def test_readme_has_runnable_snippets():
 def cookbook_env(emulator_database):
     """Seed the `Singers` table and redirect `spanner.connect` at the emulator database."""
     import adbc_driver_spanner.dbapi as sp
+    from adbc_driver_spanner import DatabaseOptions
 
     conn = sp.connect(
-        db_kwargs={"uri": f"spanner:///{emulator_database}", "spanner.emulator": "true"},
+        db_kwargs={
+            DatabaseOptions.URI.value: f"spanner:///{emulator_database}",
+            DatabaseOptions.EMULATOR.value: "true",
+        },
         autocommit=True,
     )
     try:
@@ -66,8 +70,8 @@ def cookbook_env(emulator_database):
         # Override the illustrative uri with the emulator database and force
         # emulator mode, preserving any other db_kwargs the snippet set.
         merged = dict(db_kwargs or {})
-        merged["uri"] = f"spanner:///{emulator_database}"
-        merged["spanner.emulator"] = "true"
+        merged[DatabaseOptions.URI.value] = f"spanner:///{emulator_database}"
+        merged[DatabaseOptions.EMULATOR.value] = "true"
         return original(db_kwargs=merged, **kwargs)
 
     sp.connect = redirected

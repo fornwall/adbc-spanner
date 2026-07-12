@@ -12,11 +12,15 @@ pa = pytest.importorskip("pyarrow")
 
 import adbc_driver_spanner
 import adbc_driver_spanner.dbapi as spanner
+from adbc_driver_spanner import DatabaseOptions, StatementOptions
 
 
 def _connect(database, *, autocommit):
     return spanner.connect(
-        db_kwargs={"uri": f"spanner:///{database}", "spanner.emulator": "true"},
+        db_kwargs={
+            DatabaseOptions.URI.value: f"spanner:///{database}",
+            DatabaseOptions.EMULATOR.value: "true",
+        },
         autocommit=autocommit,
     )
 
@@ -125,8 +129,8 @@ def test_execute_partitions_round_trip(emulator_database):
         with conn.cursor() as cur:
             cur.adbc_statement.set_options(
                 **{
-                    "spanner.data_boost": "true",
-                    "spanner.partition.max_count": "4",
+                    StatementOptions.DATA_BOOST.value: "true",
+                    StatementOptions.MAX_PARTITIONS.value: "4",
                 }
             )
             # A single-table scan is partitionable (no ORDER BY: not partitionable).

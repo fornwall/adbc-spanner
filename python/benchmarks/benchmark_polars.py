@@ -156,10 +156,14 @@ def build_data(n: int):
 
 def setup_table(database: str, n: int, batch: int) -> None:
     import adbc_driver_spanner.dbapi as spanner_adbc
+    from adbc_driver_spanner import DatabaseOptions
 
     data = build_data(n)
     conn = spanner_adbc.connect(
-        db_kwargs={"uri": f"spanner:///{database}", "spanner.emulator": "true"},
+        db_kwargs={
+            DatabaseOptions.URI.value: f"spanner:///{database}",
+            DatabaseOptions.EMULATOR.value: "true",
+        },
         autocommit=True,
     )
     try:
@@ -189,9 +193,13 @@ def run_adbc(database: str):
     import polars as pl
 
     import adbc_driver_spanner.dbapi as spanner_adbc
+    from adbc_driver_spanner import DatabaseOptions
 
     conn = spanner_adbc.connect(
-        db_kwargs={"uri": f"spanner:///{database}", "spanner.emulator": "true"},
+        db_kwargs={
+            DatabaseOptions.URI.value: f"spanner:///{database}",
+            DatabaseOptions.EMULATOR.value: "true",
+        },
         autocommit=True,
     )
     try:

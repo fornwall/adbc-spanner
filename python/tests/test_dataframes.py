@@ -19,11 +19,15 @@ pl = pytest.importorskip("polars")
 from polars.testing import assert_frame_equal
 
 import adbc_driver_spanner.dbapi as spanner
+from adbc_driver_spanner import DatabaseOptions
 
 
 def _connect(database):
     return spanner.connect(
-        db_kwargs={"uri": f"spanner:///{database}", "spanner.emulator": "true"},
+        db_kwargs={
+            DatabaseOptions.URI.value: f"spanner:///{database}",
+            DatabaseOptions.EMULATOR.value: "true",
+        },
         autocommit=True,
     )
 

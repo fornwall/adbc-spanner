@@ -2,27 +2,24 @@
 
 These enums mirror the style of the BigQuery ADBC driver's ``DatabaseOptions`` /
 ``StatementOptions``: each member's ``.value`` is the raw option-key string the
-driver understands. They are a discoverability and typo-safety aid for the
-lower-level escape hatches — ``db_kwargs=`` / ``conn_kwargs=`` on
-:func:`adbc_driver_spanner.dbapi.connect`, and ``adbc_stmt_kwargs=`` on
-``conn.cursor(...)`` — where you pass raw option strings instead of the friendly
-keyword arguments.
+driver understands. Every driver setting is passed as one of these keys — through
+``db_kwargs=`` / ``conn_kwargs=`` on :func:`adbc_driver_spanner.dbapi.connect`, or
+``adbc_stmt_kwargs=`` on ``conn.cursor(...)`` — and these enums make that
+discoverable and typo-safe.
 
 Example::
 
     import adbc_driver_spanner.dbapi as spanner
-    from adbc_driver_spanner import ConnectionOptions, StatementOptions
+    from adbc_driver_spanner import ConnectionOptions, DatabaseOptions, StatementOptions
 
     with spanner.connect(
-        uri="spanner:///projects/p/instances/i/databases/d",
+        db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/p/instances/i/databases/d"},
         conn_kwargs={ConnectionOptions.READ_STALENESS.value: "max:10s"},
     ) as conn:
         cur = conn.cursor(
             adbc_stmt_kwargs={StatementOptions.ROWS_PER_BATCH.value: "1024"}
         )
 
-Common credential settings (``keyfile``, ``access_token``, the ``impersonate_*``
-group, …) also have dedicated keyword arguments on ``connect`` — prefer those.
 Standard ADBC option keys (``adbc.*``) live in ``adbc_driver_manager``; a few that
 the driver honours are included here for convenience. The authoritative reference
 for every option, its type, default and behaviour is ``docs/options.md``.
@@ -88,6 +85,8 @@ class ConnectionOptions(enum.Enum):
     QUERY_OPTIMIZER_STATISTICS_PACKAGE = "spanner.query.optimizer_statistics_package"
     #: Maximum commit delay (``0..=500ms``) Spanner may add to batch commits.
     MAX_COMMIT_DELAY = "spanner.commit.max_delay"
+    #: ``"true"`` requests commit statistics on read/write commits.
+    COMMIT_STATS = "spanner.commit_stats"
     #: Overall deadline (seconds) on a query's initial execution; ``0`` disables.
     RPC_TIMEOUT_QUERY = "spanner.rpc.timeout_seconds.query"
     #: Overall deadline (seconds) on each write operation; ``0`` disables.
@@ -125,6 +124,8 @@ class StatementOptions(enum.Enum):
     DIRECTED_READ = "spanner.directed_read"
     #: Per-statement override of :attr:`ConnectionOptions.MAX_COMMIT_DELAY`.
     MAX_COMMIT_DELAY = "spanner.commit.max_delay"
+    #: Per-statement override of :attr:`ConnectionOptions.COMMIT_STATS`.
+    COMMIT_STATS = "spanner.commit_stats"
     #: Per-statement override of :attr:`ConnectionOptions.QUERY_OPTIMIZER_VERSION`.
     QUERY_OPTIMIZER_VERSION = "spanner.query.optimizer_version"
     #: Per-statement override of :attr:`ConnectionOptions.QUERY_OPTIMIZER_STATISTICS_PACKAGE`.

@@ -40,13 +40,15 @@ def connect(
     Parameters
     ----------
     db_kwargs:
-        Raw database-level driver options (see src/lib.rs / docs/options.md),
-        e.g. ``{"uri": "spanner:///projects/<p>/instances/<i>/databases/<d>"}``.
-        The ``uri`` option requires the ``spanner://`` scheme; a bare database
-        path is rejected. Credentials, the emulator, endpoint overrides, and every
-        other setting are all passed here as their raw ``spanner.*`` keys — for
-        example ``{"uri": "...", "spanner.auth.keyfile": "/path/key.json"}`` or
-        ``{"uri": "...", "spanner.emulator": "true"}``.
+        Database-level driver options, keyed by their raw option strings — best
+        written with the :class:`DatabaseOptions` constants, e.g.
+        ``{DatabaseOptions.URI.value: "spanner:///projects/<p>/instances/<i>/databases/<d>"}``
+        (see src/lib.rs / docs/options.md). The ``uri`` option requires the
+        ``spanner://`` scheme; a bare database path is rejected. Credentials, the
+        emulator, endpoint overrides, and every other setting are all passed here
+        as their raw keys — for example
+        ``{DatabaseOptions.URI.value: "...", DatabaseOptions.KEYFILE.value: "/path/key.json"}``
+        or ``{DatabaseOptions.URI.value: "...", DatabaseOptions.EMULATOR.value: "true"}``.
 
     For a DBAPI 2.0 connection, prefer :func:`adbc_driver_spanner.dbapi.connect`.
     """
