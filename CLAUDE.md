@@ -94,7 +94,12 @@ Key design points:
   `adbc.connection.transaction.isolation_level` option is honoured for read/write transactions:
   `serializable` and `repeatable_read` map to the client's `IsolationLevel` (applied via
   `TransactionRunnerBuilder::set_isolation_level`), `default` leaves the database default, and the
-  other spec levels are rejected with `NotImplemented`. The standard `adbc.connection.readonly`
+  four spec levels Spanner does not natively expose are **promoted upward** to the weakest supported
+  level that still satisfies their guarantees rather than rejected (`read_uncommitted`/`read_committed`
+  → `repeatable_read`; `snapshot`/`linearizable` → `serializable`) — spec-permitted (the spec says a
+  driver *should*, not *must*, error; JDBC sanctions substituting a higher level) and safe (a stronger
+  level always satisfies a weaker one's guarantees); `get_option` reports the effective promoted level,
+  and a truly unknown level string is still rejected with `InvalidArguments`. The standard `adbc.connection.readonly`
   option (default `false`) makes a connection reject all writes — DML/DDL/ingest fail with
   `InvalidState`, queries still run; the flag is a shared `Arc<AtomicBool>` that statements read at
   execution time, so toggling it on the connection immediately affects existing statements too.

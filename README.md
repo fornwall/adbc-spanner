@@ -102,7 +102,10 @@ TODO: Go over these and merge with above:
 - Manual transactions — setting adbc.connection.autocommit=false plus commit()/rollback() works (via the buffer-and-commit
   scheme), rather than the driver rejecting non-autocommit mode.
 - Transaction isolation level — the adbc.connection.transaction.isolation_level option is honored for serializable,
-  repeatable_read, and default.
+  repeatable_read, and default. The four levels Spanner does not natively expose are promoted upward to the weakest
+  supported level that still satisfies them (read_uncommitted/read_committed → repeatable_read; snapshot/linearizable →
+  serializable), which is spec-permitted and safe; get_option reports the effective promoted level, and an unknown
+  level string is still rejected.
 - Read-only connections — adbc.connection.readonly=true is supported, making the connection reject all writes while still
   allowing queries.
 - execute_schema() (ADBC 1.1.0) — returns a query's result schema without executing it, via Spanner's QueryMode::Plan.
