@@ -327,6 +327,13 @@ you decode a `PROTO` value with your own compiled `.proto`. If you want the deco
 `CAST(col AS STRING)` in your query and Spanner returns it server-side (the enum member name, or the
 proto text format) as a `STRING` → `Utf8` column.
 
+To let you match a value to its type, the driver tags each `ENUM`/`PROTO` Arrow field with the
+fully-qualified proto/enum name under the `spanner.type.fqn` field-metadata key (when Spanner reports
+one), e.g. `examples.shipping.OrderStatus`. The storage type disambiguates the two — `Int64` +
+`spanner.type.fqn` is an enum ordinal, `Binary` + `spanner.type.fqn` is a serialized message — so you
+can resolve the label / pick the right descriptor. For an `ARRAY<ENUM>`/`ARRAY<PROTO>` the tag sits on
+the list's child (`item`) field, matching `ARRAY<JSON>`.
+
 `JSON` columns keep `Utf8` storage (the value bytes are the JSON text) but carry the canonical
 [`arrow.json`](https://arrow.apache.org/docs/format/CanonicalExtensions.html#json) extension type as
 field metadata (`ARROW:extension:name` = `arrow.json`), so Arrow consumers that understand the

@@ -137,7 +137,12 @@ and **each is independently a crates.io publish blocker** — the crate cannot b
 
 1. The whole `google-cloud-*` family (spanner, auth, lro, `wkt`, both admin crates + `gax`)
    is pinned to a `google-cloud-rust` git revision, because native `STRUCT` mapping needs
-   `Type::struct_type()`, which is on `main` but not yet in a crates.io release.
+   `Type::struct_type()` **and** the `ENUM`/`PROTO` `spanner.type.fqn` field-metadata tag needs
+   `Type::proto_type_fqn()`, neither yet in a crates.io release. The current rev is **not** a plain
+   `main` commit: it is the old pin (`3872d28`) with just the `proto_type_fqn`/`type_annotation`
+   accessor commit cherry-picked on top (fork branch `accessor-on-pin-3872d28`), so the bump stays
+   surgical — no unrelated upstream churn — until the accessor lands on `main` via
+   `fornwall/google-cloud-rust` PR #4, after which this can move to a `main`-tracking rev.
 2. `adbc_core` and `adbc_ffi` (and the dev-dependency `adbc_driver_manager`) are pinned to an
    `apache/arrow-adbc` `main` git revision — all three must share the *same* rev — carrying three FFI
    fixes not yet in the 0.23 crates.io release: an idempotent `release_ffi_error` (no double-free on
@@ -154,7 +159,7 @@ and **each is independently a crates.io publish blocker** — the crate cannot b
 lines plus `deny.toml` plus the docs; this list is the one place that enumerates every edit needed to
 revert a family to versioned crates.io releases. Current pinned revs:
 
-- `google-cloud-rust`: `3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1`
+- `google-cloud-rust`: `794411d9adbf0c926ad329371cfa9a943c77d317`
 - `apache/arrow-adbc`: `198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab`
 
 **Invariant:** the three arrow-adbc crates (`adbc_core`, `adbc_ffi`, `adbc_driver_manager`) must

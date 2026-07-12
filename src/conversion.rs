@@ -40,7 +40,9 @@
 //! *structure* behind them (enum member names, proto field layout) lives only in the database's
 //! proto descriptor bundle, not in the query metadata, so the driver hands back the faithful
 //! primitive rather than a decoded `Dictionary`/`Struct`; a caller who wants the decoded form can
-//! `CAST(col AS STRING)` in SQL.
+//! `CAST(col AS STRING)` in SQL. Each such field is tagged with the fully-qualified proto/enum name
+//! under the [`SPANNER_TYPE_FQN`] metadata key (when Spanner reports one) so the value can be matched
+//! to its type.
 //!
 //! The `TIMESTAMP` mapping is selected by [`TimestampPrecision`] (the
 //! `spanner.max_timestamp_precision` option): the default keeps the wire's full nanosecond
@@ -91,6 +93,14 @@ const ARROW_EXTENSION_NAME: &str = "ARROW:extension:name";
 const ARROW_EXTENSION_METADATA: &str = "ARROW:extension:metadata";
 /// Canonical Arrow extension name for JSON stored as a Utf8 (string) column.
 const ARROW_JSON_EXTENSION: &str = "arrow.json";
+
+/// Driver-specific Arrow field-metadata key carrying the fully-qualified proto/enum name of an
+/// `ENUM` or `PROTO` column, from Spanner's [`Type::proto_type_fqn`]. It lets a consumer identify
+/// *which* enum an `Int64` ordinal belongs to, or *which* message a `Binary` blob is, so they can
+/// resolve the label / decode the bytes against the matching descriptor. Only set when Spanner
+/// reports a non-empty FQN; the storage type disambiguates the two (`Int64` ⇒ enum, `Binary` ⇒
+/// proto). Not a registered Arrow extension — the driver defines no faithful decode, only this hint.
+const SPANNER_TYPE_FQN: &str = "spanner.type.fqn";
 
 /// How Spanner `TIMESTAMP` columns map to Arrow — the value of the
 /// [`spanner.max_timestamp_precision`](crate::OPTION_MAX_TIMESTAMP_PRECISION) connection/statement
@@ -609,6 +619,11 @@ pub(crate) fn build_schema(
 /// Never fails today (every Spanner type maps to some Arrow type — `ENUM` → `Int64`, `PROTO` →
 /// `Binary`), but stays fallible so a future unmappable type can be rejected here without a
 /// signature change rippling through the schema-build path.
+///
+/// Attaches field metadata for the types that carry a logical identity beyond their storage type:
+/// `JSON` gets the canonical `arrow.json` extension, and `ENUM`/`PROTO` get the [`SPANNER_TYPE_FQN`]
+/// hint naming the proto/enum (when Spanner reports one). For an `ARRAY<T>` the tag lands on the
+/// recursively-built child (`item`) field, not the top-level `List`, matching `ARRAY<JSON>`.
 fn arrow_field(
     name: impl Into<String>,
     ty: &Type,
@@ -616,10 +631,19 @@ fn arrow_field(
     precision: TimestampPrecision,
 ) -> Result<Field> {
     let field = Field::new(name, arrow_type(ty, precision)?, nullable);
-    Ok(if ty.code() == TypeCode::Json {
-        field.with_metadata(json_extension_metadata())
-    } else {
-        field
+    Ok(match ty.code() {
+        TypeCode::Json => field.with_metadata(json_extension_metadata()),
+        // ENUM/PROTO: tag with the fully-qualified proto/enum name so a consumer can resolve the
+        // ordinal's labels / decode the message. Skip when Spanner reports no FQN (e.g. metadata
+        // built without it), leaving a plain Int64/Binary field.
+        TypeCode::Enum | TypeCode::Proto => match ty.proto_type_fqn() {
+            "" => field,
+            fqn => field.with_metadata(HashMap::from([(
+                SPANNER_TYPE_FQN.to_string(),
+                fqn.to_string(),
+            )])),
+        },
+        _ => field,
     })
 }
 
@@ -1216,6 +1240,11 @@ mod tests {
             .map(String::as_str)
     }
 
+    /// The `spanner.type.fqn` proto/enum name attached to a Field's metadata, if any.
+    fn type_fqn(field: &Field) -> Option<&str> {
+        field.metadata().get(SPANNER_TYPE_FQN).map(String::as_str)
+    }
+
     #[test]
     fn json_column_is_tagged_arrow_json() {
         let field = arrow_field(
@@ -1280,10 +1309,12 @@ mod tests {
         // from the generated model type and wrap it.
         let ty: Type = model::Type::new().set_code(model::TypeCode::Proto).into();
 
-        // A scalar PROTO maps to its raw serialized bytes: Binary, no extension metadata.
+        // A scalar PROTO maps to its raw serialized bytes: Binary. With no FQN in the metadata, the
+        // field carries no tag.
         let field = arrow_field("payload", &ty, true, TimestampPrecision::default()).unwrap();
         assert_eq!(field.data_type(), &DataType::Binary);
         assert_eq!(extension_name(&field), None);
+        assert_eq!(type_fqn(&field), None);
 
         // ARRAY<PROTO> maps to List<Binary> the same way, recursively.
         let array_ty = google_cloud_spanner::types::array(ty);
@@ -1314,10 +1345,12 @@ mod tests {
         // from the generated model type and wrap it.
         let ty: Type = model::Type::new().set_code(model::TypeCode::Enum).into();
 
-        // A scalar ENUM maps to its integer ordinal: Int64, no extension metadata.
+        // A scalar ENUM maps to its integer ordinal: Int64. With no FQN in the metadata, the field
+        // carries no tag.
         let field = arrow_field("color", &ty, true, TimestampPrecision::default()).unwrap();
         assert_eq!(field.data_type(), &DataType::Int64);
         assert_eq!(extension_name(&field), None);
+        assert_eq!(type_fqn(&field), None);
 
         // ARRAY<ENUM> maps to List<Int64> the same way, recursively.
         let array_ty = google_cloud_spanner::types::array(ty);
@@ -1336,6 +1369,36 @@ mod tests {
             .unwrap();
         assert_eq!(ints.len(), 1);
         assert_eq!(ints.value(0), 2);
+    }
+
+    #[test]
+    fn enum_and_proto_carry_the_fqn_when_spanner_reports_it() {
+        use google_cloud_spanner::model;
+
+        for code in [model::TypeCode::Enum, model::TypeCode::Proto] {
+            let fqn = "examples.shipping.OrderStatus";
+            let ty: Type = model::Type::new()
+                .set_code(code.clone())
+                .set_proto_type_fqn(fqn)
+                .into();
+
+            // A scalar ENUM/PROTO with an FQN carries it under the `spanner.type.fqn` key (and no
+            // `arrow.json` extension); the storage type still distinguishes enum (Int64) from proto
+            // (Binary).
+            let field = arrow_field("col", &ty, true, TimestampPrecision::default()).unwrap();
+            assert_eq!(type_fqn(&field), Some(fqn), "{code:?}");
+            assert_eq!(extension_name(&field), None, "{code:?}");
+
+            // For an ARRAY the tag lands on the child `item` field, not the top-level List — matching
+            // how ARRAY<JSON> tags its child.
+            let array_ty = google_cloud_spanner::types::array(ty);
+            let field = arrow_field("arr", &array_ty, true, TimestampPrecision::default()).unwrap();
+            assert_eq!(type_fqn(&field), None, "ARRAY<{code:?}> top-level");
+            let DataType::List(item) = field.data_type() else {
+                panic!("expected a List data type, got {:?}", field.data_type());
+            };
+            assert_eq!(type_fqn(item), Some(fqn), "ARRAY<{code:?}> item");
+        }
     }
 
     #[test]

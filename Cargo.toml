@@ -109,15 +109,15 @@ arrow-buffer = ">=58, <60"
 # their shared internal crates (gax, gaxi, ...) resolve to one compatible copy.
 # NOTE: git dependencies cannot be published to crates.io — switch these back to
 # versioned releases once `Type::struct_type()` is published.
-google-cloud-spanner = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
+google-cloud-spanner = { git = "https://github.com/fornwall/google-cloud-rust", rev = "794411d9adbf0c926ad329371cfa9a943c77d317" }
 # Anonymous / service-account credentials.
-google-cloud-auth = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
+google-cloud-auth = { git = "https://github.com/fornwall/google-cloud-rust", rev = "794411d9adbf0c926ad329371cfa9a943c77d317" }
 # The `Poller` trait, to await the admin `UpdateDatabaseDdl` long-running operation used for DDL.
-google-cloud-lro = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
+google-cloud-lro = { git = "https://github.com/fornwall/google-cloud-rust", rev = "794411d9adbf0c926ad329371cfa9a943c77d317" }
 # Well-known-types `Duration`, the type `set_max_commit_delay` takes for the `spanner.commit.max_delay`
 # option. Already in the graph (google-cloud-spanner depends on it as `wkt`); naming it directly lets
 # `src/request.rs` build the commit-delay value. Same git pin as the google-cloud family above.
-google-cloud-wkt = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
+google-cloud-wkt = { git = "https://github.com/fornwall/google-cloud-rust", rev = "794411d9adbf0c926ad329371cfa9a943c77d317" }
 # The Spanner client is async; we bridge it to the synchronous ADBC traits with a
 # dedicated multi-thread runtime.
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
@@ -145,7 +145,7 @@ arbitrary = { version = "1", features = ["derive"], optional = true }
 # `details`. Already in the dependency graph — google-cloud-spanner re-exports this crate's
 # `Error` — so this adds no new code, it only names the types. Same git pin as the
 # google-cloud family above (see the note there).
-google-cloud-gax = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
+google-cloud-gax = { git = "https://github.com/fornwall/google-cloud-rust", rev = "794411d9adbf0c926ad329371cfa9a943c77d317" }
 
 # Lints applied in local dev too (CI additionally runs `clippy -D warnings`).
 [lints.rust]
@@ -210,8 +210,8 @@ adbc_driver_manager = { git = "https://github.com/apache/arrow-adbc", rev = "198
 libloading = "0.9"
 # Admin clients, used by the emulator integration test to create the test instance and database.
 # Pinned to the same git revision as the google-cloud family above (see the note there).
-google-cloud-spanner-admin-instance-v1 = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
-google-cloud-spanner-admin-database-v1 = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
+google-cloud-spanner-admin-instance-v1 = { git = "https://github.com/fornwall/google-cloud-rust", rev = "794411d9adbf0c926ad329371cfa9a943c77d317" }
+google-cloud-spanner-admin-database-v1 = { git = "https://github.com/fornwall/google-cloud-rust", rev = "794411d9adbf0c926ad329371cfa9a943c77d317" }
 # Benchmark harness for benches/conversion.rs. Slim feature set: `cargo_bench_support` is what
 # `cargo bench` needs; the default plotters/rayon extras are skipped.
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
@@ -221,7 +221,7 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 # tests/RESILIENCE.md). This is the same mock the pinned client uses for its own end-to-end tests,
 # so its request/response protos match what the client sends on the wire.
 # Same git pin as the google-cloud family above (see the note there).
-spanner-grpc-mock = { git = "https://github.com/fornwall/google-cloud-rust", rev = "3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1" }
+spanner-grpc-mock = { git = "https://github.com/fornwall/google-cloud-rust", rev = "794411d9adbf0c926ad329371cfa9a943c77d317" }
 # Used by tests/mock_spanner.rs to script the mock server: gRPC statuses (tonic), hand-encoded
 # `google.rpc.Status`/`RetryInfo` error details (prost/prost-types/bytes). Versions track what
 # the google-cloud family already pulls in, so these add no new major dependency lines.
