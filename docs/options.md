@@ -98,8 +98,10 @@ path, not the original URI.
 | `spanner.retry.backoff.multiplier` | finite, strictly positive number; `""` unsets (see [Retry tuning](#retry-tuning)) | unset (client default, `2.0`) | yes, when set (also via `get_option_double`) | Per-attempt growth factor for the backoff delay. A value below `1.0` is floored to `1.0` (constant delay). Same combination / inheritance as `…backoff.initial_seconds`. |
 
 Two standard connection options are **read-only**: `adbc.connection.catalog` and
-`adbc.connection.db_schema` (the "current" catalog/schema) both report `""` — a Spanner database
-has a single, unnamed catalog and default schema — and cannot be set.
+`adbc.connection.db_schema` (the "current" catalog/schema) both report `""` and cannot be set — a
+Spanner database has a single, unnamed catalog, and although it supports named schemas (addressed by
+qualified name and enumerated by `get_objects`) it has no settable session/current schema to select
+one.
 
 ## Statement options
 

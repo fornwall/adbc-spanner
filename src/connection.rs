@@ -785,10 +785,13 @@ impl Optionable for SpannerConnection {
                     )));
                 }
             }
-            // A Spanner database exposes a single, unnamed catalog and (default) schema — both `""`,
-            // which is what the `get_option` side always reports — and neither can be switched. So
-            // setting either to `""` is a conformant no-op; any other value is an `InvalidArguments`
-            // (the requested catalog/schema does not exist), not `NotImplemented`.
+            // A Spanner database has a single, unnamed catalog, and — although Spanner supports named
+            // schemas (addressed by qualified name, e.g. `sales.Orders`, and enumerated by
+            // `get_objects`) — it exposes no settable session/current schema to point at one. So the
+            // "current" catalog and schema are both fixed at `""`, which is what the `get_option` side
+            // always reports; setting either to `""` is a conformant no-op, and any other value is an
+            // `InvalidArguments` (there is no such switchable current catalog/schema), not
+            // `NotImplemented`.
             OptionConnection::CurrentCatalog => {
                 check_unnamed_catalog_or_schema(value, "current catalog")?;
             }
@@ -1222,11 +1225,13 @@ fn parse_bool(value: OptionValue) -> Result<bool> {
     crate::options::bool_option(value, "option")
 }
 
-/// Validate a `current_catalog` / `current_schema` set request. A Spanner database exposes a single,
-/// unnamed (`""`) catalog and (default) schema — mirrored by the `get_option` side, which always
-/// reports `""` — and there is no way to switch either. So the only conformant value is the empty
-/// string, accepted as a no-op; any other value is rejected with `InvalidArguments` (the requested
-/// catalog/schema does not exist), not `NotImplemented`. `what` names the option in the error.
+/// Validate a `current_catalog` / `current_schema` set request. Spanner has a single, unnamed (`""`)
+/// catalog, and — although it supports named schemas (addressed by qualified name and enumerated by
+/// `get_objects`) — no settable session/current schema to select one. Both "current" values are
+/// therefore fixed at `""` (mirrored by the `get_option` side, which always reports `""`), so the
+/// only conformant value is the empty string, accepted as a no-op; any other value is rejected with
+/// `InvalidArguments` (there is no such switchable current catalog/schema), not `NotImplemented`.
+/// `what` names the option in the error.
 fn check_unnamed_catalog_or_schema(value: OptionValue, what: &str) -> Result<()> {
     let OptionValue::String(s) = value else {
         return Err(invalid_argument(format!("expected a string {what} value")));
@@ -1235,7 +1240,7 @@ fn check_unnamed_catalog_or_schema(value: OptionValue, what: &str) -> Result<()>
         Ok(())
     } else {
         Err(invalid_argument(format!(
-            "Spanner exposes a single unnamed {what}; only \"\" is valid, got {s:?}"
+            "Spanner has no settable {what}; only \"\" is valid, got {s:?}"
         )))
     }
 }
@@ -1363,9 +1368,10 @@ mod tests {
         let set = |s: &str| {
             check_unnamed_catalog_or_schema(OptionValue::String(s.to_string()), "current catalog")
         };
-        // Spanner's single unnamed catalog/schema is `""`, so setting it to `""` is a no-op success.
+        // The "current" catalog/schema is fixed at `""` (no settable session catalog/schema), so
+        // setting it to `""` is a no-op success.
         assert!(set("").is_ok());
-        // Any other value names a catalog/schema that does not exist → InvalidArguments (not
+        // Any other value has no switchable current catalog/schema to select → InvalidArguments (not
         // NotImplemented, which is what the blanket fall-through arm would have produced).
         let err = set("foo").unwrap_err();
         assert_eq!(err.status, Status::InvalidArguments);

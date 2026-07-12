@@ -121,8 +121,9 @@ TODO: Go over these and merge with above:
 - Parameter schema — get_parameter_schema() describes a parameterized statement's bind parameters.
 - get_objects with constraints — catalog/schema/table/column introspection including foreign-key constraint_column_usage, not
   just the minimal object listing.
-- Current catalog / schema options (ADBC 1.1.0) — adbc.connection.catalog / adbc.connection.db_schema are accepted (Spanner
-  exposes a single unnamed catalog/schema, so only the empty value is valid).
+- Current catalog / schema options (ADBC 1.1.0) — adbc.connection.catalog / adbc.connection.db_schema are accepted, but only
+  the default empty value is valid: Spanner has a single unnamed catalog, and although it supports named schemas (addressed by
+  qualified name, e.g. sales.Orders, and enumerated by get_objects) it has no settable session/current schema to point at one.
 - adbc.statement.bind_by_name — the SQLite-reference-driver bind-by-name convention is honored (a de-facto optional convention
   rather than a formal spec option).
 
