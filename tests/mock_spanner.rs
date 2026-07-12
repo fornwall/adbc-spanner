@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use adbc_core::error::Status as AdbcStatus;
-use adbc_core::options::{OptionDatabase, OptionStatement, OptionValue};
+use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, OptionValue};
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_spanner::{SpannerConnection, SpannerDriver};
 use arrow_array::cast::AsArray;
@@ -380,6 +380,113 @@ fn mock_server_round_trips_a_query() {
     let column = batch.column(0).as_string::<i32>();
     assert_eq!(column.value(0), "v1");
     assert_eq!(column.value(1), "v2");
+}
+
+/// Manual-transaction read-your-writes guard: a data-returning query issued while writes are
+/// buffered in a manual transaction is rejected up front with `InvalidState`, instead of silently
+/// running against a snapshot that misses the buffered writes. The negatives — a query in
+/// autocommit mode and a query in manual mode with an *empty* buffer — must still run.
+///
+/// The guard fires before any RPC, so the mock only needs to serve `ExecuteStreamingSql` for the
+/// two queries that are *allowed* through; the buffered `INSERT` just adds to the in-memory buffer
+/// (no RPC) and the guarded query never reaches the wire.
+#[test]
+fn query_while_dml_buffered_in_manual_txn_is_rejected() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "query_while_dml_buffered_in_manual_txn_is_rejected",
+    );
+
+    let server = MockServer::start(move |mock| {
+        // Served for every *allowed* query; unbounded times (the guarded query never gets here).
+        mock.expect_execute_streaming_sql().returning(move |_| {
+            Ok(stream_of(vec![Ok(partial_result_set(
+                true,
+                &["v1", "v2"],
+                b"ryw-1",
+                true,
+            ))]))
+        });
+    });
+
+    let mut connection = server.connect();
+
+    // Negative 1: autocommit mode (the default) is unaffected — the query runs.
+    let mut auto_q = connection.new_statement().expect("new statement");
+    auto_q.set_sql_query("SELECT c FROM MockTable").unwrap();
+    let batches: Vec<_> = auto_q
+        .execute()
+        .expect("autocommit query must run")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect autocommit batches");
+    assert_eq!(batches[0].num_rows(), 2);
+
+    // Enter manual transaction mode.
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("disable autocommit");
+
+    // Negative 2: manual mode with an empty buffer still allows a query.
+    let mut empty_q = connection.new_statement().expect("new statement");
+    empty_q.set_sql_query("SELECT c FROM MockTable").unwrap();
+    let batches: Vec<_> = empty_q
+        .execute()
+        .expect("query with an empty buffer must run")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect empty-buffer batches");
+    assert_eq!(batches[0].num_rows(), 2);
+
+    // Buffer a DML statement (returns None in manual mode, no RPC).
+    let mut insert = connection.new_statement().expect("new statement");
+    insert
+        .set_sql_query("INSERT INTO MockTable (c) VALUES ('x')")
+        .unwrap();
+    assert_eq!(
+        insert.execute_update().expect("buffered insert"),
+        None,
+        "DML in manual mode buffers (returns None), not commits"
+    );
+
+    // Positive: a query while a write is buffered is rejected up front with InvalidState.
+    let mut guarded = connection.new_statement().expect("new statement");
+    guarded.set_sql_query("SELECT c FROM MockTable").unwrap();
+    let Err(error) = guarded.execute() else {
+        panic!("a query while DML is buffered must be rejected, not silently run");
+    };
+    assert_eq!(
+        error.status,
+        AdbcStatus::InvalidState,
+        "querying with buffered writes must fail with InvalidState (no read-your-writes)"
+    );
+    assert!(
+        error.message.contains("read-your-writes"),
+        "the error should explain the read-your-writes hazard: {:?}",
+        error.message
+    );
+
+    // execute_partitions is guarded the same way.
+    let mut guarded_partitions = connection.new_statement().expect("new statement");
+    guarded_partitions
+        .set_sql_query("SELECT c FROM MockTable")
+        .unwrap();
+    let Err(error) = guarded_partitions.execute_partitions() else {
+        panic!("execute_partitions while DML is buffered must be rejected");
+    };
+    assert_eq!(error.status, AdbcStatus::InvalidState);
+
+    // Rolling back empties the buffer, so a query is allowed again.
+    connection.rollback().expect("rollback buffered insert");
+    let mut after = connection.new_statement().expect("new statement");
+    after.set_sql_query("SELECT c FROM MockTable").unwrap();
+    let batches: Vec<_> = after
+        .execute()
+        .expect("query after rollback must run")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect post-rollback batches");
+    assert_eq!(batches[0].num_rows(), 2);
 }
 
 /// (a) `ABORTED` (with a `google.rpc.RetryInfo` detail) on `ExecuteStreamingSql` surfaces as a

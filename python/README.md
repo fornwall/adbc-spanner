@@ -208,9 +208,11 @@ A DBAPI connection is **autocommit-off by default**, so writes are grouped into 
 applied together when you call `conn.commit()` (`conn.rollback()` discards them). Two behaviours to
 be aware of in this mode:
 
-- **Reads don't see uncommitted writes.** A query always runs against the latest committed data, so
-  an `INSERT` followed by a `SELECT COUNT(*)` in the same transaction returns the *pre-insert* count.
-  Call `conn.commit()` first if a later statement must see earlier writes.
+- **No read-your-writes — queries are guarded.** A query runs against the latest committed data and
+  cannot see writes buffered earlier in the same transaction. Rather than silently returning a stale
+  (*pre-insert*) result, a query issued while a write is buffered raises
+  `adbc_driver_manager.ProgrammingError` (ADBC `InvalidState`). Call `conn.commit()` (or
+  `conn.rollback()`) first if a later statement must see earlier writes.
 - **DDL applies immediately.** `CREATE` / `ALTER` / `DROP` are not transactional in Spanner and take
   effect as soon as they run, regardless of `commit()`.
 
@@ -218,6 +220,7 @@ Connect with `autocommit=True` if you want every statement to apply immediately.
 
 ```python
 import adbc_driver_spanner.dbapi as spanner
+from adbc_driver_manager import ProgrammingError
 from adbc_driver_spanner import DatabaseOptions
 
 with spanner.connect(
@@ -227,8 +230,13 @@ with spanner.connect(
         cur.execute("DROP TABLE IF EXISTS Albums")  # DDL runs immediately
         cur.execute("CREATE TABLE Albums (Id INT64 NOT NULL) PRIMARY KEY (Id)")
         cur.execute("INSERT INTO Albums (Id) VALUES (1)")  # buffered, not applied yet
-        cur.execute("SELECT COUNT(*) FROM Albums")
-        assert cur.fetchone()[0] == 0  # pre-insert count: the INSERT is not visible yet
+        # Querying while the INSERT is buffered is rejected (no read-your-writes) instead of
+        # silently returning a stale count.
+        try:
+            cur.execute("SELECT COUNT(*) FROM Albums")
+            raise AssertionError("expected the guarded query to raise")
+        except ProgrammingError:
+            pass  # commit (or roll back) first to see the write
     conn.commit()  # the buffered INSERT is applied here, atomically
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM Albums")

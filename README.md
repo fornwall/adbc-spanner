@@ -29,10 +29,12 @@ Early but working and tested end-to-end against the Spanner emulator.
   and applied atomically in one read/write transaction on commit, so `execute_update` returns `None`
   rather than an affected-row count — the count is unknown until the buffered batch commits (queries
   and DDL still run immediately). Because only writes are buffered, a manual transaction has **no
-  read-your-writes** — a query runs immediately in a fresh read-only snapshot, so an `INSERT`
-  followed by a `SELECT COUNT(*)` in the same open transaction returns the *pre-insert* count — and
-  **DML and DDL reorder**: DDL issued after buffered DML executes before it (Spanner DDL is never
-  transactional). Commit first if a statement needs to see earlier writes. This follows from the
+  read-your-writes** — a query runs immediately in a fresh read-only snapshot and cannot see
+  buffered writes. Rather than silently returning a *pre-insert* result, a data-returning query
+  (`execute`/`execute_partitions`) issued while any write is buffered is rejected with
+  `InvalidState`; commit or roll back first if a statement needs to see earlier writes. Writes also
+  **reorder relative to DDL**: DDL issued after buffered DML executes before it (Spanner DDL is
+  never transactional). This follows from the
   preview client exposing read/write transactions only through a closure-based runner; it will be
   fixed properly once the client exposes begin/commit handles. DML with
   a [`THEN RETURN`](https://cloud.google.com/spanner/docs/dml-returning) clause returns its rows:

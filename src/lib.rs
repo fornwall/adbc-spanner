@@ -58,8 +58,9 @@
 //! one read/write transaction on `commit` (the Spanner client exposes read/write transactions only
 //! through a closure-based runner, so there is no true open transaction to run statements in).
 //! Two consequences: a manual transaction has **no read-your-writes** — queries run immediately in
-//! a fresh read-only snapshot and do not see buffered DML, so an `INSERT` followed by a
-//! `SELECT COUNT(*)` returns the pre-insert count — and DDL issued after buffered DML **executes
+//! a fresh read-only snapshot and cannot see buffered writes, so a data-returning query issued
+//! while a write is pending is rejected with `InvalidState` (rather than silently returning a
+//! pre-insert result); commit or roll back first — and DDL issued after buffered DML **executes
 //! before it** (DDL runs immediately; it is never transactional in Spanner). See
 //! [`SpannerConnection`] for the full model.
 //!
