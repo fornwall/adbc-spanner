@@ -197,6 +197,14 @@ Early but working and tested end-to-end against the Spanner emulator. Supported 
   `google.rpc.Status` as binary protobuf — so a consumer written to Flight SQL's convention won't
   interoperate. The reason is that the pinned preview client decodes details into serde-modelled
   types whose only supported encoding is ProtoJSON, with no binary-protobuf path.
+  On a `PERMISSION_DENIED` (which maps to `Unauthorized`), the driver additionally *appends* a short
+  IAM-guidance string to the error message. Spanner's own message already names the missing permission
+  (e.g. `spanner.databases.select`), which is preserved verbatim, so the driver does not re-parse it
+  or name a specific role; it appends a fixed hint to grant an IAM role that includes the missing
+  permission and links <https://cloud.google.com/spanner/docs/iam>. (No predefined role is named —
+  matching the ADBC BigQuery driver, whose only fixed auth guidance is a re-authentication hint plus a
+  doc link and names no roles either.) The guidance only augments the message; the status,
+  `vendor_code` and forwarded details are unchanged.
 
 Not supported (returns `NotImplemented`, by nature of Spanner): **Substrait** — Spanner executes
 GoogleSQL/PostgreSQL text and has no Substrait support.

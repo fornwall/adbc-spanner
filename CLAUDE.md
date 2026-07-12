@@ -59,7 +59,19 @@ SpannerDriver ──▶ SpannerDatabase ──▶ SpannerConnection ──▶ Sp
   transaction runner retries aborts internally, consuming its `retryDelay`) into `Error.details` —
   key = lowercased proto type name
   (`google.rpc.retryinfo`), value = the detail's ProtoJSON bytes (no `-bin` suffix; the pinned
-  client's detail types have no binary-proto encoding). `from_builder` stays generic over
+  client's detail types have no binary-proto encoding). On a `PERMISSION_DENIED` (gRPC 7 →
+  `Status::Unauthorized`) it also *appends* a fixed IAM-guidance string to the message
+  (`PERMISSION_DENIED_GUIDANCE`): Spanner's own message already names the missing permission (kept
+  verbatim), so — like the ADBC BigQuery driver's `reauthGuidance` — the driver does **not** re-parse
+  it or map it to a specific role; it just appends a constant hint to grant an IAM role that includes
+  the missing permission plus the Spanner IAM doc link, and — matching the BigQuery driver, whose only
+  fixed auth guidance is a RAPT re-auth hint + doc link and names no roles — deliberately names **no
+  predefined role** (an earlier version enumerated `roles/spanner.databaseReader`/`databaseUser`/
+  `databaseAdmin`; the enumeration was dropped for BigQuery-driver parity). The guidance only
+  augments — message text, status, `vendor_code` and forwarded details are all preserved (IAM isn't
+  enforced on the emulator, so it's covered by unit tests plus a `tests/mock_spanner.rs`
+  PERMISSION_DENIED mock; `from_status_parts` adds the same guidance on the BatchWrite path).
+  `from_builder` stays generic over
   `Display` for the status-less client-builder errors.
 
 Key design points:
