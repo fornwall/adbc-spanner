@@ -36,8 +36,9 @@ __all__ = ["DatabaseOptions", "ConnectionOptions", "StatementOptions"]
 class DatabaseOptions(enum.Enum):
     """Database-level options (set before connecting, via ``db_kwargs``)."""
 
-    #: **Standard ADBC.** Fully-qualified database path,
-    #: ``projects/<p>/instances/<i>/databases/<d>`` (or a ``spanner:`` connection URI).
+    #: **Standard ADBC.** A ``spanner://`` connection URI whose path is the fully-qualified
+    #: database path, ``spanner:///projects/<p>/instances/<i>/databases/<d>``. The scheme is
+    #: required; a bare path is rejected (the ``connect(database=...)`` kwarg wraps one for you).
     URI = "uri"
     #: Override the Spanner gRPC endpoint (e.g. an emulator ``host:port``).
     ENDPOINT = "spanner.endpoint"

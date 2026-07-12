@@ -37,7 +37,7 @@ holds configuration).
 
 | Option | Type / allowed values | Default | Round-trips | Description |
 | ------ | --------------------- | ------- | ----------- | ----------- |
-| `uri` | string: `projects/<p>/instances/<i>/databases/<d>`, or a `spanner:` connection URI (see [Connection URIs](#connection-uris)) | — (required) | yes, when set (a connection URI reports the expanded database path, not the original URI) | **Standard ADBC.** The fully-qualified Spanner database path. Connecting without it fails with `InvalidState`. |
+| `uri` | string: a `spanner://` connection URI carrying the database path `projects/<p>/instances/<i>/databases/<d>` (see [Connection URIs](#connection-uris)) | — (required) | yes, when set (reports the expanded database path, not the original URI) | **Standard ADBC.** A `spanner://` connection URI whose path is the fully-qualified Spanner database path. A bare database path is **not** accepted — the scheme is required (matching the ADBC BigQuery driver's `bigquery://`). Connecting without it fails with `InvalidState`. |
 | `spanner.endpoint` | string: gRPC endpoint URL, e.g. `http://localhost:9010` | unset (production Spanner service) | yes, when set | Explicit gRPC endpoint, e.g. a Spanner emulator. Takes precedence over the endpoint derived from `SPANNER_EMULATOR_HOST` (see [Environment](#environment)). |
 | `spanner.emulator` | boolean | `false` (forced `true` when `SPANNER_EMULATOR_HOST` is set non-empty) | yes, always (`true`/`false`) | Connect with **anonymous credentials** (emulator mode). Combining emulator mode with explicitly configured credentials (`spanner.auth.keyfile`, `spanner.auth.keyfile_json`, `spanner.auth.impersonate.target_principal`, or `spanner.auth.access_token`) is refused at connect time with `InvalidState` instead of silently ignoring them; ambient ADC does not conflict. |
 | `spanner.auth.keyfile` | string: path to a credential JSON file | unset (Application Default Credentials) | yes, when set | Path to a Google credential JSON key file (dbt's `keyfile`). The credential flow is auto-detected from the JSON's `"type"` field: `service_account`, `authorized_user`, `impersonated_service_account`, or `external_account`. Overridden by `spanner.auth.keyfile_json` if both are set. See [README § Authentication](../README.md#authentication). |
@@ -51,9 +51,10 @@ holds configuration).
 
 ### Connection URIs
 
-Instead of a bare database path, `uri` also accepts a **connection URI** with
-the `spanner:` scheme (matched ASCII case-insensitively; any other scheme, including
-`cloudspanner:`, is not recognised and the value is stored verbatim as a database path):
+The `uri` option is a **connection URI** with the `spanner://` scheme (matched ASCII
+case-insensitively). The scheme is **required** — a bare database path, or any other scheme such as
+`cloudspanner:`, is rejected with `InvalidArguments` (this matches the ADBC BigQuery driver, whose
+`uri` likewise requires the `bigquery://` scheme):
 
 ```text
 spanner:///projects/<p>/instances/<i>/databases/<d>?spanner.endpoint=http://localhost:9010&spanner.emulator=true

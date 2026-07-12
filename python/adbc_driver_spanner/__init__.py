@@ -56,7 +56,14 @@ def option_kwargs(
     options: typing.Dict[str, str] = {}
     # Friendly kwargs -> the driver's option keys (see src/lib.rs).
     if database is not None:
-        options["uri"] = database
+        # The driver's `uri` option requires the `spanner://` scheme; a bare database path is
+        # rejected. Wrap a plain path into the three-slash (no-endpoint) form, but pass a value that
+        # already carries the scheme through unchanged (so a full `spanner://host/...?opts` URI works
+        # here too).
+        if database.lower().startswith("spanner:"):
+            options["uri"] = database
+        else:
+            options["uri"] = f"spanner:///{database}"
     if endpoint is not None:
         options["spanner.endpoint"] = endpoint
     if emulator:

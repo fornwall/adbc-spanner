@@ -230,16 +230,18 @@ level, bulk ingest, and so on — are accepted alongside them.
 **[docs/options.md](docs/options.md) is the complete, authoritative reference**: every option, at
 each level, with its exact type and allowed values, default, and `get_option` round-trip behaviour.
 
-Instead of a bare database path, `uri` also accepts a **connection URI** with
-the `spanner:` scheme whose query parameters are database-level options (see
-[docs/options.md](docs/options.md#connection-uris)):
+The Spanner database is set with the standard `uri` database option, a **connection URI** with the
+`spanner://` scheme: its path is the database path, and its query parameters are database-level
+options (see [docs/options.md](docs/options.md#connection-uris)):
 
 ```text
 spanner:///projects/p/instances/i/databases/d?spanner.endpoint=http://localhost:9010&spanner.emulator=true
 spanner://localhost:9010/projects/p/instances/i/databases/d
 ```
 
-The URI path is the database path; an optional `//host:port` authority becomes `spanner.endpoint`
+The `spanner://` scheme is **required** — a bare database path is rejected (this matches the ADBC
+BigQuery driver, whose `uri` likewise requires the `bigquery://` scheme). The URI path is the
+database path; an optional `//host:port` authority becomes `spanner.endpoint`
 (write `spanner:///projects/…`, with three slashes, when no
 endpoint host is intended). Query parameters must be database-level option names (unknown
 keys are rejected); values are percent-decoded per RFC 3986 (`+` is a literal plus, not a space).

@@ -97,7 +97,10 @@ impl MockServer {
         let mut driver = SpannerDriver::try_new().expect("create driver");
         let database = driver
             .new_database_with_opts([
-                (OptionDatabase::Uri, OptionValue::String(DATABASE.into())),
+                (
+                    OptionDatabase::Uri,
+                    OptionValue::String(format!("spanner:///{DATABASE}")),
+                ),
                 (
                     OptionDatabase::Other(adbc_spanner::OPTION_ENDPOINT.into()),
                     OptionValue::String(self.endpoint.clone()),

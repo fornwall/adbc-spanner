@@ -169,13 +169,12 @@ impl SpannerDatabase {
 
     /// Handle a value set through the standard `uri` option.
     ///
-    /// Two forms are accepted:
-    ///
-    /// - A bare database path, `projects/<p>/instances/<i>/databases/<d>` — stored verbatim, exactly
-    ///   as before connection URIs existed.
-    /// - A **connection URI**, recognised by a `spanner:` scheme — parsed by
-    ///   [`parse_connection_uri`] and *expanded immediately* into the underlying option fields, as
-    ///   if each part had been passed as an individual database option.
+    /// The value must be a **`spanner://` connection URI**: its path is the Spanner database path,
+    /// an optional `//host:port` authority becomes the endpoint, and query parameters are
+    /// database-level options. A bare database path is **rejected** — the `spanner://` scheme is
+    /// required, matching the ADBC BigQuery driver, whose `uri` likewise requires the `bigquery://`
+    /// scheme. The URI is parsed by [`parse_connection_uri`] and *expanded immediately* into the
+    /// underlying option fields, as if each part had been passed as an individual database option.
     ///
     /// Because the URI is expanded eagerly at `set_option` time, option precedence is purely
     /// **last-writer-wins and order-deterministic**: an explicit option set *after* the URI
@@ -188,14 +187,15 @@ impl SpannerDatabase {
     ///
     /// The whole URI is validated before any field is mutated, so a rejected URI leaves the
     /// configuration untouched.
-    fn set_database_or_uri(&mut self, value: String) -> Result<()> {
-        match connection_uri_remainder(&value) {
-            Some(remainder) => self.apply_connection_uri(remainder),
-            None => {
-                self.database = Some(value);
-                Ok(())
-            }
-        }
+    fn set_uri_option(&mut self, value: String) -> Result<()> {
+        let Some(remainder) = connection_uri_remainder(&value) else {
+            return Err(invalid_argument(format!(
+                "the `uri` option must be a `spanner://` connection URI, not a bare database path \
+                 — write `spanner:///{value}` (three slashes, no endpoint host) or \
+                 `spanner://<host:port>/{value}`"
+            )));
+        };
+        self.apply_connection_uri(remainder)
     }
 
     /// Expand a parsed connection URI (see [`parse_connection_uri`]) into this database's option
@@ -464,7 +464,7 @@ impl Optionable for SpannerDatabase {
         match &key {
             OptionDatabase::Uri => {
                 let value = string_value(&key, value)?;
-                self.set_database_or_uri(value)?
+                self.set_uri_option(value)?
             }
             OptionDatabase::Other(name) if name == OPTION_ENDPOINT => {
                 self.endpoint = Some(string_value(&key, value)?)
@@ -611,9 +611,9 @@ const URI_QUERY_OPTIONS: [&str; 10] = [
     OPTION_QUOTA_PROJECT,
 ];
 
-/// If `value` is a connection URI — it starts with the `spanner:` scheme (ASCII case-insensitive,
-/// per RFC 3986) — return the remainder after the scheme. A bare database path (or any other
-/// scheme) returns `None` and is used verbatim.
+/// If `value` starts with the `spanner:` scheme (ASCII case-insensitive, per RFC 3986) — return the
+/// remainder after the scheme. Any other value (a bare database path, or a different scheme) returns
+/// `None` and is rejected: the `uri` option requires a `spanner://` connection URI.
 fn connection_uri_remainder(value: &str) -> Option<&str> {
     const SCHEME: &str = "spanner:";
     value
@@ -661,14 +661,18 @@ fn parse_connection_uri(remainder: &str) -> Result<ParsedConnectionUri> {
         None => (remainder, None),
     };
 
-    // `//authority/path`; an empty authority (`spanner:///…`) means "no endpoint". Without the
-    // `//`, tolerate one leading `/` before the database path.
-    let (authority, path) = match before_query.strip_prefix("//") {
-        Some(after) => match after.split_once('/') {
-            Some((authority, path)) => (Some(authority), path),
-            None => (Some(after), ""),
-        },
-        None => (None, before_query.strip_prefix('/').unwrap_or(before_query)),
+    // `//authority/path`; an empty authority (`spanner:///…`) means "no endpoint". The `//` is
+    // required — a scheme-only `spanner:path` or single-slash `spanner:/path` is rejected, so the
+    // accepted form is always `spanner://`.
+    let after_authority = before_query.strip_prefix("//").ok_or_else(|| {
+        invalid_argument(
+            "connection URI must use the `spanner://` form (two slashes after the scheme); \
+             write `spanner:///projects/...` when no endpoint host is intended",
+        )
+    })?;
+    let (authority, path) = match after_authority.split_once('/') {
+        Some((authority, path)) => (Some(authority), path),
+        None => (Some(after_authority), ""),
     };
     let endpoint = authority
         .filter(|authority| !authority.is_empty())
@@ -1041,7 +1045,7 @@ mod tests {
         let mut db = new_database();
         db.set_option(
             OptionDatabase::Uri,
-            OptionValue::String("projects/p/instances/i/databases/d".into()),
+            OptionValue::String("spanner:///projects/p/instances/i/databases/d".into()),
         )
         .unwrap();
         db.set_option(
@@ -1158,7 +1162,7 @@ mod tests {
         // "option unset/unknown").
         db.set_option(
             OptionDatabase::Uri,
-            OptionValue::String("projects/p/instances/i/databases/d".into()),
+            OptionValue::String("spanner:///projects/p/instances/i/databases/d".into()),
         )
         .unwrap();
         let error = db.get_option_int(OptionDatabase::Uri).unwrap_err();
@@ -1824,26 +1828,19 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_database_path_is_stored_verbatim() {
-        // The pre-URI form keeps working exactly as before, even with URI-ish characters in it.
+    fn a_bare_database_path_is_rejected() {
+        // The `uri` option requires the `spanner://` scheme; a bare path is no longer accepted, and
+        // the error echoes back the wrapped form so the fix is obvious.
         let mut db = new_database();
-        set_uri(&mut db, DB_PATH).unwrap();
-        assert_eq!(db.database.as_deref(), Some(DB_PATH));
-        assert_eq!(db.endpoint, None);
-        assert!(!db.emulator);
-        // Not a recognised scheme → not parsed as a URI, stored as-is (and rejected only later, by
-        // Spanner itself).
-        let odd = "projects/p/instances/i/databases/d?x=y";
-        set_uri(&mut db, odd).unwrap();
-        assert_eq!(db.database.as_deref(), Some(odd));
+        let error = set_uri(&mut db, DB_PATH).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains(&format!("spanner:///{DB_PATH}")));
     }
 
     #[test]
     fn a_scheme_uri_sets_the_database_path() {
-        // All the tolerated path spellings: no slash, one slash, and an empty `//` authority.
+        // The accepted no-endpoint spelling is the three-slash `spanner:///` form (empty authority).
         for uri in [
-            format!("spanner:{DB_PATH}"),
-            format!("spanner:/{DB_PATH}"),
             format!("spanner:///{DB_PATH}"),
             format!("Spanner:///{DB_PATH}"), // schemes are case-insensitive
         ] {
@@ -1855,16 +1852,25 @@ mod tests {
     }
 
     #[test]
+    fn a_scheme_uri_without_two_slashes_is_rejected() {
+        // `spanner://` is required — the scheme-only (`spanner:path`) and single-slash
+        // (`spanner:/path`) spellings are rejected.
+        for uri in [format!("spanner:{DB_PATH}"), format!("spanner:/{DB_PATH}")] {
+            let mut db = new_database();
+            let error = set_uri(&mut db, &uri).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "uri: {uri}");
+            assert!(error.message.contains("spanner://"), "uri: {uri}");
+        }
+    }
+
+    #[test]
     fn a_cloudspanner_scheme_is_not_recognised() {
         // Only `spanner:` is a connection-URI scheme; `cloudspanner:` (the JDBC convention) is
-        // deliberately not supported. Like any other unknown scheme it is not parsed as a URI —
-        // the value is stored verbatim (and rejected only later, by Spanner itself).
+        // deliberately not supported. Not being a `spanner://` URI, it is rejected.
         let mut db = new_database();
         let uri = format!("cloudspanner:///{DB_PATH}?spanner.emulator=true");
-        set_uri(&mut db, &uri).unwrap();
-        assert_eq!(db.database.as_deref(), Some(uri.as_str()));
-        assert_eq!(db.endpoint, None);
-        assert!(!db.emulator);
+        let error = set_uri(&mut db, &uri).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
     }
 
     #[test]
@@ -2014,7 +2020,7 @@ mod tests {
     #[test]
     fn a_rejected_uri_leaves_the_configuration_untouched() {
         let mut db = new_database();
-        set_uri(&mut db, DB_PATH).unwrap();
+        set_uri(&mut db, &format!("spanner:///{DB_PATH}")).unwrap();
         db.set_option(
             OptionDatabase::Other(OPTION_ENDPOINT.into()),
             OptionValue::String("http://kept:9010".into()),
@@ -2060,7 +2066,6 @@ mod tests {
     fn a_uri_with_a_bad_database_path_is_rejected() {
         let mut db = new_database();
         for bad in [
-            "spanner:",
             "spanner:///",
             "spanner:///projects/p",
             "spanner:///projects//instances/i/databases/d",

@@ -345,7 +345,10 @@ fn ensure_setup() {
 fn connect() -> SpannerConnection {
     let mut driver = SpannerDriver::try_new().expect("create driver");
     let database: SpannerDatabase = driver
-        .new_database_with_opts([(OptionDatabase::Uri, OptionValue::String(database_path()))])
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(format!("spanner:///{}", database_path())),
+        )])
         .expect("create database");
     let mut last = None;
     for _ in 0..40 {

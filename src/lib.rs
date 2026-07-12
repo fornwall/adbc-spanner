@@ -21,19 +21,17 @@
 //!
 //! A database is configured through ADBC options. The Spanner database path is required and is
 //! supplied through the standard [`OptionDatabase::Uri`](adbc_core::options::OptionDatabase::Uri)
-//! option:
-//!
-//! ```text
-//! projects/<project>/instances/<instance>/databases/<database>
-//! ```
-//!
-//! or as a **connection URI** with the `spanner:` scheme, whose query parameters are
-//! database-level driver options and whose optional `//host:port` authority becomes
-//! [`OPTION_ENDPOINT`]:
+//! option as a **connection URI** with the `spanner://` scheme: its path is the database path, its
+//! query parameters are database-level driver options, and its optional `//host:port` authority
+//! becomes [`OPTION_ENDPOINT`]:
 //!
 //! ```text
 //! spanner:///projects/<p>/instances/<i>/databases/<d>?spanner.endpoint=http://localhost:9010&spanner.emulator=true
 //! ```
+//!
+//! Use the three-slash `spanner:///projects/...` form when no endpoint host is intended. A bare
+//! database path is **not** accepted — the `spanner://` scheme is required (this matches the ADBC
+//! BigQuery driver, whose `uri` likewise requires the `bigquery://` scheme).
 //!
 //! A URI is expanded into the individual options at the moment it is set, so ordering is
 //! deterministic: an option set after the URI wins, and the URI overwrites only the fields it
@@ -77,7 +75,7 @@
 //! let mut driver = SpannerDriver::try_new()?;
 //! let database = driver.new_database_with_opts([(
 //!     OptionDatabase::Uri,
-//!     OptionValue::String("projects/p/instances/i/databases/d".into()),
+//!     OptionValue::String("spanner:///projects/p/instances/i/databases/d".into()),
 //! )])?;
 //! let mut connection = database.new_connection()?;
 //! let mut statement = connection.new_statement()?;

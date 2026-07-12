@@ -92,7 +92,7 @@ spanner.connect(database="projects/p/instances/i/databases/d",
 
 | kwarg                             | Description                                                                                     |
 | --------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `database=`                       | Spanner database path, `projects/<p>/instances/<i>/databases/<d>` (**required**).                |
+| `database=`                       | Spanner database path, `projects/<p>/instances/<i>/databases/<d>` (**required**). Wrapped into the driver's required `spanner://` `uri` form for you; a full `spanner://…` URI is also accepted here. |
 | `endpoint=`                       | Explicit gRPC endpoint (e.g. an emulator at `localhost:9010`); defaults to production Spanner.   |
 | `emulator=`                       | `True` to connect with anonymous credentials for the emulator.                                  |
 | `keyfile=`                        | Path to a service-account / credential JSON file (default: Application Default Credentials).     |
