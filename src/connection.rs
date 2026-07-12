@@ -361,9 +361,25 @@ pub(crate) fn apply_isolation(
 
 /// Map the standard ADBC `adbc.connection.transaction.isolation_level` value to the Spanner client's
 /// [`IsolationLevel`]. Spanner supports `SERIALIZABLE` (the default) and `REPEATABLE_READ`; the
-/// `default` value leaves the database default in place. Any other spec level (read uncommitted /
-/// read committed / snapshot / linearizable) is rejected with `NotImplemented` rather than silently
-/// ignored, so callers are not misled into thinking an unsupported guarantee is in effect.
+/// `default` value leaves the database default in place.
+///
+/// The four spec levels Spanner does not natively expose are **promoted upward** to the weakest
+/// supported level that still satisfies their guarantees, rather than being rejected. A stronger
+/// isolation level always satisfies a weaker one's guarantees, so promotion is semantically safe,
+/// and it is spec-permitted: the ADBC spec says a driver *should* (not *must*) error on an
+/// unsupported level, and JDBC explicitly sanctions substituting a higher/more-restrictive level.
+/// The promotion table:
+///
+/// | requested          | promoted to    | rationale                                                     |
+/// |--------------------|----------------|---------------------------------------------------------------|
+/// | `read_uncommitted` | `REPEATABLE_READ` | weakest supported level that satisfies it                  |
+/// | `read_committed`   | `REPEATABLE_READ` | weakest supported level that satisfies it                  |
+/// | `snapshot`         | `SERIALIZABLE`    | snapshot/RR are incomparable, so map to the top to be safe |
+/// | `linearizable`     | `SERIALIZABLE`    | Spanner R/W txns are externally consistent (strict serializable = linearizable) |
+///
+/// The stored (promoted) level is what `get_option` reports back, so callers see the level that
+/// will actually run, never an unsupported input echoed. A truly unknown/unparseable level string
+/// is still rejected with `InvalidArguments`.
 fn parse_isolation_level(value: OptionValue) -> Result<IsolationLevel> {
     use adbc_core::constants::*;
     let OptionValue::String(s) = value else {
@@ -375,12 +391,13 @@ fn parse_isolation_level(value: OptionValue) -> Result<IsolationLevel> {
         ADBC_OPTION_ISOLATION_LEVEL_DEFAULT => Ok(IsolationLevel::Unspecified),
         ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE => Ok(IsolationLevel::Serializable),
         ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ => Ok(IsolationLevel::RepeatableRead),
+        // Promote levels Spanner does not natively expose to the weakest supported level that
+        // still satisfies their guarantees (see the table in this function's rustdoc).
         ADBC_OPTION_ISOLATION_LEVEL_READ_UNCOMMITTED
-        | ADBC_OPTION_ISOLATION_LEVEL_READ_COMMITTED
-        | ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT
-        | ADBC_OPTION_ISOLATION_LEVEL_LINEARIZABLE => Err(not_implemented(&format!(
-            "Spanner does not support isolation level {s:?}; supported: {ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE:?}, {ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ:?}, {ADBC_OPTION_ISOLATION_LEVEL_DEFAULT:?}"
-        ))),
+        | ADBC_OPTION_ISOLATION_LEVEL_READ_COMMITTED => Ok(IsolationLevel::RepeatableRead),
+        ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT | ADBC_OPTION_ISOLATION_LEVEL_LINEARIZABLE => {
+            Ok(IsolationLevel::Serializable)
+        }
         other => Err(invalid_argument(format!(
             "unknown isolation level {other:?}"
         ))),
@@ -1251,20 +1268,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_isolation_levels() {
+    fn promotes_unsupported_isolation_levels() {
         use adbc_core::constants::*;
         let parse = |s: &str| parse_isolation_level(OptionValue::String(s.to_string()));
-        // Spec levels Spanner cannot honour are rejected (NotImplemented), not silently ignored.
-        for level in [
-            ADBC_OPTION_ISOLATION_LEVEL_READ_UNCOMMITTED,
-            ADBC_OPTION_ISOLATION_LEVEL_READ_COMMITTED,
-            ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT,
-            ADBC_OPTION_ISOLATION_LEVEL_LINEARIZABLE,
-        ] {
-            let err = parse(level).unwrap_err();
-            assert_eq!(err.status, Status::NotImplemented, "level {level}");
-        }
-        // A completely unknown value is an invalid argument.
+        // Spec levels Spanner does not natively expose are promoted upward to the weakest
+        // supported level that still satisfies their guarantees (never rejected).
+        assert_eq!(
+            parse(ADBC_OPTION_ISOLATION_LEVEL_READ_UNCOMMITTED).unwrap(),
+            IsolationLevel::RepeatableRead
+        );
+        assert_eq!(
+            parse(ADBC_OPTION_ISOLATION_LEVEL_READ_COMMITTED).unwrap(),
+            IsolationLevel::RepeatableRead
+        );
+        assert_eq!(
+            parse(ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT).unwrap(),
+            IsolationLevel::Serializable
+        );
+        assert_eq!(
+            parse(ADBC_OPTION_ISOLATION_LEVEL_LINEARIZABLE).unwrap(),
+            IsolationLevel::Serializable
+        );
+        // A completely unknown value is still an invalid argument.
         assert_eq!(
             parse("not-a-level").unwrap_err().status,
             Status::InvalidArguments
@@ -1292,6 +1317,33 @@ mod tests {
         assert_eq!(
             isolation_to_adbc_string(&IsolationLevel::Unspecified),
             ADBC_OPTION_ISOLATION_LEVEL_DEFAULT
+        );
+    }
+
+    #[test]
+    fn promoted_isolation_level_round_trips_to_effective_level() {
+        use adbc_core::constants::*;
+        // `get_option` reports the effective (promoted) level that will actually run, not the
+        // unsupported input that was set: parse then render must land on a supported level.
+        let effective = |s: &str| {
+            let level = parse_isolation_level(OptionValue::String(s.to_string())).expect("parses");
+            isolation_to_adbc_string(&level)
+        };
+        assert_eq!(
+            effective(ADBC_OPTION_ISOLATION_LEVEL_READ_UNCOMMITTED),
+            ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ
+        );
+        assert_eq!(
+            effective(ADBC_OPTION_ISOLATION_LEVEL_READ_COMMITTED),
+            ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ
+        );
+        assert_eq!(
+            effective(ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT),
+            ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE
+        );
+        assert_eq!(
+            effective(ADBC_OPTION_ISOLATION_LEVEL_LINEARIZABLE),
+            ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE
         );
     }
 
