@@ -8202,9 +8202,16 @@ fn adbc_test_proto_descriptors() -> Vec<u8> {
 /// `ENUM` and `PROTO` tests share this one registration and each then creates its own table
 /// referencing the types (that table DDL carries no descriptors and can go through the driver).
 ///
-/// Best-effort: on a re-run against a persistent database where the bundle already exists, the
-/// `CREATE PROTO BUNDLE` fails with `AlreadyExists` and is ignored.
+/// On a re-run against a persistent database where the bundle already exists, the `CREATE PROTO
+/// BUNDLE` fails with `AlreadyExists`; that is treated as success. Any *other* error is retried a
+/// few times and, if it never succeeds, panics — a transient admin-API failure here (seen
+/// intermittently on CI) must not be swallowed, or it leaves the bundle unregistered and every
+/// later `ENUM`/`PROTO` table DDL fails far away with a confusing `Unrecognized ddl::ColumnDefinition
+/// … type: NONE`. `DONE` is only latched on an actual success, so a failed attempt is retried by the
+/// next arriving test rather than poisoning both dependent tests for the whole binary.
 fn ensure_proto_bundle_once(target: &TestTarget) {
+    use google_cloud_gax::error::rpc::Code;
+
     static DONE: Mutex<bool> = Mutex::new(false);
     let mut done = DONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if *done {
@@ -8222,16 +8229,34 @@ fn ensure_proto_bundle_once(target: &TestTarget) {
                 .build()
                 .await
                 .expect("failed to build database admin client");
-            let _ = database_admin
-                .update_database_ddl()
-                .set_database(target.database_path())
-                .set_statements(vec![
-                    "CREATE PROTO BUNDLE (`adbc.test.Color`, `adbc.test.Point`)".to_string(),
-                ])
-                .set_proto_descriptors(adbc_test_proto_descriptors())
-                .poller()
-                .until_done()
-                .await;
+            let mut last_err = None;
+            for attempt in 0..5 {
+                match database_admin
+                    .update_database_ddl()
+                    .set_database(target.database_path())
+                    .set_statements(vec![
+                        "CREATE PROTO BUNDLE (`adbc.test.Color`, `adbc.test.Point`)".to_string(),
+                    ])
+                    .set_proto_descriptors(adbc_test_proto_descriptors())
+                    .poller()
+                    .until_done()
+                    .await
+                {
+                    Ok(_) => return,
+                    // A pre-existing bundle (persistent-database re-run) is already what we want.
+                    Err(e) if e.status().map(|s| s.code) == Some(Code::AlreadyExists) => return,
+                    Err(e) => {
+                        eprintln!("proto-bundle setup attempt {} failed: {e}", attempt + 1);
+                        last_err = Some(e);
+                        tokio::time::sleep(std::time::Duration::from_millis(500 * (attempt + 1)))
+                            .await;
+                    }
+                }
+            }
+            panic!(
+                "failed to register the shared proto bundle after retries: {}",
+                last_err.expect("loop runs at least once before panicking")
+            );
         });
     *done = true;
 }
