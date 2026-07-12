@@ -71,11 +71,8 @@ jobs:
       # tag/branch in any of them could tamper with what users download. The trailing comment
       # names the ref each SHA was resolved from.
       - name: Install Rust toolchain
-        # dtolnay/rust-toolchain reads the toolchain from its ref name, so pinning the SHA
-        # requires selecting the toolchain explicitly below.
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch, 2026-06-30
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: stable
           targets: ${{ matrix.target }}
 
       # aws-lc-sys needs NASM to assemble on Windows x86-64. ARM64 Windows uses no NASM.
@@ -199,9 +196,11 @@ jobs:
       # SHA-pinned: this job compiles a binary that tagged releases attach and the PyPI
       # wheel bundles, so a hijacked mutable tag must not be able to tamper with it. The
       # digest points at the multi-arch image index, so `docker run` pulls the matching
-      # amd64/arm64 variant for whichever runner this matrix leg lands on. The trailing
-      # comment names the tag the digest was resolved from; bump both together to move
-      # the musl build's Rust toolchain forward.
+      # amd64/arm64 variant for whichever runner this matrix leg lands on; the trailing
+      # comment names the tag the digest was resolved from. The image only supplies the
+      # musl base toolchain (gcc/libgcc + apk packages) — the *Rust* version is still
+      # rust-toolchain.toml's single pin, which rustup honours inside the container (it
+      # auto-installs that toolchain over the image's default when `cargo build` runs).
       - name: Build shared library (Alpine/musl)
         run: |
           set -euo pipefail
