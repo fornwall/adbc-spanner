@@ -347,60 +347,7 @@ infinity. Those are the only two modes — there is deliberately no silently-wra
 > meantime, and downstream crates must take `adbc_core` from the same `arrow-adbc` git revision (see
 > the notes in `Cargo.toml`).
 
-## Testing
+## Contributing
 
-**[docs/testing.md](docs/testing.md) is the full testing overview** — a map of every kind of test
-(unit/doctest, emulator integration, real Cloud Spanner, resilience/fault-injection, the ADBC C++
-and Foundry validation suites, fuzzing and benchmarks), how to run each locally, and which CI
-workflow runs it.
-
-Unit tests need no external dependencies, and the Spanner integration tests
-([`tests/integration.rs`](tests/integration.rs)) **skip automatically** unless a target is
-configured — so `cargo test` stays green everywhere:
-
-```sh
-cargo test                             # unit + doctests (integration self-skips)
-scripts/with-emulator.sh cargo test    # full suite against a throwaway emulator
-```
-
-See **[docs/testing.md](docs/testing.md)** for real-instance targets, the C++/Foundry validation
-suites, fuzzing, and benchmarks.
-
-## Releasing
-
-Releases are cut with [`cargo-release`](https://github.com/crate-ci/cargo-release), configured under
-`[package.metadata.release]` in `Cargo.toml`.
-
-Prerequisites: `cargo install cargo-release` and push access to `main`.
-
-Preview a release (dry run — this is the default, nothing is changed):
-
-```sh
-cargo release patch      # or: minor / major
-```
-
-Perform it:
-
-```sh
-cargo release patch --execute
-```
-
-That single command:
-
-1. bumps the version in `Cargo.toml` and commits it (`Release X.Y.Z`),
-2. creates the annotated tag `vX.Y.Z` and pushes the commit and tag to `origin`.
-
-Publishing to crates.io is **disabled** (`publish = false` in the release config) while the
-`google-cloud-*` dependencies are pinned to a git revision, since crates.io does not accept git
-dependencies; re-enable it once those ship in a versioned release.
-
-Pushing the `vX.Y.Z` tag triggers the [`Shared libraries`](.github/workflows/libraries.yml) workflow,
-which builds the shared libraries for Linux (x86-64, aarch64), macOS (arm64, x86-64) and Windows
-(x86-64, arm64), attaches them to the [GitHub Release](https://github.com/fornwall/adbc-spanner/releases)
-for that tag, and builds and publishes the Python wheels to PyPI. So the flow is:
-`cargo release … --execute` → version bump + tag → CI attaches the prebuilt libraries and publishes
-the wheels.
-
-## License
-
-Licensed under the [Apache License, Version 2.0](LICENSE).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for building, testing, and release instructions, and
+[docs/testing.md](docs/testing.md) for the full testing overview.

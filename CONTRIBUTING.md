@@ -60,6 +60,8 @@ hand. Hand-rolling a release risks a malformed tag or a version that disagrees w
 (which the `python-wheels` CI job rejects), and cargo-release does the exact same steps
 deterministically.
 
+Prerequisites: `cargo install cargo-release` and push access to `main`.
+
 ```sh
 cargo release patch            # dry run (default) — preview only
 cargo release patch --execute  # bump + commit "Release X.Y.Z" + tag vX.Y.Z + push
