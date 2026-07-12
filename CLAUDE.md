@@ -208,14 +208,14 @@ is cross-compiled, off the universal Apple toolchain) and installs NASM only on 
   service-account JSON key → `keyfile_auth_end_to_end`) and/or
   `SPANNER_TEST_IMPERSONATE_TARGET_PRINCIPAL` (a principal to impersonate, base creds from ADC →
   `impersonation_auth_end_to_end`).
-- **CI against a real database.** `.github/workflows/real-spanner.yml` runs the integration suite
-  against a real Cloud Spanner database on a nightly `schedule` + `workflow_dispatch` — non-gating
-  (never on PR/push), the only CI job that exercises the non-emulator ADC auth path. It authenticates
-  via GitHub OIDC → Workload Identity Federation (`google-github-actions/auth`, `id-token: write`)
-  and reads config from GitHub secrets `GCP_WORKLOAD_IDENTITY_PROVIDER` / `GCP_SERVICE_ACCOUNT` and
-  var `SPANNER_GCP_DATABASE`. Its top comment documents the one-time WIF setup (mirrors the PyPI
-  one-time-setup note above); a `report-failure` job opens a tracking issue on nightly failure, like
-  `fuzz.yml`/`resilience.yml`.
+- **No CI against a real database.** The real-Cloud-Spanner integration path is exercised **locally
+  only** — there is no CI job that talks to a live, billed Spanner instance. Every CI functional suite
+  (`ci.yml` / `adbc-validation.yml`) runs against the emulator, so the non-emulator ADC auth path is
+  covered by running `SPANNER_GCP_DATABASE=… cargo test --test integration` by hand. (An earlier
+  nightly `real-spanner.yml` workflow — GitHub OIDC → Workload Identity Federation, non-gating — was
+  removed; if it is ever reinstated, it needs GitHub secrets `GCP_WORKLOAD_IDENTITY_PROVIDER` /
+  `GCP_SERVICE_ACCOUNT` and var `SPANNER_GCP_DATABASE` plus the one-time WIF setup on the Google Cloud
+  side.)
 - Setup creates the database/table via the admin clients (`instance_admin_builder()` /
   `database_admin_builder()` → `create_instance` [emulator only] / `create_database(..).poller()`),
   then exercises the driver (DML insert + typed SELECT). It runs once per binary behind a mutex
