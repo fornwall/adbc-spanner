@@ -32,8 +32,15 @@ def main() -> int:
     bp.setup_table(database, N, 20000)
 
     import adbc_driver_spanner.dbapi as spanner_adbc
+    from adbc_driver_spanner import DatabaseOptions
 
-    conn = spanner_adbc.connect(uri=f"spanner:///{database}", emulator=True, autocommit=True)
+    conn = spanner_adbc.connect(
+        db_kwargs={
+            DatabaseOptions.URI.value: f"spanner:///{database}",
+            DatabaseOptions.EMULATOR.value: "true",
+        },
+        autocommit=True,
+    )
     try:
         print(f">> {LOOPS} read loops of {N} rows (profile window)", flush=True)
         t0 = time.perf_counter()

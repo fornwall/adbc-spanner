@@ -21,7 +21,6 @@ from ._version import __version__
 
 __all__ = [
     "connect",
-    "option_kwargs",
     "ENTRYPOINT",
     "DatabaseOptions",
     "ConnectionOptions",
@@ -33,135 +32,29 @@ __all__ = [
 ENTRYPOINT = "AdbcSpannerInit"
 
 
-def option_kwargs(
-    uri: typing.Optional[str] = None,
-    *,
-    endpoint: typing.Optional[str] = None,
-    emulator: bool = False,
-    keyfile: typing.Optional[str] = None,
-    keyfile_json: typing.Optional[str] = None,
-    impersonate_target_principal: typing.Optional[str] = None,
-    impersonate_delegates: typing.Optional[typing.Union[str, typing.Sequence[str]]] = None,
-    impersonate_scopes: typing.Optional[typing.Union[str, typing.Sequence[str]]] = None,
-    impersonate_lifetime: typing.Optional[typing.Union[int, str]] = None,
-    access_token: typing.Optional[str] = None,
-    db_kwargs: typing.Optional[typing.Mapping[str, str]] = None,
-) -> typing.Dict[str, str]:
-    """Translate the friendly connection kwargs into ``spanner.*`` options.
-
-    Shared by :func:`connect` and :func:`adbc_driver_spanner.dbapi.connect` so the
-    two entry points map parameters identically. ``db_kwargs`` is an escape hatch
-    for raw option keys and is merged last.
-    """
-    options: typing.Dict[str, str] = {}
-    # Friendly kwargs -> the driver's option keys (see src/lib.rs).
-    if uri is not None:
-        # Passed through verbatim. The driver's `uri` option requires the `spanner://` scheme
-        # (e.g. `spanner:///projects/<p>/instances/<i>/databases/<d>`); a bare database path is
-        # rejected there, deliberately — the Python layer does no wrapping.
-        options["uri"] = uri
-    if endpoint is not None:
-        options["spanner.endpoint"] = endpoint
-    if emulator:
-        options["spanner.emulator"] = "true"
-    if keyfile is not None:
-        options["spanner.auth.keyfile"] = keyfile
-    if keyfile_json is not None:
-        options["spanner.auth.keyfile_json"] = keyfile_json
-    # Service-account impersonation (layered on top of the base credentials above);
-    # enabled only when a target principal is set. delegates/scopes accept either a
-    # comma-separated string or a sequence of strings.
-    if impersonate_target_principal is not None:
-        options["spanner.auth.impersonate.target_principal"] = impersonate_target_principal
-    if impersonate_delegates is not None:
-        options["spanner.auth.impersonate.delegates"] = _as_csv(impersonate_delegates)
-    if impersonate_scopes is not None:
-        options["spanner.auth.impersonate.scopes"] = _as_csv(impersonate_scopes)
-    if impersonate_lifetime is not None:
-        options["spanner.auth.impersonate.lifetime"] = str(impersonate_lifetime)
-    # A caller-supplied OAuth 2.0 bearer token, sent verbatim with no refresh; mutually
-    # exclusive with the keyfile/impersonation options above.
-    if access_token is not None:
-        options["spanner.auth.access_token"] = access_token
-    if db_kwargs:
-        options.update(db_kwargs)
-    return options
-
-
-def _as_csv(value: typing.Union[str, typing.Sequence[str]]) -> str:
-    """Render a delegates/scopes value as the comma-separated string the driver expects."""
-    if isinstance(value, str):
-        return value
-    return ",".join(value)
-
-
 def connect(
-    uri: typing.Optional[str] = None,
-    *,
-    endpoint: typing.Optional[str] = None,
-    emulator: bool = False,
-    keyfile: typing.Optional[str] = None,
-    keyfile_json: typing.Optional[str] = None,
-    impersonate_target_principal: typing.Optional[str] = None,
-    impersonate_delegates: typing.Optional[typing.Union[str, typing.Sequence[str]]] = None,
-    impersonate_scopes: typing.Optional[typing.Union[str, typing.Sequence[str]]] = None,
-    impersonate_lifetime: typing.Optional[typing.Union[int, str]] = None,
-    access_token: typing.Optional[str] = None,
     db_kwargs: typing.Optional[typing.Mapping[str, str]] = None,
 ) -> adbc_driver_manager.AdbcDatabase:
     """Create a low-level ADBC database handle for Spanner.
 
     Parameters
     ----------
-    uri:
-        A ``spanner://`` connection URI whose path is the fully-qualified database
-        path, e.g. ``spanner:///projects/<p>/instances/<i>/databases/<d>``. The
-        ``spanner://`` scheme is required; a bare path is rejected.
-    endpoint:
-        Override the Spanner gRPC endpoint (e.g. an emulator ``host:port``).
-    emulator:
-        Use anonymous credentials and talk to the emulator. When
-        ``SPANNER_EMULATOR_HOST`` is set the driver detects the emulator on its
-        own, so this is only needed to force it explicitly.
-    keyfile / keyfile_json:
-        Service-account credentials, as a path or inline JSON. Omit both to use
-        Application Default Credentials.
-    impersonate_target_principal:
-        Service account to impersonate. Setting it enables service-account
-        impersonation on top of the base credentials above; leave it unset for no
-        impersonation. Follows gcloud's ``--impersonate-service-account`` /
-        ``google-cloud-auth``'s ``impersonated`` builder naming.
-    impersonate_delegates:
-        Optional delegation chain (a comma-separated string or a sequence of
-        service-account emails).
-    impersonate_scopes:
-        Optional OAuth scopes (a comma-separated string or a sequence); defaults to
-        the ``cloud-platform`` scope.
-    impersonate_lifetime:
-        Optional impersonated-token lifetime in seconds; defaults to ``3600``.
-    access_token:
-        A caller-supplied OAuth 2.0 bearer token, sent verbatim with no refresh.
-        Mutually exclusive with the keyfile/impersonation options above.
     db_kwargs:
-        Escape hatch for raw ``spanner.*`` option keys, merged last.
+        Database-level driver options, keyed by their raw option strings — best
+        written with the :class:`DatabaseOptions` constants, e.g.
+        ``{DatabaseOptions.URI.value: "spanner:///projects/<p>/instances/<i>/databases/<d>"}``
+        (see src/lib.rs / docs/options.md). The ``uri`` option requires the
+        ``spanner://`` scheme; a bare database path is rejected. Credentials, the
+        emulator, endpoint overrides, and every other setting are all passed here
+        as their raw keys — for example
+        ``{DatabaseOptions.URI.value: "...", DatabaseOptions.KEYFILE.value: "/path/key.json"}``
+        or ``{DatabaseOptions.URI.value: "...", DatabaseOptions.EMULATOR.value: "true"}``.
 
     For a DBAPI 2.0 connection, prefer :func:`adbc_driver_spanner.dbapi.connect`.
     """
-    options = option_kwargs(
-        uri,
-        endpoint=endpoint,
-        emulator=emulator,
-        keyfile=keyfile,
-        keyfile_json=keyfile_json,
-        impersonate_target_principal=impersonate_target_principal,
-        impersonate_delegates=impersonate_delegates,
-        impersonate_scopes=impersonate_scopes,
-        impersonate_lifetime=impersonate_lifetime,
-        access_token=access_token,
-        db_kwargs=db_kwargs,
-    )
     # ** unpacking accepts the dotted, non-identifier option keys; they land in
     # AdbcDatabase's **kwargs and are forwarded as ADBC options.
+    options = dict(db_kwargs) if db_kwargs else {}
     return adbc_driver_manager.AdbcDatabase(
         driver=_driver_path(), entrypoint=ENTRYPOINT, **options
     )

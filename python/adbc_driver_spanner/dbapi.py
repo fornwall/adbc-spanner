@@ -23,7 +23,6 @@ from . import (
     DatabaseOptions,
     StatementOptions,
     _driver_path,
-    option_kwargs,
 )
 
 __all__ = [
@@ -35,47 +34,35 @@ __all__ = [
 
 
 def connect(
-    uri: typing.Optional[str] = None,
-    *,
-    endpoint: typing.Optional[str] = None,
-    emulator: bool = False,
-    keyfile: typing.Optional[str] = None,
-    keyfile_json: typing.Optional[str] = None,
-    impersonate_target_principal: typing.Optional[str] = None,
-    impersonate_delegates: typing.Optional[typing.Union[str, typing.Sequence[str]]] = None,
-    impersonate_scopes: typing.Optional[typing.Union[str, typing.Sequence[str]]] = None,
-    impersonate_lifetime: typing.Optional[typing.Union[int, str]] = None,
-    access_token: typing.Optional[str] = None,
     db_kwargs: typing.Optional[typing.Mapping[str, str]] = None,
     conn_kwargs: typing.Optional[typing.Mapping[str, str]] = None,
     autocommit: bool = False,
 ) -> adbc_driver_manager.dbapi.Connection:
     """Open a DBAPI 2.0 connection to a Spanner database.
 
-    Accepts the same connection parameters as
-    :func:`adbc_driver_spanner.connect` (including the ``impersonate_*`` service-account
-    impersonation options); ``conn_kwargs`` sets raw ``adbc.connection.*`` options and
-    ``autocommit`` toggles PEP 249 autocommit.
+    Parameters
+    ----------
+    db_kwargs:
+        Database-level driver options, keyed by their raw option strings — best
+        written with the :class:`DatabaseOptions` constants, e.g.
+        ``{DatabaseOptions.URI.value: "spanner:///projects/<p>/instances/<i>/databases/<d>"}``
+        (see src/lib.rs / docs/options.md). The ``uri`` option requires the
+        ``spanner://`` scheme; a bare database path is rejected. Credentials, the
+        emulator, endpoint overrides, and every other setting are passed here as
+        their raw keys.
+    conn_kwargs:
+        Connection-level options, keyed with the :class:`ConnectionOptions`
+        constants (``adbc.connection.*`` / ``spanner.*``).
+    autocommit:
+        Toggles PEP 249 autocommit; ``False`` (the default) puts the driver into
+        its buffer-and-commit manual-transaction mode.
     """
-    options = option_kwargs(
-        uri,
-        endpoint=endpoint,
-        emulator=emulator,
-        keyfile=keyfile,
-        keyfile_json=keyfile_json,
-        impersonate_target_principal=impersonate_target_principal,
-        impersonate_delegates=impersonate_delegates,
-        impersonate_scopes=impersonate_scopes,
-        impersonate_lifetime=impersonate_lifetime,
-        access_token=access_token,
-        db_kwargs=db_kwargs,
-    )
     # The driver manager builds and owns the database/connection handles here and
     # tears them down if the connection fails, so no manual cleanup is needed.
     return adbc_driver_manager.dbapi.connect(
         driver=_driver_path(),
         entrypoint=ENTRYPOINT,
-        db_kwargs=options,
+        db_kwargs=dict(db_kwargs) if db_kwargs else None,
         conn_kwargs=conn_kwargs,
         autocommit=autocommit,
     )

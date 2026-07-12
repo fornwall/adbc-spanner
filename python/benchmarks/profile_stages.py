@@ -29,13 +29,20 @@ def profile_adbc(database, rows_per_batch=None):
     import polars as pl
 
     import adbc_driver_spanner.dbapi as spanner_adbc
+    from adbc_driver_spanner import DatabaseOptions, StatementOptions
 
-    conn = spanner_adbc.connect(uri=f"spanner:///{database}", emulator=True, autocommit=True)
+    conn = spanner_adbc.connect(
+        db_kwargs={
+            DatabaseOptions.URI.value: f"spanner:///{database}",
+            DatabaseOptions.EMULATOR.value: "true",
+        },
+        autocommit=True,
+    )
     try:
         cur = conn.cursor()
         if rows_per_batch is not None:
             cur.adbc_statement.set_options(
-                **{"spanner.rows_per_batch": str(rows_per_batch)}
+                **{StatementOptions.ROWS_PER_BATCH.value: str(rows_per_batch)}
             )
         _, t_exec = t(lambda: cur.execute(f"SELECT {bp.COLUMNS} FROM {bp.TABLE}"))
         table, t_fetch = t(lambda: cur.fetch_arrow_table())

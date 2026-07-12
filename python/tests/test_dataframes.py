@@ -19,10 +19,17 @@ pl = pytest.importorskip("polars")
 from polars.testing import assert_frame_equal
 
 import adbc_driver_spanner.dbapi as spanner
+from adbc_driver_spanner import DatabaseOptions
 
 
 def _connect(database):
-    return spanner.connect(uri=f"spanner:///{database}", emulator=True, autocommit=True)
+    return spanner.connect(
+        db_kwargs={
+            DatabaseOptions.URI.value: f"spanner:///{database}",
+            DatabaseOptions.EMULATOR.value: "true",
+        },
+        autocommit=True,
+    )
 
 
 # A row's worth of every column type the reads below assert on. Kept as Python
