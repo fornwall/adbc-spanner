@@ -126,8 +126,6 @@ TODO: Go over these and merge with above:
 ## Unsupported optional ADBC functionality
 
 - [Substrait](https://substrait.io/) plans are unsupported.
-- The transaction levels `read_uncommitted`, `read_committed`, `snapshot` and `linearizable` are rejected; only
-  `serializable`, `repeatable_read`, and `default` are honored (Spanner offers no equivalent for the others).
 
 ## Supported Spanner functionality
 
