@@ -32,7 +32,7 @@ the minimum OS / libc each one requires.
 import adbc_driver_spanner.dbapi as spanner
 
 with spanner.connect(
-    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
+    db_kwargs={"uri": "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
 ) as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT SingerId, FirstName FROM Singers")
@@ -47,66 +47,86 @@ helpers below add zero-copy Arrow output on top.
 
 By default the driver uses [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)
 (ADC) — the same credentials `gcloud auth application-default login` and Google Cloud runtimes
-provide. To use a service-account key instead, pass its path or its JSON:
+provide. To use a service-account key instead, pass its path or its JSON as a raw option in
+`db_kwargs`:
 
 ```python
 # docs-test: skip
 import adbc_driver_spanner.dbapi as spanner
 
-spanner.connect(uri="spanner:///projects/p/instances/i/databases/d",
-                keyfile="/path/to/service-account.json")
+spanner.connect(db_kwargs={
+    "uri": "spanner:///projects/p/instances/i/databases/d",
+    "spanner.auth.keyfile": "/path/to/service-account.json",
+})
 ```
 
 To impersonate another service account on top of your base credentials, set
-`impersonate_target_principal=`:
+`spanner.auth.impersonate.target_principal`:
 
 ```python
 # docs-test: skip
-spanner.connect(uri="spanner:///projects/p/instances/i/databases/d",
-                impersonate_target_principal="target@p.iam.gserviceaccount.com",
-                impersonate_scopes=["https://www.googleapis.com/auth/cloud-platform"])
+spanner.connect(db_kwargs={
+    "uri": "spanner:///projects/p/instances/i/databases/d",
+    "spanner.auth.impersonate.target_principal": "target@p.iam.gserviceaccount.com",
+    "spanner.auth.impersonate.scopes": "https://www.googleapis.com/auth/cloud-platform",
+})
 ```
 
-Pass `access_token=` to authenticate with an OAuth 2.0 bearer token you already hold (for example
-from `gcloud auth print-access-token`). It is sent verbatim with no refresh, and is mutually
-exclusive with `keyfile=` / `keyfile_json=` / `impersonate_target_principal=`:
+Set `spanner.auth.access_token` to authenticate with an OAuth 2.0 bearer token you already hold (for
+example from `gcloud auth print-access-token`). It is sent verbatim with no refresh, and is mutually
+exclusive with `spanner.auth.keyfile` / `spanner.auth.keyfile_json` /
+`spanner.auth.impersonate.target_principal`:
 
 ```python
 # docs-test: skip
-spanner.connect(uri="spanner:///projects/p/instances/i/databases/d",
-                access_token="ya29.a0Af...")
+spanner.connect(db_kwargs={
+    "uri": "spanner:///projects/p/instances/i/databases/d",
+    "spanner.auth.access_token": "ya29.a0Af...",
+})
 ```
 
 To talk to the [Spanner emulator](https://cloud.google.com/spanner/docs/emulator), point at its
-endpoint and pass `emulator=True` (which connects with anonymous credentials):
+endpoint and set `spanner.emulator` to `"true"` (which connects with anonymous credentials):
 
 ```python
 # docs-test: skip
-spanner.connect(uri="spanner:///projects/p/instances/i/databases/d",
-                endpoint="localhost:9010", emulator=True)
+spanner.connect(db_kwargs={
+    "uri": "spanner:///projects/p/instances/i/databases/d",
+    "spanner.endpoint": "localhost:9010",
+    "spanner.emulator": "true",
+})
 ```
 
 ## Connection options
 
-`connect()` accepts these keyword arguments:
+`connect()` takes just three keyword arguments — every driver setting travels as a raw option key:
 
-| kwarg                             | Description                                                                                     |
-| --------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `uri=`                            | A `spanner://` connection URI whose path is the database path, e.g. `spanner:///projects/<p>/instances/<i>/databases/<d>` (**required**). The scheme is required; a bare path is rejected. |
-| `endpoint=`                       | Explicit gRPC endpoint (e.g. an emulator at `localhost:9010`); defaults to production Spanner.   |
-| `emulator=`                       | `True` to connect with anonymous credentials for the emulator.                                  |
-| `keyfile=`                        | Path to a service-account / credential JSON file (default: Application Default Credentials).     |
-| `keyfile_json=`                   | The same credential JSON passed inline as a string instead of a file path.                      |
-| `access_token=`                   | OAuth 2.0 bearer token sent verbatim (no refresh); mutually exclusive with the keyfile / impersonation options. |
-| `impersonate_target_principal=`   | Service account to impersonate on top of the base credentials.                                  |
-| `impersonate_delegates=`          | Delegation chain for impersonation — a comma-separated string or a list of emails.              |
-| `impersonate_scopes=`             | OAuth scopes for the impersonated token (comma-separated string or list; default cloud-platform). |
-| `impersonate_lifetime=`           | Lifetime of the impersonated token, in seconds (default `3600`).                                |
-| `autocommit=`                     | `False` (the DBAPI default) groups writes into a transaction; `True` applies each immediately — see [Transactions](#transactions). |
+| kwarg          | Description                                                                                                                                |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `db_kwargs=`   | Database-level options, keyed by their raw `spanner.*` / `uri` names (credentials, emulator, endpoint, staleness, …). See the table below. |
+| `conn_kwargs=` | Connection-level options (`adbc.connection.*` / `spanner.*`), e.g. `adbc.connection.readonly`.                                              |
+| `autocommit=`  | `False` (the DBAPI default) groups writes into a transaction; `True` applies each immediately — see [Transactions](#transactions).          |
 
-Less common settings are passed as raw option strings via `db_kwargs=` (database-level),
-`conn_kwargs=` (connection-level), or per cursor with `conn.cursor(adbc_stmt_kwargs={...})`. The
-complete, authoritative list — every option with its type, default, and behaviour — is in
+A database `uri` is required; everything else is optional. The database-level credential and
+endpoint keys are:
+
+| Option                                        | Description                                                                                     |
+| --------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `uri`                                         | A `spanner://` connection URI whose path is the database path, e.g. `spanner:///projects/<p>/instances/<i>/databases/<d>` (**required**). The scheme is required; a bare path is rejected. |
+| `spanner.endpoint`                            | Explicit gRPC endpoint (e.g. an emulator at `localhost:9010`); defaults to production Spanner.   |
+| `spanner.emulator`                            | `"true"` to connect with anonymous credentials for the emulator.                                |
+| `spanner.auth.keyfile`                        | Path to a service-account / credential JSON file (default: Application Default Credentials).     |
+| `spanner.auth.keyfile_json`                   | The same credential JSON passed inline as a string instead of a file path.                      |
+| `spanner.auth.access_token`                   | OAuth 2.0 bearer token sent verbatim (no refresh); mutually exclusive with the keyfile / impersonation options. |
+| `spanner.auth.impersonate.target_principal`   | Service account to impersonate on top of the base credentials.                                  |
+| `spanner.auth.impersonate.delegates`          | Delegation chain for impersonation — a comma-separated string of emails.                         |
+| `spanner.auth.impersonate.scopes`             | OAuth scopes for the impersonated token (comma-separated; default cloud-platform).              |
+| `spanner.auth.impersonate.lifetime`           | Lifetime of the impersonated token, in seconds (default `3600`).                                |
+
+Every other setting is passed the same way — as a raw option string via `db_kwargs=`
+(database-level), `conn_kwargs=` (connection-level), or per cursor with
+`conn.cursor(adbc_stmt_kwargs={...})`. The complete, authoritative list — every option with its
+type, default, and behaviour — is in
 [docs/options.md](https://github.com/fornwall/adbc-spanner/blob/main/docs/options.md). A few that
 are handy from Python:
 
@@ -128,10 +148,10 @@ typo-safety and discoverability — the same style as the BigQuery ADBC driver's
 
 ```python
 import adbc_driver_spanner.dbapi as spanner
-from adbc_driver_spanner import ConnectionOptions, StatementOptions
+from adbc_driver_spanner import ConnectionOptions, DatabaseOptions, StatementOptions
 
 with spanner.connect(
-    uri="spanner:///projects/p/instances/i/databases/d",
+    db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/p/instances/i/databases/d"},
     conn_kwargs={ConnectionOptions.READ_STALENESS.value: "max:10s"},
 ) as conn:
     cur = conn.cursor(
@@ -140,8 +160,7 @@ with spanner.connect(
     cur.execute("SELECT * FROM Singers")
 ```
 
-The common credential settings also have dedicated `connect()` keyword arguments (above) — prefer
-those; the enums cover the full option surface for the `db_kwargs=` / `conn_kwargs=` /
+The enums cover the full option surface for the `db_kwargs=` / `conn_kwargs=` /
 `adbc_stmt_kwargs=` escape hatches. Every key is documented in
 [docs/options.md](https://github.com/fornwall/adbc-spanner/blob/main/docs/options.md).
 
@@ -154,7 +173,7 @@ any `INSERT`/`UPDATE`/`DELETE`, DDL, or bulk ingest raises, while queries still 
 # docs-test: skip
 import adbc_driver_spanner.dbapi as spanner
 
-with spanner.connect(uri="spanner:///projects/p/instances/i/databases/d",
+with spanner.connect(db_kwargs={"uri": "spanner:///projects/p/instances/i/databases/d"},
                      conn_kwargs={"adbc.connection.readonly": "true"}) as conn:
     conn.cursor().execute("SELECT 1")   # ok
     # any INSERT/UPDATE/DELETE, DDL or adbc_ingest raises
@@ -169,7 +188,7 @@ peak memory on a wide or large result:
 import adbc_driver_spanner.dbapi as spanner
 
 with spanner.connect(
-    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
+    db_kwargs={"uri": "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
 ) as conn:
     with conn.cursor() as cur:
         cur.adbc_statement.set_options(**{"spanner.rows_per_batch": "1024"})
@@ -196,7 +215,7 @@ Connect with `autocommit=True` if you want every statement to apply immediately.
 import adbc_driver_spanner.dbapi as spanner
 
 with spanner.connect(
-    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
+    db_kwargs={"uri": "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
 ) as conn:  # DBAPI default: autocommit off => manual transaction
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS Albums")  # DDL runs immediately
@@ -224,7 +243,7 @@ All examples assume a `Singers(SingerId INT64, FirstName STRING)` table.
 import adbc_driver_spanner.dbapi as spanner
 
 with spanner.connect(
-    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
+    db_kwargs={"uri": "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
 ) as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT SingerId, FirstName FROM Singers ORDER BY SingerId")
@@ -237,7 +256,7 @@ with spanner.connect(
 import adbc_driver_spanner.dbapi as spanner
 
 with spanner.connect(
-    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
+    db_kwargs={"uri": "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
 ) as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT SingerId, FirstName FROM Singers ORDER BY SingerId")
@@ -251,7 +270,7 @@ import polars as pl
 import adbc_driver_spanner.dbapi as spanner
 
 with spanner.connect(
-    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
+    db_kwargs={"uri": "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
 ) as conn:
     df = pl.read_database(
         "SELECT SingerId, FirstName FROM Singers ORDER BY SingerId",
@@ -266,7 +285,7 @@ import duckdb
 import adbc_driver_spanner.dbapi as spanner
 
 with spanner.connect(
-    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
+    db_kwargs={"uri": "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
 ) as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT SingerId, FirstName FROM Singers")
@@ -289,7 +308,7 @@ import adbc_driver_spanner.dbapi as spanner
 frame = pd.DataFrame({"SingerId": [10, 11], "FirstName": ["Carol", "Dave"]})
 
 with spanner.connect(
-    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
+    db_kwargs={"uri": "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
     autocommit=True,                         # apply immediately; returns the row count
 ) as conn:
     with conn.cursor() as cur:
@@ -318,7 +337,7 @@ the ADBC partitioned-execution extension (`adbc_execute_partitions` / `adbc_read
 import adbc_driver_spanner.dbapi as spanner
 
 with spanner.connect(
-    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
+    db_kwargs={"uri": "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
 ) as conn:
     with conn.cursor() as cur:
         # Optional statement options, set on the underlying ADBC statement:

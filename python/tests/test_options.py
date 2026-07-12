@@ -8,38 +8,19 @@ from adbc_driver_spanner import (
     ConnectionOptions,
     DatabaseOptions,
     StatementOptions,
-    option_kwargs,
 )
 
 
-def test_connect_functions_accept_access_token():
-    """Regression: the low-level connect() once referenced access_token without
-    declaring it as a parameter, so any call raised NameError."""
+def test_connect_functions_take_db_kwargs():
+    """Both connect entry points expose the raw-option escape hatch and nothing
+    else credential-shaped — all options travel through db_kwargs now."""
     for fn in (adbc_driver_spanner.connect, adbc_driver_spanner.dbapi.connect):
-        assert "access_token" in inspect.signature(fn).parameters
-
-
-def test_option_kwargs_maps_credentials():
-    opts = option_kwargs(
-        "spanner:///projects/p/instances/i/databases/d",
-        keyfile="/k.json",
-        access_token="ya29.tok",
-        impersonate_target_principal="sa@p.iam.gserviceaccount.com",
-        impersonate_delegates=["a@p.iam", "b@p.iam"],
-        impersonate_scopes="https://www.googleapis.com/auth/cloud-platform",
-        impersonate_lifetime=1800,
-    )
-    # The `uri` value is passed through verbatim (the package does no wrapping).
-    assert opts["uri"] == "spanner:///projects/p/instances/i/databases/d"
-    assert opts["spanner.auth.keyfile"] == "/k.json"
-    assert opts["spanner.auth.access_token"] == "ya29.tok"
-    assert opts["spanner.auth.impersonate.target_principal"] == "sa@p.iam.gserviceaccount.com"
-    # A sequence of delegates/scopes is rendered as a comma-separated string.
-    assert opts["spanner.auth.impersonate.delegates"] == "a@p.iam,b@p.iam"
-    assert opts["spanner.auth.impersonate.scopes"] == (
-        "https://www.googleapis.com/auth/cloud-platform"
-    )
-    assert opts["spanner.auth.impersonate.lifetime"] == "1800"
+        params = inspect.signature(fn).parameters
+        assert "db_kwargs" in params
+        # The friendly per-credential kwargs were removed in favour of db_kwargs.
+        assert "access_token" not in params
+        assert "keyfile" not in params
+        assert "uri" not in params
 
 
 def test_option_enums_are_exported_and_well_formed():

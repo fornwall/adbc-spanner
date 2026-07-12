@@ -44,7 +44,8 @@ def cookbook_env(emulator_database):
     import adbc_driver_spanner.dbapi as sp
 
     conn = sp.connect(
-        uri=f"spanner:///{emulator_database}", emulator=True, autocommit=True
+        db_kwargs={"uri": f"spanner:///{emulator_database}", "spanner.emulator": "true"},
+        autocommit=True,
     )
     try:
         with conn.cursor() as cur:
@@ -61,9 +62,13 @@ def cookbook_env(emulator_database):
 
     original = sp.connect
 
-    def redirected(uri=None, **kwargs):
-        kwargs.setdefault("emulator", True)
-        return original(uri=f"spanner:///{emulator_database}", **kwargs)
+    def redirected(db_kwargs=None, **kwargs):
+        # Override the illustrative uri with the emulator database and force
+        # emulator mode, preserving any other db_kwargs the snippet set.
+        merged = dict(db_kwargs or {})
+        merged["uri"] = f"spanner:///{emulator_database}"
+        merged["spanner.emulator"] = "true"
+        return original(db_kwargs=merged, **kwargs)
 
     sp.connect = redirected
     try:

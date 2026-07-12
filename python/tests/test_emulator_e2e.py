@@ -16,7 +16,8 @@ import adbc_driver_spanner.dbapi as spanner
 
 def _connect(database, *, autocommit):
     return spanner.connect(
-        uri=f"spanner:///{database}", emulator=True, autocommit=autocommit
+        db_kwargs={"uri": f"spanner:///{database}", "spanner.emulator": "true"},
+        autocommit=autocommit,
     )
 
 

@@ -30,7 +30,10 @@ def profile_adbc(database, rows_per_batch=None):
 
     import adbc_driver_spanner.dbapi as spanner_adbc
 
-    conn = spanner_adbc.connect(uri=f"spanner:///{database}", emulator=True, autocommit=True)
+    conn = spanner_adbc.connect(
+        db_kwargs={"uri": f"spanner:///{database}", "spanner.emulator": "true"},
+        autocommit=True,
+    )
     try:
         cur = conn.cursor()
         if rows_per_batch is not None:
