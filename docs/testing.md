@@ -12,7 +12,7 @@ unset, so a plain `cargo test` is green everywhere with no external dependencies
 | --- | --- | --- | --- |
 | Unit tests + doctests | `cargo test` | [`ci.yml`](../.github/workflows/ci.yml) | — |
 | Emulator integration | `scripts/with-emulator.sh cargo test` | [`ci.yml`](../.github/workflows/ci.yml) | — |
-| Real Cloud Spanner | `SPANNER_GCP_DATABASE=… cargo test --test integration` | [`real-spanner.yml`](../.github/workflows/real-spanner.yml) | — |
+| Real Cloud Spanner | `SPANNER_GCP_DATABASE=… cargo test --test integration` | — (local only) | — |
 | Resilience / fault injection | `scripts/with-toxiproxy.sh cargo test --test resilience` | [`resilience.yml`](../.github/workflows/resilience.yml) | [`tests/RESILIENCE.md`](../tests/RESILIENCE.md) |
 | ADBC C++ validation | `scripts/run-adbc-validation.sh` | [`adbc-validation.yml`](../.github/workflows/adbc-validation.yml) | [`adbc-validation/README.md`](../adbc-validation/README.md) |
 | Foundry differential oracle | `scripts/run-foundry-validation.sh` | [`foundry-validation.yml`](../.github/workflows/foundry-validation.yml) | [`foundry-validation/README.md`](../foundry-validation/README.md) |
@@ -72,9 +72,9 @@ best-effort creates the database and its scratch tables and cleans up after itse
 (the emulator refuses these credentials). They self-skip unless `SPANNER_GCP_DATABASE` plus
 `SPANNER_TEST_KEYFILE` and/or `SPANNER_TEST_IMPERSONATE_TARGET_PRINCIPAL` are set.
 
-In CI, [`real-spanner.yml`](../.github/workflows/real-spanner.yml) runs this suite nightly (and on
-manual dispatch) against a real database — **non-gating**, never on PR/push. It authenticates via
-GitHub OIDC → Workload Identity Federation and opens a tracking issue on nightly failure.
+This suite is **run locally only** — no CI job exercises a real Cloud Spanner database. The canonical
+functional suites (`ci.yml` / `adbc-validation.yml`) run entirely against the emulator, so the
+non-emulator ADC auth path is covered by running the command above by hand against a real target.
 
 ## Resilience / fault injection
 
