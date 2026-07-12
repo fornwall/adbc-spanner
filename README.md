@@ -97,6 +97,38 @@ Early but working and tested end-to-end against the Spanner emulator.
   `spanner.data_boost` bakes [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview)
   into the descriptors; `spanner.partition.max_count` hints the partition count.
 
+TODO: Go over these and merge with above:
+
+- Manual transactions — setting adbc.connection.autocommit=false plus commit()/rollback() works (via the buffer-and-commit
+  scheme), rather than the driver rejecting non-autocommit mode.
+- Transaction isolation level — the adbc.connection.transaction.isolation_level option is honored for serializable,
+  repeatable_read, and default.
+- Read-only connections — adbc.connection.readonly=true is supported, making the connection reject all writes while still
+  allowing queries.
+- execute_schema() (ADBC 1.1.0) — returns a query's result schema without executing it, via Spanner's QueryMode::Plan.
+- Bulk ingest — the full adbc.ingest.* surface (append/create/create_append/replace modes, plus target
+  catalog/db_schema/temporary) is implemented over native Spanner mutations.
+- Partitioned execution — execute_partitions() and read_partition() are supported, serializing Spanner batch-read partitions
+  into opaque ADBC descriptors.
+- Cancellation (ADBC 1.1.0) — both Connection::cancel() and Statement::cancel() interrupt an in-flight operation.
+- Statistics (ADBC 1.1.0) — get_statistics() returns exact row/null/distinct counts and get_statistic_names() returns a
+  correctly-typed empty result.
+- Typed option getters (ADBC 1.1.0) — get_option_int(), get_option_double(), and get_option_bytes() are implemented alongside
+  the string getter.
+- Parameter schema — get_parameter_schema() describes a parameterized statement's bind parameters.
+- get_objects with constraints — catalog/schema/table/column introspection including foreign-key constraint_column_usage, not
+  just the minimal object listing.
+- Current catalog / schema options (ADBC 1.1.0) — adbc.connection.catalog / adbc.connection.db_schema are accepted (Spanner
+  exposes a single unnamed catalog/schema, so only the empty value is valid).
+- adbc.statement.bind_by_name — the SQLite-reference-driver bind-by-name convention is honored (a de-facto optional convention
+  rather than a formal spec option).
+
+## Unsupported optional ADBC functionality
+
+- [Substrait](https://substrait.io/) plans are unsupported.
+- The transaction levels `read_uncommitted`, `read_committed`, `snapshot` and `linearizable` are rejected; only
+  `serializable`, `repeatable_read`, and `default` are honored (Spanner offers no equivalent for the others).
+
 ## Supported Spanner functionality
 
 - Connecting to production Spanner or a [Spanner emulator](https://docs.cloud.google.com/spanner/docs/emulator).
