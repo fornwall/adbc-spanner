@@ -175,19 +175,16 @@ maps onto Spanner, without diving into the line-by-line internals.
 ### 5.1 Opening a database (configuration)
 
 You start with a `SpannerDriver`, then ask it for a `SpannerDatabase`, passing options. The one
-required option is the **database path**:
-
-```
-projects/<project>/instances/<instance>/databases/<database>
-```
-
-supplied either as the standard `uri` option or the driver-specific `spanner.database` key (they
-are the same value). You can also pass a `spanner:`-scheme **connection URI** that packs the path,
-endpoint, and options into one string:
+required option is the standard `uri` option, a `spanner://` **connection URI** whose path is the
+**database path** `projects/<project>/instances/<instance>/databases/<database>` and whose query
+parameters pack the endpoint and other options into the one string:
 
 ```
 spanner:///projects/p/instances/i/databases/d?spanner.emulator=true
 ```
+
+A bare database path is not accepted — the `spanner://` scheme is required (write the three-slash
+`spanner:///projects/...` form when no endpoint host is intended).
 
 The database object is **pure configuration** — no network happens yet. It just holds the path,
 the credentials configuration, the endpoint, and any inherited options. Credentials can come from

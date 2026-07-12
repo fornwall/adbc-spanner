@@ -34,7 +34,7 @@ ENTRYPOINT = "AdbcSpannerInit"
 
 
 def option_kwargs(
-    database: typing.Optional[str] = None,
+    uri: typing.Optional[str] = None,
     *,
     endpoint: typing.Optional[str] = None,
     emulator: bool = False,
@@ -55,8 +55,11 @@ def option_kwargs(
     """
     options: typing.Dict[str, str] = {}
     # Friendly kwargs -> the driver's option keys (see src/lib.rs).
-    if database is not None:
-        options["spanner.database"] = database
+    if uri is not None:
+        # Passed through verbatim. The driver's `uri` option requires the `spanner://` scheme
+        # (e.g. `spanner:///projects/<p>/instances/<i>/databases/<d>`); a bare database path is
+        # rejected there, deliberately — the Python layer does no wrapping.
+        options["uri"] = uri
     if endpoint is not None:
         options["spanner.endpoint"] = endpoint
     if emulator:
@@ -93,7 +96,7 @@ def _as_csv(value: typing.Union[str, typing.Sequence[str]]) -> str:
 
 
 def connect(
-    database: typing.Optional[str] = None,
+    uri: typing.Optional[str] = None,
     *,
     endpoint: typing.Optional[str] = None,
     emulator: bool = False,
@@ -110,9 +113,10 @@ def connect(
 
     Parameters
     ----------
-    database:
-        Fully-qualified database path,
-        ``projects/<p>/instances/<i>/databases/<d>``.
+    uri:
+        A ``spanner://`` connection URI whose path is the fully-qualified database
+        path, e.g. ``spanner:///projects/<p>/instances/<i>/databases/<d>``. The
+        ``spanner://`` scheme is required; a bare path is rejected.
     endpoint:
         Override the Spanner gRPC endpoint (e.g. an emulator ``host:port``).
     emulator:
@@ -144,7 +148,7 @@ def connect(
     For a DBAPI 2.0 connection, prefer :func:`adbc_driver_spanner.dbapi.connect`.
     """
     options = option_kwargs(
-        database,
+        uri,
         endpoint=endpoint,
         emulator=emulator,
         keyfile=keyfile,

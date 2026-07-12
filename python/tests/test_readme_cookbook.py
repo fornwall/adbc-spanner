@@ -43,7 +43,9 @@ def cookbook_env(emulator_database):
     """Seed the `Singers` table and redirect `spanner.connect` at the emulator database."""
     import adbc_driver_spanner.dbapi as sp
 
-    conn = sp.connect(database=emulator_database, emulator=True, autocommit=True)
+    conn = sp.connect(
+        uri=f"spanner:///{emulator_database}", emulator=True, autocommit=True
+    )
     try:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS Singers")
@@ -59,9 +61,9 @@ def cookbook_env(emulator_database):
 
     original = sp.connect
 
-    def redirected(database=None, **kwargs):
+    def redirected(uri=None, **kwargs):
         kwargs.setdefault("emulator", True)
-        return original(database=emulator_database, **kwargs)
+        return original(uri=f"spanner:///{emulator_database}", **kwargs)
 
     sp.connect = redirected
     try:

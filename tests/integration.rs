@@ -73,6 +73,12 @@ impl TestTarget {
         )
     }
 
+    /// The database path wrapped as a `spanner://` connection URI, the form the `uri` option
+    /// requires (a bare path is rejected).
+    fn database_uri(&self) -> String {
+        format!("spanner:///{}", self.database_path())
+    }
+
     fn instance_path(&self) -> String {
         format!("projects/{}/instances/{}", self.project, self.instance)
     }
@@ -361,7 +367,7 @@ fn query_and_dml_round_trip() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -2132,7 +2138,7 @@ fn commit_stats_reports_mutation_count() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -2237,7 +2243,7 @@ fn bulk_ingest_chunks_past_the_byte_budget() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -2355,7 +2361,7 @@ fn bulk_ingest_via_batch_write() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -2503,7 +2509,7 @@ fn timestamp_precision_modes_round_trip() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -2663,7 +2669,7 @@ fn bulk_ingest_edge_cases() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -3004,7 +3010,7 @@ fn bulk_ingest_mid_chunk_failure_reports_committed_rows() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -3221,7 +3227,7 @@ fn get_objects_filter_pushdown_matches_client_filtering() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -3468,7 +3474,7 @@ fn prop_bind_round_trip() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let connection = RefCell::new(connect_with_retry(&database));
@@ -3653,7 +3659,7 @@ fn prop_temporal_round_trip() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let connection = RefCell::new(connect_with_retry(&database));
@@ -3770,7 +3776,7 @@ fn ddl_execute_clears_stale_bound_rows() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -3878,7 +3884,7 @@ fn ffi_driver_manager_smoke() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("new_database via FFI");
 
@@ -3948,7 +3954,7 @@ fn conformance_via_driver_manager() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("new_database via FFI");
     // The freshly-created emulator database can lag; retry the connection briefly.
@@ -4170,7 +4176,7 @@ fn ffi_connect(
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("new_database via FFI");
     let mut connection = None;
@@ -4274,7 +4280,7 @@ fn stream_survives_statement_connection_database_release() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -4474,7 +4480,7 @@ fn drop_half_consumed_reader_then_connection_still_works() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -4581,7 +4587,7 @@ fn ffi_double_release_and_error_struct_reuse() {
     let status = unsafe { driver.DatabaseNew.unwrap()(&mut database, &mut error) };
     assert_eq!(status, ADBC_STATUS_OK);
     let key = CString::new("uri").unwrap();
-    let value = CString::new(target.database_path()).unwrap();
+    let value = CString::new(target.database_uri()).unwrap();
     let status = unsafe {
         driver.DatabaseSetOption.unwrap()(&mut database, key.as_ptr(), value.as_ptr(), &mut error)
     };
@@ -4692,7 +4698,7 @@ fn retry_tuning_round_trip_and_execute() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -4785,7 +4791,7 @@ fn gql_graph_query_round_trip() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -4951,7 +4957,7 @@ fn named_schema_round_trip() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -5240,7 +5246,7 @@ fn get_statistics_reports_real_counts() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -5322,7 +5328,7 @@ fn json_and_float32_round_trip() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -5543,7 +5549,7 @@ fn execute_streams_in_batches() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -5629,7 +5635,7 @@ fn bind_by_name_modes() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -5759,7 +5765,7 @@ fn bound_query_streams_in_batches() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -5846,7 +5852,7 @@ fn cancel_between_stream_chunks_cancels_the_next_fetch() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -5925,7 +5931,7 @@ fn dropping_reader_mid_stream_aborts_the_prefetch() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -5992,7 +5998,7 @@ fn view_and_narrow_types_bind_round_trip() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -6090,7 +6096,7 @@ fn hinted_dml_routes_to_the_read_write_path() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -6149,7 +6155,7 @@ fn dml_then_return_round_trip() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -6266,7 +6272,7 @@ fn execute_partitions_round_trip() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -6371,7 +6377,7 @@ fn query_with_trailing_semicolons_returns_rows() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -6448,7 +6454,7 @@ fn readonly_connection_rejects_writes() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -6624,7 +6630,7 @@ fn readonly_toggle_from_another_thread_locks_existing_statement() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -6699,7 +6705,7 @@ fn rollback_without_a_transaction_is_invalid_state() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -6769,7 +6775,7 @@ fn get_statistic_names_is_empty_and_correctly_typed() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let connection = connect_with_retry(&database);
@@ -6815,7 +6821,7 @@ fn read_partition_rejects_garbage_descriptors() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let connection = connect_with_retry(&database);
@@ -6861,7 +6867,7 @@ fn connection_cancel_is_sticky_until_the_next_operation() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -6966,7 +6972,7 @@ fn request_priority_and_tags() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -7315,7 +7321,7 @@ fn zero_row_schema_fidelity() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -7466,7 +7472,7 @@ fn rpc_timeouts() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -7837,7 +7843,7 @@ fn change_stream_via_plain_sql() {
     let database = driver
         .new_database_with_opts([(
             OptionDatabase::Uri,
-            OptionValue::String(target.database_path()),
+            OptionValue::String(target.database_uri()),
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
@@ -8069,7 +8075,7 @@ mod auth_end_to_end {
             .new_database_with_opts([
                 (
                     OptionDatabase::Uri,
-                    OptionValue::String(target.database_path()),
+                    OptionValue::String(target.database_uri()),
                 ),
                 (
                     OptionDatabase::Other(OPTION_KEYFILE.into()),
@@ -8107,7 +8113,7 @@ mod auth_end_to_end {
             .new_database_with_opts([
                 (
                     OptionDatabase::Uri,
-                    OptionValue::String(target.database_path()),
+                    OptionValue::String(target.database_uri()),
                 ),
                 (
                     OptionDatabase::Other(OPTION_IMPERSONATE_TARGET_PRINCIPAL.into()),

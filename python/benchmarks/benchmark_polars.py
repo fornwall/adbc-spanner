@@ -158,7 +158,7 @@ def setup_table(database: str, n: int, batch: int) -> None:
     import adbc_driver_spanner.dbapi as spanner_adbc
 
     data = build_data(n)
-    conn = spanner_adbc.connect(database=database, emulator=True, autocommit=True)
+    conn = spanner_adbc.connect(uri=f"spanner:///{database}", emulator=True, autocommit=True)
     try:
         with conn.cursor() as cur:
             cur.execute(f"DROP TABLE IF EXISTS {TABLE}")
@@ -187,7 +187,7 @@ def run_adbc(database: str):
 
     import adbc_driver_spanner.dbapi as spanner_adbc
 
-    conn = spanner_adbc.connect(database=database, emulator=True, autocommit=True)
+    conn = spanner_adbc.connect(uri=f"spanner:///{database}", emulator=True, autocommit=True)
     try:
         with conn.cursor() as cur:
             cur.execute(f"SELECT {COLUMNS} FROM {TABLE}")

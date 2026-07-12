@@ -59,7 +59,7 @@ class SpannerQuirks(model.DriverQuirks):
 
     # database options are filled in by get_quirks() (emulator vs real target).
     setup = model.DriverSetup(
-        database={"spanner.database": model.FromEnv("ADBC_SPANNER_DATABASE")},
+        database={"uri": model.FromEnv("ADBC_SPANNER_URI")},
     )
 
     @property
@@ -127,7 +127,7 @@ class SpannerQuirks(model.DriverQuirks):
 
 def get_quirks(vendor_version: str | None = None) -> SpannerQuirks:
     q = SpannerQuirks()
-    database = {"spanner.database": model.FromEnv("ADBC_SPANNER_DATABASE")}
+    database = {"uri": model.FromEnv("ADBC_SPANNER_URI")}
     if os.environ.get("SPANNER_EMULATOR_HOST"):
         database["spanner.emulator"] = "true"
     q.setup = model.DriverSetup(database=database)
