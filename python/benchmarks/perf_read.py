@@ -33,7 +33,7 @@ def main() -> int:
 
     import adbc_driver_spanner.dbapi as spanner_adbc
 
-    conn = spanner_adbc.connect(database=database, emulator=True, autocommit=True)
+    conn = spanner_adbc.connect(uri=f"spanner:///{database}", emulator=True, autocommit=True)
     try:
         print(f">> {LOOPS} read loops of {N} rows (profile window)", flush=True)
         t0 = time.perf_counter()

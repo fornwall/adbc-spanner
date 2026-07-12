@@ -22,7 +22,7 @@ import adbc_driver_spanner.dbapi as spanner
 
 
 def _connect(database):
-    return spanner.connect(database=database, emulator=True, autocommit=True)
+    return spanner.connect(uri=f"spanner:///{database}", emulator=True, autocommit=True)
 
 
 # A row's worth of every column type the reads below assert on. Kept as Python

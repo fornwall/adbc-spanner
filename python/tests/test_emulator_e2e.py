@@ -15,7 +15,9 @@ import adbc_driver_spanner.dbapi as spanner
 
 
 def _connect(database, *, autocommit):
-    return spanner.connect(database=database, emulator=True, autocommit=autocommit)
+    return spanner.connect(
+        uri=f"spanner:///{database}", emulator=True, autocommit=autocommit
+    )
 
 
 def test_driver_library_is_bundled():

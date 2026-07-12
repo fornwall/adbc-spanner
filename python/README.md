@@ -32,7 +32,7 @@ the minimum OS / libc each one requires.
 import adbc_driver_spanner.dbapi as spanner
 
 with spanner.connect(
-    database="projects/my-project/instances/my-instance/databases/my-db",
+    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
 ) as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT SingerId, FirstName FROM Singers")
@@ -53,7 +53,7 @@ provide. To use a service-account key instead, pass its path or its JSON:
 # docs-test: skip
 import adbc_driver_spanner.dbapi as spanner
 
-spanner.connect(database="projects/p/instances/i/databases/d",
+spanner.connect(uri="spanner:///projects/p/instances/i/databases/d",
                 keyfile="/path/to/service-account.json")
 ```
 
@@ -62,7 +62,7 @@ To impersonate another service account on top of your base credentials, set
 
 ```python
 # docs-test: skip
-spanner.connect(database="projects/p/instances/i/databases/d",
+spanner.connect(uri="spanner:///projects/p/instances/i/databases/d",
                 impersonate_target_principal="target@p.iam.gserviceaccount.com",
                 impersonate_scopes=["https://www.googleapis.com/auth/cloud-platform"])
 ```
@@ -73,7 +73,7 @@ exclusive with `keyfile=` / `keyfile_json=` / `impersonate_target_principal=`:
 
 ```python
 # docs-test: skip
-spanner.connect(database="projects/p/instances/i/databases/d",
+spanner.connect(uri="spanner:///projects/p/instances/i/databases/d",
                 access_token="ya29.a0Af...")
 ```
 
@@ -82,7 +82,7 @@ endpoint and pass `emulator=True` (which connects with anonymous credentials):
 
 ```python
 # docs-test: skip
-spanner.connect(database="projects/p/instances/i/databases/d",
+spanner.connect(uri="spanner:///projects/p/instances/i/databases/d",
                 endpoint="localhost:9010", emulator=True)
 ```
 
@@ -92,7 +92,7 @@ spanner.connect(database="projects/p/instances/i/databases/d",
 
 | kwarg                             | Description                                                                                     |
 | --------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `database=`                       | Spanner database path, `projects/<p>/instances/<i>/databases/<d>` (**required**). Wrapped into the driver's required `spanner://` `uri` form for you; a full `spanner://…` URI is also accepted here. |
+| `uri=`                            | A `spanner://` connection URI whose path is the database path, e.g. `spanner:///projects/<p>/instances/<i>/databases/<d>` (**required**). The scheme is required; a bare path is rejected. |
 | `endpoint=`                       | Explicit gRPC endpoint (e.g. an emulator at `localhost:9010`); defaults to production Spanner.   |
 | `emulator=`                       | `True` to connect with anonymous credentials for the emulator.                                  |
 | `keyfile=`                        | Path to a service-account / credential JSON file (default: Application Default Credentials).     |
@@ -131,7 +131,7 @@ import adbc_driver_spanner.dbapi as spanner
 from adbc_driver_spanner import ConnectionOptions, StatementOptions
 
 with spanner.connect(
-    database="projects/p/instances/i/databases/d",
+    uri="spanner:///projects/p/instances/i/databases/d",
     conn_kwargs={ConnectionOptions.READ_STALENESS.value: "max:10s"},
 ) as conn:
     cur = conn.cursor(
@@ -154,7 +154,7 @@ any `INSERT`/`UPDATE`/`DELETE`, DDL, or bulk ingest raises, while queries still 
 # docs-test: skip
 import adbc_driver_spanner.dbapi as spanner
 
-with spanner.connect(database="projects/p/instances/i/databases/d",
+with spanner.connect(uri="spanner:///projects/p/instances/i/databases/d",
                      conn_kwargs={"adbc.connection.readonly": "true"}) as conn:
     conn.cursor().execute("SELECT 1")   # ok
     # any INSERT/UPDATE/DELETE, DDL or adbc_ingest raises
@@ -169,7 +169,7 @@ peak memory on a wide or large result:
 import adbc_driver_spanner.dbapi as spanner
 
 with spanner.connect(
-    database="projects/my-project/instances/my-instance/databases/my-db",
+    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
 ) as conn:
     with conn.cursor() as cur:
         cur.adbc_statement.set_options(**{"spanner.rows_per_batch": "1024"})
@@ -196,7 +196,7 @@ Connect with `autocommit=True` if you want every statement to apply immediately.
 import adbc_driver_spanner.dbapi as spanner
 
 with spanner.connect(
-    database="projects/my-project/instances/my-instance/databases/my-db",
+    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
 ) as conn:  # DBAPI default: autocommit off => manual transaction
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS Albums")  # DDL runs immediately
@@ -224,7 +224,7 @@ All examples assume a `Singers(SingerId INT64, FirstName STRING)` table.
 import adbc_driver_spanner.dbapi as spanner
 
 with spanner.connect(
-    database="projects/my-project/instances/my-instance/databases/my-db",
+    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
 ) as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT SingerId, FirstName FROM Singers ORDER BY SingerId")
@@ -237,7 +237,7 @@ with spanner.connect(
 import adbc_driver_spanner.dbapi as spanner
 
 with spanner.connect(
-    database="projects/my-project/instances/my-instance/databases/my-db",
+    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
 ) as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT SingerId, FirstName FROM Singers ORDER BY SingerId")
@@ -251,7 +251,7 @@ import polars as pl
 import adbc_driver_spanner.dbapi as spanner
 
 with spanner.connect(
-    database="projects/my-project/instances/my-instance/databases/my-db",
+    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
 ) as conn:
     df = pl.read_database(
         "SELECT SingerId, FirstName FROM Singers ORDER BY SingerId",
@@ -266,7 +266,7 @@ import duckdb
 import adbc_driver_spanner.dbapi as spanner
 
 with spanner.connect(
-    database="projects/my-project/instances/my-instance/databases/my-db",
+    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
 ) as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT SingerId, FirstName FROM Singers")
@@ -289,7 +289,7 @@ import adbc_driver_spanner.dbapi as spanner
 frame = pd.DataFrame({"SingerId": [10, 11], "FirstName": ["Carol", "Dave"]})
 
 with spanner.connect(
-    database="projects/my-project/instances/my-instance/databases/my-db",
+    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
     autocommit=True,                         # apply immediately; returns the row count
 ) as conn:
     with conn.cursor() as cur:
@@ -318,7 +318,7 @@ the ADBC partitioned-execution extension (`adbc_execute_partitions` / `adbc_read
 import adbc_driver_spanner.dbapi as spanner
 
 with spanner.connect(
-    database="projects/my-project/instances/my-instance/databases/my-db",
+    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
 ) as conn:
     with conn.cursor() as cur:
         # Optional statement options, set on the underlying ADBC statement:

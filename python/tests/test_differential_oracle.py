@@ -219,7 +219,7 @@ def _official_query(database, sql):
 
 
 def test_scalar_and_array_types_match_oracle(emulator_database, official_database):
-    conn = adbc_spanner.connect(database=emulator_database, emulator=True, autocommit=True)
+    conn = adbc_spanner.connect(uri=f"spanner:///{emulator_database}", emulator=True, autocommit=True)
     try:
         with conn.cursor() as cur:
             _create_and_seed(cur)
@@ -277,7 +277,7 @@ def test_array_of_struct_matches_oracle(emulator_database, official_database):
         ") AS arr"
     )
 
-    conn = adbc_spanner.connect(database=emulator_database, emulator=True, autocommit=True)
+    conn = adbc_spanner.connect(uri=f"spanner:///{emulator_database}", emulator=True, autocommit=True)
     try:
         with conn.cursor() as cur:
             cur.execute(sql)

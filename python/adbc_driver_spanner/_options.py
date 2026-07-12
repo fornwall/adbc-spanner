@@ -14,7 +14,7 @@ Example::
     from adbc_driver_spanner import ConnectionOptions, StatementOptions
 
     with spanner.connect(
-        database="projects/p/instances/i/databases/d",
+        uri="spanner:///projects/p/instances/i/databases/d",
         conn_kwargs={ConnectionOptions.READ_STALENESS.value: "max:10s"},
     ) as conn:
         cur = conn.cursor(
@@ -38,7 +38,7 @@ class DatabaseOptions(enum.Enum):
 
     #: **Standard ADBC.** A ``spanner://`` connection URI whose path is the fully-qualified
     #: database path, ``spanner:///projects/<p>/instances/<i>/databases/<d>``. The scheme is
-    #: required; a bare path is rejected (the ``connect(database=...)`` kwarg wraps one for you).
+    #: required; a bare path is rejected. Also settable as the ``uri`` kwarg on ``connect``.
     URI = "uri"
     #: Override the Spanner gRPC endpoint (e.g. an emulator ``host:port``).
     ENDPOINT = "spanner.endpoint"

@@ -21,7 +21,7 @@ def test_connect_functions_accept_access_token():
 
 def test_option_kwargs_maps_credentials():
     opts = option_kwargs(
-        "projects/p/instances/i/databases/d",
+        "spanner:///projects/p/instances/i/databases/d",
         keyfile="/k.json",
         access_token="ya29.tok",
         impersonate_target_principal="sa@p.iam.gserviceaccount.com",
@@ -29,6 +29,7 @@ def test_option_kwargs_maps_credentials():
         impersonate_scopes="https://www.googleapis.com/auth/cloud-platform",
         impersonate_lifetime=1800,
     )
+    # The `uri` value is passed through verbatim (the package does no wrapping).
     assert opts["uri"] == "spanner:///projects/p/instances/i/databases/d"
     assert opts["spanner.auth.keyfile"] == "/k.json"
     assert opts["spanner.auth.access_token"] == "ya29.tok"
