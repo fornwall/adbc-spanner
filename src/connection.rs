@@ -22,8 +22,9 @@
 //! - **No read-your-writes (guarded):** queries always run immediately in a fresh single-use
 //!   read-only snapshot, so a query cannot observe DML buffered earlier in the same manual
 //!   transaction. Rather than silently returning a *pre-insert* result, a data-returning query
-//!   (`execute`, the bound-query path, and `execute_partitions`) issued while any write — a
-//!   buffered DML statement *or* an ingest mutation — is pending is rejected with
+//!   (`execute`, the bound-query path, `execute_partitions`, and a query routed through
+//!   `execute_update` — which executes it read-only and discards the rows) issued while any write
+//!   — a buffered DML statement *or* an ingest mutation — is pending is rejected with
 //!   [`Status::InvalidState`]. Commit or roll back first if a statement needs to see earlier
 //!   writes. (`execute_schema`, a schema-only PLAN probe, is not guarded.)
 //! - **DML and DDL reorder:** DDL also runs immediately (DDL is never transactional in Spanner),

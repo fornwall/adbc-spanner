@@ -20,7 +20,9 @@ Early but working and tested end-to-end against the Spanner emulator.
   columnar results directly - rows are pulled from Spanner and converted to Arrow in bounded chunks (with configurable
   size) as the reader is iterated, so a large result set is never fully materialised in memory.
 - DML: A `;`-separated batch (e.g. `DELETE; INSERT`) runs atomically in one read/write transaction using
-  [batch DML](https://docs.cloud.google.com/spanner/docs/samples/spanner-dml-batch-update).
+  [batch DML](https://docs.cloud.google.com/spanner/docs/samples/spanner-dml-batch-update). A batch
+  must be all-DML: mixing in a query or DDL is rejected up front with `InvalidArguments` (before
+  anything is buffered in a manual transaction).
 - DDL (`CREATE`/`ALTER`/`DROP`/`RENAME`/…): Routed to the Database Admin `UpdateDatabaseDdl` API. A
   `;`-separated batch (e.g. a intermediate-table build then rename swap) is submitted as a single
   [schema change](https://docs.cloud.google.com/spanner/docs/schema-updates) near-atomic (but not
@@ -31,7 +33,8 @@ Early but working and tested end-to-end against the Spanner emulator.
   and DDL still run immediately). Because only writes are buffered, a manual transaction has **no
   read-your-writes** — a query runs immediately in a fresh read-only snapshot and cannot see
   buffered writes. Rather than silently returning a *pre-insert* result, a data-returning query
-  (`execute`/`execute_partitions`) issued while any write is buffered is rejected with
+  (`execute`/`execute_partitions`, or a query routed through `execute_update` — which executes it
+  read-only and discards the rows) issued while any write is buffered is rejected with
   `InvalidState`; commit or roll back first if a statement needs to see earlier writes. Writes also
   **reorder relative to DDL**: DDL issued after buffered DML executes before it (Spanner DDL is
   never transactional). This follows from the
