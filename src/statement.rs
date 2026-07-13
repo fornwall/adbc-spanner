@@ -572,7 +572,7 @@ impl SpannerStatement {
         let target = bind::mutation_table(self.target_db_schema.as_deref(), table);
         {
             let mut txn = self.txn.lock().unwrap();
-            if !txn.autocommit() {
+            if !txn.autocommit {
                 for batch in &self.bound {
                     for row in 0..batch.num_rows() {
                         txn.buffer_mutation(bind::insert_mutation(&target, batch, row)?);
@@ -841,7 +841,7 @@ impl SpannerStatement {
     fn run_or_buffer(&self, statements: Vec<SpannerSql>) -> Result<Option<i64>> {
         {
             let mut txn = self.txn.lock().unwrap();
-            if !txn.autocommit() {
+            if !txn.autocommit {
                 for statement in statements {
                     txn.buffer(statement);
                 }
@@ -962,7 +962,7 @@ impl SpannerStatement {
             let statements = self.build_dml_statements(sql)?;
             return Ok(DmlOutcome::Plain(self.run_or_buffer(statements)?));
         }
-        if !self.txn.lock().unwrap().autocommit() {
+        if !self.txn.lock().unwrap().autocommit {
             return Err(invalid_state(
                 "DML with THEN RETURN cannot run in a manual transaction: buffered DML is applied \
                  via ExecuteBatchDml on commit, which does not support THEN RETURN. Re-enable \

@@ -79,7 +79,7 @@ use crate::timeout::{RpcTimeouts, with_timeout};
 #[derive(Debug)]
 pub(crate) struct TxnState {
     /// When false, the connection is in manual transaction mode and DML is buffered.
-    autocommit: bool,
+    pub(crate) autocommit: bool,
     /// DML statements buffered while in manual mode, applied atomically on commit. Built
     /// statements (not raw SQL) so that parameterized DML — which carries bound values — buffers
     /// just like a plain `;`-batch does.
@@ -98,11 +98,6 @@ impl TxnState {
             pending: Vec::new(),
             pending_mutations: Vec::new(),
         }
-    }
-
-    /// Whether the connection is currently in autocommit mode.
-    pub(crate) fn autocommit(&self) -> bool {
-        self.autocommit
     }
 
     /// Whether a data-returning query would silently miss buffered writes: the connection is in
@@ -181,7 +176,7 @@ mod txn_state_tests {
         st.buffer(sql("UPDATE b"));
         st.buffer_mutation(mutation(1));
         let (taken, taken_mutations) = st.enter_autocommit();
-        assert!(st.autocommit());
+        assert!(st.autocommit);
         assert!(st.pending.is_empty());
         assert!(st.pending_mutations.is_empty());
         assert_eq!(
@@ -206,7 +201,7 @@ mod txn_state_tests {
         st.buffer(sql("UPDATE late"));
         st.buffer_mutation(mutation(2));
         st.restore_manual(taken, taken_mutations);
-        assert!(!st.autocommit());
+        assert!(!st.autocommit);
         assert_eq!(pending_sqls(&st), ["UPDATE a", "UPDATE late"]);
         assert_eq!(st.pending_mutations, [mutation(1), mutation(2)]);
     }
