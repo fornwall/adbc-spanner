@@ -1987,3 +1987,120 @@ fn directed_read_reaches_the_wire_on_queries_but_never_on_dml() {
     assert_eq!(batch_dml[0].statements.len(), 1);
     assert_eq!(batch_dml[0].statements[0].sql, INSERT_SQL);
 }
+
+// ---------------------------------------------------------------------------
+// Shared client stack (SPAN-1)
+// ---------------------------------------------------------------------------
+
+/// Like [`MockServer::start`], but with a **counting** `CreateSession` handler in place of
+/// [`serve_sessions`]: every session-creation RPC increments `sessions`. Since the pinned client
+/// issues exactly one `CreateSession` (its multiplexed session) when a `DatabaseClient` is built,
+/// the counter counts how many client stacks were actually built. No other RPC is scripted — the
+/// trailing catch-alls reject anything else.
+fn start_counting_sessions(sessions: Arc<AtomicUsize>) -> MockServer {
+    let mut mock = MockSpanner::new();
+    mock.expect_create_session().returning(move |request| {
+        sessions.fetch_add(1, Ordering::SeqCst);
+        let database = request.into_inner().database;
+        Ok(tonic::Response::new(v1::Session {
+            name: format!(
+                "{database}/sessions/mock-session-{}",
+                sessions.load(Ordering::SeqCst)
+            ),
+            multiplexed: true,
+            ..Default::default()
+        }))
+    });
+    reject_unscripted_rpcs(&mut mock);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build mock-server runtime");
+    let (endpoint, server) = runtime
+        .block_on(spanner_grpc_mock::start("127.0.0.1:0", mock))
+        .expect("start mock Spanner server");
+    MockServer {
+        endpoint,
+        server,
+        _runtime: runtime,
+    }
+}
+
+/// **SPAN-1** — connections share one client stack. Building the Spanner client stack is
+/// expensive (a 4-channel gRPC pool, credential resolution, a `CreateSession` RPC, and a
+/// background session-maintenance task), and it is a per-*database* cost: the `SpannerDatabase`
+/// caches the stack built for its first connection and hands cheap clones (shared session +
+/// channels) to every later one. Setting **any** database option invalidates the cache, since
+/// options affect the endpoint/credentials/database path the stack was built from. The
+/// `CreateSession` count observed by the mock is a direct proxy for "how many stacks were built".
+#[test]
+fn connections_share_one_client_stack_until_an_option_is_set() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "connections_share_one_client_stack_until_an_option_is_set",
+    );
+
+    let sessions = Arc::new(AtomicUsize::new(0));
+    let server = start_counting_sessions(sessions.clone());
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let mut database = driver
+        .new_database_with_opts([
+            (
+                OptionDatabase::Uri,
+                OptionValue::String(format!("spanner:///{DATABASE}")),
+            ),
+            (
+                OptionDatabase::Other(adbc_spanner::OPTION_ENDPOINT.into()),
+                OptionValue::String(server.endpoint.clone()),
+            ),
+            (
+                OptionDatabase::Other(adbc_spanner::OPTION_EMULATOR.into()),
+                OptionValue::String("true".into()),
+            ),
+        ])
+        .expect("create database");
+
+    // The stack is lazy: merely configuring the database builds nothing.
+    assert_eq!(
+        sessions.load(Ordering::SeqCst),
+        0,
+        "no client stack may be built before the first connection"
+    );
+
+    let _first = database.new_connection().expect("first connection");
+    let _second = database.new_connection().expect("second connection");
+    assert_eq!(
+        sessions.load(Ordering::SeqCst),
+        1,
+        "two connections on one database must share one client stack (one CreateSession)"
+    );
+
+    // The cached stack renders presence-only in Debug — never the client types' own Debug output.
+    let rendered = format!("{database:?}");
+    assert!(
+        rendered.contains(r#"connected: Some("<client stack>")"#),
+        "the cached stack must render presence-only: {rendered}"
+    );
+    assert!(
+        !rendered.contains("DatabaseClient"),
+        "Debug must not delegate to the client's own Debug: {rendered}"
+    );
+
+    // Setting any database option (here: re-setting the endpoint to the same value) invalidates
+    // the cache, so the next connection rebuilds the stack — a second CreateSession.
+    database
+        .set_option(
+            OptionDatabase::Other(adbc_spanner::OPTION_ENDPOINT.into()),
+            OptionValue::String(server.endpoint.clone()),
+        )
+        .expect("re-set endpoint");
+    let _third = database.new_connection().expect("third connection");
+    assert_eq!(
+        sessions.load(Ordering::SeqCst),
+        2,
+        "set_option must invalidate the cached stack (second CreateSession on the next connection)"
+    );
+}

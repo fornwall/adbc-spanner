@@ -26,6 +26,7 @@ use crate::{
     OPTION_IMPERSONATE_LIFETIME, OPTION_IMPERSONATE_SCOPES, OPTION_IMPERSONATE_TARGET_PRINCIPAL,
     OPTION_KEYFILE, OPTION_KEYFILE_JSON, OPTION_QUOTA_PROJECT,
 };
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// The HTTP request header carrying the quota / billing project (`spanner.auth.quota_project`).
@@ -91,6 +92,16 @@ impl Driver for SpannerDriver {
 /// Holds the connection parameters (the database path and, optionally, an emulator endpoint) and
 /// mints [`SpannerConnection`]s from them.
 ///
+/// The underlying Spanner client stack — the gRPC channel pool, the resolved credentials, and the
+/// [`DatabaseClient`] with its multiplexed session — is built **once**, lazily, on the first
+/// connection and *shared* by every connection this database mints: the client's own docs describe
+/// a `DatabaseClient` as a long-lived, one-per-database object whose clones cheaply share the
+/// session and channels, and ADBC's `Database` is exactly that owner. Setting **any** database
+/// option invalidates the cached stack (options affect the endpoint / credentials / database
+/// path), so the next connection rebuilds it from the new configuration. One consequence: the
+/// `SPANNER_EMULATOR_HOST` environment variable is consulted when the stack is *built* — on the
+/// first connection, or the first after a `set_option` — not once per connection.
+///
 /// [`Debug`] is hand-written rather than derived so the three credential fields (`keyfile`,
 /// `keyfile_json` — a full service-account private key — and `access_token` — a live OAuth bearer
 /// token) never render in cleartext: each is shown as `Some("<redacted>")` / `None`, exposing only
@@ -121,6 +132,11 @@ pub struct SpannerDatabase {
     /// project id), so it renders in `Debug` and round-trips through `get_option`. Composes with
     /// every non-emulator credential path; refused in emulator mode.
     quota_project: Option<String>,
+    /// The lazily-built client stack shared by every connection (see the struct docs). `None`
+    /// until the first successful [`Database::new_connection`]; reset to `None` by any
+    /// `set_option`. Rendered presence-only in `Debug` — the client's own `Debug` output is a
+    /// client-crate surface outside this crate's control, so it must not be interpolated here.
+    connected: Mutex<Option<Connected>>,
 }
 
 impl std::fmt::Debug for SpannerDatabase {
@@ -145,6 +161,17 @@ impl std::fmt::Debug for SpannerDatabase {
             .field("impersonate_lifetime_secs", &self.impersonate_lifetime_secs)
             .field("access_token", &redact(&self.access_token))
             .field("quota_project", &self.quota_project)
+            // Presence-only, like the credential fields: never delegate to the cached client's
+            // own `Debug` (an external surface that could render endpoint/credential internals).
+            .field(
+                "connected",
+                &self
+                    .connected
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|_| "<client stack>"),
+            )
             .finish()
     }
 }
@@ -164,6 +191,7 @@ impl SpannerDatabase {
             impersonate_lifetime_secs: None,
             access_token: None,
             quota_project: None,
+            connected: Mutex::new(None),
         }
     }
 
@@ -446,11 +474,36 @@ impl SpannerDatabase {
             })
         })
     }
+
+    /// Return the shared client stack, building it via [`Self::connect`] on first use.
+    ///
+    /// The expensive parts of `connect` — the gRPC channel pool, credential resolution, and the
+    /// `CreateSession` RPC with its background session-maintenance task — are per-*database*
+    /// costs, so the stack is cached here and cheaply [`Clone`]d into every connection (the
+    /// clones share the multiplexed session and channels). `set_option` invalidates the cache. A
+    /// failed build caches nothing, so the next connection attempt retries from scratch.
+    fn connect_shared(&self) -> Result<Connected> {
+        // Hold the lock across the build so two concurrent `new_connection` calls cannot build
+        // the stack twice. This cannot deadlock: the lock is only ever taken on caller (sync
+        // ADBC) threads — never by anything running *on* the shared runtime that `connect`'s
+        // `block_on` drives — so the losing thread simply parks until the winner finishes.
+        let mut cached = self.connected.lock().unwrap();
+        if let Some(connected) = cached.as_ref() {
+            return Ok(connected.clone());
+        }
+        let connected = self.connect()?;
+        *cached = Some(connected.clone());
+        Ok(connected)
+    }
 }
 
 /// An established connection's handles: the data-plane [`DatabaseClient`], the [`Spanner`] client
 /// (used to reach the Database Admin API for DDL), and the resolved database path.
-#[derive(Debug)]
+///
+/// `Clone` is cheap by design — the client types share their channel pool and multiplexed session
+/// across clones — which is what lets [`SpannerDatabase`] cache one stack and hand a clone to
+/// every connection.
+#[derive(Clone, Debug)]
 pub(crate) struct Connected {
     pub(crate) client: DatabaseClient,
     pub(crate) spanner: Spanner,
@@ -461,6 +514,10 @@ impl Optionable for SpannerDatabase {
     type Option = OptionDatabase;
 
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
+        // Any database option can change the endpoint / credentials / database path the cached
+        // client stack was built from, so drop it up front (even if the set fails below — a
+        // spurious rebuild is harmless); the next connection rebuilds from the new configuration.
+        *self.connected.get_mut().unwrap() = None;
         match &key {
             OptionDatabase::Uri => {
                 let value = string_value(&key, value)?;
@@ -567,7 +624,7 @@ impl Database for SpannerDatabase {
     fn new_connection(&self) -> Result<Self::ConnectionType> {
         Ok(SpannerConnection::new(
             self.runtime.clone(),
-            self.connect()?,
+            self.connect_shared()?,
         ))
     }
 
@@ -1128,6 +1185,25 @@ mod tests {
             rendered.contains("access_token: None"),
             "absent access_token not shown: {rendered}"
         );
+    }
+
+    #[test]
+    fn debug_renders_the_client_stack_cache_presence_only() {
+        // The cached client stack must never delegate to the client types' own `Debug` (an
+        // external surface that could render endpoint/credential internals): unbuilt it renders
+        // as `connected: None`, and once built it renders as the fixed `<client stack>` marker
+        // (asserted end-to-end in tests/mock_spanner.rs, where a real stack exists). Redaction
+        // of the credential fields alongside it is covered by `debug_redacts_credential_fields`.
+        let db = new_database();
+        let rendered = format!("{db:?}");
+        assert!(
+            rendered.contains("connected: None"),
+            "absent client stack not shown: {rendered}"
+        );
+        // The cache must not cost `SpannerDatabase` its `Send + Sync` (the ADBC database is
+        // shared across threads by driver managers; the client handles are both).
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SpannerDatabase>();
     }
 
     #[test]

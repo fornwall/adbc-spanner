@@ -150,7 +150,7 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 
 ## 6. Utilizing Spanner well
 
-- [ ] **SPAN-1 (Medium)** — Every ADBC connection rebuilds the whole Spanner client stack (4 TLS channels + CreateSession + credential resolution + a lingering session-maintenance task) — `src/driver.rs:567,369-448`
+- [x] **SPAN-1 (Medium)** — Every ADBC connection rebuilds the whole Spanner client stack (4 TLS channels + CreateSession + credential resolution + a lingering session-maintenance task) — `src/driver.rs:567,369-448`
   The client's docs say `DatabaseClient` is long-lived, one per database, and *cloning* is cheap (shares session + channels); the ADBC `Database` object is exactly the right owner. DBAPI-style pools currently multiply handshakes/sessions/maintenance tasks by pool size. **Fix:** cache the built `Spanner` + `DatabaseClient` in `SpannerDatabase` (invalidated when a database option changes) and clone into each connection; make per-connection isolation opt-in if ever wanted.
 
 - [ ] **SPAN-2 (Medium)** — Partitioned DML not exposed — `src/statement.rs:1472`; client `partitioned_dml_transaction.rs`
