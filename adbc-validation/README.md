@@ -232,8 +232,8 @@ none of them incremental driver work:
   `CREATE TABLE x (foo INT)` / `TEXT` / `FLOAT` with no primary key and
   double-quoted identifiers. There is no quirks hook for these, and they are not
   valid Spanner DDL (which needs `INT64`/`FLOAT64`, a `PRIMARY KEY`, backtick
-  quoting). Covers e.g. `SqlBind`, `SqlQueryEmpty`, `SqlQueryFloats`,
-  `SqlSchemaFloats`, `SqlQueryRowsAffectedDelete`.
+  quoting). Covers e.g. `SqlBind`, `SqlQueryEmpty`,
+  `SqlQueryRowsAffectedDelete`.
 - **Ingest readback** — the driver supports create-mode ingest (with a
   synthetic `adbc_ingest_key` UUID primary key, since Spanner mandates one),
   and since the quirks declare it the `SqlIngest*` cases now *run* under
@@ -275,6 +275,15 @@ carries the fix the case now passes and is **gate-enforced** (the driver
 implements `execute_partitions`/`read_partition` and the `supports_partitioned_data`
 quirk is `true`). Its round-trip is additionally covered natively by
 `execute_partitions_round_trip` in `tests/integration.rs`.
+
+`SqlQueryFloats` / `SqlSchemaFloats` were formerly part of the "suite-internal
+non-Spanner DDL" bucket: both hardcoded `SELECT CAST(1.5 AS FLOAT)`, and GoogleSQL
+has no bare `FLOAT` type. apache/arrow-adbc#4496 added the generic
+`DriverQuirks::RewriteSql(query_id, default_sql)` hook (a per-query override in the
+spirit of the existing `BindParameter` dialect hook), which `SpannerQuirks`
+overrides to rewrite that query to `SELECT CAST(1.5 AS FLOAT64)`. With
+`ARROW_ADBC_TAG` on a `main` revision that carries the hook, both cases now pass
+and are **gate-enforced**.
 
 The three `adbc_ffi` issues that previously blocked a whole swath of these — a
 non-idempotent error release (which aborted the process), a missing
