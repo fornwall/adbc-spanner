@@ -1091,7 +1091,10 @@ fn scan_timestamp_utc(s: &str) -> Option<chrono::NaiveDateTime> {
     // After the seconds: either `Z` (no fraction) or `.<1..=9 digits>Z`.
     let nanos = match b[19] {
         b'Z' if b.len() == 20 => 0,
-        b'.' => {
+        // Need room for at least the trailing `Z` after the `.`; a bare `SS.` (len 20) has none, so
+        // `b.len() > 20` keeps the `b[20..b.len() - 1]` slice below in-bounds (it would otherwise be
+        // the backwards range `b[20..19]`). A too-short/empty fraction still returns `None` below.
+        b'.' if b.len() > 20 => {
             // Fractional digits run from offset 20 up to the trailing `Z`.
             let frac = &b[20..b.len() - 1];
             if b[b.len() - 1] != b'Z' || frac.is_empty() || frac.len() > 9 {
@@ -1457,6 +1460,7 @@ mod tests {
             "2024-01-15T12:34:56z",            // lowercase 'z'
             "2024-01-15T12:34:56",             // missing 'Z'
             "2024-01-15T12:34:56.Z",           // empty fraction
+            "2024-01-15T12:34:56.",            // trailing dot, no digits or `Z` (must not panic)
             "2024-01-15T12:34:56.1234567890Z", // >9 fractional digits
             "2024-13-15T00:00:00Z",            // month out of range
             "2024-01-15T25:00:00Z",            // hour out of range

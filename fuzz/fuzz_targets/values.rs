@@ -34,7 +34,12 @@ fuzz_target!(|s: String| {
         // `nanos` came from a parsed timestamp, so it is representable (and thus in range).
         let dt: DateTime<chrono::Utc> = DateTime::from_timestamp_nanos(nanos);
         if (1..=9999).contains(&dt.year()) {
-            let canonical = dt.to_rfc3339();
+            // Render with a `Z` suffix (not the `+00:00` offset `to_rfc3339` emits): the parser
+            // only accepts Spanner's actual wire form. Per the Spanner `TypeCode::TIMESTAMP`
+            // contract the time zone "must be present, and must be `\"Z\"`", so a numeric offset
+            // never appears on the wire and re-parsing a `+00:00` canonical would be an oracle
+            // artifact (like the year-range restriction above), not a parser bug.
+            let canonical = dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
             assert_eq!(
                 parse_timestamp_nanos(&canonical),
                 Some(nanos),
