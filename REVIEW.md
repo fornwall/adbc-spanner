@@ -201,10 +201,10 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 
 ## 8. Testing
 
-- [ ] **TEST-1 (High)** — `spanner.read.staleness` has zero behavioral coverage — nothing verifies a non-strong `TransactionSelector` ever reaches the wire
+- [x] **TEST-1 (High)** — `spanner.read.staleness` has zero behavioral coverage — nothing verifies a non-strong `TransactionSelector` ever reaches the wire
   Parse/round-trip unit tests only; a regression dropping the `staleness::single_use` call at the query sites would pass all gating CI. **Fix:** mock-server tests capturing `ExecuteSqlRequest.transaction` for each of the four prefixes, plus a bound-query case asserting the multi-use begin pins `max:`/`min:` per `pinned_for_multi_use`. Optionally an emulator test with `exact:1ms`.
 
-- [ ] **TEST-2 (High)** — `spanner.directed_read` never asserted on the wire; the "read-only paths only" contract untested
+- [x] **TEST-2 (High)** — `spanner.directed_read` never asserted on the wire; the "read-only paths only" contract untested
   A regression applying it to DML would break *writes* whenever the option is set (Spanner rejects directed reads on r/w transactions). **Fix:** mock test asserting `ExecuteSqlRequest.directed_read_options` populated on a query and absent on DML.
 
 - [ ] **TEST-3 (Medium)** — Isolation-level promotion never verified to reach `TransactionOptions` — mock test asserting `isolation_level` on the begin of an autocommit DML.

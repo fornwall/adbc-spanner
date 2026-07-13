@@ -1080,3 +1080,497 @@ fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
         "the driver must read back the server's mutation_count verbatim"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Read-option wire assertions: spanner.read.staleness + spanner.directed_read
+// ---------------------------------------------------------------------------
+//
+// Both options are exhaustively parse/round-trip tested offline (src/staleness.rs,
+// src/directed_read.rs), but those unit tests never prove the parsed value leaves the driver. The
+// tests below capture the actual `ExecuteSqlRequest`s the server receives — the same
+// request-capture pattern as `mock_server_round_trips_a_query` — so a regression that silently
+// dropped either option (serving strong reads, or ignoring the replica selection) fails gating CI.
+
+/// `2026-07-07T00:00:00Z` (the timestamp the `read:`/`min:` staleness forms use below) as Unix
+/// seconds, for asserting the wire `prost_types::Timestamp`.
+const READ_TIMESTAMP_RFC3339: &str = "2026-07-07T00:00:00Z";
+const READ_TIMESTAMP_UNIX: i64 = 1_783_382_400;
+
+/// Unwrap the read-only timestamp bound out of a query's `single_use` transaction selector,
+/// panicking with the actual shape when the query is not a single-use read-only transaction.
+fn single_use_read_only_bound(
+    selector: Option<&v1::TransactionSelector>,
+) -> v1::transaction_options::read_only::TimestampBound {
+    let selector = selector
+        .and_then(|s| s.selector.as_ref())
+        .expect("the query must carry a transaction selector");
+    let v1::transaction_selector::Selector::SingleUse(options) = selector else {
+        panic!("a plain autocommit query must run single-use, got: {selector:?}");
+    };
+    read_only_bound(options)
+}
+
+/// Unwrap the timestamp bound out of read-only `TransactionOptions`, panicking with the actual
+/// shape when the options are not read-only or carry no bound.
+fn read_only_bound(
+    options: &v1::TransactionOptions,
+) -> v1::transaction_options::read_only::TimestampBound {
+    let Some(v1::transaction_options::Mode::ReadOnly(read_only)) = &options.mode else {
+        panic!("expected read-only transaction options, got: {options:?}");
+    };
+    read_only
+        .timestamp_bound
+        .expect("the read-only transaction options must carry a timestamp bound")
+}
+
+/// TEST-1 (wire): `spanner.read.staleness` must reach Spanner as the matching non-strong
+/// timestamp bound in the `ExecuteSqlRequest`'s single-use transaction selector — for each of the
+/// four prefix forms (`exact:`/`max:`/`read:`/`min:`). Also pins the option's two levels: the
+/// first query *inherits* the connection-level value, the second *overrides* it on the statement.
+#[test]
+fn read_staleness_reaches_the_wire_on_single_use_queries() {
+    use v1::transaction_options::read_only::TimestampBound as WireBound;
+
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "read_staleness_reaches_the_wire_on_single_use_queries",
+    );
+
+    // The transaction selector of every ExecuteStreamingSql request the server sees, in order.
+    let selectors: Arc<Mutex<Vec<Option<v1::TransactionSelector>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let record = selectors.clone();
+    let server = MockServer::start(move |mock| {
+        mock.expect_execute_streaming_sql()
+            .returning(move |request| {
+                record
+                    .lock()
+                    .unwrap()
+                    .push(request.into_inner().transaction);
+                Ok(stream_of(vec![Ok(partial_result_set(
+                    true,
+                    &["v1"],
+                    b"st-1",
+                    true,
+                ))]))
+            });
+    });
+
+    let mut connection = server.connect();
+    // Connection-level value; statements inherit it at creation (and may override it).
+    connection
+        .set_option(
+            OptionConnection::Other(adbc_spanner::OPTION_READ_STALENESS.into()),
+            OptionValue::String("exact:10s".into()),
+        )
+        .expect("set connection-level staleness");
+
+    let mut run_query = |staleness: Option<&str>| {
+        let mut statement = connection.new_statement().expect("new statement");
+        if let Some(value) = staleness {
+            statement
+                .set_option(
+                    OptionStatement::Other(adbc_spanner::OPTION_READ_STALENESS.into()),
+                    OptionValue::String(value.into()),
+                )
+                .expect("set statement-level staleness");
+        }
+        statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+        statement
+            .execute()
+            .expect("query against mock server")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect batches");
+    };
+    run_query(None); // inherits the connection's exact:10s
+    run_query(Some("max:500ms")); // statement overrides the connection value
+    run_query(Some(&format!("read:{READ_TIMESTAMP_RFC3339}")));
+    run_query(Some(&format!("min:{READ_TIMESTAMP_RFC3339}")));
+
+    let selectors = selectors.lock().unwrap();
+    assert_eq!(selectors.len(), 4, "one request per staleness form");
+    let bounds: Vec<WireBound> = selectors
+        .iter()
+        .map(|s| single_use_read_only_bound(s.as_ref()))
+        .collect();
+    assert_eq!(
+        bounds[0],
+        WireBound::ExactStaleness(prost_types::Duration {
+            seconds: 10,
+            nanos: 0,
+        }),
+        "exact:10s (inherited from the connection) must arrive as exact_staleness"
+    );
+    assert_eq!(
+        bounds[1],
+        WireBound::MaxStaleness(prost_types::Duration {
+            seconds: 0,
+            nanos: 500_000_000,
+        }),
+        "max:500ms (the statement's override of the connection value) must arrive as max_staleness"
+    );
+    assert_eq!(
+        bounds[2],
+        WireBound::ReadTimestamp(prost_types::Timestamp {
+            seconds: READ_TIMESTAMP_UNIX,
+            nanos: 0,
+        }),
+        "read:<rfc3339> must arrive as read_timestamp"
+    );
+    assert_eq!(
+        bounds[3],
+        WireBound::MinReadTimestamp(prost_types::Timestamp {
+            seconds: READ_TIMESTAMP_UNIX,
+            nanos: 0,
+        }),
+        "min:<rfc3339> must arrive as min_read_timestamp"
+    );
+}
+
+/// Run one two-row bound (parameterized) query with the given `spanner.read.staleness` against its
+/// own mock server, returning the transaction selector of every `ExecuteSqlRequest` the server
+/// saw. Two bound rows force the multi-use read-only transaction path; the client begins it
+/// *inline*, so the first request carries `transaction.begin` (whose bound is asserted on by the
+/// caller) and expects the created transaction's id back in the result metadata, which the later
+/// per-row request then references by id.
+fn bound_query_transaction_selectors(staleness: &str) -> Vec<Option<v1::TransactionSelector>> {
+    let selectors: Arc<Mutex<Vec<Option<v1::TransactionSelector>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let record = selectors.clone();
+    let server = MockServer::start(move |mock| {
+        mock.expect_execute_streaming_sql()
+            .returning(move |request| {
+                let request = request.into_inner();
+                let inline_begin = matches!(
+                    request
+                        .transaction
+                        .as_ref()
+                        .and_then(|t| t.selector.as_ref()),
+                    Some(v1::transaction_selector::Selector::Begin(_))
+                );
+                record.lock().unwrap().push(request.transaction);
+                let mut first = partial_result_set(true, &["v"], b"bq-1", true);
+                if inline_begin {
+                    first
+                        .metadata
+                        .as_mut()
+                        .expect("first message carries metadata")
+                        .transaction = Some(v1::Transaction {
+                        id: b"bound-txn".to_vec(),
+                        ..Default::default()
+                    });
+                }
+                Ok(stream_of(vec![Ok(first)]))
+            });
+    });
+
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_READ_STALENESS.into()),
+            OptionValue::String(staleness.into()),
+        )
+        .expect("set staleness");
+    statement
+        .set_sql_query("SELECT c FROM MockTable WHERE c = @val")
+        .expect("set query");
+    let rows = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("val", DataType::Utf8, false)])),
+        vec![Arc::new(StringArray::from(vec!["a", "b"]))],
+    )
+    .expect("build bound batch");
+    statement.bind(rows).expect("bind rows");
+    let total: usize = statement
+        .execute()
+        .expect("bound query against mock server")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect batches")
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    assert_eq!(total, 2, "one result row per bound row ({staleness})");
+
+    let seen = selectors.lock().unwrap().clone();
+    drop(server); // shut the mock down before handing the captured selectors back
+    seen
+}
+
+/// TEST-1 (wire, multi-use pinning): a bound query over several bound rows runs all its per-row
+/// statements in **one** multi-use read-only transaction, and Spanner accepts the
+/// bounded-staleness kinds only on single-use transactions — so the driver must pin `max:`/`min:`
+/// to their most-stale legal equivalent when beginning it (`max:<d>` → exact staleness `<d>`,
+/// `min:<t>` → read timestamp `<t>`; `ReadBound::pinned_for_multi_use` in src/staleness.rs).
+/// Asserts the pinned bound on the wire `transaction.begin`, and that the later per-row statement
+/// reuses the begun transaction by id (i.e. the bound really is shared, not re-sent).
+#[test]
+fn bounded_staleness_is_pinned_for_multi_use_bound_queries() {
+    use v1::transaction_options::read_only::TimestampBound as WireBound;
+
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "bounded_staleness_is_pinned_for_multi_use_bound_queries",
+    );
+
+    let cases = [
+        (
+            "max:500ms",
+            WireBound::ExactStaleness(prost_types::Duration {
+                seconds: 0,
+                nanos: 500_000_000,
+            }),
+        ),
+        (
+            &format!("min:{READ_TIMESTAMP_RFC3339}") as &str,
+            WireBound::ReadTimestamp(prost_types::Timestamp {
+                seconds: READ_TIMESTAMP_UNIX,
+                nanos: 0,
+            }),
+        ),
+    ];
+    for (staleness, expected_pin) in cases {
+        let selectors = bound_query_transaction_selectors(staleness);
+        assert_eq!(
+            selectors.len(),
+            2,
+            "two bound rows must produce two statements ({staleness})"
+        );
+
+        // The first statement begins the multi-use transaction, carrying the *pinned* bound.
+        let first = selectors[0]
+            .as_ref()
+            .and_then(|s| s.selector.as_ref())
+            .expect("the first statement must carry a transaction selector");
+        let v1::transaction_selector::Selector::Begin(options) = first else {
+            panic!("the first bound-row statement must begin the transaction, got: {first:?}");
+        };
+        assert_eq!(
+            read_only_bound(options),
+            expected_pin,
+            "{staleness} must be pinned to its most-stale legal multi-use equivalent"
+        );
+
+        // The second statement reuses that transaction by id — one shared snapshot for all rows.
+        let second = selectors[1]
+            .as_ref()
+            .and_then(|s| s.selector.as_ref())
+            .expect("the second statement must carry a transaction selector");
+        assert_eq!(
+            second,
+            &v1::transaction_selector::Selector::Id(b"bound-txn".to_vec()),
+            "later bound-row statements must reuse the begun transaction ({staleness})"
+        );
+    }
+}
+
+/// TEST-2 (wire): `spanner.directed_read` must land on `ExecuteSqlRequest.directed_read_options`
+/// for read-only queries, and must NOT ride along on DML — Spanner rejects directed reads on a
+/// read/write transaction with `INVALID_ARGUMENT`, so a regression here breaks every write while
+/// the option is set. Plain DML goes out as `ExecuteBatchDml`, whose request proto has no
+/// directed-read field at all (asserted via the RPC choice below); the DML shape that *could*
+/// regress is `THEN RETURN`, which shares `ExecuteSqlRequest` with the query path inside a
+/// read/write transaction — that is the negative asserted on the wire. Also pins the option's two
+/// levels: the plain query *inherits* the connection-level value, the second query *overrides* it
+/// on the statement.
+#[test]
+fn directed_read_reaches_the_wire_on_queries_but_never_on_dml() {
+    use v1::directed_read_options as dro;
+
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "directed_read_reaches_the_wire_on_queries_but_never_on_dml",
+    );
+
+    const QUERY_SQL: &str = "SELECT c FROM MockTable";
+    const OVERRIDE_QUERY_SQL: &str = "SELECT c FROM OtherMockTable";
+    const INSERT_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
+    const RETURNING_SQL: &str = "INSERT INTO MockTable (c) VALUES ('y') THEN RETURN c";
+
+    /// `(sql, directed_read_options)` of one `ExecuteStreamingSql` request the server saw.
+    type SeenExecuteSql = (String, Option<v1::DirectedReadOptions>);
+    let streaming: Arc<Mutex<Vec<SeenExecuteSql>>> = Arc::new(Mutex::new(Vec::new()));
+    // Every ExecuteBatchDml request (the plain-DML path).
+    let batch_dml: Arc<Mutex<Vec<v1::ExecuteBatchDmlRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let record_streaming = streaming.clone();
+    let record_batch_dml = batch_dml.clone();
+    let server = MockServer::start(move |mock| {
+        // In case the client begins the read/write transaction explicitly rather than inline.
+        serve_begin_transaction(mock);
+        mock.expect_execute_streaming_sql()
+            .returning(move |request| {
+                let request = request.into_inner();
+                let inline_begin = matches!(
+                    request
+                        .transaction
+                        .as_ref()
+                        .and_then(|t| t.selector.as_ref()),
+                    Some(v1::transaction_selector::Selector::Begin(_))
+                );
+                record_streaming
+                    .lock()
+                    .unwrap()
+                    .push((request.sql.clone(), request.directed_read_options));
+                let mut first = partial_result_set(true, &["v"], b"dr-1", true);
+                if inline_begin {
+                    first
+                        .metadata
+                        .as_mut()
+                        .expect("first message carries metadata")
+                        .transaction = Some(v1::Transaction {
+                        id: b"dml-txn".to_vec(),
+                        ..Default::default()
+                    });
+                }
+                Ok(stream_of(vec![Ok(first)]))
+            });
+        mock.expect_execute_batch_dml().returning(move |request| {
+            let request = request.into_inner();
+            let inline_begin = matches!(
+                request
+                    .transaction
+                    .as_ref()
+                    .and_then(|t| t.selector.as_ref()),
+                Some(v1::transaction_selector::Selector::Begin(_))
+            );
+            record_batch_dml.lock().unwrap().push(request);
+            let metadata = v1::ResultSetMetadata {
+                transaction: inline_begin.then(|| v1::Transaction {
+                    id: b"dml-txn".to_vec(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
+                result_sets: vec![v1::ResultSet {
+                    metadata: Some(metadata),
+                    stats: Some(v1::ResultSetStats {
+                        row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                status: Some(spanner_grpc_mock::google::rpc::Status {
+                    code: 0,
+                    message: "OK".into(),
+                    details: vec![],
+                }),
+                ..Default::default()
+            }))
+        });
+        mock.expect_commit().returning(|_| commit_ok());
+    });
+
+    let mut connection = server.connect();
+    // Connection-level value; statements inherit it at creation (and may override it).
+    connection
+        .set_option(
+            OptionConnection::Other(adbc_spanner::OPTION_DIRECTED_READ.into()),
+            OptionValue::String("include:us-east1:read_only".into()),
+        )
+        .expect("set connection-level directed read");
+
+    // 1. A plain query, inheriting the connection-level directed read.
+    let mut query = connection.new_statement().expect("new statement");
+    query.set_sql_query(QUERY_SQL).unwrap();
+    query
+        .execute()
+        .expect("query against mock server")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect batches");
+
+    // 2. A query whose statement overrides the connection-level value.
+    let mut override_query = connection.new_statement().expect("new statement");
+    override_query
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_DIRECTED_READ.into()),
+            OptionValue::String("exclude:eu-west1".into()),
+        )
+        .expect("set statement-level directed read");
+    override_query.set_sql_query(OVERRIDE_QUERY_SQL).unwrap();
+    override_query
+        .execute()
+        .expect("override query against mock server")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect batches");
+
+    // 3. Plain DML: rides ExecuteBatchDml inside a read/write transaction.
+    let mut insert = connection.new_statement().expect("new statement");
+    insert.set_sql_query(INSERT_SQL).unwrap();
+    assert_eq!(
+        insert.execute_update().expect("autocommit insert"),
+        Some(1),
+        "the scripted batch-DML row count must surface"
+    );
+
+    // 4. THEN RETURN DML: rides ExecuteSql inside a read/write transaction — the request shape
+    //    that could regress into carrying directed reads.
+    let mut returning = connection.new_statement().expect("new statement");
+    returning.set_sql_query(RETURNING_SQL).unwrap();
+    assert_eq!(
+        returning.execute_update().expect("THEN RETURN insert"),
+        Some(1),
+        "the drained THEN RETURN row count must surface"
+    );
+
+    let streaming = streaming.lock().unwrap();
+    let directed_for = |sql: &str| -> Option<v1::DirectedReadOptions> {
+        streaming
+            .iter()
+            .find(|(seen, _)| seen == sql)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no ExecuteSql request seen for {sql:?}; saw: {:?}",
+                    streaming.iter().map(|(seen, _)| seen).collect::<Vec<_>>()
+                )
+            })
+            .1
+            .clone()
+    };
+
+    // The plain query carries the connection's include list, replica type resolved to READ_ONLY.
+    assert_eq!(
+        directed_for(QUERY_SQL),
+        Some(v1::DirectedReadOptions {
+            replicas: Some(dro::Replicas::IncludeReplicas(dro::IncludeReplicas {
+                replica_selections: vec![dro::ReplicaSelection {
+                    location: "us-east1".to_string(),
+                    r#type: dro::replica_selection::Type::ReadOnly as i32,
+                }],
+                auto_failover_disabled: false,
+            })),
+        }),
+        "the connection-level include list must land on ExecuteSqlRequest.directed_read_options"
+    );
+
+    // The second query carries the statement's override (an exclude list), not the inherited one.
+    assert_eq!(
+        directed_for(OVERRIDE_QUERY_SQL),
+        Some(v1::DirectedReadOptions {
+            replicas: Some(dro::Replicas::ExcludeReplicas(dro::ExcludeReplicas {
+                replica_selections: vec![dro::ReplicaSelection {
+                    location: "eu-west1".to_string(),
+                    r#type: dro::replica_selection::Type::Unspecified as i32,
+                }],
+            })),
+        }),
+        "a statement-level value must override the inherited connection-level one on the wire"
+    );
+
+    // The negative: THEN RETURN DML shares ExecuteSqlRequest with the query path but must carry
+    // no directed-read options — Spanner rejects them on a read/write transaction.
+    assert_eq!(
+        directed_for(RETURNING_SQL),
+        None,
+        "DML must never carry directed-read options, even with the connection option set"
+    );
+
+    // Plain DML went out as ExecuteBatchDml (whose request proto cannot carry directed reads).
+    let batch_dml = batch_dml.lock().unwrap();
+    assert_eq!(
+        batch_dml.len(),
+        1,
+        "the plain INSERT must ride a single ExecuteBatchDml"
+    );
+    assert_eq!(batch_dml[0].statements.len(), 1);
+    assert_eq!(batch_dml[0].statements[0].sql, INSERT_SQL);
+}
