@@ -125,16 +125,19 @@ EXCLUDED=(
   # These cases issue hardcoded CREATE TABLE with no primary key, double-quoted
   # identifiers, and INT/TEXT/FLOAT types — not valid Spanner DDL (which needs
   # INT64/FLOAT64, a PRIMARY KEY, backtick quoting) and there is no quirks hook.
+  #
+  # SqlQueryFloats / SqlSchemaFloats are NOT here: their only Spanner-incompatible
+  # bit was the bare `CAST(1.5 AS FLOAT)` query, and the SpannerQuirks::RewriteSql
+  # override (apache/arrow-adbc#4496) rewrites it to GoogleSQL `FLOAT64`, so both
+  # now pass and are gate-enforced.
   'SpannerStatementTest.SqlBind'
   'SpannerStatementTest.SqlPrepareSelectParams'
   'SpannerStatementTest.SqlPrepareUpdate'
   'SpannerStatementTest.SqlPrepareUpdateStream'
   'SpannerStatementTest.SqlQueryEmpty'
-  'SpannerStatementTest.SqlQueryFloats'
   'SpannerStatementTest.SqlQueryInsertRollback'
   'SpannerStatementTest.SqlQueryRowsAffectedDelete'
   'SpannerStatementTest.SqlQueryRowsAffectedDeleteStream'
-  'SpannerStatementTest.SqlSchemaFloats'
   # Transactions is NOT excluded: Spanner has no transactional DDL (DDL auto-commits
   # via the admin API and cannot be rolled back), so the case can never apply. The
   # `ddl_implicit_commit_txn` quirk makes it self-skip, which the gate tolerates —

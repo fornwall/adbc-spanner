@@ -49,17 +49,21 @@ endif()
 
 # Pin to an apache/arrow-adbc `main` revision, matching the family of the
 # adbc_core / adbc_ffi git pin the driver builds on (see Cargo.toml). Tracking
-# `main` (rather than the 0.23 release tag) picks up the C++ validation fix in
+# `main` (rather than the 0.23 release tag) picks up two C++ validation fixes:
 # apache/arrow-adbc#4493 — TestSqlPartitionedInts now allows >1 partition, so
-# SpannerStatementTest.SqlPartitionedInts is gate-enforced instead of excluded.
-# Bump the SHA to advance the suite.
+# SpannerStatementTest.SqlPartitionedInts is gate-enforced instead of excluded —
+# and apache/arrow-adbc#4496, which adds the general
+# `DriverQuirks::RewriteSql(query_id, default_sql)` hook. The Spanner quirks
+# override it (spanner_validation.cc) to rewrite the `CAST(1.5 AS FLOAT)` in
+# TestSqlQueryFloats / TestSqlSchemaFloats to GoogleSQL `FLOAT64`, so both cases
+# are gate-enforced instead of excluded. Bump the SHA to advance the suite.
 #
 # FORCE so this pin always wins over a value cached in a restored/incremental
 # build tree: a plain `set(... CACHE STRING)` is a no-op when the entry already
 # exists, so a stale `CMakeCache.txt` (e.g. one restored from a run on the old
 # rev) would silently keep the previous tag and rebuild against the wrong
 # arrow-adbc source. FORCE makes a rev bump here authoritative.
-set(ARROW_ADBC_TAG "f9886ddca13a2ea2f044a453216b3973b66cd98f"
+set(ARROW_ADBC_TAG "138861516b5818ca0ab638678932418c652fa2f6"
     CACHE STRING "arrow-adbc main revision" FORCE)
 
 include(FetchContent)

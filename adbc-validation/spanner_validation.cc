@@ -127,6 +127,26 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
     return "@p" + std::to_string(index);
   }
 
+  // GoogleSQL has no bare `FLOAT` type. The suite's float cases default to
+  // `SELECT CAST(1.5 AS FLOAT)`, which Spanner rejects; rewrite them to the
+  // GoogleSQL 64-bit floating-point type `FLOAT64` (the generic per-query
+  // override hook from apache/arrow-adbc#4496) so both cases run and pass.
+  std::string RewriteSql(std::string_view query_id,
+                         std::string default_sql) const override {
+    if (query_id == "StatementTest::TestSqlQueryFloats::cast-1.5-as-float" ||
+        query_id == "StatementTest::TestSqlSchemaFloats::cast-1.5-as-float") {
+      // Pin the upstream default so a future ARROW_ADBC_TAG bump that changes the
+      // query out from under us fails the test loudly, rather than silently
+      // rewriting a query that may no longer be the `CAST(1.5 AS FLOAT)` this
+      // FLOAT64 substitution assumes.
+      EXPECT_EQ(default_sql, "SELECT CAST(1.5 AS FLOAT)")
+          << "upstream default SQL for " << query_id
+          << " changed; revisit the FLOAT64 rewrite";
+      return "SELECT CAST(1.5 AS FLOAT64)";
+    }
+    return default_sql;
+  }
+
   // The driver supports all four ingest modes; for the create modes it builds
   // the table from the ingest data's Arrow schema with a synthetic
   // `adbc_ingest_key` UUID primary key (Spanner mandates a primary key).
