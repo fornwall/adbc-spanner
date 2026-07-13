@@ -593,11 +593,9 @@ fn query_and_dml_round_trip() {
             .unwrap();
         assert_eq!(s.execute_update().expect("buffered insert"), None);
     }
-    assert_eq!(
-        count_rows(&mut connection, "AdbcTxn"),
-        0,
-        "buffered rows must not be visible before commit"
-    );
+    // A query while writes are buffered is rejected up front (no read-your-writes) instead of
+    // silently returning the pre-insert snapshot.
+    assert_query_guarded(&mut connection, "AdbcTxn");
 
     // Commit applies the whole batch atomically.
     connection.commit().expect("commit");
@@ -642,11 +640,8 @@ fn query_and_dml_round_trip() {
 
     // Buffered, then committed: the bound row appears only after commit.
     buffer_param_insert(&mut connection, 3);
-    assert_eq!(
-        count_rows(&mut connection, "AdbcTxn"),
-        2,
-        "buffered parameterized row must not be visible before commit"
-    );
+    // A query while the parameterized insert is buffered is likewise guarded.
+    assert_query_guarded(&mut connection, "AdbcTxn");
     connection.commit().expect("commit param");
     assert_eq!(
         count_rows(&mut connection, "AdbcTxn"),
@@ -670,11 +665,9 @@ fn query_and_dml_round_trip() {
         .set_sql_query("INSERT INTO AdbcTxn (Id) VALUES (5)")
         .unwrap();
     assert_eq!(pending.execute_update().expect("buffered insert"), None);
-    assert_eq!(
-        count_rows(&mut connection, "AdbcTxn"),
-        3,
-        "the buffered row must not be visible before the autocommit toggle"
-    );
+    // The buffered row is not queryable before the toggle (guarded), and toggling autocommit back
+    // on commits it.
+    assert_query_guarded(&mut connection, "AdbcTxn");
     connection
         .set_option(
             OptionConnection::AutoCommit,
@@ -735,11 +728,11 @@ fn query_and_dml_round_trip() {
         connection.commit().is_err(),
         "committing a batch with an unknown table must fail"
     );
-    assert_eq!(
-        count_rows(&mut connection, "AdbcTxn"),
-        5,
-        "a failed commit must apply nothing (the batch is atomic)"
-    );
+    // A failed commit keeps the batch buffered, so a query is still guarded here (the buffer is
+    // non-empty). That the batch applied *nothing* — atomicity — is checked below: the clean
+    // re-commit of `VALUES (7)` after the rollback succeeds without a duplicate-key error, which it
+    // could not if the failed batch had partially applied its own `VALUES (7)`.
+    assert_query_guarded(&mut connection, "AdbcTxn");
     assert!(
         connection.commit().is_err(),
         "a retried failed commit must replay the buffer and fail again — not report success \
@@ -815,11 +808,8 @@ fn query_and_dml_round_trip() {
     };
     buffer_ingest(&mut connection, &[100, 101]);
     buffer_sql(&mut connection, "INSERT INTO AdbcTxn (Id) VALUES (102)");
-    assert_eq!(
-        count_rows(&mut connection, "AdbcTxn"),
-        6,
-        "buffered ingest mutations must not be visible before commit"
-    );
+    // Buffered ingest mutations count as pending writes too, so a query is guarded here.
+    assert_query_guarded(&mut connection, "AdbcTxn");
     connection.commit().expect("commit ingest + DML");
     assert_eq!(
         count_rows(&mut connection, "AdbcTxn"),
@@ -4052,11 +4042,21 @@ fn conformance_via_driver_manager() {
     s.set_sql_query("INSERT INTO AdbcConf (Id, Name) VALUES (2, 'b')")
         .unwrap();
     assert_eq!(s.execute_update().expect("buffered insert"), None);
-    assert_eq!(
-        ffi_count(&mut connection, "AdbcConf"),
-        1,
-        "not visible pre-commit"
-    );
+    // A query while writes are buffered is rejected up front (no read-your-writes), even through
+    // the FFI/driver-manager path — the InvalidState status maps back across the C ABI.
+    {
+        let mut q = connection.new_statement().expect("new statement");
+        q.set_sql_query("SELECT COUNT(*) AS n FROM AdbcConf")
+            .unwrap();
+        let Err(error) = q.execute() else {
+            panic!("a query with buffered writes must be rejected through FFI");
+        };
+        assert_eq!(
+            error.status,
+            Status::InvalidState,
+            "FFI query with buffered writes must fail with InvalidState"
+        );
+    }
     connection.commit().expect("commit");
     assert_eq!(
         ffi_count(&mut connection, "AdbcConf"),
@@ -5170,6 +5170,23 @@ fn count_rows(connection: &mut SpannerConnection, table: &str) -> i64 {
         .downcast_ref::<Int64Array>()
         .unwrap()
         .value(0)
+}
+
+/// Assert that a data-returning query on `table` is rejected up front with `InvalidState` — the
+/// manual-transaction read-your-writes guard, which fires when writes are buffered and a query
+/// would otherwise silently miss them (no read-your-writes).
+fn assert_query_guarded(connection: &mut SpannerConnection, table: &str) {
+    let mut q = connection.new_statement().expect("new statement");
+    q.set_sql_query(format!("SELECT COUNT(*) AS n FROM {table}"))
+        .unwrap();
+    let Err(error) = q.execute() else {
+        panic!("a query with buffered writes must be rejected, not silently run");
+    };
+    assert_eq!(
+        error.status,
+        Status::InvalidState,
+        "querying with buffered writes must fail with InvalidState (no read-your-writes)"
+    );
 }
 
 /// Extract (table, column, key, value) tuples from a get_statistics result batch.

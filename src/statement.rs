@@ -1171,6 +1171,29 @@ impl SpannerStatement {
         }
         Ok(())
     }
+
+    /// Guard the data-returning read paths against the manual-transaction "no read-your-writes"
+    /// hazard.
+    ///
+    /// In manual mode the driver *buffers* DML statements and bulk-ingest mutations and applies
+    /// them atomically at `commit`; a query, however, runs immediately against a fresh read-only
+    /// snapshot that does not observe those buffered writes. Rather than silently returning a
+    /// pre-write result (e.g. an `INSERT` followed by `SELECT COUNT(*)` reporting the *old* count),
+    /// reject the query up front. The guard fires only when the connection is in manual mode **and**
+    /// at least one write (DML *or* ingest mutation) is buffered — an empty buffer, and every query
+    /// in autocommit mode, is unaffected. DDL and `execute_update` are not guarded (they simply
+    /// buffer more work), and `execute_schema` (a `QueryMode::Plan` probe returning no data) has no
+    /// data-visibility concern, so it is left working.
+    fn ensure_no_buffered_writes_for_query(&self) -> Result<()> {
+        if self.txn.lock().unwrap().query_would_miss_buffered_writes() {
+            return Err(invalid_state(
+                "cannot run a query while DML is buffered in a manual transaction: Spanner buffers \
+                 DML until commit, so the query would not observe the pending writes (no \
+                 read-your-writes). Commit or roll back the transaction first.",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Optionable for SpannerStatement {
@@ -1396,6 +1419,10 @@ impl Statement for SpannerStatement {
         // DDL and DML paths above go through `split_statements`, which already drops empty trailing
         // segments, so this stripping is scoped to the query path and never splits a `;`-batch.
         let sql = crate::sql::strip_trailing_terminators(&sql);
+        // Reject a data-returning query (plain or the parameterized bound-query path below) issued
+        // while writes are buffered in a manual transaction — it would run against a snapshot that
+        // does not observe them (no read-your-writes).
+        self.ensure_no_buffered_writes_for_query()?;
         // Parameterized query: run once per bound row.
         if !self.bound.is_empty() {
             let reader = self.execute_bound_query(&sql)?;
@@ -1556,6 +1583,10 @@ impl Statement for SpannerStatement {
         // does — both the PLAN probe and `partition_query` run through the same ExecuteSql surface,
         // which rejects a trailing `;`, yet callers routinely append one.
         let sql = crate::sql::strip_trailing_terminators(&sql);
+        // Partitioning a read has the same read-your-writes hazard as `execute`: reject it while
+        // writes are buffered in a manual transaction (the partitions would read a pre-write
+        // snapshot).
+        self.ensure_no_buffered_writes_for_query()?;
         // Probe the schema and create the partitions. The partition query runs inside a batch
         // read-only transaction; each returned partition carries its session, transaction id and
         // partition token and is independently serializable, so it maps directly onto ADBC's opaque

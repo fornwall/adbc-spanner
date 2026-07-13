@@ -19,10 +19,13 @@
 //! - DML with a `THEN RETURN` clause is rejected in manual mode: it must run via `ExecuteSql` to
 //!   produce its rows, but buffered DML is applied through `ExecuteBatchDml` (which does not
 //!   support `THEN RETURN`) — and the rows would be unobtainable at commit time anyway.
-//! - **No read-your-writes:** queries (`execute`) always run immediately in a fresh single-use
-//!   read-only snapshot, so a query does not observe DML buffered earlier in the same manual
-//!   transaction — an `INSERT` followed by a `SELECT COUNT(*)` returns the *pre-insert* count.
-//!   Commit first if a statement needs to see earlier writes.
+//! - **No read-your-writes (guarded):** queries always run immediately in a fresh single-use
+//!   read-only snapshot, so a query cannot observe DML buffered earlier in the same manual
+//!   transaction. Rather than silently returning a *pre-insert* result, a data-returning query
+//!   (`execute`, the bound-query path, and `execute_partitions`) issued while any write — a
+//!   buffered DML statement *or* an ingest mutation — is pending is rejected with
+//!   [`Status::InvalidState`]. Commit or roll back first if a statement needs to see earlier
+//!   writes. (`execute_schema`, a schema-only PLAN probe, is not guarded.)
 //! - **DML and DDL reorder:** DDL also runs immediately (DDL is never transactional in Spanner),
 //!   so DDL issued after buffered DML executes before it.
 //! - **Ingest mutations apply at commit time:** a buffered bulk ingest's insert mutations are
@@ -99,6 +102,16 @@ impl TxnState {
     /// Whether the connection is currently in autocommit mode.
     pub(crate) fn autocommit(&self) -> bool {
         self.autocommit
+    }
+
+    /// Whether a data-returning query would silently miss buffered writes: the connection is in
+    /// **manual** mode *and* at least one write is buffered (a DML statement *or* an ingest
+    /// mutation). Manual-mode queries run against a fresh read-only snapshot that does not observe
+    /// buffered writes, so this is the condition under which the driver rejects a query up front
+    /// (see [`SpannerStatement::ensure_no_buffered_writes_for_query`]) rather than returning a
+    /// pre-write result (no read-your-writes).
+    pub(crate) fn query_would_miss_buffered_writes(&self) -> bool {
+        !self.autocommit && (!self.pending.is_empty() || !self.pending_mutations.is_empty())
     }
 
     /// Buffer a DML statement to be applied on the next commit.
@@ -212,10 +225,11 @@ pub(crate) type SharedTxn = Arc<Mutex<TxnState>>;
 /// client exposes read/write transactions only through a closure-based runner (no begin/commit
 /// handle). Two consequences callers must be aware of:
 ///
-/// - **No read-your-writes:** queries always run immediately in a fresh read-only snapshot, so a
-///   query does not observe DML buffered earlier in the same manual transaction — an `INSERT`
-///   followed by a `SELECT COUNT(*)` returns the *pre-insert* count. Commit first if a statement
-///   needs to see earlier writes.
+/// - **No read-your-writes (guarded):** queries always run immediately in a fresh read-only
+///   snapshot, so a query cannot observe DML buffered earlier in the same manual transaction.
+///   Rather than silently returning a *pre-insert* result, a data-returning query issued while any
+///   write (a buffered DML statement or an ingest mutation) is pending is rejected with
+///   [`Status::InvalidState`]. Commit or roll back first if a statement needs to see earlier writes.
 /// - **DML and DDL reorder:** DDL also runs immediately (DDL is never transactional in Spanner),
 ///   so DDL issued after buffered DML executes before it.
 #[derive(Debug)]

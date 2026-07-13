@@ -84,13 +84,21 @@ Key design points:
   batch atomically in one read/write transaction on `commit` (`rollback` discards it). The client
   exposes no manual begin/commit handle, so buffer-and-replay is what makes manual transactions both
   possible and retry-safe. In manual mode `execute_update` returns `None` (count unknown until
-  commit); queries and DDL still run immediately — so a manual transaction has **no
-  read-your-writes** (`INSERT` → `SELECT COUNT(*)` returns the pre-insert count) and **DML/DDL
-  reorder** (DDL issued after buffered DML executes before it). Both consequences are documented
-  user-facing (README.md Transactions bullet, python/README.md "Manual transactions" section with a
-  CI-executed example, `SpannerConnection` rustdoc + lib.rs crate docs); rejecting/warning on
-  queries while DML is buffered was deliberately not done, and the proper fix waits on the client
-  exposing begin/commit handles. The standard
+  commit); queries and DDL still run immediately (against a fresh read-only snapshot), so a manual
+  transaction has **no read-your-writes**. Because a query cannot observe buffered writes, a
+  data-returning read issued while any write is buffered is **rejected** rather than silently
+  returning a pre-insert result: `SpannerStatement::ensure_no_buffered_writes_for_query` (backed by
+  `TxnState::query_would_miss_buffered_writes` — manual mode AND a non-empty `pending` **or**
+  `pending_mutations`) returns `InvalidState` at the start of the guarded read paths (`execute`'s
+  query path, the bound-query path, and `execute_partitions`); `execute_schema` (a schema-only
+  `QueryMode::Plan` probe) and `execute_update`/DDL are deliberately **not** guarded. The other
+  caveat, **DML/DDL reorder** (DDL issued after buffered DML executes before it), still stands. Both
+  are documented user-facing (README.md Transactions bullet, python/README.md "Transactions" section
+  with a CI-executed example that now asserts the guard raises `ProgrammingError`,
+  `SpannerConnection` rustdoc + lib.rs crate docs). Guarding queries while DML is buffered is exactly
+  what the driver now does (an earlier version silently returned the stale snapshot); the deeper fix
+  — genuine read-your-writes inside a manual transaction — still waits on the client exposing
+  begin/commit handles. The standard
   `adbc.connection.transaction.isolation_level` option is honoured for read/write transactions:
   `serializable` and `repeatable_read` map to the client's `IsolationLevel` (applied via
   `TransactionRunnerBuilder::set_isolation_level`), `default` leaves the database default, and the
