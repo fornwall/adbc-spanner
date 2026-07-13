@@ -443,6 +443,15 @@ mod tests {
         }
     }
 
+    /// A duration too large for `std::time::Duration` must be `InvalidArguments`, not a panic:
+    /// the shared `parse_duration` conversion runs *before* the 500ms cap check, so the cap alone
+    /// cannot catch it.
+    #[test]
+    fn rejects_oversized_max_commit_delay_instead_of_panicking() {
+        let error = parse_max_commit_delay("1e30").unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+    }
+
     #[test]
     fn max_commit_delay_round_trips_and_unsets() {
         let mut config = RequestConfig::default();

@@ -5,8 +5,11 @@
 //! streaming Arrow [`RecordBatchReader`]: rows are pulled from Spanner and converted to Arrow in
 //! bounded chunks (see [`OPTION_ROWS_PER_BATCH`](crate::OPTION_ROWS_PER_BATCH)) as the consumer
 //! iterates, so a large result set is not fully materialised in memory. Calling
-//! [`Statement::execute_update`] runs it as DML inside a read/write transaction and returns the
-//! number of affected rows.
+//! [`Statement::execute_update`] runs DML inside a read/write transaction and returns the number
+//! of affected rows, and routes DDL to the admin API. SQL that is neither (a query — `adbc.h`
+//! sanctions executing any statement without expecting a result set) runs through the same
+//! read-only query machinery as `execute`, with the rows drained and discarded and no count
+//! (`None`) reported.
 //!
 //! DML with a `THEN RETURN` clause returns rows: through [`Statement::execute`] they come back as
 //! an Arrow result (running via `ExecuteSql` in a read/write transaction, since `ExecuteBatchDml`
@@ -423,13 +426,17 @@ impl SpannerStatement {
     /// statements so the whole batch is applied atomically. Shared by `execute` and `execute_update`.
     fn build_dml_statements(&self, sql: &str) -> Result<Vec<SpannerSql>> {
         if !self.bound.is_empty() {
-            self.build_bound_statements(sql)
-        } else {
-            Ok(crate::sql::split_statements(sql)
-                .into_iter()
-                .map(|s| self.sql_builder(&s).build())
-                .collect())
+            return self.build_bound_statements(sql);
         }
+        let statements = crate::sql::split_statements(sql);
+        // The batch is applied via `ExecuteBatchDml`, which executes DML only — reject a batch
+        // mixing in a query or DDL up front (see `check_all_dml_batch`), crucially *before* any
+        // statement is buffered in a manual transaction.
+        check_all_dml_batch(&statements)?;
+        Ok(statements
+            .into_iter()
+            .map(|s| self.sql_builder(&s).build())
+            .collect())
     }
 
     /// Run a bulk ingest of the bound rows into `table`, honouring the configured ingest mode.
@@ -1092,6 +1099,74 @@ impl SpannerStatement {
         Ok(Box::new(reader))
     }
 
+    /// Execute `sql` as a **read-only query** and return its streaming reader — the shared query
+    /// tail of [`Statement::execute`] and the query-shaped arm of [`Statement::execute_update`],
+    /// so both entry points get identical read semantics (staleness, directed reads, query
+    /// optimizer options and timeouts included).
+    ///
+    /// Strips any trailing statement terminator(s) — Spanner's single-use query API rejects a
+    /// trailing `;` ("Expected end of input but got `;`"), yet clients and conformance suites
+    /// routinely append one (e.g. `SELECT current_date;;;`); the DDL and DML paths go through
+    /// `split_statements`, which already drops empty trailing segments, so the stripping is scoped
+    /// to the query path and never splits a `;`-batch. Applies the manual-transaction
+    /// read-your-writes guard ([`ensure_no_buffered_writes_for_query`](Self::ensure_no_buffered_writes_for_query)),
+    /// and dispatches to the bound-query path (consuming the bound rows) when parameter rows are
+    /// bound.
+    fn execute_query_reader(
+        &mut self,
+        sql: &str,
+    ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+        let sql = crate::sql::strip_trailing_terminators(sql);
+        // Reject a data-returning query (plain or the parameterized bound-query path below) issued
+        // while writes are buffered in a manual transaction — it would run against a snapshot that
+        // does not observe them (no read-your-writes).
+        self.ensure_no_buffered_writes_for_query()?;
+        // Parameterized query: run once per bound row.
+        if !self.bound.is_empty() {
+            let reader = self.execute_bound_query(&sql)?;
+            self.bound.clear();
+            return Ok(reader);
+        }
+        let client = self.client.clone();
+        let runtime = self.runtime.clone();
+        let cancel = self.cancel.current();
+        let batch_size = self.rows_per_batch;
+        let precision = self.timestamp_precision;
+        let bound = self.read_staleness.timestamp_bound()?;
+        let statement = self.read_sql_builder(&sql).build();
+        let fetch_timeout = self.timeouts.fetch_timeout();
+        // Stream the result: `stream_query` fetches the first chunk (settling the schema) and the
+        // returned reader converts the rest to Arrow one bounded chunk at a time as it is
+        // iterated, with a background task prefetching the next chunk ahead of the consumer.
+        // The query timeout bounds the initial execution through that first chunk; the fetch
+        // timeout bounds each later chunk inside the prefetch task.
+        let reader = block_on_cancellable(
+            &self.runtime,
+            &self.cancel.current(),
+            with_timeout(
+                self.timeouts.query_timeout(),
+                crate::OPTION_RPC_TIMEOUT_QUERY,
+                async move {
+                    let transaction = crate::staleness::single_use(&client, bound);
+                    let result_set = transaction
+                        .execute_query(statement)
+                        .await
+                        .map_err(from_spanner)?;
+                    stream_query(
+                        runtime,
+                        cancel,
+                        result_set,
+                        batch_size,
+                        precision,
+                        fetch_timeout,
+                    )
+                    .await
+                },
+            ),
+        )?;
+        Ok(Box::new(reader))
+    }
+
     /// Apply one or more DDL statements as a single Spanner `UpdateDatabaseDdl` schema change.
     ///
     /// Batching all statements into one call makes a multi-step change (for example dbt's
@@ -1184,9 +1259,11 @@ impl SpannerStatement {
     /// pre-write result (e.g. an `INSERT` followed by `SELECT COUNT(*)` reporting the *old* count),
     /// reject the query up front. The guard fires only when the connection is in manual mode **and**
     /// at least one write (DML *or* ingest mutation) is buffered — an empty buffer, and every query
-    /// in autocommit mode, is unaffected. DDL and `execute_update` are not guarded (they simply
-    /// buffer more work), and `execute_schema` (a `QueryMode::Plan` probe returning no data) has no
-    /// data-visibility concern, so it is left working.
+    /// in autocommit mode, is unaffected. DDL and `execute_update`'s DML arm are not guarded (they
+    /// simply buffer more work) — but a *query* routed through `execute_update` is, exactly like
+    /// `execute` (both run through [`execute_query_reader`](Self::execute_query_reader)) — and
+    /// `execute_schema` (a `QueryMode::Plan` probe returning no data) has no data-visibility
+    /// concern, so it is left working.
     fn ensure_no_buffered_writes_for_query(&self) -> Result<()> {
         if self.txn.lock().unwrap().query_would_miss_buffered_writes() {
             return Err(invalid_state(
@@ -1418,60 +1495,9 @@ impl Statement for SpannerStatement {
                 DmlOutcome::Plain(_) => Ok(Self::empty_reader()),
             };
         }
-        // Query path (SELECT / WITH / …). Strip any trailing statement terminator(s): Spanner's
-        // single-use query API rejects a trailing `;` ("Expected end of input but got `;`"), yet
-        // clients and conformance suites routinely append one (e.g. `SELECT current_date;;;`). The
-        // DDL and DML paths above go through `split_statements`, which already drops empty trailing
-        // segments, so this stripping is scoped to the query path and never splits a `;`-batch.
-        let sql = crate::sql::strip_trailing_terminators(&sql);
-        // Reject a data-returning query (plain or the parameterized bound-query path below) issued
-        // while writes are buffered in a manual transaction — it would run against a snapshot that
-        // does not observe them (no read-your-writes).
-        self.ensure_no_buffered_writes_for_query()?;
-        // Parameterized query: run once per bound row.
-        if !self.bound.is_empty() {
-            let reader = self.execute_bound_query(&sql)?;
-            self.bound.clear();
-            return Ok(reader);
-        }
-        let client = self.client.clone();
-        let runtime = self.runtime.clone();
-        let cancel = self.cancel.current();
-        let batch_size = self.rows_per_batch;
-        let precision = self.timestamp_precision;
-        let bound = self.read_staleness.timestamp_bound()?;
-        let statement = self.read_sql_builder(&sql).build();
-        let fetch_timeout = self.timeouts.fetch_timeout();
-        // Stream the result: `stream_query` fetches the first chunk (settling the schema) and the
-        // returned reader converts the rest to Arrow one bounded chunk at a time as it is
-        // iterated, with a background task prefetching the next chunk ahead of the consumer.
-        // The query timeout bounds the initial execution through that first chunk; the fetch
-        // timeout bounds each later chunk inside the prefetch task.
-        let reader = block_on_cancellable(
-            &self.runtime,
-            &self.cancel.current(),
-            with_timeout(
-                self.timeouts.query_timeout(),
-                crate::OPTION_RPC_TIMEOUT_QUERY,
-                async move {
-                    let transaction = crate::staleness::single_use(&client, bound);
-                    let result_set = transaction
-                        .execute_query(statement)
-                        .await
-                        .map_err(from_spanner)?;
-                    stream_query(
-                        runtime,
-                        cancel,
-                        result_set,
-                        batch_size,
-                        precision,
-                        fetch_timeout,
-                    )
-                    .await
-                },
-            ),
-        )?;
-        Ok(Box::new(reader))
+        // Query path (SELECT / WITH / …): the shared read-only query machinery (which also backs
+        // `execute_update`'s query-shaped arm).
+        self.execute_query_reader(&sql)
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
@@ -1497,6 +1523,24 @@ impl Statement for SpannerStatement {
             self.bound.clear();
             // DDL does not report an affected-row count (and is never transactional in Spanner, so
             // it always runs immediately rather than buffering).
+            return Ok(None);
+        }
+        // Neither DDL nor DML (SELECT / WITH / GRAPH / …): a query. `adbc.h` sanctions executing
+        // any statement without expecting a result set (`ExecuteQuery`'s out-stream may be NULL —
+        // "Pass NULL if the client does not expect a result set"), and such a call lands here, so
+        // run the query through the same read-only machinery as `execute` — including the
+        // manual-transaction read-your-writes guard and every read-side option — then drain and
+        // discard the rows: this entry point only reports a count, and a read query has none.
+        // Routing it into the DML pipeline instead surfaced a raw, misleading `ExecuteBatchDml`
+        // error in autocommit mode and, in manual mode, silently buffered the query as pending
+        // "DML", poisoning the eventual commit.
+        if !crate::sql::is_dml(&sql) {
+            // A multi-statement `;`-batch whose first statement is not DML is neither a query nor
+            // an all-DML batch — reject it up front with a clear message (the DML arm below gets
+            // the same check via `build_dml_statements`).
+            check_all_dml_batch(&crate::sql::split_statements(&sql))?;
+            let reader = self.execute_query_reader(&sql)?;
+            drain_discarding_rows(reader)?;
             return Ok(None);
         }
         if self.is_read_only() {
@@ -1749,6 +1793,53 @@ fn check_schema_query(sql: &str) -> Result<()> {
             "execute_schema only supports queries: DML (INSERT/UPDATE/DELETE) cannot be planned \
              in a read-only schema probe; run it via execute or execute_update instead",
         ));
+    }
+    Ok(())
+}
+
+/// Guard for `;`-separated **multi-statement** batches on the DML paths: `ExecuteBatchDml`
+/// executes DML only, so a batch mixing DML with queries or DDL can neither run atomically nor be
+/// split across Spanner's different execution surfaces. Reject it up front, naming the offending
+/// statement — crucially *before* anything is buffered in a manual transaction, where a poisoned
+/// buffer would otherwise fail the eventual commit of the whole batch (recoverable only by
+/// `rollback`). A single statement (or empty text) always passes: classifying a lone statement is
+/// the caller's concern. (All-DDL batches never reach this — the leading keyword routes them to
+/// `run_ddl` first.)
+fn check_all_dml_batch(statements: &[String]) -> Result<()> {
+    if statements.len() > 1
+        && let Some(other) = statements.iter().find(|s| !crate::sql::is_dml(s))
+    {
+        return Err(invalid_argument(format!(
+            "a `;`-separated statement batch must be all-DML (INSERT/UPDATE/DELETE), but it \
+             contains {other:?}: run queries and DDL as individual statements"
+        )));
+    }
+    Ok(())
+}
+
+/// Fully drain a query's streaming reader, discarding the rows. Backs `execute_update`'s
+/// query-shaped arm: the statement still executes (and any mid-stream failure still surfaces),
+/// but that entry point has no result stream to hand back. A failure is unwrapped back to the
+/// ADBC error the streaming layer wrapped into `ArrowError::ExternalError` (see `to_arrow_error`
+/// in `src/conversion.rs`), so the caller sees the same status/message `execute` would surface.
+fn drain_discarding_rows(reader: Box<dyn RecordBatchReader + Send + 'static>) -> Result<()> {
+    for batch in reader {
+        batch.map_err(|e| {
+            if let ArrowError::ExternalError(inner) = e {
+                match inner.downcast::<Error>() {
+                    Ok(adbc_error) => *adbc_error,
+                    Err(other) => err(
+                        format!("query failed while its discarded result set was drained: {other}"),
+                        Status::Internal,
+                    ),
+                }
+            } else {
+                err(
+                    format!("query failed while its discarded result set was drained: {e}"),
+                    Status::Internal,
+                )
+            }
+        })?;
     }
     Ok(())
 }
@@ -2167,6 +2258,40 @@ mod tests {
                 error.message
             );
         }
+    }
+
+    #[test]
+    fn all_dml_batch_guard_rejects_mixed_batches_and_passes_single_statements() {
+        let split = |sql: &str| crate::sql::split_statements(sql);
+        // Single statements always pass — classification of a lone statement is the caller's
+        // concern — as do genuine all-DML batches and empty text.
+        for sql in [
+            "SELECT 1",
+            "INSERT INTO t (id) VALUES (1)",
+            "DELETE FROM t WHERE true; INSERT INTO t (id) VALUES (1)",
+            "@{PDML_MAX_PARALLELISM=1} DELETE FROM t WHERE true; update t set c = 1 where true",
+            "",
+        ] {
+            check_all_dml_batch(&split(sql)).unwrap_or_else(|e| panic!("should pass: {sql}: {e}"));
+        }
+        // A multi-statement batch mixing DML with a query or DDL is rejected with
+        // InvalidArguments, naming the offending statement — whichever side comes first.
+        for (sql, offending) in [
+            ("DELETE FROM t WHERE true; SELECT 1", "SELECT 1"),
+            ("SELECT 1; DELETE FROM t WHERE true", "SELECT 1"),
+            ("DELETE FROM t WHERE true; DROP TABLE t", "DROP TABLE t"),
+            ("SELECT 1; SELECT 2", "SELECT 1"),
+        ] {
+            let error = check_all_dml_batch(&split(sql)).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "{sql}");
+            assert!(
+                error.message.contains("all-DML") && error.message.contains(offending),
+                "unexpected message for {sql}: {}",
+                error.message
+            );
+        }
+        // A `;` inside a literal is not a separator, so this is a single statement and passes.
+        check_all_dml_batch(&split("SELECT 'a;b'")).unwrap();
     }
 
     #[test]

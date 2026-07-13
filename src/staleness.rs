@@ -225,7 +225,9 @@ pub(crate) fn parse_duration(value: &str) -> Result<Duration> {
     if !seconds.is_finite() || seconds < 0.0 {
         return Err(bad());
     }
-    Ok(Duration::from_secs_f64(seconds))
+    // `try_from_secs_f64` rejects (rather than panics on) durations too large for `Duration`,
+    // e.g. "exact:1e20".
+    Duration::try_from_secs_f64(seconds).map_err(|_| bad())
 }
 
 /// Convert a UTC timestamp to [`SystemTime`] without relying on chrono's optional `SystemTime`
@@ -243,6 +245,7 @@ fn to_system_time(dt: DateTime<Utc>) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use adbc_core::error::Status;
 
     fn dt(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
@@ -305,6 +308,17 @@ mod tests {
             "min:12345",  // not a timestamp
         ] {
             assert!(parse_read_bound(bad).is_err(), "expected error for {bad:?}");
+        }
+    }
+
+    /// Durations too large for `std::time::Duration` (roughly above 1.8e19 seconds) must be
+    /// rejected with `InvalidArguments`, not panic in `Duration::from_secs_f64`. The unit suffix
+    /// multiplies before the conversion, so `1e19h` overflows even though `1e19` alone would not.
+    #[test]
+    fn rejects_oversized_duration_instead_of_panicking() {
+        for bad in ["exact:1e20", "max:1e20", "exact:1e19h"] {
+            let error = parse_read_bound(bad).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "{bad}");
         }
     }
 

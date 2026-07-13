@@ -25,13 +25,13 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 
 ## 1. Correctness & error handling
 
-- [ ] **COR-1 (High)** — Panic on oversized duration values in two user-facing options — `src/staleness.rs:228`, `src/request.rs:310`
+- [x] **COR-1 (High)** — Panic on oversized duration values in two user-facing options — `src/staleness.rs:228`, `src/request.rs:310`
   `parse_duration` calls `Duration::from_secs_f64(seconds)` without an upper-bound check; anything above ~1.8e19s **panics** (verified by repro). Reachable from plain option strings: `spanner.read.staleness = "exact:1e20"` (also `max:`, or `exact:1e19h` since the unit multiplies first) and `spanner.commit.max_delay = "1e30"` (the panic fires before the 500 ms cap check). A malformed option must be `InvalidArguments`; instead the panic crosses into the FFI exporter's poison latch and bricks the driver handle. Sibling modules (`timeout.rs:143`, `retry.rs`) already use `Duration::try_from_secs_f64`. **Fix:** `Duration::try_from_secs_f64(...).map_err(|_| bad())`.
 
 - [ ] **COR-2 (High)** — Manual-mode bulk ingest partially poisons the transaction buffer on a mid-row conversion failure — `src/statement.rs:567-574`
   The manual branch of `run_ingest_mutations` buffers row-by-row: `txn.buffer_mutation(bind::insert_mutation(...)?)`. `insert_mutation` can fail on a specific row (out-of-range Date32/Date64, out-of-range non-nanosecond timestamp), leaving rows `0..k` already in `TxnState::pending_mutations`. A later `commit` — or a re-ingest of fixed data then commit — silently applies duplicate/partial rows atomically with the rest of the transaction. Breaks the module's own "commit applies the user's whole transaction atomically" contract. **Fix:** build all mutations into a `Vec<Mutation>` first (or reuse `build_range_mutations` over the full range), buffer only after the whole batch converts. (Also resolves the lock-hold half of CON-4.)
 
-- [ ] **COR-3 (Medium)** — `execute_update` mis-routes non-DML SQL (SELECT/WITH); in manual mode it silently "succeeds" and poisons the eventual commit — `src/statement.rs:1472-1508`
+- [x] **COR-3 (Medium)** — `execute_update` mis-routes non-DML SQL (SELECT/WITH); in manual mode it silently "succeeds" and poisons the eventual commit — `src/statement.rs:1472-1508`
   `execute_update` never checks `is_dml` (unlike `execute` at `statement.rs:1397`): anything not DDL goes to the DML pipeline. Autocommit: a SELECT fails with a raw, misleading Spanner `ExecuteBatchDml` error. Manual mode: `execute_update("SELECT 1")` returns `Ok(None)` and buffers the SELECT as pending DML — subsequent queries are rejected by the read-your-writes guard, and `commit()` fails the whole batch; only `rollback` (discarding legitimate DML) recovers. Same for mixed `;`-batches (`"DELETE FROM t; SELECT 1"`). Spec angle: `adbc.h` allows `ExecuteQuery(out=NULL)` for *any* statement, so a hard error on SELECT is itself debatable (see UP-11). **Fix:** either run non-DDL/non-DML through the read-only query machinery and discard rows (returning `None`), or reject each non-DML split statement with `InvalidArguments` before buffering.
 
 - [ ] **COR-4 (Medium)** — Boolean options: set-as-int succeeds, get-as-int fails (round-trip lie) — `src/options.rs:20-31,70-75`
@@ -82,7 +82,7 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 
 (Verified against the pinned `arrow-adbc` checkout, rev `198f39a9…`. The big-ticket items — get_info/get_objects/statistics schemas, depth semantics, option contracts, ingest statuses, FFI export — all check out; see also UP-9..11.)
 
-- [ ] **SPEC-1 (Medium)** — covered by **COR-3** (execute_update vs `ExecuteQuery(out=NULL)` for result-producing statements). Tick there.
+- [x] **SPEC-1 (Medium)** — covered by **COR-3** (execute_update vs `ExecuteQuery(out=NULL)` for result-producing statements). Tick there.
 
 - [ ] **SPEC-2 (Low)** — `adbc.statement.exec.incremental` rejected even at its spec default — `src/statement.rs:1271-1276`
   Spec default is DISABLED; setting `"false"` should be an accept-default no-op (the `check_ingest_temporary` pattern at `statement.rs:1221-1226`), `"true"` → `NotImplemented`, and the getter should report `"false"` instead of `NotFound`. Generic clients that always write defaults currently break.
@@ -201,10 +201,10 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 
 ## 8. Testing
 
-- [ ] **TEST-1 (High)** — `spanner.read.staleness` has zero behavioral coverage — nothing verifies a non-strong `TransactionSelector` ever reaches the wire
+- [x] **TEST-1 (High)** — `spanner.read.staleness` has zero behavioral coverage — nothing verifies a non-strong `TransactionSelector` ever reaches the wire
   Parse/round-trip unit tests only; a regression dropping the `staleness::single_use` call at the query sites would pass all gating CI. **Fix:** mock-server tests capturing `ExecuteSqlRequest.transaction` for each of the four prefixes, plus a bound-query case asserting the multi-use begin pins `max:`/`min:` per `pinned_for_multi_use`. Optionally an emulator test with `exact:1ms`.
 
-- [ ] **TEST-2 (High)** — `spanner.directed_read` never asserted on the wire; the "read-only paths only" contract untested
+- [x] **TEST-2 (High)** — `spanner.directed_read` never asserted on the wire; the "read-only paths only" contract untested
   A regression applying it to DML would break *writes* whenever the option is set (Spanner rejects directed reads on r/w transactions). **Fix:** mock test asserting `ExecuteSqlRequest.directed_read_options` populated on a query and absent on DML.
 
 - [ ] **TEST-3 (Medium)** — Isolation-level promotion never verified to reach `TransactionOptions` — mock test asserting `isolation_level` on the begin of an autocommit DML.

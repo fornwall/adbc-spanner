@@ -90,8 +90,14 @@ Key design points:
   returning a pre-insert result: `SpannerStatement::ensure_no_buffered_writes_for_query` (backed by
   `TxnState::query_would_miss_buffered_writes` — manual mode AND a non-empty `pending` **or**
   `pending_mutations`) returns `InvalidState` at the start of the guarded read paths (`execute`'s
-  query path, the bound-query path, and `execute_partitions`); `execute_schema` (a schema-only
-  `QueryMode::Plan` probe) and `execute_update`/DDL are deliberately **not** guarded. The other
+  query path, the bound-query path, `execute_partitions`, and a non-DML/non-DDL statement routed
+  through `execute_update` — which, per `adbc.h`'s `ExecuteQuery(out=NULL)`, executes via the same
+  read-only query machinery, `SpannerStatement::execute_query_reader`, with the rows drained and
+  discarded); `execute_schema` (a schema-only
+  `QueryMode::Plan` probe) and `execute_update`'s DML/DDL arms are deliberately **not** guarded. A
+  `;`-batch on the DML paths must be **all-DML** (`check_all_dml_batch`, shared by
+  `build_dml_statements` and `execute_update`'s classification): mixing DML with a query or DDL is
+  rejected with `InvalidArguments` up front, before anything is buffered. The other
   caveat, **DML/DDL reorder** (DDL issued after buffered DML executes before it), still stands. Both
   are documented user-facing (README.md Transactions bullet, python/README.md "Transactions" section
   with a CI-executed example that now asserts the guard raises `ProgrammingError`,
