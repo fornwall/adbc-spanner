@@ -12,6 +12,7 @@ pa = pytest.importorskip("pyarrow")
 
 import adbc_driver_spanner
 import adbc_driver_spanner.dbapi as spanner
+from adbc_driver_manager import ProgrammingError
 from adbc_driver_spanner import DatabaseOptions, StatementOptions
 
 
@@ -169,9 +170,13 @@ def test_manual_commit_and_rollback(emulator_database):
 
         with conn.cursor() as cur:
             cur.execute("INSERT INTO AdbcPyTxn (Id) VALUES (1)")
-            # Buffered, not yet committed: a fresh single-use read must not see it.
-            cur.execute("SELECT COUNT(*) AS n FROM AdbcPyTxn")
-            assert cur.fetch_arrow_table().column("n").to_pylist() == [0]
+            # Buffered, not yet committed. A query issued while DML is buffered would
+            # not observe the pending write (no read-your-writes), so rather than
+            # silently returning a stale snapshot the driver rejects it with
+            # InvalidState (surfaced as DBAPI ProgrammingError). The buffered INSERT is
+            # left intact and still applies on the commit below.
+            with pytest.raises(ProgrammingError):
+                cur.execute("SELECT COUNT(*) AS n FROM AdbcPyTxn")
 
         conn.commit()
         with conn.cursor() as cur:
