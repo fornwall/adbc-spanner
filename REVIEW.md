@@ -25,7 +25,7 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 
 ## 1. Correctness & error handling
 
-- [ ] **COR-1 (High)** — Panic on oversized duration values in two user-facing options — `src/staleness.rs:228`, `src/request.rs:310`
+- [x] **COR-1 (High)** — Panic on oversized duration values in two user-facing options — `src/staleness.rs:228`, `src/request.rs:310`
   `parse_duration` calls `Duration::from_secs_f64(seconds)` without an upper-bound check; anything above ~1.8e19s **panics** (verified by repro). Reachable from plain option strings: `spanner.read.staleness = "exact:1e20"` (also `max:`, or `exact:1e19h` since the unit multiplies first) and `spanner.commit.max_delay = "1e30"` (the panic fires before the 500 ms cap check). A malformed option must be `InvalidArguments`; instead the panic crosses into the FFI exporter's poison latch and bricks the driver handle. Sibling modules (`timeout.rs:143`, `retry.rs`) already use `Duration::try_from_secs_f64`. **Fix:** `Duration::try_from_secs_f64(...).map_err(|_| bad())`.
 
 - [ ] **COR-2 (High)** — Manual-mode bulk ingest partially poisons the transaction buffer on a mid-row conversion failure — `src/statement.rs:567-574`
