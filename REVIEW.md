@@ -93,8 +93,9 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 - [ ] **SPEC-4 (Low, documented deviation — decide & record)** — Isolation-level promotion instead of the spec-recommended error — `src/connection.rs:397-419`
   The spec says a driver *should* error on unsupported levels; the driver promotes upward (documented, JDBC-sanctioned, get_option reports the effective level). Recording as a knowing deviation; literal-minded conformance tooling could flag it. Recommended action: none (tick once acknowledged).
 
-- [ ] **SPEC-5 (Low)** — `get_info(None)` returns a curated subset; explicit requests for the omitted codes return null rows — `src/info.rs:38-46`
+- [x] **SPEC-5 (Low)** — `get_info(None)` returns a curated subset; explicit requests for the omitted codes return null rows — `src/info.rs:38-46`
   Asymmetric: "all" omits `VendorVersion`/`VendorArrowVersion`/Substrait min-max entirely, while an explicit request yields a null-valued row. Pick one behavior (include the null rows in the default set, or omit them from explicit requests).
+  *Fixed: the null-valued rows are now in the default set — `REPORTED` lists all 11 recognised codes (null is `adbc.h`'s defined value for the Substrait bounds when Substrait is unsupported, and the driver's `VendorVersion` null is deliberate) — and explicit requests filter to `REPORTED`, omitting unrecognized codes per spec, so explicit ⊆ all holds structurally even if `InfoCode` grows.*
 
 - [ ] **SPEC-6 (Low)** — Status-code consistency nits — `src/connection.rs:809-814,1249-1260`, `src/statement.rs:1731-1742`
   `current_catalog`/`current_db_schema` set to non-empty → `InvalidArguments` (C++ PostgreSQL driver uses `NotImplemented` for the same class); `execute_schema` guard returns `InvalidState` for DDL but `InvalidArguments` for DML on the same "not a query" class. Cosmetic alignment only.
