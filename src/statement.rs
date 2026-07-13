@@ -553,7 +553,10 @@ impl SpannerStatement {
     /// atomically in the *same* read/write transaction as any buffered DML — Spanner applies
     /// buffered mutations at commit time, after the transaction's DML has executed. Never chunked:
     /// the commit applies the user's whole transaction atomically, so an over-limit manual-mode
-    /// ingest fails at commit, as any over-limit user transaction would.
+    /// ingest fails at commit, as any over-limit user transaction would. Buffering is
+    /// **all-or-nothing**: the whole batch is built (outside the transaction lock) before any of
+    /// it is buffered, so a row that fails Arrow→Spanner conversion leaves the pending buffer
+    /// exactly as it was — a later `commit` never silently applies a partial batch.
     ///
     /// **Autocommit mode** builds and ships the mutations chunk by chunk, each chunk in its own
     /// write-only transaction (with the client's retry/replay protection), returning the ingested
@@ -580,20 +583,40 @@ impl SpannerStatement {
         // Mutations name their target table directly (no SQL quoting; a named schema joins with a
         // plain dot).
         let target = bind::mutation_table(self.target_db_schema.as_deref(), table);
-        {
+        let manual = {
+            let txn = self.txn.lock().unwrap();
+            if txn.autocommit() {
+                false
+            } else {
+                // An ingest is DML-kind work: a transaction that began with a query rejects it
+                // up front, before any mutation-building work is done.
+                txn.check_kind_allowed(TxnKind::Dml)?;
+                true
+            }
+        };
+        if manual {
+            // Manual mode: build *every* row's mutation before touching the transaction buffer,
+            // and build outside the txn lock. All-or-nothing buffering keeps the commit contract
+            // honest — a mid-row conversion failure (e.g. an out-of-range date) must not strand
+            // the rows before it in the buffer for a later `commit` to apply silently. Keeping
+            // the O(rows) build out of the connection-wide mutex also means concurrent
+            // txn-state users are not stalled behind it, and a build panic cannot poison it.
+            let rows = self.bound.iter().map(RecordBatch::num_rows).sum();
+            let mutations = self.build_range_mutations(&target, 0, rows)?;
             let mut txn = self.txn.lock().unwrap();
             if !txn.autocommit() {
-                // An ingest is DML-kind work: the first buffered mutation fixes the transaction's
-                // kind, and a transaction that began with a query rejects it up front (before
-                // any further mutation is built).
-                txn.check_kind_allowed(TxnKind::Dml)?;
-                for batch in &self.bound {
-                    for row in 0..batch.num_rows() {
-                        txn.buffer_mutation(bind::insert_mutation(&target, batch, row)?)?;
-                    }
+                // `buffer_mutation` re-checks the DML kind under this lock (a concurrent
+                // statement may have fixed the transaction to queries in the unlocked window);
+                // a rejection fails the *first* call, before anything is buffered, so
+                // all-or-nothing still holds. Its first success fixes the transaction's kind.
+                for mutation in mutations {
+                    txn.buffer_mutation(mutation)?;
                 }
                 return Ok(None);
             }
+            // The mode flipped to autocommit while the batch was being built (enabling
+            // autocommit commits the manual transaction): fall through to the autocommit path
+            // below, exactly where a fresh mode check would have routed this ingest.
         }
         // Autocommit: walk the flattened row sequence (all bound batches concatenated), cutting it
         // into commit chunks by the same [`IngestChunkBudget`]. A chunk is a contiguous

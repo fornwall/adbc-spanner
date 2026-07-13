@@ -41,7 +41,7 @@ use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, Opti
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_spanner::{SpannerConnection, SpannerDriver};
 use arrow_array::cast::AsArray;
-use arrow_array::{Int64Array, RecordBatch, StringArray};
+use arrow_array::{Date32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use prost::Message;
 use spanner_grpc_mock::MockSpanner;
@@ -1383,6 +1383,131 @@ fn ingest_does_not_bisect_a_non_mutation_limit_error() {
         commits.load(Ordering::SeqCst),
         1,
         "a non-mutation-limit error must not trigger the bisect retry"
+    );
+}
+
+/// (d″) **Manual-mode ingest atomicity.** A manual-transaction ingest whose *later* row fails
+/// Arrow→Spanner conversion (row 1 here: a Date32 far outside Spanner's
+/// 0001-01-01..9999-12-31 range) must leave the transaction buffer completely untouched — not
+/// buffer rows `0..k` and then error, which a later `commit` would silently apply as a partial
+/// batch atomically with the rest of the transaction.
+///
+/// Three assertions pin the buffer state after the failed ingest, each deterministic offline:
+/// 1. a query runs — a partially-buffered batch would have fixed the transaction's kind to DML,
+///    and the kind-exclusive guard rejects queries in a DML transaction, so success proves the
+///    buffer is empty (the query fixes the kind to queries; the test rolls back afterwards so
+///    the re-ingest starts a fresh transaction);
+/// 2. a re-ingest of the fixed data buffers cleanly (`None`);
+/// 3. the `commit` reaches the mock with **exactly** the fixed batch's two mutations — no
+///    stragglers from the failed batch.
+///
+/// (In `append` mode the conversion failure is remapped by the ingest-append contract: the mock's
+/// unbounded query expectation also serves the remap's `table_exists` probe, whose one-row answer
+/// turns the error into the contract's `AlreadyExists` with the original out-of-range message
+/// folded in.)
+#[test]
+fn manual_ingest_conversion_failure_leaves_txn_buffer_untouched() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "manual_ingest_conversion_failure_leaves_txn_buffer_untouched",
+    );
+
+    let commit_sizes: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+    let sizes_in_mock = commit_sizes.clone();
+    let server = MockServer::start(move |mock| {
+        // Serves both the append remap's `table_exists` probe (one row → "exists") and the
+        // post-failure guard query — which begins the manual transaction's shared read-only
+        // transaction inline, so the helper echoes a transaction id back; unbounded times.
+        serve_streaming_sql_begin_aware(mock, &["v0"], None);
+        // The manual-mode commit begins a read/write transaction and commits the buffered
+        // mutations; record how many each commit carries.
+        serve_begin_transaction(mock);
+        mock.expect_commit().returning(move |request| {
+            sizes_in_mock
+                .lock()
+                .unwrap()
+                .push(request.into_inner().mutations.len());
+            commit_ok()
+        });
+    });
+
+    let mut connection = server.connect();
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("enter manual transaction mode");
+
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("MockTable".into()),
+        )
+        .expect("set target table");
+    statement
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .expect("set ingest mode append");
+
+    let date_schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, false)]));
+    // Row 0 converts fine (1970-01-01); row 1 is out of Spanner's DATE range, so the conversion
+    // fails only after the first row has already been built.
+    let poisoned = RecordBatch::try_new(
+        date_schema.clone(),
+        vec![Arc::new(Date32Array::from(vec![0, i32::MAX]))],
+    )
+    .expect("build poisoned ingest batch");
+    statement.bind(poisoned).expect("bind poisoned batch");
+
+    let error = statement
+        .execute_update()
+        .expect_err("an out-of-range date must fail the ingest");
+    assert!(
+        error.message.contains("out of range"),
+        "the conversion failure must surface (folded into the append remap): {}",
+        error.message
+    );
+
+    // 1. The buffer must be untouched: a partially-buffered batch would have fixed the
+    //    transaction's kind to DML, and the kind-exclusive guard rejects queries in a DML
+    //    transaction — so a successful query proves nothing from the failed batch was kept.
+    let mut probe = connection.new_statement().expect("new statement");
+    probe.set_sql_query("SELECT c FROM MockTable").unwrap();
+    let batches: Vec<_> = probe
+        .execute()
+        .expect("a query after the failed ingest must run — nothing may be buffered")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect probe batches");
+    assert_eq!(batches[0].num_rows(), 1);
+    // The probe fixed the transaction's kind to queries; end it so the re-ingest below starts a
+    // fresh transaction (a read-only transaction rolls back by drop, no RPC).
+    connection
+        .rollback()
+        .expect("end the probe's query transaction");
+
+    // 2. Re-ingest the fixed data (both dates in range); manual mode buffers it (`None`).
+    let fixed = RecordBatch::try_new(date_schema, vec![Arc::new(Date32Array::from(vec![0, 1]))])
+        .expect("build fixed ingest batch");
+    statement.bind(fixed).expect("bind fixed batch");
+    assert_eq!(
+        statement
+            .execute_update()
+            .expect("re-ingest of fixed data must buffer"),
+        None,
+        "a manual-mode ingest buffers (returns None), not commits"
+    );
+
+    // 3. Commit: the mock must see exactly one commit carrying exactly the fixed batch's two
+    //    mutations — any third mutation would be a straggler from the failed batch.
+    connection.commit().expect("commit the fixed batch");
+    assert_eq!(
+        *commit_sizes.lock().unwrap(),
+        [2],
+        "the commit must carry only the fixed batch's rows, none from the failed batch"
     );
 }
 
