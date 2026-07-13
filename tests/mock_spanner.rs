@@ -489,6 +489,189 @@ fn query_while_dml_buffered_in_manual_txn_is_rejected() {
     assert_eq!(batches[0].num_rows(), 2);
 }
 
+/// COR-3 regression, autocommit half: `execute_update` on SQL that is neither DDL nor DML (a
+/// SELECT) must execute it through the **read-only query** machinery — `ExecuteStreamingSql`, not
+/// `ExecuteBatchDml` — drain and discard the rows, and report no count (`None`). `adbc.h`
+/// sanctions running any statement without expecting a result set (`ExecuteQuery` with a NULL
+/// out-stream), which is exactly the call that lands here.
+///
+/// The mock scripts only `ExecuteStreamingSql`; the old mis-routing to the DML pipeline would hit
+/// the unscripted `ExecuteBatchDml` catch-all (`UNIMPLEMENTED`) and fail loudly. Bound parameters
+/// must ride the same path: a bound SELECT runs the bound-query machinery (with the parameter
+/// attached), drained and discarded the same way.
+#[test]
+fn execute_update_routes_a_query_to_the_read_only_path() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "execute_update_routes_a_query_to_the_read_only_path",
+    );
+
+    // Record every ExecuteStreamingSql request (SQL + params) the mock receives.
+    type SeenQuery = (String, Vec<String>);
+    let seen: Arc<Mutex<Vec<SeenQuery>>> = Arc::new(Mutex::new(Vec::new()));
+    let record = seen.clone();
+    let server = MockServer::start(move |mock| {
+        mock.expect_execute_streaming_sql()
+            .returning(move |request| {
+                let request = request.into_inner();
+                let params = request
+                    .params
+                    .map(|p| p.fields.into_keys().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                record.lock().unwrap().push((request.sql, params));
+                Ok(stream_of(vec![Ok(partial_result_set(
+                    true,
+                    &["v1", "v2"],
+                    b"cor3-1",
+                    true,
+                ))]))
+            });
+    });
+
+    let mut connection = server.connect();
+
+    // Plain SELECT: executes as a read-only query, rows drained and discarded, count unknown.
+    let mut statement = connection.new_statement().expect("new statement");
+    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+    assert_eq!(
+        statement
+            .execute_update()
+            .expect("execute_update on a SELECT must run it as a read-only query"),
+        None,
+        "a read query has no affected-row count"
+    );
+
+    // Bound parameters on a SELECT ride the same (bound-query) read path, drained and discarded.
+    let mut bound = connection.new_statement().expect("new statement");
+    bound
+        .set_sql_query("SELECT c FROM MockTable WHERE c = @p")
+        .unwrap();
+    let param_schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Utf8, false)]));
+    let param_batch =
+        RecordBatch::try_new(param_schema, vec![Arc::new(StringArray::from(vec!["v1"]))])
+            .expect("build bound batch");
+    bound.bind(param_batch).expect("bind parameter row");
+    assert_eq!(
+        bound
+            .execute_update()
+            .expect("execute_update on a bound SELECT must run the bound-query path"),
+        None
+    );
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.iter().map(|(sql, _)| sql.as_str()).collect::<Vec<_>>(),
+        vec![
+            "SELECT c FROM MockTable",
+            "SELECT c FROM MockTable WHERE c = @p",
+        ],
+        "both statements must arrive via ExecuteStreamingSql (never ExecuteBatchDml)"
+    );
+    assert_eq!(
+        seen[1].1,
+        vec!["p".to_string()],
+        "the bound row must be attached as the @p parameter"
+    );
+}
+
+/// COR-3 regression, manual-mode half: in a manual transaction `execute_update` on a SELECT must
+/// run it immediately as a read-only query and buffer **nothing** — the old mis-routing buffered
+/// the SELECT as pending "DML", which poisoned the eventual `ExecuteBatchDml` commit (only
+/// `rollback` recovered). Also covered here:
+///
+/// - a mixed `;`-batch (`DELETE …; SELECT 1`) is rejected up front with `InvalidArguments`,
+///   before anything is buffered;
+/// - with real DML buffered, `execute_update` on a SELECT hits the read-your-writes guard
+///   (`InvalidState`) exactly like `execute`.
+///
+/// The proof nothing was buffered: `commit()` succeeds without any transaction RPC — the mock
+/// scripts only `ExecuteStreamingSql`, so a commit that tried to apply a buffered statement would
+/// hit the unscripted `BeginTransaction`/`ExecuteBatchDml`/`Commit` catch-alls and fail.
+#[test]
+fn execute_update_query_in_manual_mode_buffers_nothing() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "execute_update_query_in_manual_mode_buffers_nothing",
+    );
+
+    let server = MockServer::start(move |mock| {
+        // Served for the immediate read-only queries; nothing else is scripted.
+        mock.expect_execute_streaming_sql().returning(move |_| {
+            Ok(stream_of(vec![Ok(partial_result_set(
+                true,
+                &["v1"],
+                b"cor3-m1",
+                true,
+            ))]))
+        });
+    });
+
+    let mut connection = server.connect();
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("disable autocommit");
+
+    // A SELECT through execute_update runs immediately (read-only) and buffers nothing.
+    let mut query = connection.new_statement().expect("new statement");
+    query.set_sql_query("SELECT c FROM MockTable").unwrap();
+    assert_eq!(
+        query.execute_update().expect("query must run immediately"),
+        None
+    );
+
+    // A mixed batch is rejected up front with InvalidArguments — and buffers nothing either.
+    let mut mixed = connection.new_statement().expect("new statement");
+    mixed
+        .set_sql_query("DELETE FROM MockTable WHERE true; SELECT 1")
+        .unwrap();
+    let Err(error) = mixed.execute_update() else {
+        panic!("a mixed DML/query batch must be rejected");
+    };
+    assert_eq!(
+        error.status,
+        AdbcStatus::InvalidArguments,
+        "mixed batch must fail with InvalidArguments: {:?}",
+        error.message
+    );
+    assert!(
+        error.message.contains("all-DML"),
+        "the error should explain the all-DML batch requirement: {:?}",
+        error.message
+    );
+
+    // Nothing was buffered by either statement: the commit applies an empty batch, which needs no
+    // RPC at all — any buffered statement would hit an unscripted RPC and fail this commit.
+    connection
+        .commit()
+        .expect("commit must succeed with an empty buffer (nothing may have been buffered)");
+
+    // With real DML buffered, a SELECT through execute_update hits the read-your-writes guard.
+    let mut insert = connection.new_statement().expect("new statement");
+    insert
+        .set_sql_query("INSERT INTO MockTable (c) VALUES ('x')")
+        .unwrap();
+    assert_eq!(insert.execute_update().expect("buffered insert"), None);
+    let mut guarded = connection.new_statement().expect("new statement");
+    guarded.set_sql_query("SELECT c FROM MockTable").unwrap();
+    let Err(error) = guarded.execute_update() else {
+        panic!("execute_update on a query while DML is buffered must be rejected");
+    };
+    assert_eq!(
+        error.status,
+        AdbcStatus::InvalidState,
+        "the read-your-writes guard must fire on execute_update's query arm too"
+    );
+    assert!(
+        error.message.contains("read-your-writes"),
+        "the error should explain the read-your-writes hazard: {:?}",
+        error.message
+    );
+    connection.rollback().expect("discard the buffered insert");
+}
+
 /// (a) `ABORTED` (with a `google.rpc.RetryInfo` detail) on `ExecuteStreamingSql` surfaces as a
 /// clean ADBC error with the numeric gRPC code preserved in `vendor_code` (ABORTED = 10).
 ///
