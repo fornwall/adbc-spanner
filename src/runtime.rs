@@ -20,20 +20,24 @@ use crate::error::err;
 /// A reference-counted handle to the driver's Tokio runtime.
 pub(crate) type SharedRuntime = Arc<Runtime>;
 
-/// A **sticky** cancellation signal shared between an ADBC object and its blocking operations.
+/// A **sticky, per-operation** cancellation signal shared between one operation (and any streamed
+/// reader it produces) and the `cancel()` call aimed at it.
 ///
 /// ADBC's `cancel` must be thread-safe, so this is `Clone` + `Send`/`Sync` interior mutability.
 /// [`CancelSignal::signal`] — invoked from another thread by a `cancel()` call — sets a latched
 /// flag and wakes an operation currently waiting inside [`block_on_cancellable`], which then
 /// returns [`Status::Cancelled`].
 ///
-/// The flag *stays set* until [`CancelSignal::reset`] is called, which is what makes cancelling a
-/// streamed result reliable: a query's result is streamed lazily, so a cancel that lands *between*
-/// two chunk fetches (while rows are being converted to Arrow, or while the consumer processes a
-/// batch) must still cancel the *next* fetch rather than evaporate — `Notify` alone wakes only
-/// currently-registered waiters and would lose exactly that signal. Each ADBC entry point that
-/// begins a **new** operation calls [`CancelSignal::reset`] first, so a stale cancel aimed at a
-/// finished (or never-started) operation does not leak into the next one.
+/// Once latched the flag stays set **forever** — there is deliberately no way to clear it. That is
+/// what makes cancelling a streamed result reliable: a query's result is streamed lazily, so a
+/// cancel that lands *between* two chunk fetches (while rows are being converted to Arrow, or
+/// while the consumer processes a batch) must still cancel the *next* fetch rather than evaporate
+/// — `Notify` alone wakes only currently-registered waiters and would lose exactly that signal.
+/// Scoping the signal to one operation is the other half: the owning statement/connection mints a
+/// **fresh** signal per operation via [`CancelSlot::begin_operation`], so a stale cancel aimed at
+/// a finished operation cannot leak into the next one, and — conversely — starting a new operation
+/// cannot un-cancel a still-live streamed reader from an earlier one (the reader keeps its own
+/// operation's signal, which nothing ever clears).
 #[derive(Clone)]
 pub(crate) struct CancelSignal(Arc<CancelInner>);
 
@@ -48,7 +52,7 @@ impl std::fmt::Debug for CancelSignal {
 }
 
 struct CancelInner {
-    /// Latched cancellation state; `true` from `signal()` until the next `reset()`.
+    /// Latched cancellation state; `true` from `signal()` on, forever (never cleared).
     cancelled: AtomicBool,
     /// Wakes an operation currently parked in [`block_on_cancellable`].
     notify: Notify,
@@ -63,18 +67,12 @@ impl CancelSignal {
     }
 
     /// Request cancellation: latch the flag and wake the in-flight operation, if any. The flag
-    /// stays set (cancelling any subsequent [`block_on_cancellable`] on this signal, such as the
-    /// next chunk fetch of a streamed result) until [`CancelSignal::reset`].
+    /// stays set forever, cancelling any subsequent [`block_on_cancellable`] on this signal —
+    /// such as the next chunk fetch of a streamed result.
     pub(crate) fn signal(&self) {
         // Order matters: latch the flag before waking, so a woken waiter always observes it.
         self.0.cancelled.store(true, Ordering::Release);
         self.0.notify.notify_waiters();
-    }
-
-    /// Clear a latched cancellation. Called by ADBC entry points that begin a new operation, so a
-    /// cancel aimed at a previous (or absent) operation does not cancel this one.
-    pub(crate) fn reset(&self) {
-        self.0.cancelled.store(false, Ordering::Release);
     }
 
     /// Wait until this signal is cancelled. Completes immediately if it already is.
@@ -93,8 +91,51 @@ impl CancelSignal {
                 return;
             }
             notified.await;
-            // Woken: loop to re-read the flag (a concurrent `reset()` may have cleared it).
+            // Woken: loop to re-read the flag (defensive against spurious wakeups).
         }
+    }
+}
+
+/// The owner side of per-operation cancellation: a slot holding the [`CancelSignal`] of the
+/// owning ADBC object's **current** operation.
+///
+/// Each entry point that begins a new operation mints a fresh, uncancelled signal via
+/// [`CancelSlot::begin_operation`]; `cancel()` ([`CancelSlot::signal`]) always targets the
+/// current one. A superseded signal is *replaced*, never cleared — once latched it stays latched
+/// — which yields exactly the ADBC contract:
+///
+/// - a cancel aimed at a previous (or absent) operation does not leak into a new one (the new
+///   operation runs on its own fresh signal);
+/// - starting a new operation cannot **un-cancel** an earlier operation's still-live streamed
+///   reader, and a cancelled stream can never present as cleanly complete: the reader keeps a
+///   clone of its own operation's signal, whose latch nothing clears, so every subsequent fetch
+///   keeps failing with [`Status::Cancelled`].
+#[derive(Debug)]
+pub(crate) struct CancelSlot(std::sync::Mutex<CancelSignal>);
+
+impl CancelSlot {
+    pub(crate) fn new() -> Self {
+        Self(std::sync::Mutex::new(CancelSignal::new()))
+    }
+
+    /// Begin a new operation: mint a fresh (uncancelled) signal and make it the target of
+    /// subsequent `cancel()` calls. The previous operation's signal keeps its state — a latched
+    /// cancel on it stays latched for any reader still holding it.
+    pub(crate) fn begin_operation(&self) -> CancelSignal {
+        let fresh = CancelSignal::new();
+        *self.0.lock().unwrap() = fresh.clone();
+        fresh
+    }
+
+    /// The current operation's signal (a clone sharing the same latch), for the operation's own
+    /// [`block_on_cancellable`] waits and for handing to the streamed readers it produces.
+    pub(crate) fn current(&self) -> CancelSignal {
+        self.0.lock().unwrap().clone()
+    }
+
+    /// Forward a cancel to the current operation's signal, latching it forever.
+    pub(crate) fn signal(&self) {
+        self.0.lock().unwrap().signal();
     }
 }
 
@@ -271,15 +312,38 @@ mod tests {
         assert_eq!(third.unwrap_err().status, Status::Cancelled);
     }
 
-    // A stale cancel does not leak into a new operation: entry points reset the signal first.
+    // A stale cancel does not leak into a new operation: entry points mint a fresh signal via
+    // `CancelSlot::begin_operation`, so the slot's current signal starts uncancelled.
     #[test]
-    fn reset_clears_a_stale_signal() {
+    fn begin_operation_shields_a_new_operation_from_a_stale_cancel() {
         let runtime = new_runtime().unwrap();
-        let cancel = CancelSignal::new();
-        cancel.signal();
-        cancel.reset();
+        let slot = CancelSlot::new();
+        slot.signal(); // cancel with nothing meaningful in flight
+        let cancel = slot.begin_operation();
         let result: Result<i32> = block_on_cancellable(&runtime, &cancel, async { Ok(7) });
         assert_eq!(result.unwrap(), 7);
+    }
+
+    // The converse: beginning a new operation must not *un-cancel* an earlier operation's signal —
+    // a streamed reader holding it keeps failing with Cancelled (previously a shared resettable
+    // signal let a new operation silently revive a cancelled stream, or worse, let it end cleanly
+    // truncated).
+    #[test]
+    fn begin_operation_does_not_uncancel_an_earlier_operations_signal() {
+        let runtime = new_runtime().unwrap();
+        let slot = CancelSlot::new();
+        let old = slot.begin_operation(); // what a streamed reader would hold on to
+        slot.signal(); // cancel() aimed at that operation
+        let fresh = slot.begin_operation(); // the owner's next operation
+        let revived: Result<i32> = block_on_cancellable(&runtime, &old, async { Ok(1) });
+        assert_eq!(revived.unwrap_err().status, Status::Cancelled);
+        let new_op: Result<i32> = block_on_cancellable(&runtime, &fresh, async { Ok(2) });
+        assert_eq!(new_op.unwrap(), 2);
+        // A cancel now targets the current (fresh) signal, not the superseded one.
+        slot.signal();
+        let cancelled: Result<i32> =
+            block_on_cancellable(&runtime, &slot.current(), async { Ok(3) });
+        assert_eq!(cancelled.unwrap_err().status, Status::Cancelled);
     }
 
     /// One step of a [`ScriptedSource`]: a ready chunk (or error), or a fetch that never completes.

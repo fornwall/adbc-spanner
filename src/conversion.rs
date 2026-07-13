@@ -318,7 +318,9 @@ impl ChunkSource for ResultSetChunks {
 /// the same spirit as the BigQuery ADBC driver's buffered reader). The ADBC traits are
 /// synchronous, so each `next` bridges to the async channel with a cancellable `block_on`; a
 /// latched [`CancelSignal`] both fails the wait and stops the background fetch, and dropping the
-/// reader aborts the task.
+/// reader aborts the task. The signal is the producing operation's **own** (per-operation, minted
+/// by `CancelSlot::begin_operation`), so once cancelled the reader stays cancelled — a later
+/// operation on the owning statement/connection can neither clear it nor be affected by it.
 pub(crate) struct SpannerBatchReader {
     runtime: SharedRuntime,
     cancel: CancelSignal,

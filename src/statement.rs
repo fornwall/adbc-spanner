@@ -44,7 +44,7 @@ use crate::options::impl_shared_option_dispatch;
 use crate::query_options::QueryOptionsConfig;
 use crate::request::{CommitStats, RequestConfig};
 use crate::retry::RetryConfig;
-use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
+use crate::runtime::{CancelSlot, SharedRuntime, block_on_cancellable};
 use crate::staleness::ReadStaleness;
 use crate::timeout::{RpcTimeouts, with_timeout};
 
@@ -197,8 +197,11 @@ pub struct SpannerStatement {
     /// `spanner.commit_stats.mutation_count`. Statement-owned and **not** inherited from the
     /// connection (the connection owns the manual-mode commit's stats); fresh (unset) per statement.
     commit_stats: CommitStats,
-    /// Cancellation signal for this statement's in-flight execution (see [`Statement::cancel`]).
-    cancel: CancelSignal,
+    /// Per-operation cancellation for this statement (see [`Statement::cancel`]): each execution
+    /// entry point mints a fresh [`crate::runtime::CancelSignal`] here, and `cancel()` latches the
+    /// current one — forever, so a cancelled streamed reader stays cancelled even after this
+    /// statement starts a new operation.
+    cancel: CancelSlot,
 }
 
 impl SpannerStatement {
@@ -252,7 +255,7 @@ impl SpannerStatement {
             timeouts,
             retry,
             commit_stats: CommitStats::default(),
-            cancel: CancelSignal::new(),
+            cancel: CancelSlot::new(),
         }
     }
 
@@ -390,7 +393,7 @@ impl SpannerStatement {
         let exists = crate::connection::table_exists(
             &self.runtime,
             &self.client,
-            &self.cancel,
+            &self.cancel.current(),
             self.timeouts.query_timeout(),
             db_schema,
             table,
@@ -505,7 +508,7 @@ impl SpannerStatement {
         match crate::connection::table_exists(
             &self.runtime,
             &self.client,
-            &self.cancel,
+            &self.cancel.current(),
             self.timeouts.query_timeout(),
             db_schema,
             table,
@@ -721,7 +724,7 @@ impl SpannerStatement {
         let retry = self.retry;
         let mutation_count = block_on_cancellable(
             &self.runtime,
-            &self.cancel,
+            &self.cancel.current(),
             with_timeout(
                 self.timeouts.update_timeout(),
                 crate::OPTION_RPC_TIMEOUT_UPDATE,
@@ -780,7 +783,7 @@ impl SpannerStatement {
             .collect();
         block_on_cancellable(
             &self.runtime,
-            &self.cancel,
+            &self.cancel.current(),
             with_timeout(
                 self.timeouts.update_timeout(),
                 crate::OPTION_RPC_TIMEOUT_UPDATE,
@@ -844,7 +847,7 @@ impl SpannerStatement {
         let count = crate::connection::run_batch_dml(
             &self.runtime,
             &self.client,
-            &self.cancel,
+            &self.cancel.current(),
             self.isolation.clone(),
             self.request.clone(),
             self.retry,
@@ -917,7 +920,7 @@ impl SpannerStatement {
         };
         let (results, mutation_count) = block_on_cancellable(
             &self.runtime,
-            &self.cancel,
+            &self.cancel.current(),
             with_timeout(
                 update_timeout,
                 crate::OPTION_RPC_TIMEOUT_UPDATE,
@@ -1021,7 +1024,7 @@ impl SpannerStatement {
         let base_builder = self.read_sql_builder(sql);
         let client = self.client.clone();
         let runtime = self.runtime.clone();
-        let cancel = self.cancel.clone();
+        let cancel = self.cancel.current();
         let batch_size = self.rows_per_batch;
         let precision = self.timestamp_precision;
         // The query timeout bounds the initial execution (through the first chunk); the fetch
@@ -1038,7 +1041,7 @@ impl SpannerStatement {
             let bound = self.read_staleness.timestamp_bound()?;
             let reader = block_on_cancellable(
                 &self.runtime,
-                &self.cancel,
+                &self.cancel.current(),
                 with_timeout(query_timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async move {
                     let transaction = crate::staleness::single_use(&client, bound);
                     let result_set = transaction
@@ -1067,7 +1070,7 @@ impl SpannerStatement {
         });
         let reader = block_on_cancellable(
             &self.runtime,
-            &self.cancel,
+            &self.cancel.current(),
             with_timeout(query_timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async move {
                 let mut builder = client.read_only_transaction();
                 if let Some(b) = bound {
@@ -1107,7 +1110,7 @@ impl SpannerStatement {
         // with `Status::Timeout`; unset (the default) leaves the poll unbounded.
         block_on_cancellable(
             &self.runtime,
-            &self.cancel,
+            &self.cancel.current(),
             with_timeout(
                 self.timeouts.update_timeout(),
                 crate::OPTION_RPC_TIMEOUT_UPDATE,
@@ -1365,8 +1368,10 @@ impl Statement for SpannerStatement {
     }
 
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
-        self.cancel.reset();
+        // A new operation begins: mint a fresh cancel signal for it, so a stale cancel aimed at a
+        // previous operation does not leak in — and so no later operation can un-cancel this one's
+        // streamed reader (see `CancelSlot`).
+        self.cancel.begin_operation();
         // Bulk ingest arriving through the query entry point (needs no SQL query): a standard ADBC
         // FFI caller may drive an ingest via `execute` with a non-null stream out-pointer. Run it
         // the same way `execute_update` does and return an empty stream — the query interface has
@@ -1431,7 +1436,7 @@ impl Statement for SpannerStatement {
         }
         let client = self.client.clone();
         let runtime = self.runtime.clone();
-        let cancel = self.cancel.clone();
+        let cancel = self.cancel.current();
         let batch_size = self.rows_per_batch;
         let precision = self.timestamp_precision;
         let bound = self.read_staleness.timestamp_bound()?;
@@ -1444,7 +1449,7 @@ impl Statement for SpannerStatement {
         // timeout bounds each later chunk inside the prefetch task.
         let reader = block_on_cancellable(
             &self.runtime,
-            &self.cancel,
+            &self.cancel.current(),
             with_timeout(
                 self.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
@@ -1470,8 +1475,10 @@ impl Statement for SpannerStatement {
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
-        // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
-        self.cancel.reset();
+        // A new operation begins: mint a fresh cancel signal for it, so a stale cancel aimed at a
+        // previous operation does not leak in — and so no later operation can un-cancel this one's
+        // streamed reader (see `CancelSlot`).
+        self.cancel.begin_operation();
         // Bulk ingest: insert the bound rows into the target table (needs no SQL query). Gate on
         // there being no SQL for the same reason as `execute` — a query and an ingest target are
         // mutually exclusive (each setter clears the other), so a reused handle runs whichever was
@@ -1508,8 +1515,10 @@ impl Statement for SpannerStatement {
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {
-        // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
-        self.cancel.reset();
+        // A new operation begins: mint a fresh cancel signal for it, so a stale cancel aimed at a
+        // previous operation does not leak in — and so no later operation can un-cancel this one's
+        // streamed reader (see `CancelSlot`).
+        self.cancel.begin_operation();
         let sql = self.sql()?;
         check_schema_query(&sql)?;
         // Query path only (`check_schema_query` rejected DDL/DML): strip any trailing statement
@@ -1530,7 +1539,7 @@ impl Statement for SpannerStatement {
         // The schema probe is a query execution, so the query timeout bounds it.
         let schema = block_on_cancellable(
             &self.runtime,
-            &self.cancel,
+            &self.cancel.current(),
             with_timeout(
                 self.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
@@ -1571,8 +1580,10 @@ impl Statement for SpannerStatement {
     /// blobs, not opaque data:
     /// transport them only over trusted channels and never accept one from an untrusted source.
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
-        // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
-        self.cancel.reset();
+        // A new operation begins: mint a fresh cancel signal for it, so a stale cancel aimed at a
+        // previous operation does not leak in — and so no later operation can un-cancel this one's
+        // streamed reader (see `CancelSlot`).
+        self.cancel.begin_operation();
         let sql = self.sql()?;
         if crate::sql::is_ddl(&sql) {
             return Err(invalid_state(
@@ -1646,7 +1657,7 @@ impl Statement for SpannerStatement {
         };
         let (schema, partitions) = block_on_cancellable(
             &self.runtime,
-            &self.cancel,
+            &self.cancel.current(),
             with_timeout(
                 self.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
@@ -1710,10 +1721,11 @@ impl Statement for SpannerStatement {
     }
 
     fn cancel(&mut self) -> Result<()> {
-        // Latch the (sticky) signal: an in-flight execution wakes and returns Cancelled, and a
-        // cancel landing between two chunk fetches of a streamed result still cancels the next
-        // fetch. The latch is cleared when the statement starts its next operation, so a cancel
-        // with nothing running does not affect later executions.
+        // Latch the current operation's (sticky) signal: an in-flight execution wakes and returns
+        // Cancelled, and a cancel landing between two chunk fetches of a streamed result still
+        // cancels the next fetch — permanently, since the latch is never cleared. The statement's
+        // next operation mints a fresh signal instead, so a cancel with nothing running does not
+        // affect later executions, and later executions cannot revive a cancelled reader.
         self.cancel.signal();
         Ok(())
     }

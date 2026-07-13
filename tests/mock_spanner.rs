@@ -832,6 +832,90 @@ fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
     );
 }
 
+/// A new operation on the statement must not **un-cancel** a live streamed reader from an earlier
+/// `execute`. With the old shared resettable signal, the new operation's `reset()` cleared the
+/// latch a `cancel()` had set between two chunk fetches, so the old reader either resumed
+/// streaming or — if the prefetch task had already exited with a chunk still buffered — yielded
+/// that chunk and then a clean end-of-stream: a silently **truncated** result. With per-operation
+/// signals the old reader keeps its own latched signal forever, so its next fetch must fail with
+/// `Status::Cancelled`, while the new operation (on a fresh signal) runs to completion.
+#[test]
+fn new_operation_does_not_uncancel_an_earlier_streamed_reader() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "new_operation_does_not_uncancel_an_earlier_streamed_reader",
+    );
+
+    // Every query gets the same complete three-row stream; with one row per batch the first
+    // reader has fetches outstanding when the cancel lands (the prefetch buffers row 2 and is
+    // fetching/holding row 3 — exactly the full-channel shape of the truncation failure mode).
+    let server = MockServer::start(move |mock| {
+        mock.expect_execute_streaming_sql().returning(move |_| {
+            Ok(stream_of(vec![Ok(partial_result_set(
+                true,
+                &["v1", "v2", "v3"],
+                b"rt-1",
+                true,
+            ))]))
+        });
+    });
+
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionValue::Int(1),
+        )
+        .expect("set rows_per_batch");
+    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+    let mut old_reader = statement.execute().expect("first execute");
+
+    // The first batch was fetched by `execute` itself (it settles the schema) — consume it.
+    let first = old_reader
+        .next()
+        .expect("first batch exists")
+        .expect("first batch is clean");
+    assert_eq!(first.num_rows(), 1);
+
+    // Cancel between two chunk fetches of the old reader, then start a NEW operation on the same
+    // statement before the old reader observes the cancel.
+    statement.cancel().expect("cancel");
+    let new_batches: Vec<_> = statement
+        .execute()
+        .expect("a new operation after a cancel must start uncancelled")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("the new operation's reader must stream to completion");
+    assert_eq!(
+        new_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        3,
+        "the new reader must deliver the full result"
+    );
+
+    // The old reader must surface the cancel — not resume streaming (row 2 as a clean batch) and
+    // not end cleanly truncated (`None`).
+    let item = old_reader
+        .next()
+        .expect("the cancelled reader must yield an error item, not a clean end of stream");
+    let error = item.expect_err("the cancelled reader must not resume streaming rows");
+    let ArrowError::ExternalError(source) = &error else {
+        panic!("expected the reader to surface the driver error, got: {error}");
+    };
+    let adbc_error = source
+        .downcast_ref::<adbc_core::error::Error>()
+        .expect("the reader error wraps the ADBC error");
+    assert_eq!(
+        adbc_error.status,
+        AdbcStatus::Cancelled,
+        "got error: {adbc_error}"
+    );
+    // And the cancel is sticky for the old reader: iteration stays ended (no stale row 3).
+    assert!(
+        old_reader.next().is_none(),
+        "a cancelled reader must not yield further batches"
+    );
+}
+
 /// (d) **Self-healing bulk ingest.** An autocommit ingest chunk the driver sized as "safe"
 /// (rows × columns under its 20k budget) can still overshoot Spanner's *true* per-commit mutation
 /// cap once invisible secondary-index entries are counted. The mock rejects any `Commit` carrying
