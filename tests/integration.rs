@@ -160,9 +160,11 @@ fn singers_ddl(if_not_exists: bool) -> String {
     )
 }
 
-/// DDL for the tables the property-based round-trip tests write to. Created during one-time setup
-/// (not in the test bodies) so the parallel tests never issue concurrent schema changes, which the
-/// emulator rejects database-wide. Column names avoid Spanner reserved words (e.g. `BY`).
+/// DDL for the scratch tables the round-trip tests write to (the property-based ones plus
+/// `AdbcReturn` / `AdbcHint`). Created during one-time setup (not in the test bodies) so the
+/// parallel tests never issue concurrent schema changes, which the emulator rejects database-wide —
+/// it locks schema changes against any in-flight read-write transaction. Column names avoid Spanner
+/// reserved words (e.g. `BY`).
 fn prop_tables_ddl(if_not_exists: bool) -> Vec<String> {
     let g = if if_not_exists { "IF NOT EXISTS " } else { "" };
     vec![
@@ -177,6 +179,8 @@ fn prop_tables_ddl(if_not_exists: bool) -> Vec<String> {
             "CREATE TABLE {g}AdbcPropTypes \
                  (Id INT64, D DATE, T TIMESTAMP, N NUMERIC) PRIMARY KEY (Id)"
         ),
+        format!("CREATE TABLE {g}AdbcReturn (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)"),
+        format!("CREATE TABLE {g}AdbcHint (Id INT64, N INT64) PRIMARY KEY (Id)"),
     ]
 }
 
@@ -6407,11 +6411,10 @@ fn hinted_dml_routes_to_the_read_write_path() {
         .expect("create database");
     let mut connection = connect_with_retry(&database);
 
-    run(
-        &mut connection,
-        "DROP TABLE IF EXISTS AdbcHint; \
-         CREATE TABLE AdbcHint (Id INT64, N INT64) PRIMARY KEY (Id)",
-    );
+    // `AdbcHint` is created once in `ensure_database` (not here): in-body DDL would race the
+    // emulator's database-wide schema-change lock against concurrent read-write transactions from
+    // other parallel tests. Just clear any rows a previous run left behind.
+    run(&mut connection, "DELETE FROM AdbcHint WHERE true");
 
     // Through the query entry point (`execute`), exactly as ADBC clients issue DML.
     // `LOCK_SCANNED_RANGES` is a documented statement hint for read/write transactions, accepted
@@ -6437,10 +6440,6 @@ fn hinted_dml_routes_to_the_read_write_path() {
         Some(1),
         "the hinted INSERT committed exactly one row"
     );
-
-    let mut drop = connection.new_statement().expect("new statement");
-    drop.set_sql_query("DROP TABLE AdbcHint").unwrap();
-    drop.execute_update().expect("drop hint table");
 }
 
 /// DML with a `THEN RETURN` clause returns its rows through `execute()` (previously they were
@@ -6466,11 +6465,10 @@ fn dml_then_return_round_trip() {
         .expect("create database");
     let mut connection = connect_with_retry(&database);
 
-    run(
-        &mut connection,
-        "DROP TABLE IF EXISTS AdbcReturn; \
-         CREATE TABLE AdbcReturn (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
-    );
+    // `AdbcReturn` is created once in `ensure_database` (not here): issuing DDL in the test body
+    // would race the emulator's database-wide schema-change lock against concurrent read-write
+    // transactions from other parallel tests. Just clear any rows a previous run left behind.
+    run(&mut connection, "DELETE FROM AdbcReturn WHERE true");
 
     // execute(): the THEN RETURN rows come back as a typed Arrow result.
     let mut insert = connection.new_statement().expect("new statement");
@@ -6556,10 +6554,6 @@ fn dml_then_return_round_trip() {
             OptionValue::String("true".into()),
         )
         .expect("re-enable autocommit");
-
-    let mut drop = connection.new_statement().expect("new statement");
-    drop.set_sql_query("DROP TABLE AdbcReturn").unwrap();
-    drop.execute_update().expect("drop return table");
 }
 
 /// Partitioned execution: `Statement::execute_partitions` splits a query into opaque partition
