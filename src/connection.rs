@@ -1066,25 +1066,30 @@ impl LikeMatcher {
 
     pub(crate) fn matches(&self, value: &str) -> bool {
         let p = &self.pattern;
-        let v: Vec<char> = value.chars().collect();
+        // Walk the value by byte offset, decoding one `char` at a time, so matching a candidate
+        // allocates nothing (the old code collected a `Vec<char>` per value). `_` still consumes
+        // exactly one *character*: every advance steps by the decoded char's UTF-8 width.
         let (mut pi, mut vi) = (0usize, 0usize);
-        // Position in the pattern/value to backtrack to after the most recent `%`.
+        // Pattern index / value byte offset to backtrack to after the most recent `%`.
         let mut star: Option<(usize, usize)> = None;
-        while vi < v.len() {
+        while vi < value.len() {
+            // The char starting at byte offset `vi`; `vi` only ever lands on char boundaries.
+            let ch = value[vi..].chars().next().expect("vi is a char boundary");
             // `%` must be tested before the literal/`_` branch: otherwise a `%` in the pattern that
             // happens to equal the current value char (e.g. both are `%`) would be consumed as a
             // literal instead of acting as a wildcard.
             if pi < p.len() && p[pi] == '%' {
                 star = Some((pi, vi));
                 pi += 1;
-            } else if pi < p.len() && (p[pi] == '_' || p[pi] == v[vi]) {
+            } else if pi < p.len() && (p[pi] == '_' || p[pi] == ch) {
                 pi += 1;
-                vi += 1;
+                vi += ch.len_utf8();
             } else if let Some((sp, sv)) = star {
                 // Let the last `%` consume one more character and retry.
+                let skipped = value[sv..].chars().next().expect("sv is a char boundary");
                 pi = sp + 1;
-                vi = sv + 1;
-                star = Some((sp, sv + 1));
+                vi = sv + skipped.len_utf8();
+                star = Some((sp, vi));
             } else {
                 return false;
             }
@@ -1128,6 +1133,24 @@ mod like_tests {
         assert!(like_match("%", "%foo"));
         assert!(like_match("%", "%^%?"));
         assert!(like_match("a%", "a%b"));
+    }
+
+    #[test]
+    fn like_matching_multibyte_utf8() {
+        // The matcher walks values by byte offset; `_` must still consume one *character* (of any
+        // UTF-8 width), never one byte, and `%` backtracking must skip whole characters.
+        assert!(like_match("_", "é")); // 2-byte char is one `_`
+        assert!(!like_match("__", "é")); // ... not two
+        assert!(like_match("caf_", "café"));
+        assert!(like_match("_本_", "日本語")); // 3-byte chars
+        assert!(!like_match("____", "日本語"));
+        assert!(like_match("_", "🦀")); // 4-byte char
+        assert!(like_match("%語", "日本語")); // `%` backtracks over multi-byte chars
+        assert!(like_match("%本%", "日本語"));
+        assert!(!like_match("%x%", "日本語"));
+        assert!(like_match("日%語", "日本語"));
+        assert!(like_match("é%é", "été"));
+        assert!(!like_match("é_é", "été été")); // literal tail must land on the right char
     }
 }
 

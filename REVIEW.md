@@ -139,11 +139,11 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 - [ ] **PERF-5 (Low)** — Per-cell `String` clones building metadata arrays — `src/objects.rs:715,728-733,795-807,862-867,889-897`, `src/statistics.rs:190,355-357,404-409`, `src/objects.rs:315`
   `StringArray::from_iter(iter.map(|x| Some(x.name.clone())))` → use `Option<&str>` / `from_iter_values`; `(0..n).map(|_| None).collect()` → `vec![None; n]`; don't `to_string()` before the table-type filter can drop the row.
 
-- [ ] **PERF-6 (Low)** — `LikeMatcher::matches` allocates a `Vec<char>` per candidate — `src/connection.rs:684`
-  The type amortizes pattern compilation but re-allocates every value. Walk by byte offset instead. Metadata-path only.
+- [x] **PERF-6 (Low)** — `LikeMatcher::matches` allocates a `Vec<char>` per candidate — `src/connection.rs:684`
+  The type amortizes pattern compilation but re-allocates every value. Walk by byte offset instead. Metadata-path only. *Resolved:* `matches` walks the value by byte offset, decoding one `char` at a time and advancing by `len_utf8()` (backtracking included), so matching a candidate allocates nothing while `_` still consumes exactly one character of any UTF-8 width; multi-byte semantics pinned by `like_matching_multibyte_utf8` in `src/connection.rs`.
 
-- [ ] **PERF-7 (Low)** — `is_raw_prefix` allocates per word lexeme — `src/sql.rs:90`
-  `to_ascii_lowercase()` per `Word` in every lexed SQL string; `eq_ignore_ascii_case` is allocation-free.
+- [x] **PERF-7 (Low)** — `is_raw_prefix` allocates per word lexeme — `src/sql.rs:90`
+  `to_ascii_lowercase()` per `Word` in every lexed SQL string; `eq_ignore_ascii_case` is allocation-free. *Resolved:* replaced the `to_ascii_lowercase()` + `matches!` with three `eq_ignore_ascii_case` comparisons (allocation-free); case-variant coverage added as `raw_prefix_detection` in `src/sql.rs`.
 
 - [ ] **PERF-8 (Low)** — `InfoValue::Str(String)` for static-only strings; duplicated `arrow_err` helper — `src/info.rs:49-77,159`
   All `Str` values are `&'static str`; switch the variant and drop four allocations. Reuse `nested.rs:19`'s `arrow_err`.
