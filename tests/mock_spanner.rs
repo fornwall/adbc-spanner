@@ -2299,6 +2299,124 @@ fn directed_read_reaches_the_wire_on_queries_but_never_on_dml() {
     assert_eq!(batch_dml[0].statements[0].sql, INSERT_SQL);
 }
 
+/// SPAN-7 (wire): every mutation-free autocommit `ExecuteBatchDml` batch is by construction the
+/// transaction's *entire* content — nothing follows it before the commit — so the driver must
+/// flag it as the transaction's last request (`ExecuteBatchDmlRequest.last_statements = true`)
+/// for a multi-statement `;`-batch (the dbt-style `DELETE …; INSERT …` shape) just as for a
+/// single statement. The negative: buffered manual-mode DML replayed at commit must go out with
+/// the flag OFF — that commit may still apply buffered mutations *after* the batch executes, so
+/// the batch is not the transaction's last request there.
+#[test]
+fn autocommit_batch_dml_is_flagged_last_statements_but_manual_commit_is_not() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "autocommit_batch_dml_is_flagged_last_statements_but_manual_commit_is_not",
+    );
+
+    const BATCH_SQL: &str =
+        "DELETE FROM MockTable WHERE TRUE; INSERT INTO MockTable (c) VALUES ('x')";
+
+    // Every ExecuteBatchDml request the server saw, in order.
+    let batch_dml: Arc<Mutex<Vec<v1::ExecuteBatchDmlRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let record = batch_dml.clone();
+    let server = MockServer::start(move |mock| {
+        // In case the client begins the read/write transaction explicitly rather than inline.
+        serve_begin_transaction(mock);
+        mock.expect_execute_batch_dml().returning(move |request| {
+            let request = request.into_inner();
+            let inline_begin = matches!(
+                request
+                    .transaction
+                    .as_ref()
+                    .and_then(|t| t.selector.as_ref()),
+                Some(v1::transaction_selector::Selector::Begin(_))
+            );
+            let statements = request.statements.len();
+            record.lock().unwrap().push(request);
+            // One result set per statement (row count 1 each); the first echoes the begun
+            // transaction id back when the batch began the transaction inline.
+            let result_sets = (0..statements)
+                .map(|i| v1::ResultSet {
+                    metadata: Some(v1::ResultSetMetadata {
+                        transaction: (i == 0 && inline_begin).then(|| v1::Transaction {
+                            id: b"dml-txn".to_vec(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    stats: Some(v1::ResultSetStats {
+                        row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect();
+            Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
+                result_sets,
+                status: Some(spanner_grpc_mock::google::rpc::Status {
+                    code: 0,
+                    message: "OK".into(),
+                    details: vec![],
+                }),
+                ..Default::default()
+            }))
+        });
+        mock.expect_commit().returning(|_| commit_ok());
+    });
+
+    let mut connection = server.connect();
+
+    // 1. Autocommit: a multi-statement `;`-batch runs immediately as one ExecuteBatchDml — the
+    //    whole read/write transaction — and reports the summed affected-row count.
+    let mut batch = connection.new_statement().expect("new statement");
+    batch.set_sql_query(BATCH_SQL).unwrap();
+    assert_eq!(
+        batch.execute_update().expect("autocommit `;`-batch"),
+        Some(2),
+        "the summed batch-DML row count must surface"
+    );
+
+    // 2. Manual mode: the same `;`-batch buffers (no RPC), and commit replays it in one
+    //    read/write transaction.
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("disable autocommit");
+    let mut buffered = connection.new_statement().expect("new statement");
+    buffered.set_sql_query(BATCH_SQL).unwrap();
+    assert_eq!(
+        buffered.execute_update().expect("buffered `;`-batch"),
+        None,
+        "DML in manual mode buffers (returns None), not commits"
+    );
+    connection.commit().expect("commit the buffered DML");
+
+    let seen = batch_dml.lock().unwrap();
+    assert_eq!(
+        seen.len(),
+        2,
+        "one ExecuteBatchDml per transaction: the autocommit batch, then the manual commit"
+    );
+    assert_eq!(
+        seen[0].statements.len(),
+        2,
+        "both statements ride one batch"
+    );
+    assert!(
+        seen[0].last_statements,
+        "a mutation-free autocommit `;`-batch is the transaction's entire content, so it must \
+         be flagged as the transaction's last request"
+    );
+    assert_eq!(seen[1].statements.len(), 2, "the commit replays the buffer");
+    assert!(
+        !seen[1].last_statements,
+        "buffered manual-mode DML replayed at commit must NOT be flagged — the commit may still \
+         apply buffered mutations after the batch executes"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Shared client stack (SPAN-1)
 // ---------------------------------------------------------------------------

@@ -768,16 +768,15 @@ fn isolation_to_adbc_string(isolation: &IsolationLevel) -> &'static str {
 /// an autocommit DML bulk ingest (which calls this once per chunk so a retry only ever clones one
 /// chunk, not the whole ingest).
 ///
-/// `last_statement` optimization: a single-statement autocommit batch is the entire transaction —
-/// the runner runs this one-statement `ExecuteBatchDml` and immediately commits, with no further
-/// statement, read, or query in the transaction. Flagging the batch as the transaction's last
-/// request (`ExecuteBatchDmlRequest.last_statements`) lets Spanner release the transaction as part
-/// of the same round-trip, saving the separate `Commit` RPC for the common single-DML case. We
-/// only set it for `statements.len() == 1`: a multi-statement `;`-batch is deliberately left
-/// unflagged (conservative — the flag is a whole-batch assertion, and we reserve it for the
-/// unambiguous single-statement case), and mutation-carrying / manual-commit batches go through
-/// [`run_batch_txn`] with the flag off (their commit still applies buffered mutations, so the
-/// batch is *not* the transaction's last request).
+/// `last_statement` optimization: an autocommit batch — whether a single statement or a
+/// multi-statement `;`-batch — is by construction the transaction's *entire* content: the runner
+/// runs this one `ExecuteBatchDml` and immediately commits, with no further statement, read, or
+/// query in the transaction. Flagging the batch as the transaction's last request
+/// (`ExecuteBatchDmlRequest.last_statements`) lets Spanner release the transaction as part of the
+/// same round-trip, so the trailing `Commit` needs no extra server work — covering the common
+/// single-DML case and dbt-style `DELETE …; INSERT …` batches alike. Mutation-carrying /
+/// manual-commit batches instead go through [`run_batch_txn`] with the flag off (their commit
+/// still applies buffered mutations, so the batch is *not* the transaction's last request).
 #[allow(clippy::too_many_arguments)] // threads one connection/statement config item per argument
 pub(crate) fn run_batch_dml(
     runtime: &SharedRuntime,
@@ -790,8 +789,9 @@ pub(crate) fn run_batch_dml(
     commit_stats: &CommitStats,
     statements: Vec<SpannerSql>,
 ) -> Result<i64> {
-    // Free RPC saving only for the single-statement autocommit case (see the doc comment above).
-    let last_statements = statements.len() == 1;
+    // Every autocommit batch is the whole transaction — nothing follows it before the commit —
+    // so it is always the transaction's last request (see the doc comment above).
+    let last_statements = true;
     run_batch_txn(
         runtime,
         client,

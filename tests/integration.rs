@@ -682,13 +682,14 @@ fn query_and_dml_round_trip() {
         (2, "Bob", false, 3.25)
     );
 
-    // --- single-statement autocommit DML carries the `last_statement` optimization ---
+    // --- autocommit DML carries the `last_statement` optimization ---
     //
-    // A single-statement autocommit UPDATE is the entire read/write transaction, so the driver
-    // flags its `ExecuteBatchDml` batch as the transaction's last request (`last_statements=true`),
-    // letting Spanner release the transaction without a separate Commit RPC. The flag must not
-    // change the observable result: the statement still reports its exact affected-row count and
-    // the write is durably committed. Update one row, assert the count, and read it back.
+    // An autocommit UPDATE is the entire read/write transaction, so the driver flags its
+    // `ExecuteBatchDml` batch as the transaction's last request (`last_statements=true` — set for
+    // every autocommit batch, single- or multi-statement), letting Spanner release the
+    // transaction as part of the same round-trip. The flag must not change the observable result:
+    // the statement still reports its exact affected-row count and the write is durably
+    // committed. Update one row, assert the count, and read it back.
     let mut update = connection.new_statement().expect("new statement");
     update
         .set_sql_query("UPDATE Singers SET Score = 9.5 WHERE SingerId = 1")
