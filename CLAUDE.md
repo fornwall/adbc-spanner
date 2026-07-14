@@ -168,7 +168,7 @@ and **each is independently a crates.io publish blocker** — the crate cannot b
 lines plus `deny.toml` plus the docs; this list is the one place that enumerates every edit needed to
 revert a family to versioned crates.io releases. Current pinned revs:
 
-- `google-cloud-rust`: `3872d2885c6da3a9463e85b50bf1fe8e9ddc1fa1`
+- `google-cloud-rust`: `a69f6d5771ea454cadb6aace92a0f114b1b27e50` (upstream `googleapis/google-cloud-rust` `main`)
 - `apache/arrow-adbc`: `198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab`
 
 **Invariant:** the three arrow-adbc crates (`adbc_core`, `adbc_ffi`, `adbc_driver_manager`) must

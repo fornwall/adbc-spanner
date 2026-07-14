@@ -55,7 +55,7 @@ since DWARF can't unwind through libc's `memmove`.)
 
 Read throughput is currently gated by an O(n²) row-assembly loop in the pinned
 `google-cloud-spanner` client (`process_partial_result_set`), which caps it at a
-flat ~40k rows/s. The fix (fork PR `fornwall/google-cloud-rust#2`) lifts it to
+flat ~40k rows/s. The fix (upstream PR `googleapis/google-cloud-rust#6037`) lifts it to
 ~290k rows/s (~7×) and makes the ADBC driver ~2× faster than the official client
 on this workload. Until that fix lands in the pinned rev, these benchmarks will
 show the driver at parity-or-slower — the Arrow/Polars advantage is real but
