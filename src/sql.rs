@@ -87,7 +87,11 @@ pub(crate) fn is_dml_returning(sql: &str) -> bool {
 /// an ordinary character rather than an escape. A plain bytes prefix (`b`) keeps backslash
 /// escapes, so it needs no special handling.
 pub(crate) fn is_raw_prefix(word: &str) -> bool {
-    matches!(word.to_ascii_lowercase().as_str(), "r" | "rb" | "br")
+    // `eq_ignore_ascii_case` keeps this allocation-free — this runs once per word lexeme of every
+    // lexed SQL string, so a `to_ascii_lowercase()` here would allocate per word.
+    word.eq_ignore_ascii_case("r")
+        || word.eq_ignore_ascii_case("rb")
+        || word.eq_ignore_ascii_case("br")
 }
 
 /// Consume a string/bytes literal or quoted identifier whose opening `quote` has just been read,
@@ -447,6 +451,17 @@ pub(crate) fn qualified_table(db_schema: Option<&str>, table_name: &str) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_prefix_detection() {
+        // Any case of `r` / `rb` / `br` is a raw-literal prefix; nothing else is.
+        for word in ["r", "R", "rb", "Rb", "rB", "RB", "br", "bR", "Br", "BR"] {
+            assert!(is_raw_prefix(word), "should be a raw prefix: {word}");
+        }
+        for word in ["", "b", "B", "rr", "bb", "rbr", "raw", "x", "ré"] {
+            assert!(!is_raw_prefix(word), "should not be a raw prefix: {word}");
+        }
+    }
 
     #[test]
     fn detects_ddl() {
