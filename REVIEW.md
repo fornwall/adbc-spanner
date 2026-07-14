@@ -168,8 +168,8 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 - [ ] **SPAN-6 (Low)** — Mutations-only manual commit uses the read/write runner instead of the write-only transaction — `src/connection.rs:320-343,498`
   `WriteOnlyTransaction::write` documents exactly-once replay protection — precisely the ambiguous-transport double-apply caveat the module doc warns about. It already gets the same config via `apply_to_write_only`. **Fix:** in `apply_transaction`, when `statements.is_empty()`, route through the write-only machinery.
 
-- [ ] **SPAN-7 (Low)** — `last_statements` left off for multi-statement autocommit `;`-batches — `src/connection.rs:451-477`
-  `set_last_statements(true)` only when `len() == 1`, yet every mutation-free autocommit batch is by construction the transaction's entire content. Extending to `>= 1` is equally safe and covers dbt-style `DELETE; INSERT`.
+- [x] **SPAN-7 (Low)** — `last_statements` left off for multi-statement autocommit `;`-batches — `src/connection.rs:451-477`
+  `set_last_statements(true)` only when `len() == 1`, yet every mutation-free autocommit batch is by construction the transaction's entire content. Extending to `>= 1` is equally safe and covers dbt-style `DELETE; INSERT`. *Resolved:* `run_batch_dml` now flags every autocommit batch (`last_statements = true` unconditionally — the batch is always the transaction's whole content there); the manual-commit path still goes through `run_batch_txn` with the flag off (its commit may apply buffered mutations after the batch). Wire-asserted both ways by `autocommit_batch_dml_is_flagged_last_statements_but_manual_commit_is_not` in `tests/mock_spanner.rs`.
 
 - [ ] **SPAN-8 (Low, tracked limitation)** — `spanner.request.priority` never reaches the `ExecuteBatchDml` RPC (all plain DML) — `src/request.rs:224-232`
   `BatchDmlBuilder` exposes only `set_request_tag`, though the proto carries full `RequestOptions`. Priority applies to the commit only. Documented driver-side; blocked on UP-4. Tick when tracked/linked to the upstream issue.
