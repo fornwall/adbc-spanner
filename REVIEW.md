@@ -104,8 +104,8 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 - [x] **CONV-1 (Medium)** — Null-typed bind columns rejected, contradicting the driver's own `get_parameter_schema` — `src/bind.rs:263-366`, `src/statement.rs:1678`
   `get_parameter_schema` advertises every `@param` as `DataType::Null`, but `scalar_binder`/`cell_value` have no `Null` arm — a batch built from that very schema (or pyarrow's inferred `null` column for all-`None` params) fails `InvalidArguments`. **Fix:** add a `DataType::Null` arm returning `null_value()`.
 
-- [ ] **CONV-2 (Medium)** — No `Dictionary` (or `RunEndEncoded`) support on the Arrow→Spanner path — `src/bind.rs:263-366`
-  Pandas categoricals / dictionary-encoded string columns are rejected wholesale even though the value type is supported. **Fix:** unwrap `Dictionary(_, value_ty)` in `cell_value` (resolve `keys[row] → values[key]`, or `arrow_cast` once per batch).
+- [x] **CONV-2 (Medium)** — No `Dictionary` (or `RunEndEncoded`) support on the Arrow→Spanner path — `src/bind.rs:263-366`
+  Pandas categoricals / dictionary-encoded string columns are rejected wholesale even though the value type is supported. **Fix:** unwrap `Dictionary(_, value_ty)` in `cell_value` (resolve `keys[row] → values[key]`, or `arrow_cast` once per batch). *Resolved:* `cell_value` resolves `keys[row] → values[key]` and recurses on the value type (bind + mutation ingest + create-mode DDL). `RunEndEncoded` stays rejected — no known producer emits it over the C data interface today; revisit on demand.
 
 - [ ] **CONV-3 (Medium)** — `INTERVAL` missing from `is_groupable`'s non-groupable list can break `get_statistics` for the whole database — `src/statistics.rs:328-335`
   `COUNT(DISTINCT interval_col)` fails the per-table aggregate and the error propagates out of `collect_statistics`, so one INTERVAL column anywhere fails the entire call. The function's own doc says the list must stay complete. **Fix:** add `INTERVAL` (excluding a groupable type is always safe; the reverse fails the whole scan). Check `UUID` on the emulator while at it.
