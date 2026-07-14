@@ -1828,14 +1828,11 @@ impl Statement for SpannerStatement {
         // streamed reader (see `CancelSlot`).
         self.cancel.begin_operation();
         let sql = self.sql()?;
-        if crate::sql::is_ddl(&sql) {
-            return Err(invalid_state(
-                "execute_partitions is only valid for queries",
-            ));
-        }
-        // Query path (not DDL): strip any trailing statement terminator(s), exactly as `execute`
-        // does — both the PLAN probe and `partition_query` run through the same ExecuteSql surface,
-        // which rejects a trailing `;`, yet callers routinely append one.
+        check_partition_query(&sql)?;
+        // Query path only (`check_partition_query` rejected DDL/DML): strip any trailing statement
+        // terminator(s), exactly as `execute` does — both the PLAN probe and `partition_query` run
+        // through the same ExecuteSql surface, which rejects a trailing `;`, yet callers routinely
+        // append one.
         let sql = crate::sql::strip_trailing_terminators(&sql);
         // Partitioning a read has the same read-your-writes hazard as `execute`: reject it in a
         // manual transaction that began with DML (the partitions would read a pre-write
@@ -2015,22 +2012,42 @@ fn undeclared_parameter_types(
         .unwrap_or_default()
 }
 
-/// Guard for `execute_schema`: only queries can be planned. The PLAN probe runs in a single-use
-/// read-only transaction, and letting DML reach it surfaces Spanner's raw "DML statements can only
-/// be performed in a read-write transaction" error, which misleads the caller into thinking the
-/// transaction mode is the problem. Catch DDL and DML up front with a clear message instead. (This
-/// also covers `THEN RETURN` DML — it does produce rows, but Spanner cannot plan it read-only.)
-fn check_schema_query(sql: &str) -> Result<()> {
+/// Shared guard for the query-only entry points (`execute_schema`, `execute_partitions`): both run
+/// through read-only transactions, and letting DML reach them surfaces Spanner's raw "DML
+/// statements can only be performed in a read-write transaction" error, which misleads the caller
+/// into thinking the transaction mode is the problem. Catch DDL and DML up front with a clear
+/// message instead. (This also covers `THEN RETURN` DML — it does produce rows, but Spanner cannot
+/// run it read-only.) `dml_rationale` completes "DML (INSERT/UPDATE/DELETE) cannot be …" with the
+/// entry point's read-only operation.
+fn check_query_only(sql: &str, entry_point: &str, dml_rationale: &str) -> Result<()> {
     if crate::sql::is_ddl(sql) {
-        return Err(invalid_state("execute_schema is only valid for queries"));
+        return Err(invalid_state(format!(
+            "{entry_point} is only valid for queries"
+        )));
     }
     if crate::sql::is_dml(sql) {
-        return Err(invalid_argument(
-            "execute_schema only supports queries: DML (INSERT/UPDATE/DELETE) cannot be planned \
-             in a read-only schema probe; run it via execute or execute_update instead",
-        ));
+        return Err(invalid_argument(format!(
+            "{entry_point} only supports queries: DML (INSERT/UPDATE/DELETE) cannot be \
+             {dml_rationale}; run it via execute or execute_update instead"
+        )));
     }
     Ok(())
+}
+
+/// Guard for `execute_schema`: only queries can be planned (the PLAN probe runs in a single-use
+/// read-only transaction).
+fn check_schema_query(sql: &str) -> Result<()> {
+    check_query_only(sql, "execute_schema", "planned in a read-only schema probe")
+}
+
+/// Guard for `execute_partitions`: only queries can be partitioned (`partition_query` runs in a
+/// batch read-only transaction).
+fn check_partition_query(sql: &str) -> Result<()> {
+    check_query_only(
+        sql,
+        "execute_partitions",
+        "partitioned in a batch read-only transaction",
+    )
 }
 
 /// Guard for `;`-separated **multi-statement** batches on the DML paths: `ExecuteBatchDml`
@@ -2490,6 +2507,49 @@ mod tests {
             assert_eq!(error.status, Status::InvalidArguments, "{sql}");
             assert!(
                 error.message.contains("only supports queries"),
+                "unexpected message for {sql}: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn execute_partitions_guard_rejects_ddl_and_dml() {
+        // Queries — plain, CTE, parenthesised, statement-hinted — pass through to partitioning.
+        for sql in [
+            "SELECT 1",
+            "WITH cte AS (SELECT 1 AS a) SELECT a FROM cte",
+            "(SELECT 1)",
+            "@{USE_ADDITIONAL_PARALLELISM=true} SELECT 1",
+            "GRAPH g MATCH (n) RETURN n.id",
+        ] {
+            check_partition_query(sql).unwrap_or_else(|e| panic!("query should pass: {sql}: {e}"));
+        }
+        // DDL is rejected up front (unchanged behaviour).
+        let error =
+            check_partition_query("CREATE TABLE t (id INT64) PRIMARY KEY (id)").unwrap_err();
+        assert_eq!(error.status, Status::InvalidState);
+        assert!(
+            error.message.contains("execute_partitions"),
+            "unexpected message: {}",
+            error.message
+        );
+        // DML — in any spelling, hinted, or with THEN RETURN — gets a clear `InvalidArguments`
+        // instead of Spanner's raw read-only-transaction error from `partition_query` (COR-11).
+        for sql in [
+            "INSERT INTO t (id) VALUES (1)",
+            "update t set c = 1 where true",
+            "Delete From t Where true",
+            "/* comment */ INSERT INTO t (id) VALUES (1)",
+            "@{PDML_MAX_PARALLELISM=1} DELETE FROM t WHERE true",
+            "INSERT INTO t (id) VALUES (1) THEN RETURN id",
+        ] {
+            let error = check_partition_query(sql).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "{sql}");
+            assert!(
+                error
+                    .message
+                    .contains("execute_partitions only supports queries"),
                 "unexpected message for {sql}: {}",
                 error.message
             );

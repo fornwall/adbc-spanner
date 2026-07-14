@@ -55,8 +55,8 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 - [ ] **COR-10 (Low)** — `commit()` / autocommit-toggle apply buffered writes even when the connection is read-only — `src/connection.rs:1083-1108,754-780`
   `adbc.connection.readonly` is only enforced in the statement write paths; buffer DML → set `readonly=true` → `commit()` (or `autocommit=true`) still writes. **Fix:** check the flag on the commit paths, or document the exception to the "reject all writes" contract.
 
-- [ ] **COR-11 (Low)** — `execute_partitions` rejects DDL cleanly but lets DML through to a raw Spanner error — `src/statement.rs:1576-1581`
-  Only `is_ddl` gets the clean `InvalidState`; `INSERT …` reaches `partition_query` and surfaces Spanner's read-only-transaction error. **Fix:** mirror the `check_schema_query` guard (which handles both with clear messages).
+- [x] **COR-11 (Low)** — `execute_partitions` rejects DDL cleanly but lets DML through to a raw Spanner error — `src/statement.rs:1576-1581`
+  Only `is_ddl` gets the clean `InvalidState`; `INSERT …` reaches `partition_query` and surfaces Spanner's read-only-transaction error. **Fix:** mirror the `check_schema_query` guard (which handles both with clear messages). *Resolved:* the two guards now share one parameterized `check_query_only` helper; `execute_partitions` calls `check_partition_query`, rejecting DDL with `InvalidState` (unchanged) and DML with a clear `InvalidArguments` before any RPC. Unit-tested alongside the `execute_schema` guard test.
 
 - [ ] **COR-12 (Low)** — Inconsistent bound-data consumption on error between execute paths — `src/statement.rs:1403-1404,1500-1501` vs `:1427-1430`
   DML paths clear `self.bound` even on error (deliberate); the bound *query* path clears only on success, so a failed bound query leaves stale rows a later, unrelated `execute` silently reuses. **Fix:** clear on the bound-query error path too. (Related: SPEC-3 — `execute_partitions` never clears bound data at all.)
