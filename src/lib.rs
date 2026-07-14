@@ -53,16 +53,25 @@
 //! ## Transactions
 //!
 //! Connections are in **autocommit** mode by default. Setting `adbc.connection.autocommit` to
-//! `false` enters manual transaction mode, in which DML — and any bulk ingest's insert mutations —
-//! is **buffered** and applied atomically in
-//! one read/write transaction on `commit` (the Spanner client exposes read/write transactions only
-//! through a closure-based runner, so there is no true open transaction to run statements in).
-//! Two consequences: a manual transaction has **no read-your-writes** — queries run immediately in
-//! a fresh read-only snapshot and cannot see buffered writes, so a data-returning query issued
-//! while a write is pending is rejected with `InvalidState` (rather than silently returning a
-//! pre-insert result); commit or roll back first — and DDL issued after buffered DML **executes
-//! before it** (DDL runs immediately; it is never transactional in Spanner). See
-//! [`SpannerConnection`] for the full model.
+//! `false` enters manual transaction mode. A manual transaction is exactly one of three kinds —
+//! **queries**, **DML**, or **DDL** — fixed by its *first* statement; a statement of any other
+//! kind is rejected with `InvalidState` until `commit` or `rollback` ends the transaction:
+//!
+//! - **Queries** all run on one shared multi-use read-only transaction, so every read in the
+//!   transaction observes a single consistent snapshot (pinned at the first query's
+//!   `spanner.read.staleness` bound); commit/rollback simply drop it — Spanner read-only
+//!   transactions need no commit RPC.
+//! - **DML** — and any bulk ingest's insert mutations — is **buffered** and applied atomically in
+//!   one read/write transaction on `commit` (the Spanner client exposes read/write transactions
+//!   only through a closure-based runner, so there is no true open transaction to run statements
+//!   in). Consequently a DML transaction has **no read-your-writes** — a data-returning query
+//!   inside it is rejected rather than silently returning a pre-insert result — and DML counts
+//!   report as unknown (`None`) until commit.
+//! - **DDL** is **buffered** and applied on `commit` as one `UpdateDatabaseDdl` batch
+//!   (near-atomic: Spanner applies the batch in order, so a mid-batch failure leaves earlier
+//!   statements applied).
+//!
+//! See [`SpannerConnection`] for the full model.
 //!
 //! ## Example
 //!

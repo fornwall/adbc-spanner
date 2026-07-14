@@ -251,25 +251,29 @@ in [`src/statement.rs`](../src/statement.rs).
 ### 5.5 Transactions
 
 By default a connection is in **autocommit** mode: every statement commits on its own. Each query
-gets a fresh read snapshot; each DML statement gets its own read/write transaction.
+gets a fresh read snapshot; each DML statement gets its own read/write transaction; DDL applies
+immediately.
 
 Set the standard `adbc.connection.autocommit` option to `false` to enter **manual** mode, then call
-`commit()` or `rollback()` on the connection to end the transaction.
+`commit()` or `rollback()` on the connection to end the transaction. A manual transaction is
+exactly one kind of work — **queries**, **DML**, or **DDL** — fixed by its *first* statement;
+a statement of any other kind fails with `InvalidState` until the transaction ends:
 
-There is one important subtlety, and it comes from the preview Spanner client: that client exposes
-read/write transactions only through a **closure-based runner** — there is no "open a transaction,
-run statements against it, then commit" handle. To make manual transactions work anyway, the driver
-**buffers** the DML you issue and replays the whole batch atomically inside a single read/write
-runner call at `commit()` time. Two consequences follow, and both are documented user-facing:
+- **Queries** all run on one shared multi-use read-only transaction, so every read in the
+  transaction observes a single consistent snapshot; `commit()`/`rollback()` simply drop it
+  (Spanner read-only transactions need no commit RPC).
+- **DML** is **buffered** and replayed atomically inside a single read/write runner call at
+  `commit()` time. This shape comes from the preview Spanner client, which exposes read/write
+  transactions only through a **closure-based runner** — there is no "open a transaction, run
+  statements against it, then commit" handle. Two consequences: **no read-your-writes** (a query
+  could not see the buffered DML, which is exactly why the kind rule rejects it — `INSERT` then
+  `SELECT COUNT(*)` would return the *pre-insert* count), and **`execute_update` returns `None`**
+  — the affected-row count is genuinely unknown until the buffered batch commits.
+- **DDL** is buffered too and applied at `commit()` as one `UpdateDatabaseDdl` batch (applied in
+  order — near-atomic, a mid-batch failure leaves earlier statements applied).
 
-- **No read-your-writes.** A query in a manual transaction runs immediately against a fresh
-  read-only snapshot; it does not see DML you have buffered but not yet committed. So `INSERT` then
-  `SELECT COUNT(*)` returns the *pre-insert* count.
-- **`execute_update` returns `None` in manual mode** — the affected-row count is genuinely unknown
-  until the buffered batch commits.
-
-This is a deliberate, documented trade-off; the proper fix waits on the client exposing real
-begin/commit handles. For the full model see the [`SpannerConnection`
+This is a deliberate, documented trade-off; genuine read-your-writes waits on the client exposing
+real begin/commit handles. For the full model see the [`SpannerConnection`
 rustdoc](../src/connection.rs) and the [README transactions bullet](../README.md#status).
 
 ### 5.6 Introspection — asking the database about itself

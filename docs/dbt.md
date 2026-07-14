@@ -37,33 +37,32 @@ This driver defaults to autocommit; setting `adbc.connection.autocommit=false` e
 that **buffers** DML and applies it in one read/write transaction at `commit`. For a dbt
 materialization, that mode is the wrong tool, for three independent reasons:
 
-- **No read-your-writes.** In manual mode only *writes* are buffered. Queries (`execute`) always run
-  immediately in a fresh read-only snapshot, so they cannot see the transaction's own buffered
-  writes. An `INSERT … SELECT` into a staging table followed by a `SELECT`/`MERGE` reading that
-  staging table would read the *pre-insert* state — the staged rows would be invisible. Rather than
-  silently returning that stale snapshot, the driver now **rejects** a data-returning query issued
-  while any write is buffered, failing loudly with `InvalidState` ("commit or roll back first"). So a
-  materialization that assumes it can read a table it just wrote in the same open transaction fails
-  outright instead of being quietly wrong — but it still cannot work as written.
-- **DML/DDL reorder.** DDL still executes immediately in manual mode while DML is buffered until
-  commit, so a `CREATE TABLE` issued *after* a buffered `INSERT` actually runs *before* it. A
-  build that interleaves DDL and DML — which every table materialization does — cannot rely on
-  program order.
-- **DDL can't be in the transaction anyway.** As above, `CREATE`/`ALTER`/`DROP TABLE` auto-commit
-  through the admin API; they are never part of the buffered read/write transaction, so "roll back
-  the transaction" would not undo them.
+- **One kind of work per transaction.** A manual transaction is exactly one of **queries, DML, or
+  DDL**, fixed by its first statement; a statement of any other kind fails with `InvalidState`
+  until `commit`/`rollback`. A build that interleaves DDL and DML — which every table
+  materialization does — therefore cannot run inside one manual transaction at all.
+- **No read-your-writes.** In a DML transaction the writes are *buffered* until commit, so a query
+  could never see them. An `INSERT … SELECT` into a staging table followed by a `SELECT`/`MERGE`
+  reading that staging table would read the *pre-insert* state — so rather than silently returning
+  that stale snapshot, the driver **rejects** the query (the kind-mixing rule above), failing
+  loudly with `InvalidState` ("commit or roll back first"). A materialization that assumes it can
+  read a table it just wrote in the same open transaction fails outright instead of being quietly
+  wrong — but it still cannot work as written.
+- **DDL commits are only near-atomic.** A DDL manual transaction buffers its statements and
+  applies them on commit as one `UpdateDatabaseDdl` batch — applied *in order*, so a mid-batch
+  failure leaves the earlier statements applied ("roll back the transaction" cannot undo a
+  half-applied batch, and Spanner DDL is never transactional to begin with).
 
-Autocommit sidesteps all three: **each statement commits before the next runs**, so a staging table
-that step *N* writes is fully visible to step *N+1*, and the sequence reads exactly like ordinary
-sequential SQL. The price — no cross-statement atomicity — is paid back by structuring every
-materialization so that the *only* operation that makes the new data live is a single atomic step: an
-`ALTER TABLE … RENAME`.
+Autocommit sidesteps all of this: **each statement commits before the next runs**, so a staging
+table that step *N* writes is fully visible to step *N+1*, and the sequence reads exactly like
+ordinary sequential SQL. The price — no cross-statement atomicity — is paid back by structuring
+every materialization so that the *only* operation that makes the new data live is a single atomic
+step: an `ALTER TABLE … RENAME`.
 
 > **Do not do this:** do not set `adbc.connection.autocommit=false` around a multi-step
-> materialization expecting to read intermediate writes back. A query issued while a write is
-> buffered now **fails with `InvalidState`** (queries read a fresh snapshot, not the buffer, so the
-> driver rejects the read rather than silently returning stale data), DDL will reorder ahead of
-> buffered DML, and DDL is not in the transaction to roll back. Use autocommit + a rename swap
+> materialization expecting to read intermediate writes back. A manual transaction is one kind of
+> work (queries, DML, or DDL) — the first DDL/DML statement of the build fixes the kind, and the
+> next statement of another kind **fails with `InvalidState`**. Use autocommit + a rename swap
 > instead.
 
 ## Spanner SQL dialect notes the adapter must honour
@@ -252,9 +251,10 @@ Beyond credentials, several driver options are directly useful in a dbt profile 
 ## Summary
 
 Spanner's lack of CTAS and its non-transactional DDL mean a dbt adapter cannot lean on
-transaction-wrapped builds, and this driver's manual mode (buffered DML, no read-your-writes — a
-read-back now fails loudly with `InvalidState` — DML/DDL reorder) makes wrapping a multi-step
-materialization in `autocommit=false` actively incorrect. The
+transaction-wrapped builds, and this driver's manual mode (one kind of work per transaction —
+queries, DML, or DDL — with buffered DML/DDL and no read-your-writes, so a read-back or a mixed
+DDL/DML sequence fails loudly with `InvalidState`) makes wrapping a multi-step materialization in
+`autocommit=false` actively incorrect. The
 workable design — mirroring `dbt-bigquery` — runs entirely in **autocommit**, so each staged
 statement is committed and visible to the next, and derives atomicity/idempotency from an **atomic
 `ALTER TABLE … RENAME` swap** for tables and from **individually-complete `MERGE` statements** for
