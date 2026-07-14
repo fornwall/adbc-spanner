@@ -5562,14 +5562,22 @@ fn get_statistics_reports_real_counts() {
         .expect("create database");
     let mut connection = connect_with_retry(&database);
 
+    // The UUID column pins down that UUID stays classified as groupable (distinct-countable): a
+    // misclassification either drops its DISTINCT_COUNT row or — worse, the CONV-3 failure mode —
+    // breaks the whole get_statistics call. INTERVAL (non-groupable, skipped from COUNT(DISTINCT))
+    // cannot get the same end-to-end coverage: the emulator rejects INTERVAL table columns
+    // outright, so it is covered by the `groupable_types` unit test instead.
     run(
         &mut connection,
         "DROP TABLE IF EXISTS AdbcStats; \
-         CREATE TABLE AdbcStats (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
+         CREATE TABLE AdbcStats (Id INT64, Name STRING(MAX), Tag UUID) PRIMARY KEY (Id)",
     );
     run(
         &mut connection,
-        "INSERT INTO AdbcStats (Id, Name) VALUES (1, 'a'), (2, 'a'), (3, NULL)",
+        "INSERT INTO AdbcStats (Id, Name, Tag) VALUES \
+         (1, 'a', CAST('11111111-2222-3333-4444-555555555555' AS UUID)), \
+         (2, 'a', CAST('11111111-2222-3333-4444-555555555555' AS UUID)), \
+         (3, NULL, NULL)",
     );
 
     // Exact statistics.
@@ -5603,6 +5611,14 @@ fn get_statistics_reports_real_counts() {
     assert!(
         has(Some("Id"), ADBC_STATISTIC_DISTINCT_COUNT_KEY, 3),
         "Id distinct 3: {stats:?}"
+    );
+    assert!(
+        has(Some("Tag"), ADBC_STATISTIC_NULL_COUNT_KEY, 1),
+        "Tag null 1: {stats:?}"
+    );
+    assert!(
+        has(Some("Tag"), ADBC_STATISTIC_DISTINCT_COUNT_KEY, 1),
+        "Tag distinct 1 (UUID is groupable): {stats:?}"
     );
 
     // approximate=true serves the same exact statistics: approximate merely *allows* inexact
