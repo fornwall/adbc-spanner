@@ -122,9 +122,16 @@ done
 # ---------------------------------------------------------------------------
 EXCLUDED=(
   # --- Bucket 1: suite-internal non-Spanner DDL -------------------------------
-  # These cases issue hardcoded CREATE TABLE with no primary key, double-quoted
-  # identifiers, and INT/TEXT/FLOAT types — not valid Spanner DDL (which needs
-  # INT64/FLOAT64, a PRIMARY KEY, backtick quoting) and there is no quirks hook.
+  # These cases issue hardcoded CREATE TABLE with no primary key and INT/TEXT
+  # types — not valid Spanner DDL (which needs INT64/TEXT-less types and a
+  # PRIMARY KEY) and there is no quirks hook for the DDL text. (Identifier
+  # *quoting* is no longer a blocker: DriverQuirks::QuoteIdentifier —
+  # apache/arrow-adbc#4504, overridden to backticks in spanner_validation.cc —
+  # covers the statements that used it, but the type/PK problems remain.)
+  # SqlPrepareUpdate/SqlPrepareUpdateStream create their table via create-mode
+  # ingest instead, so their table carries the synthetic adbc_ingest_key column;
+  # their `INSERT INTO bulk_ingest VALUES (@p0)` then has the wrong arity and
+  # their `SELECT *` readback surfaces the extra column.
   #
   # SqlQueryFloats / SqlSchemaFloats are NOT here: their only Spanner-incompatible
   # bit was the bare `CAST(1.5 AS FLOAT)` query, and the SpannerQuirks::RewriteSql
@@ -147,10 +154,11 @@ EXCLUDED=(
 
   # --- Bucket 2: ingest readback ----------------------------------------------
   # Create-mode ingest is supported (synthetic adbc_ingest_key UUID PK), so these
-  # now *run* instead of skipping, but they read back via a hardcoded double-quoted
-  # `SELECT * FROM "bulk_ingest" ...` (not GoogleSQL, no quirks hook), and `SELECT *`
-  # would also surface the synthetic key column, breaking the single-column
-  # assertions. This includes the view-type variants SqlIngest{BinaryView,StringView}:
+  # now *run* instead of skipping. Their readback SQL is valid GoogleSQL since
+  # DriverQuirks::QuoteIdentifier (apache/arrow-adbc#4504, overridden to
+  # backticks), but the `SELECT *` readback surfaces the synthetic key column,
+  # breaking the single-column assertions.
+  # This includes the view-type variants SqlIngest{BinaryView,StringView}:
   # the driver supports those inputs (the quirks declare it), so they run and fail
   # on the same readback as the rest — an expected failure that flips to passing
   # once the readback is fixed, guarded here.

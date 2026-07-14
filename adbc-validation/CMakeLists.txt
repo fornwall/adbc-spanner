@@ -47,23 +47,30 @@ if(SPANNER_VALIDATION_SANITIZE)
   add_link_options(-fsanitize=${SPANNER_VALIDATION_SANITIZE})
 endif()
 
-# Pin to an apache/arrow-adbc `main` revision, matching the family of the
-# adbc_core / adbc_ffi git pin the driver builds on (see Cargo.toml). Tracking
-# `main` (rather than the 0.23 release tag) picks up two C++ validation fixes:
+# Pin to an apache/arrow-adbc `main` revision. This is the same *family* as the
+# adbc_core / adbc_ffi git pin the driver builds on (see Cargo.toml), but the two
+# revisions are bumped independently and may differ — this one only selects the
+# C++ validation-suite sources. Tracking `main` (rather than the 0.23 release
+# tag) picks up three C++ validation fixes:
 # apache/arrow-adbc#4493 — TestSqlPartitionedInts now allows >1 partition, so
-# SpannerStatementTest.SqlPartitionedInts is gate-enforced instead of excluded —
-# and apache/arrow-adbc#4496, which adds the general
+# SpannerStatementTest.SqlPartitionedInts is gate-enforced instead of excluded;
+# apache/arrow-adbc#4496, which adds the general
 # `DriverQuirks::RewriteSql(query_id, default_sql)` hook. The Spanner quirks
 # override it (spanner_validation.cc) to rewrite the `CAST(1.5 AS FLOAT)` in
 # TestSqlQueryFloats / TestSqlSchemaFloats to GoogleSQL `FLOAT64`, so both cases
-# are gate-enforced instead of excluded. Bump the SHA to advance the suite.
+# are gate-enforced instead of excluded; and apache/arrow-adbc#4504, which adds
+# the `DriverQuirks::QuoteIdentifier(name)` hook (the Spanner quirks override it
+# to GoogleSQL backticks, so the ingest/prepare readback queries are no longer
+# blocked on ANSI double-quoting — see the EXCLUDED buckets in
+# scripts/run-adbc-validation.sh for what still keeps them excluded). Bump the
+# SHA to advance the suite.
 #
 # FORCE so this pin always wins over a value cached in a restored/incremental
 # build tree: a plain `set(... CACHE STRING)` is a no-op when the entry already
 # exists, so a stale `CMakeCache.txt` (e.g. one restored from a run on the old
 # rev) would silently keep the previous tag and rebuild against the wrong
 # arrow-adbc source. FORCE makes a rev bump here authoritative.
-set(ARROW_ADBC_TAG "138861516b5818ca0ab638678932418c652fa2f6"
+set(ARROW_ADBC_TAG "9be02985954c29b19ca14be9564f3ad92e63b5d9"
     CACHE STRING "arrow-adbc main revision" FORCE)
 
 include(FetchContent)
@@ -98,6 +105,16 @@ FetchContent_Declare(
   # or a new runner), so the extra history costs nothing on the common cached path.
   # The C/C++ project lives under c/ in the monorepo.
   SOURCE_SUBDIR c)
+# Keep the suite hermetic: arrow-adbc's `find_package(GTest)` (AdbcDefines.cmake)
+# would otherwise pick up any *installed* GTest config package (e.g. a
+# Homebrew/linuxbrew googletest). Besides linking an arbitrary host googletest,
+# the imported GTest::* targets a config package creates are directory-scoped to
+# the fetched subproject and invisible up here, so the target_link_libraries
+# below would fail with "GTest::gtest_main ... not found". Disabling the
+# find_package forces arrow-adbc's from-source googletest fallback (the CI path
+# everywhere), whose targets are real and global.
+set(CMAKE_DISABLE_FIND_PACKAGE_GTest TRUE)
+
 FetchContent_MakeAvailable(arrow_adbc)
 
 add_executable(spanner_validation spanner_validation.cc)
