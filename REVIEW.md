@@ -119,8 +119,8 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 - [ ] **CONV-6 (Low)** — Duplicate struct field names collapse to the first value in the keyed `build_struct` path — `src/conversion.rs:985-991`
   Only reachable through the defensive `Kind::Struct` branch (the wire encodes STRUCT positionally, handled correctly, dups included) — latent inconsistency, not a live bug.
 
-- [ ] **CONV-7 (Low)** — `parse_numeric_i128` accepts non-canonical `".5"` / `"5."` against its own comment — `src/conversion.rs:1158-1163`
-  Spanner never emits these and the parse is correct; strictness/doc nit only.
+- [x] **CONV-7 (Low)** — `parse_numeric_i128` accepts non-canonical `".5"` / `"5."` against its own comment — `src/conversion.rs:1158-1163`
+  Spanner never emits these and the parse is correct; strictness/doc nit only. *Resolved:* the parser is now strict — digits are required on both sides of any point, so `".5"` / `"5."` / `"."` / `"-."` are rejected like other malformed input (`None` → the usual NUMERIC decode error); the trailing-dot case folds into the split match and the emptiness check simplifies from a compound `int && frac` test to plain `int_part.is_empty()`, keeping comment and code in agreement (unit-tested in `numerics_to_unscaled_i128`).
 
 ## 5. Performance & efficiency
 

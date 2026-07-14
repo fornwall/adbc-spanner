@@ -1157,19 +1157,24 @@ pub(crate) fn parse_timestamp_micros(s: &str) -> Option<i64> {
 /// `Decimal128(38, 9)`). Returns `None` on malformed input or i128 overflow.
 pub(crate) fn parse_numeric_i128(s: &str) -> Option<i128> {
     // Spanner emits NUMERIC in one canonical shape: a bare decimal `[-]digits[.digits]` with fixed
-    // scale 9 — no leading `+`, no surrounding whitespace, at most nine fractional digits. Scan the
-    // bytes directly (rather than `.trim()` + a `char`-pattern `split_once('.')`, which dominated
-    // NUMERIC decoding in profiling) and reject anything outside that shape.
+    // scale 9 — no leading `+`, no surrounding whitespace, at most nine fractional digits, and
+    // digits on both sides of any point (never `.5` or `5.`). Scan the bytes directly (rather than
+    // `.trim()` + a `char`-pattern `split_once('.')`, which dominated NUMERIC decoding in
+    // profiling) and reject anything outside that shape.
     let (negative, bytes) = match s.as_bytes().split_first() {
         Some((b'-', rest)) => (true, rest),
         _ => (false, s.as_bytes()),
     };
-    // Integer / fractional split at the first '.' (a byte search, not a `char` pattern scan).
+    // Integer / fractional split at the first '.' (a byte search, not a `char` pattern scan); a
+    // point must be followed by at least one fractional digit, so a trailing `.` is malformed.
     let (int_part, frac_part) = match bytes.iter().position(|&b| b == b'.') {
-        Some(i) => (&bytes[..i], &bytes[i + 1..]),
+        Some(i) if i + 1 < bytes.len() => (&bytes[..i], &bytes[i + 1..]),
+        Some(_) => return None,
         None => (bytes, &bytes[bytes.len()..]),
     };
-    if (int_part.is_empty() && frac_part.is_empty()) || frac_part.len() > NUMERIC_SCALE as usize {
+    // The integer part always carries digits (this rejects "", "-", and a leading `.`); the
+    // fractional part carries at most `NUMERIC_SCALE` (the scale is fixed at 9).
+    if int_part.is_empty() || frac_part.len() > NUMERIC_SCALE as usize {
         return None;
     }
     // Accumulate the integer part, validating each byte; `checked_*` yields `None` on i128 overflow.
@@ -1519,6 +1524,13 @@ mod tests {
         assert_eq!(parse_numeric_i128("+3"), None); // leading '+'
         assert_eq!(parse_numeric_i128("0.0000000019"), None); // >9 fractional digits (scale is 9)
         assert_eq!(parse_numeric_i128(" 1"), None); // surrounding whitespace
+        assert_eq!(parse_numeric_i128(".5"), None); // no digits before the point
+        assert_eq!(parse_numeric_i128("-.5"), None); // no digits before the point (negative)
+        assert_eq!(parse_numeric_i128("5."), None); // no digits after the point
+        assert_eq!(parse_numeric_i128("-5."), None); // no digits after the point (negative)
+        assert_eq!(parse_numeric_i128("."), None); // no digits at all
+        assert_eq!(parse_numeric_i128("-."), None); // no digits at all (negative)
+        assert_eq!(parse_numeric_i128("-"), None); // bare sign
     }
 
     /// The chunk byte-budget estimate: strings count their UTF-8 length, SQL NULLs contribute
