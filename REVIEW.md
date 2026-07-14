@@ -242,8 +242,8 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 - [ ] **IDIO-5 (Low)** — Four private `as_string` copies shadow `options::string_option` — `src/request.rs:320`, `src/staleness.rs:154`, `src/directed_read.rs:163`, `src/query_options.rs:83` (+ duplicated `non_empty` helpers)
   Exactly the coercion `options.rs` exists to centralize, per its own module doc.
 
-- [ ] **IDIO-6 (Low)** — `first_keyword` hand-rolls a second comment/quote scanner beside the shared lexer — `src/sql.rs:318,357`
-  Contradicts the `Lexeme` rustdoc's one-lexer claim (sql.rs:146). Rewriting over `lex()` deletes both helpers and drops a per-classification `String` allocation.
+- [x] **IDIO-6 (Low)** — `first_keyword` hand-rolls a second comment/quote scanner beside the shared lexer — `src/sql.rs:318,357`
+  Contradicts the `Lexeme` rustdoc's one-lexer claim (sql.rs:146). Rewriting over `lex()` deletes both helpers and drops a per-classification `String` allocation. *Resolved:* `first_keyword` now iterates the shared `lex()` stream (comments/whitespace skipped as lexemes, a `@{…}` hint skipped through its `Other('}')` — literals inside the hint are `Quoted` lexemes, so an embedded `}` still can't close it) and returns the keyword as a `&str` borrowed from the input; `is_ddl`/`is_dml` compare with `eq_ignore_ascii_case`, so classification allocates nothing. Both hand-rolled helpers (`skip_leading_whitespace_and_comments`, `skip_hint_body`) are deleted — `push_statement`'s blank-segment check also rides the lexer now — and the edge classes are pinned by `first_keyword_edge_cases` in `src/sql.rs`.
 
 - [ ] **IDIO-7 (Low)** — Option-error labels inconsistently name the option — `src/statement.rs:1722,1790,1806,1811`, `src/connection.rs:1238`
   Some errors say which key failed; others say `"option expects a boolean"` or use a short name that isn't the key. Pass the full key as `what` everywhere.
