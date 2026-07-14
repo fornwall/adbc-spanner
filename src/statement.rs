@@ -1300,8 +1300,9 @@ impl SpannerStatement {
         if crate::sql::is_ddl(&sql) {
             return Ok(BTreeMap::new());
         }
-        // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
-        self.cancel.reset();
+        // A new operation begins: mint a fresh cancel signal for it, so a stale cancel aimed at a
+        // previous operation does not leak in (see `CancelSlot`).
+        self.cancel.begin_operation();
         if crate::sql::is_dml(&sql) {
             if self.is_read_only() {
                 return Ok(BTreeMap::new());
@@ -1312,7 +1313,7 @@ impl SpannerStatement {
         let client = self.client.clone();
         block_on_cancellable(
             &self.runtime,
-            &self.cancel,
+            &self.cancel.current(),
             with_timeout(
                 self.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
@@ -1346,7 +1347,7 @@ impl SpannerStatement {
         let retry = self.retry;
         block_on_cancellable(
             &self.runtime,
-            &self.cancel,
+            &self.cancel.current(),
             with_timeout(
                 self.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
@@ -1434,7 +1435,7 @@ impl SpannerStatement {
         }
         let bound = self.read_staleness.multi_use_timestamp_bound()?;
         let client = self.client.clone();
-        let built = block_on_cancellable(&self.runtime, &self.cancel, async move {
+        let built = block_on_cancellable(&self.runtime, &self.cancel.current(), async move {
             let mut builder = client.read_only_transaction();
             if let Some(b) = bound {
                 builder = builder.set_timestamp_bound(b);
