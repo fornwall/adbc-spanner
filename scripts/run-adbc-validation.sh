@@ -138,10 +138,12 @@ EXCLUDED=(
   'SpannerStatementTest.SqlQueryInsertRollback'
   'SpannerStatementTest.SqlQueryRowsAffectedDelete'
   'SpannerStatementTest.SqlQueryRowsAffectedDeleteStream'
-  # Transactions is NOT excluded: Spanner has no transactional DDL (DDL auto-commits
-  # via the admin API and cannot be rolled back), so the case can never apply. The
-  # `ddl_implicit_commit_txn` quirk makes it self-skip, which the gate tolerates —
-  # no expected-failure bookkeeping needed.
+  # Transactions is NOT excluded: it expects read-your-writes of an uncommitted
+  # ingest, which the driver's buffer-and-commit manual transactions (one kind of
+  # work per transaction — queries or DML) reject with InvalidState, so the case
+  # can never apply. The `ddl_implicit_commit_txn` quirk makes it self-skip
+  # (see the comment on the quirk in adbc-validation/spanner_validation.cc), which
+  # the gate tolerates — no expected-failure bookkeeping needed.
 
   # --- Bucket 2: ingest readback ----------------------------------------------
   # Create-mode ingest is supported (synthetic adbc_ingest_key UUID PK), so these

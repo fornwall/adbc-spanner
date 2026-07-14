@@ -3,15 +3,33 @@
 //! ## Transactions
 //!
 //! By default the connection is in **autocommit** mode: every statement runs in its own Spanner
-//! transaction (a single-use read-only transaction for queries, a read/write transaction for DML).
+//! transaction (a single-use read-only transaction for queries, a read/write transaction for
+//! DML).
 //!
 //! Setting the `adbc.connection.autocommit` option to `false` begins **manual** transaction mode.
-//! Because Spanner's client only exposes read/write transactions through a closure-based runner
-//! (there is no public begin/commit handle), the driver implements manual transactions by
-//! *buffering* DML statements — and the insert **mutations** of any bulk ingest — and applying the
-//! whole batch atomically in a single read/write transaction on [`Connection::commit`] — which
-//! also makes the retry-on-abort safe, since the buffer is simply replayed.
-//! [`Connection::rollback`] discards the buffer.
+//! A manual transaction is exactly one of two kinds — **queries** or **DML** — fixed by its
+//! *first* statement; a statement of the other kind is rejected with [`Status::InvalidState`]
+//! until [`Connection::commit`] or [`Connection::rollback`] ends the transaction:
+//!
+//! - **Queries** (first statement is a data-returning read): the driver opens one **multi-use
+//!   read-only transaction** and runs every query of the transaction on it, so all reads observe
+//!   a single consistent snapshot (pinned at the first query's `spanner.read.staleness` bound —
+//!   the bounded-staleness kinds are pinned to their most-stale legal equivalent, as on any
+//!   multi-use transaction). Commit and rollback are local: a Spanner read-only transaction needs
+//!   no commit/rollback RPC, so the snapshot is simply dropped.
+//! - **DML** (first statement is DML or a bulk ingest): because Spanner's client only exposes
+//!   read/write transactions through a closure-based runner (there is no public begin/commit
+//!   handle), the driver *buffers* DML statements — and the insert **mutations** of any bulk
+//!   ingest — and applies the whole batch atomically in a single read/write transaction on
+//!   commit, which also makes the retry-on-abort safe, since the buffer is simply replayed.
+//!
+//! **DDL is not transaction-aware.** Matching the ADBC BigQuery driver — which classifies
+//! nothing and sends every statement down its one execution path — DDL always executes
+//! immediately (through the admin `UpdateDatabaseDdl` API; Spanner DDL is never transactional)
+//! and leaves the transaction state untouched: it neither fixes the transaction's kind nor is
+//! rejected by it, and `commit`/`rollback` never affect it.
+//!
+//! [`Connection::rollback`] discards the buffered work (or drops the read-only snapshot).
 //!
 //! Consequences of this model, which callers should be aware of:
 //! - In manual mode, `execute_update` on DML returns `None` (the affected-row count is not known
@@ -19,16 +37,17 @@
 //! - DML with a `THEN RETURN` clause is rejected in manual mode: it must run via `ExecuteSql` to
 //!   produce its rows, but buffered DML is applied through `ExecuteBatchDml` (which does not
 //!   support `THEN RETURN`) — and the rows would be unobtainable at commit time anyway.
-//! - **No read-your-writes (guarded):** queries always run immediately in a fresh single-use
-//!   read-only snapshot, so a query cannot observe DML buffered earlier in the same manual
-//!   transaction. Rather than silently returning a *pre-insert* result, a data-returning query
-//!   (`execute`, the bound-query path, `execute_partitions`, and a query routed through
-//!   `execute_update` — which executes it read-only and discards the rows) issued while any write
-//!   — a buffered DML statement *or* an ingest mutation — is pending is rejected with
-//!   [`Status::InvalidState`]. Commit or roll back first if a statement needs to see earlier
-//!   writes. (`execute_schema`, a schema-only PLAN probe, is not guarded.)
-//! - **DML and DDL reorder:** DDL also runs immediately (DDL is never transactional in Spanner),
-//!   so DDL issued after buffered DML executes before it.
+//! - **No read-your-writes (guarded):** buffered DML only executes at commit, so a query could
+//!   never observe it. Rather than silently returning a *pre-write* result, a data-returning
+//!   query (`execute`, the bound-query path, `execute_partitions`, and a query routed through
+//!   `execute_update` — which executes it read-only and discards the rows) issued in a manual
+//!   transaction that began with DML is rejected with [`Status::InvalidState`] — the kind-mixing
+//!   rule above. (`execute_schema`, a schema-only PLAN probe returning no data, is not guarded;
+//!   partitioned reads run in their own batch read-only transaction and do not join a query
+//!   transaction's snapshot.)
+//! - **DML and DDL reorder:** DDL executes immediately, so DDL issued after buffered DML runs
+//!   before it. (Inside a query transaction, immediate DDL is invisible to the pinned snapshot —
+//!   ordinary snapshot semantics.)
 //! - **Ingest mutations apply at commit time:** a buffered bulk ingest's insert mutations are
 //!   applied by Spanner as part of the commit itself — after every buffered DML statement in the
 //!   transaction has executed, regardless of issue order — so DML in the same transaction cannot
@@ -59,7 +78,7 @@ use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::model::transaction_options::IsolationLevel;
 use google_cloud_spanner::mutation::Mutation;
 use google_cloud_spanner::statement::Statement as SpannerSql;
-use google_cloud_spanner::transaction::ReadWriteTransaction;
+use google_cloud_spanner::transaction::{MultiUseReadOnlyTransaction, ReadWriteTransaction};
 
 use crate::conversion::{TimestampPrecision, result_set_to_batch, stream_query};
 use crate::directed_read::DirectedRead;
@@ -75,28 +94,108 @@ use crate::staleness::ReadStaleness;
 use crate::statement::{DEFAULT_ROWS_PER_BATCH, SpannerStatement};
 use crate::timeout::{RpcTimeouts, with_timeout};
 
+/// What a manual transaction has become — fixed by its **first** statement, after which work of
+/// the other kind is rejected with [`Status::InvalidState`] until `commit` or `rollback` (see
+/// [`TxnState::check_kind_allowed`]).
+///
+/// DDL is deliberately **not** a kind: like the ADBC BigQuery driver — which classifies nothing
+/// and lets every statement run down the one execution path — this driver never gates DDL on the
+/// transaction. DDL executes immediately through the admin API (Spanner DDL is never
+/// transactional) and leaves the transaction state untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxnKind {
+    /// Data-returning queries, all running on one shared multi-use read-only transaction (a
+    /// single consistent snapshot).
+    Read,
+    /// DML statements and bulk-ingest mutations, buffered and applied atomically in one
+    /// read/write transaction on commit.
+    Dml,
+}
+
+impl TxnKind {
+    /// How the kind reads in an error message, as the thing being run / that began the txn.
+    fn what(self) -> &'static str {
+        match self {
+            TxnKind::Read => "a query",
+            TxnKind::Dml => "DML",
+        }
+    }
+
+    /// Why work of the other kind cannot join a transaction of this (active) kind.
+    fn rationale(self) -> &'static str {
+        match self {
+            TxnKind::Read => "the transaction is pinned to a multi-use read-only snapshot",
+            TxnKind::Dml => {
+                "the buffered DML is applied at commit, so a query would not observe the \
+                 pending writes (no read-your-writes)"
+            }
+        }
+    }
+}
+
+/// The state — kind *and* payload — of a manual transaction. The kind is fixed by the
+/// transaction's **first** statement; holding the payload inside the variant makes the kinds
+/// mutually exclusive by construction (a transaction cannot simultaneously carry a read-only
+/// snapshot and buffered DML).
+#[derive(Debug, Default, Clone)]
+enum ManualTxn {
+    /// No statement has fixed the transaction's kind yet.
+    #[default]
+    Unset,
+    /// Began with a data-returning query: every query in the transaction runs on this shared
+    /// multi-use read-only transaction, so all reads observe one consistent snapshot.
+    /// `Arc`-shared so a statement can execute on it without holding the [`SharedTxn`] lock;
+    /// dropped (no commit/rollback RPC needed) when the transaction ends.
+    Read(Arc<MultiUseReadOnlyTransaction>),
+    /// Began with DML or a bulk ingest: statements and insert mutations buffered here are
+    /// applied atomically in one read/write transaction on commit. Built statements (not raw
+    /// SQL) so that parameterized DML — which carries bound values — buffers just like a plain
+    /// `;`-batch does. Spanner applies buffered mutations at commit time, so they land *after*
+    /// every buffered DML statement executes, regardless of the order they were issued in.
+    Dml {
+        statements: Vec<SpannerSql>,
+        mutations: Vec<Mutation>,
+    },
+}
+
+impl ManualTxn {
+    fn kind(&self) -> Option<TxnKind> {
+        match self {
+            ManualTxn::Unset => None,
+            ManualTxn::Read(_) => Some(TxnKind::Read),
+            ManualTxn::Dml { .. } => Some(TxnKind::Dml),
+        }
+    }
+
+    /// Whether there is buffered work a commit must apply (a read-only transaction has none —
+    /// it ends by being dropped).
+    fn has_pending_work(&self) -> bool {
+        match self {
+            ManualTxn::Unset | ManualTxn::Read(_) => false,
+            ManualTxn::Dml {
+                statements,
+                mutations,
+            } => !statements.is_empty() || !mutations.is_empty(),
+        }
+    }
+}
+
 /// Transaction state shared between a connection and the statements it creates.
 #[derive(Debug)]
 pub(crate) struct TxnState {
-    /// When false, the connection is in manual transaction mode and DML is buffered.
+    /// When false, the connection is in manual transaction mode: DML and DDL buffer into
+    /// [`Self::txn`] and queries run on its shared read-only transaction.
     autocommit: bool,
-    /// DML statements buffered while in manual mode, applied atomically on commit. Built
-    /// statements (not raw SQL) so that parameterized DML — which carries bound values — buffers
-    /// just like a plain `;`-batch does.
-    pending: Vec<SpannerSql>,
-    /// Insert mutations buffered while in manual mode (a bulk ingest issued inside the manual
-    /// transaction), committed atomically with [`Self::pending`] in the same read/write transaction. Spanner
-    /// applies buffered mutations at commit time, so they land *after* every buffered DML
-    /// statement executes, regardless of the order they were issued in.
-    pending_mutations: Vec<Mutation>,
+    /// The manual transaction's state. Always [`ManualTxn::Unset`] in autocommit mode (ending a
+    /// manual transaction resets it, and nothing buffers while autocommit is on).
+    txn: ManualTxn,
 }
 
 impl TxnState {
     fn new() -> Self {
         Self {
             autocommit: true,
-            pending: Vec::new(),
-            pending_mutations: Vec::new(),
+            txn: ManualTxn::Unset,
         }
     }
 
@@ -105,57 +204,160 @@ impl TxnState {
         self.autocommit
     }
 
-    /// Whether a data-returning query would silently miss buffered writes: the connection is in
-    /// **manual** mode *and* at least one write is buffered (a DML statement *or* an ingest
-    /// mutation). Manual-mode queries run against a fresh read-only snapshot that does not observe
-    /// buffered writes, so this is the condition under which the driver rejects a query up front
-    /// (see [`SpannerStatement::ensure_no_buffered_writes_for_query`]) rather than returning a
-    /// pre-write result (no read-your-writes).
-    pub(crate) fn query_would_miss_buffered_writes(&self) -> bool {
-        !self.autocommit && (!self.pending.is_empty() || !self.pending_mutations.is_empty())
+    /// Check that work of `attempted` kind may run in the current transaction. Always allowed in
+    /// autocommit mode; in manual mode the transaction's kind is fixed by its **first** statement
+    /// (queries or DML) and the other kind is rejected with [`Status::InvalidState`] — naming
+    /// both kinds and the reason — until `commit` or `rollback` ends the transaction. (DDL has no
+    /// kind and is never checked: it executes immediately, outside the transaction.)
+    ///
+    /// The statement paths call this under the [`SharedTxn`] lock as part of buffering (the
+    /// `buffer_*` methods) or when adopting the shared read-only transaction
+    /// ([`Self::start_read_txn`]), which is what keeps the kinds mutually exclusive under
+    /// concurrent statements; the read paths additionally call it up front so a mixed-kind query
+    /// fails before any work is done.
+    pub(crate) fn check_kind_allowed(&self, attempted: TxnKind) -> Result<()> {
+        if self.autocommit {
+            return Ok(());
+        }
+        let Some(active) = self.txn.kind() else {
+            return Ok(());
+        };
+        if active == attempted {
+            return Ok(());
+        }
+        Err(invalid_state(format!(
+            "cannot run {} in a manual transaction that began with {}: {}. A manual transaction \
+             is either queries or DML — its kind is fixed by its first statement. Commit or \
+             roll back the transaction first.",
+            attempted.what(),
+            active.what(),
+            active.rationale(),
+        )))
     }
 
-    /// Buffer a DML statement to be applied on the next commit.
-    pub(crate) fn buffer(&mut self, statement: SpannerSql) {
-        self.pending.push(statement);
+    /// The manual transaction's shared read-only transaction, if one is active.
+    pub(crate) fn read_txn(&self) -> Option<Arc<MultiUseReadOnlyTransaction>> {
+        match &self.txn {
+            ManualTxn::Read(txn) => Some(txn.clone()),
+            _ => None,
+        }
     }
 
-    /// Buffer a mutation to be applied on the next commit (alongside any buffered DML).
-    pub(crate) fn buffer_mutation(&mut self, mutation: Mutation) {
-        self.pending_mutations.push(mutation);
+    /// Install `txn` as the manual transaction's shared read-only transaction and return the
+    /// effective one — the existing transaction if a concurrent statement won the install race
+    /// (`txn` is dropped; it has issued no RPC yet under the default inline begin), otherwise
+    /// `txn` itself.
+    ///
+    /// Re-checks the transaction kind first: the caller built `txn` outside the lock (the build
+    /// is async), so a concurrent statement may have fixed the transaction to DML/DDL in the
+    /// window — re-checking here, under the same lock the buffer paths write under, closes that
+    /// race with the same rejection the caller's up-front guard produces.
+    pub(crate) fn start_read_txn(
+        &mut self,
+        txn: Arc<MultiUseReadOnlyTransaction>,
+    ) -> Result<Arc<MultiUseReadOnlyTransaction>> {
+        self.check_kind_allowed(TxnKind::Read)?;
+        match &self.txn {
+            ManualTxn::Read(existing) => Ok(existing.clone()),
+            _ => {
+                self.txn = ManualTxn::Read(txn.clone());
+                Ok(txn)
+            }
+        }
     }
 
-    /// Atomically flip into autocommit mode and take the buffered DML and mutations that must be
-    /// committed first.
+    /// Buffer DML statements to be applied on the next commit, fixing the transaction's kind to
+    /// [`TxnKind::Dml`] (rejecting the buffer if a query fixed it to read-only).
+    pub(crate) fn buffer_dml(&mut self, new: Vec<SpannerSql>) -> Result<()> {
+        self.check_kind_allowed(TxnKind::Dml)?;
+        if new.is_empty() {
+            return Ok(());
+        }
+        match &mut self.txn {
+            ManualTxn::Dml { statements, .. } => statements.extend(new),
+            txn => {
+                *txn = ManualTxn::Dml {
+                    statements: new,
+                    mutations: Vec::new(),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Buffer a bulk-ingest insert mutation to be applied on the next commit (alongside any
+    /// buffered DML — an ingest counts as DML for the transaction's kind).
+    pub(crate) fn buffer_mutation(&mut self, mutation: Mutation) -> Result<()> {
+        self.check_kind_allowed(TxnKind::Dml)?;
+        match &mut self.txn {
+            ManualTxn::Dml { mutations, .. } => mutations.push(mutation),
+            txn => {
+                *txn = ManualTxn::Dml {
+                    statements: Vec::new(),
+                    mutations: vec![mutation],
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Atomically flip into autocommit mode and take the manual transaction's state — whose
+    /// buffered DML work, if any, must be committed first (a taken read-only transaction
+    /// needs no commit; taking it out ends it by drop).
     ///
     /// Doing both in one step — under the caller's single lock acquisition — is what closes the
-    /// enable-autocommit race: `run_or_buffer` checks the mode and buffers under this same mutex,
-    /// so once the mode reads autocommit no statement can add to the buffer, and the batch taken
-    /// here is the complete transaction. Flipping only *after* the apply (in a later acquisition)
-    /// would strand any DML buffered while the commit RPC was in flight.
-    fn enter_autocommit(&mut self) -> (Vec<SpannerSql>, Vec<Mutation>) {
+    /// enable-autocommit race: the buffer paths check the mode under this same mutex, so once the
+    /// mode reads autocommit no statement can add to the buffer, and the state taken here is the
+    /// complete transaction. Flipping only *after* the apply (in a later acquisition) would
+    /// strand any DML buffered while the commit RPC was in flight.
+    fn enter_autocommit(&mut self) -> ManualTxn {
         self.autocommit = true;
-        (
-            std::mem::take(&mut self.pending),
-            std::mem::take(&mut self.pending_mutations),
-        )
+        std::mem::take(&mut self.txn)
     }
 
-    /// Re-enter manual mode with `pending` / `mutations` re-buffered — the failure path of
+    /// Re-enter manual mode with the taken state restored — the failure path of
     /// [`Self::enter_autocommit`], so a failed apply keeps the transaction open and replayable
     /// (retry the toggle or `commit`, or `rollback` to discard). Nothing can have buffered while
-    /// autocommit was on (see `enter_autocommit`), but splice at the front anyway so replay order
-    /// would survive even if that invariant ever changed.
-    fn restore_manual(&mut self, pending: Vec<SpannerSql>, mutations: Vec<Mutation>) {
+    /// autocommit was on (`enter_autocommit` flips the mode and takes the state under one lock
+    /// acquisition, and every buffer path checks the mode under the same mutex), so the current
+    /// state is still `Unset` and the taken state simply moves back in.
+    fn restore_manual(&mut self, work: ManualTxn) {
         self.autocommit = false;
-        self.pending.splice(0..0, pending);
-        self.pending_mutations.splice(0..0, mutations);
+        debug_assert!(matches!(self.txn, ManualTxn::Unset));
+        self.txn = work;
+    }
+
+    /// End a committed transaction: remove exactly the `applied` work — anything buffered
+    /// *concurrently* while the commit RPC ran (appended behind the applied prefix under this
+    /// mutex) stays pending, and keeps the kind, for the next commit — and otherwise reset the
+    /// state, which also ends a read-only transaction by dropping its snapshot, so the next
+    /// statement fixes a fresh kind.
+    fn finish_commit(&mut self, applied: &ManualTxn) {
+        if let (
+            ManualTxn::Dml {
+                statements,
+                mutations,
+            },
+            ManualTxn::Dml {
+                statements: applied_statements,
+                mutations: applied_mutations,
+            },
+        ) = (&mut self.txn, applied)
+        {
+            statements.drain(..applied_statements.len());
+            mutations.drain(..applied_mutations.len());
+        }
+        if !self.txn.has_pending_work() {
+            self.txn = ManualTxn::Unset;
+        }
     }
 }
 
 #[cfg(test)]
 mod txn_state_tests {
-    use super::{Mutation, SpannerSql, TxnState};
+    use adbc_core::error::Status;
+
+    use super::{ManualTxn, Mutation, SpannerSql, TxnKind, TxnState};
 
     fn sql(s: &str) -> SpannerSql {
         SpannerSql::builder(s).build()
@@ -165,50 +367,125 @@ mod txn_state_tests {
         Mutation::new_insert_builder("t").set("Id").to(&id).build()
     }
 
-    fn pending_sqls(st: &TxnState) -> Vec<&str> {
-        st.pending.iter().map(|s| s.sql()).collect()
+    fn manual() -> TxnState {
+        let mut st = TxnState::new();
+        st.autocommit = false;
+        st
     }
 
-    /// The mode flip and the buffer take must be one atomic step: after `enter_autocommit` the
-    /// state already reads as autocommit (so `run_or_buffer`, which checks under the same mutex,
-    /// routes new DML to immediate execution) and the taken batch is the complete buffer — both
-    /// the DML statements and the mutations.
+    /// In autocommit mode every kind passes the check — each statement is its own transaction,
+    /// so there is no kind to mix with.
+    #[test]
+    fn autocommit_allows_every_kind() {
+        let st = TxnState::new();
+        for kind in [TxnKind::Read, TxnKind::Dml] {
+            st.check_kind_allowed(kind)
+                .expect("autocommit allows every kind");
+        }
+    }
+
+    /// An unset manual transaction allows either first kind; the first buffered DML fixes the
+    /// kind, after which queries are rejected with `InvalidState` (keeping the read-your-writes
+    /// rationale in the message, and naming the active kind) until the transaction ends.
+    #[test]
+    fn first_statement_fixes_the_transaction_kind() {
+        let mut st = manual();
+        for kind in [TxnKind::Read, TxnKind::Dml] {
+            st.check_kind_allowed(kind)
+                .expect("an unset transaction allows either first kind");
+        }
+        st.buffer_dml(vec![sql("UPDATE a")])
+            .expect("first DML fixes the kind");
+        st.check_kind_allowed(TxnKind::Dml)
+            .expect("more DML joins the transaction");
+        let error = st.check_kind_allowed(TxnKind::Read).unwrap_err();
+        assert_eq!(error.status, Status::InvalidState);
+        assert!(
+            error.message.contains("read-your-writes"),
+            "the query rejection should explain the read-your-writes hazard: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("began with DML"),
+            "the rejection should name the active kind: {}",
+            error.message
+        );
+    }
+
+    /// An ingest mutation counts as DML for the transaction's kind: it mixes freely with DML,
+    /// and queries are rejected against it exactly as against buffered DML.
+    #[test]
+    fn mutations_share_the_dml_kind() {
+        let mut st = manual();
+        st.buffer_mutation(mutation(1))
+            .expect("first ingest fixes the kind to DML");
+        st.buffer_dml(vec![sql("UPDATE a")])
+            .expect("DML joins an ingest-started transaction");
+        let error = st.check_kind_allowed(TxnKind::Read).unwrap_err();
+        assert_eq!(error.status, Status::InvalidState);
+    }
+
+    /// The mode flip and the state take must be one atomic step: after `enter_autocommit` the
+    /// state already reads as autocommit (so the buffer paths, which check under the same mutex,
+    /// route new DML to immediate execution) and the taken state is the complete transaction —
+    /// both the DML statements and the mutations.
     #[test]
     fn enter_autocommit_flips_and_takes_in_one_step() {
-        let mut st = TxnState::new();
-        st.autocommit = false;
-        st.buffer(sql("UPDATE a"));
-        st.buffer(sql("UPDATE b"));
-        st.buffer_mutation(mutation(1));
-        let (taken, taken_mutations) = st.enter_autocommit();
+        let mut st = manual();
+        st.buffer_dml(vec![sql("UPDATE a"), sql("UPDATE b")])
+            .unwrap();
+        st.buffer_mutation(mutation(1)).unwrap();
+        let taken = st.enter_autocommit();
         assert!(st.autocommit());
-        assert!(st.pending.is_empty());
-        assert!(st.pending_mutations.is_empty());
+        assert!(matches!(st.txn, ManualTxn::Unset));
+        let ManualTxn::Dml {
+            statements,
+            mutations,
+        } = taken
+        else {
+            panic!("the taken state must be the DML transaction");
+        };
         assert_eq!(
-            taken.iter().map(|s| s.sql()).collect::<Vec<_>>(),
+            statements.iter().map(|s| s.sql()).collect::<Vec<_>>(),
             ["UPDATE a", "UPDATE b"]
         );
-        assert_eq!(taken_mutations, [mutation(1)]);
+        assert_eq!(mutations, [mutation(1)]);
     }
 
-    /// The failure path must re-enter manual mode with the batch re-buffered — replaying the
-    /// toggle (or `commit`) then applies exactly the original transaction, and any DML that
-    /// somehow got buffered in between stays *behind* the restored batch.
+    /// The failure path must re-enter manual mode with the taken state restored — replaying the
+    /// toggle (or `commit`) then applies exactly the original transaction.
     #[test]
-    fn restore_manual_rebuffers_in_front() {
-        let mut st = TxnState::new();
-        st.autocommit = false;
-        st.buffer(sql("UPDATE a"));
-        st.buffer_mutation(mutation(1));
-        let (taken, taken_mutations) = st.enter_autocommit();
-        // Defensively simulate a buffer written during the window (run_or_buffer cannot actually
-        // do this while autocommit is on): restore must keep it, ordered after the original batch.
-        st.buffer(sql("UPDATE late"));
-        st.buffer_mutation(mutation(2));
-        st.restore_manual(taken, taken_mutations);
+    fn restore_manual_restores_the_taken_state() {
+        let mut st = manual();
+        st.buffer_dml(vec![sql("UPDATE a")]).unwrap();
+        let taken = st.enter_autocommit();
+        st.restore_manual(taken);
         assert!(!st.autocommit());
-        assert_eq!(pending_sqls(&st), ["UPDATE a", "UPDATE late"]);
-        assert_eq!(st.pending_mutations, [mutation(1), mutation(2)]);
+        assert!(matches!(&st.txn, ManualTxn::Dml { statements, .. } if statements.len() == 1));
+    }
+
+    /// `finish_commit` removes exactly the applied prefix: work buffered concurrently while the
+    /// commit RPC ran stays pending (keeping the kind) for the next commit, and a fully-drained
+    /// transaction resets to `Unset` so the next statement fixes a fresh kind.
+    #[test]
+    fn finish_commit_keeps_concurrently_buffered_work() {
+        let mut st = manual();
+        st.buffer_dml(vec![sql("UPDATE a")]).unwrap();
+        let applied = st.txn.clone();
+        // A statement buffers more DML while the commit RPC is in flight.
+        st.buffer_dml(vec![sql("UPDATE late")]).unwrap();
+        st.finish_commit(&applied);
+        let ManualTxn::Dml { statements, .. } = &st.txn else {
+            panic!("the late DML must stay pending, keeping the kind");
+        };
+        assert_eq!(
+            statements.iter().map(|s| s.sql()).collect::<Vec<_>>(),
+            ["UPDATE late"]
+        );
+        // Committing the remainder drains the state fully, resetting the kind.
+        let applied = st.txn.clone();
+        st.finish_commit(&applied);
+        assert!(matches!(st.txn, ManualTxn::Unset));
     }
 }
 
@@ -220,19 +497,25 @@ pub(crate) type SharedTxn = Arc<Mutex<TxnState>>;
 /// # Transactions
 ///
 /// The connection is in **autocommit** mode by default. Setting `adbc.connection.autocommit` to
-/// `false` enters **manual** transaction mode, in which DML — and the insert mutations of any bulk
-/// ingest — is *buffered* and applied atomically in one read/write transaction on
-/// [`Connection::commit`] ([`Connection::rollback`] discards the buffer), because the Spanner
-/// client exposes read/write transactions only through a closure-based runner (no begin/commit
-/// handle). Two consequences callers must be aware of:
+/// `false` enters **manual** transaction mode. A manual transaction is exactly one of two kinds
+/// — **queries** or **DML** — fixed by its *first* statement; mixing kinds is rejected with
+/// [`Status::InvalidState`] until [`Connection::commit`] or [`Connection::rollback`] ends the
+/// transaction:
 ///
-/// - **No read-your-writes (guarded):** queries always run immediately in a fresh read-only
-///   snapshot, so a query cannot observe DML buffered earlier in the same manual transaction.
-///   Rather than silently returning a *pre-insert* result, a data-returning query issued while any
-///   write (a buffered DML statement or an ingest mutation) is pending is rejected with
-///   [`Status::InvalidState`]. Commit or roll back first if a statement needs to see earlier writes.
-/// - **DML and DDL reorder:** DDL also runs immediately (DDL is never transactional in Spanner),
-///   so DDL issued after buffered DML executes before it.
+/// - **Queries** all run on one shared multi-use read-only transaction (a single consistent
+///   snapshot, pinned at the first query's `spanner.read.staleness` bound); commit/rollback
+///   simply drop it (Spanner read-only transactions need no commit RPC).
+/// - **DML** — and the insert mutations of any bulk ingest — is *buffered* and applied atomically
+///   in one read/write transaction on commit, because the Spanner client exposes read/write
+///   transactions only through a closure-based runner (no begin/commit handle).
+///
+/// **DDL is not transaction-aware** (matching the ADBC BigQuery driver): it always executes
+/// immediately via the admin API — Spanner DDL is never transactional — and leaves the
+/// transaction state untouched, so DDL issued after buffered DML executes *before* it.
+///
+/// See the [crate documentation](crate) — and the fuller module-level notes in `connection.rs` —
+/// for the list of consequences (no read-your-writes, `None` DML counts before commit,
+/// commit-failure replay semantics).
 #[derive(Debug)]
 pub struct SpannerConnection {
     runtime: SharedRuntime,
@@ -313,6 +596,19 @@ impl SpannerConnection {
             commit_stats: CommitStats::default(),
             txn: Arc::new(Mutex::new(TxnState::new())),
             cancel: CancelSignal::new(),
+        }
+    }
+
+    /// Apply the buffered work of a manual transaction: DML statements and ingest mutations
+    /// atomically in one read/write transaction. A read-only (or empty) transaction has nothing
+    /// to apply — its snapshot ends by being dropped when the caller clears the state.
+    fn apply_manual_txn(&self, work: &ManualTxn) -> Result<()> {
+        match work {
+            ManualTxn::Unset | ManualTxn::Read(_) => Ok(()),
+            ManualTxn::Dml {
+                statements,
+                mutations,
+            } => self.apply_transaction(statements.clone(), mutations.clone()),
         }
     }
 
@@ -755,14 +1051,15 @@ impl Optionable for SpannerConnection {
             OptionConnection::AutoCommit => {
                 let enable = parse_bool(value)?;
                 // Enabling autocommit commits any active manual transaction. The mode flip and the
-                // buffer take happen in ONE lock acquisition (`enter_autocommit`): once the mode is
-                // autocommit, `run_or_buffer` — which checks-and-buffers under this same mutex —
-                // can no longer add DML, so nothing a concurrent statement buffers can be stranded
-                // behind the flip (the old read/apply/flip-in-separate-acquisitions shape had
-                // exactly that race). Like `commit`, a failed apply must not lose the writes:
-                // `restore_manual` re-enters manual mode with the batch re-buffered so the caller
-                // can retry the toggle (a genuine replay) or roll back. Apply from a clone so the
-                // taken batch is still around to restore.
+                // state take happen in ONE lock acquisition (`enter_autocommit`): once the mode is
+                // autocommit, the buffer paths — which check-and-buffer under this same mutex —
+                // can no longer add work, so nothing a concurrent statement buffers can be
+                // stranded behind the flip (the old read/apply/flip-in-separate-acquisitions shape
+                // had exactly that race). Like `commit`, a failed apply must not lose the work:
+                // `restore_manual` re-enters manual mode with the state restored so the caller can
+                // retry the toggle (a genuine replay) or roll back. Apply from a borrow so the
+                // taken state is still around to restore. (A taken read-only transaction has
+                // nothing to apply; dropping it ends the snapshot.)
                 let pending = {
                     let mut st = self.txn.lock().unwrap();
                     if enable && !st.autocommit {
@@ -772,10 +1069,10 @@ impl Optionable for SpannerConnection {
                         None
                     }
                 };
-                if let Some((pending, mutations)) = pending
-                    && let Err(e) = self.apply_transaction(pending.clone(), mutations.clone())
+                if let Some(work) = pending
+                    && let Err(e) = self.apply_manual_txn(&work)
                 {
-                    self.txn.lock().unwrap().restore_manual(pending, mutations);
+                    self.txn.lock().unwrap().restore_manual(work);
                     return Err(e);
                 }
             }
@@ -1082,30 +1379,27 @@ impl Connection for SpannerConnection {
     }
 
     fn commit(&mut self) -> Result<()> {
-        // Apply from a *clone* of the buffer and drain it only after success. Taking the buffer
-        // up front would lose the DML on a failed apply (e.g. ABORTED once the runner's retries
-        // are exhausted — the very code `error.rs` preserves in `vendor_code` so callers can
-        // retry) and, worse, a retried `commit()` would then see an empty list and report
-        // success with nothing written. Keeping the buffer makes retry a genuine replay and
-        // leaves `rollback()` available to discard instead (see the module doc for the replay
-        // caveats).
-        let (pending, mutations) = {
+        // Apply from a *clone* of the buffered state and clear it only after success. Taking the
+        // state up front would lose the work on a failed apply (e.g. ABORTED once the runner's
+        // retries are exhausted — the very code `error.rs` preserves in `vendor_code` so callers
+        // can retry) and, worse, a retried `commit()` would then see an empty transaction and
+        // report success with nothing written. Keeping the buffer makes retry a genuine replay
+        // and leaves `rollback()` available to discard instead (see the module doc for the
+        // replay caveats).
+        //
+        // Committing a **read-only** transaction applies nothing: the snapshot is simply dropped
+        // (Spanner read-only transactions need no commit RPC).
+        let work = {
             let st = self.txn.lock().unwrap();
             if st.autocommit {
                 return Err(invalid_state(
                     "commit invoked with autocommit enabled; no active transaction",
                 ));
             }
-            (st.pending.clone(), st.pending_mutations.clone())
+            st.txn.clone()
         };
-        let applied = pending.len();
-        let applied_mutations = mutations.len();
-        self.apply_transaction(pending, mutations)?;
-        // Drain exactly the statements/mutations that were applied; anything buffered concurrently
-        // while the commit RPC ran stays pending for the next commit.
-        let mut st = self.txn.lock().unwrap();
-        st.pending.drain(..applied);
-        st.pending_mutations.drain(..applied_mutations);
+        self.apply_manual_txn(&work)?;
+        self.txn.lock().unwrap().finish_commit(&work);
         Ok(())
     }
 
@@ -1116,8 +1410,9 @@ impl Connection for SpannerConnection {
                 "rollback invoked with autocommit enabled; no active transaction",
             ));
         }
-        st.pending.clear();
-        st.pending_mutations.clear();
+        // Discards any buffered DML and drops a read-only transaction's snapshot (Spanner
+        // read-only transactions need no rollback RPC).
+        st.txn = ManualTxn::Unset;
         Ok(())
     }
 

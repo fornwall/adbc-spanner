@@ -160,13 +160,14 @@ def test_execute_partitions_round_trip(emulator_database):
 
 
 def test_manual_commit_and_rollback(emulator_database):
-    # autocommit off => the driver buffers DML and applies it atomically on commit.
+    # autocommit off => statements group into manual transactions, each one kind of work
+    # (queries or DML) fixed by its first statement. DDL is not transaction-aware: it
+    # applies immediately, regardless of the transaction.
     conn = _connect(emulator_database, autocommit=False)
     try:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS AdbcPyTxn")  # DDL runs immediately
             cur.execute("CREATE TABLE AdbcPyTxn (Id INT64 NOT NULL) PRIMARY KEY (Id)")
-        conn.commit()
 
         with conn.cursor() as cur:
             cur.execute("INSERT INTO AdbcPyTxn (Id) VALUES (1)")
@@ -182,6 +183,9 @@ def test_manual_commit_and_rollback(emulator_database):
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) AS n FROM AdbcPyTxn")
             assert cur.fetch_arrow_table().column("n").to_pylist() == [1]
+        # The count opened a query transaction (a pinned read-only snapshot); end it so the
+        # write below starts a fresh transaction.
+        conn.rollback()
 
         # A rolled-back insert must leave the table unchanged.
         with conn.cursor() as cur:

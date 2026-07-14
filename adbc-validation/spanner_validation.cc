@@ -170,12 +170,16 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   bool supports_error_on_incompatible_schema() const override { return true; }
   bool supports_concurrent_statements() const override { return true; }
   bool supports_transactions() const override { return true; }
-  // Spanner has no transactional DDL: CREATE/DROP go through the admin
-  // UpdateDatabaseDdl API, auto-commit immediately, and cannot be rolled back. So
-  // the `Transactions` case — which creates a table inside an uncommitted
-  // transaction and expects it hidden from other connections and removed on
-  // rollback — cannot apply. Declaring DDL as implicitly committing makes that
-  // case self-skip (its own guard honours this quirk) rather than fail.
+  // The `Transactions` case cannot apply to this driver's manual-transaction
+  // model: it bulk-ingests a table inside an uncommitted transaction and then
+  // expects to read it back on the same connection (read-your-writes). The
+  // driver buffers a manual transaction's writes until commit — a manual
+  // transaction is one kind of work (queries or DML), fixed by its first
+  // statement — so that read-back is rejected with InvalidState rather than
+  // served. Declaring DDL as implicitly committing makes the case self-skip
+  // (its own guard honours this quirk) rather than fail — and it is literally
+  // true: Spanner DDL goes through the admin UpdateDatabaseDdl API, applies
+  // immediately whatever the transaction state, and cannot be rolled back.
   bool ddl_implicit_commit_txn() const override { return true; }
   // Spanner has a single, unnamed catalog and default schema (both "", which base
   // catalog()/db_schema() return), so the connection reports them rather than NOT_FOUND.

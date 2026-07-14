@@ -59,29 +59,41 @@ Early, tested end-to-end against the Spanner emulator.
       the priority / request-tag / `commit.max_delay` / `commit_stats` options do not apply on that path.
       TODO: Move BatchWrite to section below. perhaps a dedicated bulk ingestion explaining everything around
       that - supported moves, BatchWrite, transaction splitting, transaction behaviour, etc.
-- Manual transactions (setting `adbc.connection.autocommit=false` plus `commit()`/`rollback()`:
-    -  Works for DDL and DML, not for querying data (querying data fails with TODO).
-    -  In manual mode DDL statements, DML statement and bulk ingestions are buffered and applied
-       atomically in one read/write transaction on commit, so `execute_update` returns `None`
-       rather than an affected-row count — the count is unknown until the buffered batch commits (queries
-       and DDL still run immediately). Because only writes are buffered, a manual transaction has **no
-      read-your-writes** — a query runs immediately in a fresh read-only snapshot and cannot see
-      buffered writes. Rather than silently returning a *pre-insert* result, a data-returning query
-      (`execute`/`execute_partitions`, or a query routed through `execute_update` — which executes it
-      read-only and discards the rows) issued while any write is buffered is rejected with
-      `InvalidState`; commit or roll back first if a statement needs to see earlier writes. Writes also
-      **reorder relative to DDL**: DDL issued after buffered DML executes before it (Spanner DDL is
-      never transactional). This follows from the
-      preview client exposing read/write transactions only through a closure-based runner; it will be
-      fixed properly once the client exposes begin/commit handles. DML with
-      a [`THEN RETURN`](https://cloud.google.com/spanner/docs/dml-returning) clause returns its rows:
-      `execute()` yields them as an Arrow result (autocommit mode only — buffered manual transactions
-      cannot produce them).
+- Manual transactions (setting `adbc.connection.autocommit=false` plus `commit()`/`rollback()`):
+    - A manual transaction is exactly **one of two kinds — queries or DML — fixed by its first
+      statement**; a statement of the other kind is rejected with `InvalidState` until `commit()`
+      or `rollback()` ends the transaction.
+    - **Queries**: the first data-returning query opens one multi-use read-only transaction, and
+      every query in the transaction runs on it — a single consistent snapshot, pinned at the
+      first query's `spanner.read.staleness` bound (rows committed by others mid-transaction stay
+      invisible until the transaction ends). `commit()`/`rollback()` are local no-ops on the wire:
+      Spanner read-only transactions need no commit or rollback RPC. (`execute_partitions` is
+      allowed but runs in its own batch read-only transaction — it does not share the snapshot;
+      `execute_schema`, a plan-only probe, stays outside the transaction model entirely.)
+    - **DML**: DML statements and bulk-ingest insert mutations are buffered and applied
+      atomically in one read/write transaction on commit, so `execute_update` returns `None`
+      rather than an affected-row count — the count is unknown until the buffered batch commits.
+      Because writes are buffered, a DML transaction has **no read-your-writes**; that is exactly
+      why a query inside it is rejected rather than silently returning a *pre-insert* result. The
+      buffer-and-commit shape follows from the preview client exposing read/write transactions
+      only through a closure-based runner; it will be revisited once the client exposes
+      begin/commit handles. DML with a
+      [`THEN RETURN`](https://cloud.google.com/spanner/docs/dml-returning) clause returns its
+      rows: `execute()` yields them as an Arrow result (autocommit mode only — buffered manual
+      transactions cannot produce them).
+    - **DDL is not transaction-aware** — the same no-special-handling approach as the ADBC
+      BigQuery driver: DDL always executes **immediately** through the admin API (Spanner DDL is
+      never transactional), regardless of the transaction state. It neither fixes the
+      transaction's kind nor is rejected by it; `commit()` is not needed and `rollback()` cannot
+      undo it; and DDL issued after buffered DML executes *before* it (the DML/DDL reorder
+      caveat). A `;`-separated DDL batch still applies as one `UpdateDatabaseDdl` call.
 - Transaction isolation level — the adbc.connection.transaction.isolation_level option is honored for serializable,
   repeatable_read, and default. The four levels Spanner does not natively expose are promoted upward to the weakest
   supported level that still satisfies them (read_uncommitted/read_committed → repeatable_read; snapshot/linearizable →
   serializable), which is spec-permitted and safe; get_option reports the effective promoted level, and an unknown
-  level string is still rejected. TODO: Note the limitations of no reads in transactions.
+  level string is still rejected. It applies to the driver's read/write transactions (autocommit DML and the
+  manual-mode DML commit); query-kind manual transactions are Spanner read-only snapshot reads, which take no
+  isolation level.
 - Parameter binding: `bind`/`bind_stream` an Arrow batch whose columns become Spanner named
   parameters; each bound row runs the statement once. How columns pair with the query's `@name`
   parameters is set by the `adbc.statement.bind_by_name` statement option (the [SQLite reference

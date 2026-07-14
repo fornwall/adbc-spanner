@@ -256,6 +256,45 @@ fn stream_of(
     tonic::Response::new(rx)
 }
 
+/// Serve `ExecuteStreamingSql` (unbounded) with a fixed single-message STRING result, echoing a
+/// transaction id (`manual-ro-txn`) back in the result metadata whenever the request carries an
+/// inline `transaction.begin` selector — which is what a query in a manual transaction sends: it
+/// begins the transaction's shared multi-use read-only transaction inline with its first
+/// statement, and the client requires the created transaction's id in the first response.
+/// Optionally records each request's transaction selector for wire assertions.
+fn serve_streaming_sql_begin_aware(
+    mock: &mut MockSpanner,
+    values: &'static [&'static str],
+    record: Option<Arc<Mutex<Vec<Option<v1::TransactionSelector>>>>>,
+) {
+    mock.expect_execute_streaming_sql()
+        .returning(move |request| {
+            let request = request.into_inner();
+            let inline_begin = matches!(
+                request
+                    .transaction
+                    .as_ref()
+                    .and_then(|t| t.selector.as_ref()),
+                Some(v1::transaction_selector::Selector::Begin(_))
+            );
+            if let Some(record) = &record {
+                record.lock().unwrap().push(request.transaction);
+            }
+            let mut first = partial_result_set(true, values, b"ro-1", true);
+            if inline_begin {
+                first
+                    .metadata
+                    .as_mut()
+                    .expect("first message carries metadata")
+                    .transaction = Some(v1::Transaction {
+                    id: b"manual-ro-txn".to_vec(),
+                    ..Default::default()
+                });
+            }
+            Ok(stream_of(vec![Ok(first)]))
+        });
+}
+
 // ---------------------------------------------------------------------------
 // google.rpc.Status / RetryInfo details
 // ---------------------------------------------------------------------------
@@ -383,12 +422,14 @@ fn mock_server_round_trips_a_query() {
 }
 
 /// Manual-transaction read-your-writes guard: a data-returning query issued while writes are
-/// buffered in a manual transaction is rejected up front with `InvalidState`, instead of silently
-/// running against a snapshot that misses the buffered writes. The negatives — a query in
-/// autocommit mode and a query in manual mode with an *empty* buffer — must still run.
+/// buffered in a manual transaction is rejected up front with `InvalidState` (the kind-mixing
+/// rule: the transaction began with DML), instead of silently running against a snapshot that
+/// misses the buffered writes. The negatives — a query in autocommit mode and a query in a
+/// *fresh* manual transaction (which then fixes the transaction's kind to queries) — must still
+/// run.
 ///
 /// The guard fires before any RPC, so the mock only needs to serve `ExecuteStreamingSql` for the
-/// two queries that are *allowed* through; the buffered `INSERT` just adds to the in-memory buffer
+/// queries that are *allowed* through; the buffered `INSERT` just adds to the in-memory buffer
 /// (no RPC) and the guarded query never reaches the wire.
 #[test]
 fn query_while_dml_buffered_in_manual_txn_is_rejected() {
@@ -398,15 +439,10 @@ fn query_while_dml_buffered_in_manual_txn_is_rejected() {
     );
 
     let server = MockServer::start(move |mock| {
-        // Served for every *allowed* query; unbounded times (the guarded query never gets here).
-        mock.expect_execute_streaming_sql().returning(move |_| {
-            Ok(stream_of(vec![Ok(partial_result_set(
-                true,
-                &["v1", "v2"],
-                b"ryw-1",
-                true,
-            ))]))
-        });
+        // Served for every *allowed* query — including the manual-mode ones, which begin the
+        // transaction's shared read-only transaction inline; unbounded times (the guarded query
+        // never gets here).
+        serve_streaming_sql_begin_aware(mock, &["v1", "v2"], None);
     });
 
     let mut connection = server.connect();
@@ -429,15 +465,17 @@ fn query_while_dml_buffered_in_manual_txn_is_rejected() {
         )
         .expect("disable autocommit");
 
-    // Negative 2: manual mode with an empty buffer still allows a query.
+    // Negative 2: a fresh manual transaction allows a query (which fixes its kind to queries —
+    // roll back afterwards so the DML below starts a fresh transaction).
     let mut empty_q = connection.new_statement().expect("new statement");
     empty_q.set_sql_query("SELECT c FROM MockTable").unwrap();
     let batches: Vec<_> = empty_q
         .execute()
-        .expect("query with an empty buffer must run")
+        .expect("query in a fresh manual transaction must run")
         .collect::<Result<Vec<_>, _>>()
         .expect("collect empty-buffer batches");
     assert_eq!(batches[0].num_rows(), 2);
+    connection.rollback().expect("end the query transaction");
 
     // Buffer a DML statement (returns None in manual mode, no RPC).
     let mut insert = connection.new_statement().expect("new statement");
@@ -487,6 +525,117 @@ fn query_while_dml_buffered_in_manual_txn_is_rejected() {
         .collect::<Result<Vec<_>, _>>()
         .expect("collect post-rollback batches");
     assert_eq!(batches[0].num_rows(), 2);
+}
+
+/// TEST (wire): a manual transaction that begins with a query runs **every** query of the
+/// transaction on ONE shared multi-use read-only transaction — the first statement begins it
+/// inline (a read-only `transaction.begin` selector on the wire), and later statements, from a
+/// *different* statement handle on the same connection, reference the begun transaction by id.
+/// While it is active, DML is rejected with `InvalidState` (kind-mixing); `commit` ends it
+/// **without any RPC** (a Spanner read-only transaction needs no commit — anything else would
+/// hit the unscripted `Commit`/`Rollback` catch-alls and fail loudly); and the next transaction
+/// is fresh, so DML buffers again. (DDL is not covered here: it is not transaction-aware — it
+/// always runs immediately through the admin API, which this data-plane mock does not serve.)
+#[test]
+fn manual_transaction_queries_share_one_read_only_transaction() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "manual_transaction_queries_share_one_read_only_transaction",
+    );
+
+    let selectors: Arc<Mutex<Vec<Option<v1::TransactionSelector>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let server = {
+        let record = selectors.clone();
+        MockServer::start(move |mock| {
+            serve_streaming_sql_begin_aware(mock, &["v1"], Some(record));
+        })
+    };
+
+    let mut connection = server.connect();
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("disable autocommit");
+
+    // Two queries on two different statement handles of the same connection.
+    for _ in 0..2 {
+        let mut query = connection.new_statement().expect("new statement");
+        query.set_sql_query("SELECT c FROM MockTable").unwrap();
+        let batches: Vec<_> = query
+            .execute()
+            .expect("manual-transaction query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect batches");
+        assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    {
+        let seen = selectors.lock().unwrap();
+        assert_eq!(seen.len(), 2, "both queries must reach the wire");
+        // The first query begins the transaction inline, and it must be read-only.
+        let first = seen[0]
+            .as_ref()
+            .and_then(|s| s.selector.as_ref())
+            .expect("the first query must carry a transaction selector");
+        let v1::transaction_selector::Selector::Begin(options) = first else {
+            panic!("the first manual-mode query must begin the transaction, got: {first:?}");
+        };
+        assert!(
+            matches!(
+                options.mode,
+                Some(v1::transaction_options::Mode::ReadOnly(_))
+            ),
+            "the begun transaction must be read-only: {options:?}"
+        );
+        // The second query — a different ADBC statement — reuses it by id: one shared snapshot.
+        let second = seen[1]
+            .as_ref()
+            .and_then(|s| s.selector.as_ref())
+            .expect("the second query must carry a transaction selector");
+        assert_eq!(
+            second,
+            &v1::transaction_selector::Selector::Id(b"manual-ro-txn".to_vec()),
+            "later queries must reuse the begun read-only transaction"
+        );
+    }
+
+    // DML in a query transaction is rejected — the write would commit in a separate read/write
+    // transaction, invisible to the snapshot the reads observed.
+    let mut insert = connection.new_statement().expect("new statement");
+    insert
+        .set_sql_query("INSERT INTO MockTable (c) VALUES ('x')")
+        .unwrap();
+    let Err(error) = insert.execute_update() else {
+        panic!("DML in a manual transaction that began with a query must be rejected");
+    };
+    assert_eq!(error.status, AdbcStatus::InvalidState);
+    assert!(
+        error.message.contains("began with a query"),
+        "the rejection should name the active kind: {:?}",
+        error.message
+    );
+
+    // Commit ends the read-only transaction locally: no RPC (unscripted Commit would fail).
+    connection
+        .commit()
+        .expect("committing a query transaction needs no RPC");
+
+    // The next transaction is fresh: DML buffers again (returns None, no RPC).
+    let mut insert = connection.new_statement().expect("new statement");
+    insert
+        .set_sql_query("INSERT INTO MockTable (c) VALUES ('x')")
+        .unwrap();
+    assert_eq!(
+        insert
+            .execute_update()
+            .expect("fresh transaction buffers DML"),
+        None,
+        "after commit the connection must accept a DML-kind transaction again"
+    );
+    connection.rollback().expect("discard the buffered insert");
 }
 
 /// COR-3 regression, autocommit half: `execute_update` on SQL that is neither DDL nor DML (a
@@ -575,18 +724,21 @@ fn execute_update_routes_a_query_to_the_read_only_path() {
 }
 
 /// COR-3 regression, manual-mode half: in a manual transaction `execute_update` on a SELECT must
-/// run it immediately as a read-only query and buffer **nothing** — the old mis-routing buffered
+/// run it immediately as a read-only query (on the transaction's shared multi-use read-only
+/// transaction, which it begins) and buffer **nothing** to commit — the old mis-routing buffered
 /// the SELECT as pending "DML", which poisoned the eventual `ExecuteBatchDml` commit (only
 /// `rollback` recovered). Also covered here:
 ///
 /// - a mixed `;`-batch (`DELETE …; SELECT 1`) is rejected up front with `InvalidArguments`,
 ///   before anything is buffered;
-/// - with real DML buffered, `execute_update` on a SELECT hits the read-your-writes guard
-///   (`InvalidState`) exactly like `execute`.
+/// - with real DML buffered, `execute_update` on a SELECT hits the kind guard (`InvalidState`,
+///   read-your-writes rationale) exactly like `execute`.
 ///
 /// The proof nothing was buffered: `commit()` succeeds without any transaction RPC — the mock
 /// scripts only `ExecuteStreamingSql`, so a commit that tried to apply a buffered statement would
-/// hit the unscripted `BeginTransaction`/`ExecuteBatchDml`/`Commit` catch-alls and fail.
+/// hit the unscripted `BeginTransaction`/`ExecuteBatchDml`/`Commit` catch-alls and fail. (A
+/// query-kind transaction's commit is a pure no-op on the wire: a Spanner read-only transaction
+/// needs no commit RPC.)
 #[test]
 fn execute_update_query_in_manual_mode_buffers_nothing() {
     let _watchdog = Watchdog::arm(
@@ -595,15 +747,9 @@ fn execute_update_query_in_manual_mode_buffers_nothing() {
     );
 
     let server = MockServer::start(move |mock| {
-        // Served for the immediate read-only queries; nothing else is scripted.
-        mock.expect_execute_streaming_sql().returning(move |_| {
-            Ok(stream_of(vec![Ok(partial_result_set(
-                true,
-                &["v1"],
-                b"cor3-m1",
-                true,
-            ))]))
-        });
+        // Served for the immediate read-only queries (the manual-mode one begins the shared
+        // read-only transaction inline); nothing else is scripted.
+        serve_streaming_sql_begin_aware(mock, &["v1"], None);
     });
 
     let mut connection = server.connect();

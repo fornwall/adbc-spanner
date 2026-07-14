@@ -416,12 +416,14 @@ impl BoundStatementSource for NoBoundStatements {
 /// predecessor's result set drains — so at most one per-row `SpannerSql` resides in memory at a
 /// time. Like [`stream_query`], rows are converted to Arrow in bounded chunks of `batch_size` (plus
 /// the [`CHUNK_BYTE_BUDGET`]), so the concatenated result is never fully materialised. The reader
-/// owns `transaction`, keeping the snapshot alive for as long as it is iterated; Spanner read-only
-/// transactions need no commit/rollback, so dropping it is cleanup enough.
+/// holds `transaction` (`Arc`-shared: in a manual transaction it is the connection's shared
+/// snapshot, in autocommit a dedicated one), keeping the snapshot alive for as long as it is
+/// iterated; Spanner read-only transactions need no commit/rollback, so dropping it is cleanup
+/// enough.
 pub(crate) async fn stream_bound_query(
     runtime: SharedRuntime,
     cancel: CancelSignal,
-    transaction: MultiUseReadOnlyTransaction,
+    transaction: Arc<MultiUseReadOnlyTransaction>,
     mut statements: Box<dyn BoundStatementSource>,
     batch_size: usize,
     precision: TimestampPrecision,
@@ -465,8 +467,8 @@ pub(crate) struct BoundQueryBatchReader {
     runtime: SharedRuntime,
     cancel: CancelSignal,
     schema: SchemaRef,
-    /// The shared snapshot every statement executes in; owned so it outlives lazy iteration.
-    transaction: MultiUseReadOnlyTransaction,
+    /// The shared snapshot every statement executes in; held so it outlives lazy iteration.
+    transaction: Arc<MultiUseReadOnlyTransaction>,
     /// The lazy source of not-yet-built, not-yet-executed per-bound-row statements.
     statements: Box<dyn BoundStatementSource>,
     /// The live result set of the statement currently being drained, if any.
