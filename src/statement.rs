@@ -18,7 +18,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{IngestMode, OptionStatement, OptionValue};
@@ -375,7 +374,7 @@ impl SpannerStatement {
             Err(error) => error,
         };
         // A driver-side transaction-state rejection (ingesting in a manual transaction that began
-        // with a query or DDL) is not an insert failure, so the spec's NotFound/AlreadyExists
+        // with a query) is not an insert failure, so the spec's NotFound/AlreadyExists
         // append contract does not apply — it propagates unchanged.
         if error.status == Status::InvalidState {
             return Err(error);
@@ -477,10 +476,7 @@ impl SpannerStatement {
     fn run_bound_ingest(&self, table: &str) -> Result<Option<i64>> {
         let ingest_ddl = self.build_ingest_table_ddl(table, self.ingest_mode)?;
         if let Some(ddl) = ingest_ddl {
-            // The create modes' table-building DDL runs immediately even in a manual transaction
-            // (see `run_ddl_now`): the ingest is DML-kind work, and Spanner DDL is never
-            // transactional anyway.
-            self.run_ddl_now(ddl)
+            self.run_ddl(ddl)
                 .map_err(|error| self.remap_ingest_create_error(table, error))?;
         }
         let result = self.run_ingest_mutations(table);
@@ -584,8 +580,8 @@ impl SpannerStatement {
             let mut txn = self.txn.lock().unwrap();
             if !txn.autocommit() {
                 // An ingest is DML-kind work: the first buffered mutation fixes the transaction's
-                // kind, and a transaction that began with a query or DDL rejects it up front
-                // (before any further mutation is built).
+                // kind, and a transaction that began with a query rejects it up front (before
+                // any further mutation is built).
                 txn.check_kind_allowed(TxnKind::Dml)?;
                 for batch in &self.bound {
                     for row in 0..batch.num_rows() {
@@ -856,8 +852,8 @@ impl SpannerStatement {
         {
             let mut txn = self.txn.lock().unwrap();
             if !txn.autocommit() {
-                // Fixes the transaction's kind to DML — a transaction that began with a query or
-                // DDL rejects the buffer (kinds cannot mix).
+                // Fixes the transaction's kind to DML — a transaction that began with a query
+                // rejects the buffer (kinds cannot mix).
                 txn.buffer_dml(statements)?;
                 return Ok(None);
             }
@@ -1149,7 +1145,7 @@ impl SpannerStatement {
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let sql = crate::sql::strip_trailing_terminators(sql);
         // Reject a data-returning query (plain or the parameterized bound-query path below) issued
-        // in a manual transaction that began with DML or DDL — the buffered work only executes at
+        // in a manual transaction that began with DML — the buffered work only executes at
         // commit, so the query would not observe it (no read-your-writes).
         self.ensure_query_allowed()?;
         // Parameterized query: run once per bound row.
@@ -1204,41 +1200,51 @@ impl SpannerStatement {
         Ok(Box::new(reader))
     }
 
-    /// Apply `statements` immediately as a single `UpdateDatabaseDdl` schema change (see the free
-    /// [`run_ddl`]), with this statement's runtime/cancel/timeout config. Used by the autocommit
-    /// DDL path and by the ingest create modes' table-building DDL — which runs immediately even
-    /// in a manual transaction (Spanner DDL is never transactional, and the ingest itself is
-    /// DML-kind work; only *user* DDL statements buffer, via
-    /// [`run_or_buffer_ddl`](Self::run_or_buffer_ddl)).
-    fn run_ddl_now(&self, statements: Vec<String>) -> Result<()> {
-        run_ddl(
-            &self.runtime,
-            &self.spanner,
-            &self.database,
-            &self.cancel,
-            self.timeouts.update_timeout(),
-            statements,
-        )
-    }
-
-    /// Run `statements` as DDL, honouring the connection's transaction mode: in autocommit they
-    /// are applied immediately as a single `UpdateDatabaseDdl` schema change; in manual mode they
-    /// are **buffered** — fixing the transaction's kind to DDL (a transaction that began with a
-    /// query or DML rejects them — see [`TxnState::buffer_ddl`](crate::connection::TxnState)) —
-    /// and applied in one `UpdateDatabaseDdl` batch on commit.
-    fn run_or_buffer_ddl(&self, statements: Vec<String>) -> Result<()> {
+    /// Apply one or more DDL statements as a single Spanner `UpdateDatabaseDdl` schema change.
+    ///
+    /// Batching all statements into one call makes a multi-step change (for example dbt's
+    /// intermediate-table build followed by a rename swap) near-atomic. DDL always runs
+    /// **immediately, regardless of the connection's transaction mode** — like the ADBC BigQuery
+    /// driver, which classifies nothing, the driver never gates DDL on the transaction: Spanner
+    /// DDL goes through the admin API and is never transactional, so it neither fixes a manual
+    /// transaction's kind nor is rejected by it (and it cannot be rolled back).
+    ///
+    /// DDL is issued through the write/update path, so the update timeout bounds the whole
+    /// change — the admin-client build, the `UpdateDatabaseDdl` call, **and** its long-running
+    /// operation poll loop (which otherwise polls without any bound). An expired deadline fails
+    /// with `Status::Timeout`; unset (the default) leaves the poll unbounded.
+    fn run_ddl(&self, statements: Vec<String>) -> Result<()> {
         if self.is_read_only() {
             return Err(invalid_state(
                 "cannot execute DDL: the connection is read-only",
             ));
         }
-        {
-            let mut txn = self.txn.lock().unwrap();
-            if !txn.autocommit() {
-                return txn.buffer_ddl(statements);
-            }
-        }
-        self.run_ddl_now(statements)
+        let spanner = self.spanner.clone();
+        let database = self.database.clone();
+        block_on_cancellable(
+            &self.runtime,
+            &self.cancel,
+            with_timeout(
+                self.timeouts.update_timeout(),
+                crate::OPTION_RPC_TIMEOUT_UPDATE,
+                async move {
+                    let admin = spanner
+                        .database_admin_builder()
+                        .build()
+                        .await
+                        .map_err(from_builder)?;
+                    admin
+                        .update_database_ddl()
+                        .set_database(database)
+                        .set_statements(statements)
+                        .poller()
+                        .until_done()
+                        .await
+                        .map_err(from_spanner)?;
+                    Ok::<(), Error>(())
+                },
+            ),
+        )
     }
 
     fn sql(&self) -> Result<String> {
@@ -1285,14 +1291,15 @@ impl SpannerStatement {
     /// Guard the data-returning read paths against kind-mixing in a manual transaction.
     ///
     /// In manual mode the transaction's kind is fixed by its first statement: buffered DML (and
-    /// bulk-ingest mutations) or DDL only executes at `commit`, so a query could never observe it.
+    /// bulk-ingest mutations) only executes at `commit`, so a query could never observe it.
     /// Rather than silently returning a pre-write result (e.g. an `INSERT` followed by
     /// `SELECT COUNT(*)` reporting the *old* count), reject the query up front. Queries in an
     /// unset or query-kind manual transaction, and every query in autocommit mode, pass. A
     /// *query* routed through `execute_update` is guarded exactly like `execute` (both run
-    /// through [`execute_query_reader`](Self::execute_query_reader)); the DML and DDL paths
-    /// enforce their own kinds when buffering; and `execute_schema` (a `QueryMode::Plan` probe
-    /// returning no data) has no data-visibility concern, so it is left working.
+    /// through [`execute_query_reader`](Self::execute_query_reader)); the DML path enforces its
+    /// own kind when buffering; DDL is not transaction-aware (it runs immediately, unguarded);
+    /// and `execute_schema` (a `QueryMode::Plan` probe returning no data) has no data-visibility
+    /// concern, so it is left working.
     fn ensure_query_allowed(&self) -> Result<()> {
         self.txn.lock().unwrap().check_kind_allowed(TxnKind::Read)
     }
@@ -1342,55 +1349,6 @@ impl SpannerStatement {
         // instead) in the unlocked window.
         st.start_read_txn(Arc::new(built)).map(Some)
     }
-}
-
-/// Apply one or more DDL statements as a single Spanner `UpdateDatabaseDdl` schema change.
-///
-/// Batching all statements into one call makes a multi-step change (for example dbt's
-/// intermediate-table build followed by a rename swap, or a whole buffered DDL transaction)
-/// near-atomic: Spanner applies the batch's statements in order, so a failure mid-batch leaves
-/// the earlier statements applied. A free function so the connection's manual-transaction commit
-/// (which applies buffered DDL) shares the exact same path as the statement's autocommit DDL.
-///
-/// DDL is issued through the write/update path, so `update_timeout`
-/// (`spanner.rpc.timeout_seconds.update`) bounds the whole change — the admin-client build, the
-/// `UpdateDatabaseDdl` call, **and** its long-running operation poll loop (which otherwise polls
-/// without any bound). An expired deadline fails with `Status::Timeout`; unset (the default)
-/// leaves the poll unbounded.
-pub(crate) fn run_ddl(
-    runtime: &SharedRuntime,
-    spanner: &Spanner,
-    database: &str,
-    cancel: &CancelSignal,
-    update_timeout: Option<Duration>,
-    statements: Vec<String>,
-) -> Result<()> {
-    let spanner = spanner.clone();
-    let database = database.to_string();
-    block_on_cancellable(
-        runtime,
-        cancel,
-        with_timeout(
-            update_timeout,
-            crate::OPTION_RPC_TIMEOUT_UPDATE,
-            async move {
-                let admin = spanner
-                    .database_admin_builder()
-                    .build()
-                    .await
-                    .map_err(from_builder)?;
-                admin
-                    .update_database_ddl()
-                    .set_database(database)
-                    .set_statements(statements)
-                    .poller()
-                    .until_done()
-                    .await
-                    .map_err(from_spanner)?;
-                Ok::<(), Error>(())
-            },
-        ),
-    )
 }
 
 impl Optionable for SpannerStatement {
@@ -1579,7 +1537,7 @@ impl Statement for SpannerStatement {
         self.check_bound_has_destination()?;
         let sql = self.sql()?;
         if crate::sql::is_ddl(&sql) {
-            self.run_or_buffer_ddl(crate::sql::split_statements(&sql))?;
+            self.run_ddl(crate::sql::split_statements(&sql))?;
             // A reused statement handle must not silently re-bind stale rows past a DDL statement.
             self.bound.clear();
             // DDL has no result set — return an empty reader with an empty schema.
@@ -1631,11 +1589,11 @@ impl Statement for SpannerStatement {
 
         let sql = self.sql()?;
         if crate::sql::is_ddl(&sql) {
-            self.run_or_buffer_ddl(crate::sql::split_statements(&sql))?;
+            self.run_ddl(crate::sql::split_statements(&sql))?;
             // A reused statement handle must not silently re-bind stale rows past a DDL statement.
             self.bound.clear();
-            // DDL does not report an affected-row count (in autocommit it runs immediately; in a
-            // manual transaction it buffers for the commit's `UpdateDatabaseDdl` batch).
+            // DDL does not report an affected-row count (and is never transactional in Spanner,
+            // so it always runs immediately rather than buffering).
             return Ok(None);
         }
         // Neither DDL nor DML (SELECT / WITH / GRAPH / …): a query. `adbc.h` sanctions executing
@@ -1748,7 +1706,7 @@ impl Statement for SpannerStatement {
         // which rejects a trailing `;`, yet callers routinely append one.
         let sql = crate::sql::strip_trailing_terminators(&sql);
         // Partitioning a read has the same read-your-writes hazard as `execute`: reject it in a
-        // manual transaction that began with DML or DDL (the partitions would read a pre-write
+        // manual transaction that began with DML (the partitions would read a pre-write
         // snapshot). Note a partitioned read never joins a query transaction's shared snapshot —
         // it always runs in its own batch read-only transaction below.
         self.ensure_query_allowed()?;

@@ -256,8 +256,8 @@ immediately.
 
 Set the standard `adbc.connection.autocommit` option to `false` to enter **manual** mode, then call
 `commit()` or `rollback()` on the connection to end the transaction. A manual transaction is
-exactly one kind of work — **queries**, **DML**, or **DDL** — fixed by its *first* statement;
-a statement of any other kind fails with `InvalidState` until the transaction ends:
+exactly one kind of work — **queries** or **DML** — fixed by its *first* statement; a statement of
+the other kind fails with `InvalidState` until the transaction ends:
 
 - **Queries** all run on one shared multi-use read-only transaction, so every read in the
   transaction observes a single consistent snapshot; `commit()`/`rollback()` simply drop it
@@ -269,8 +269,11 @@ a statement of any other kind fails with `InvalidState` until the transaction en
   could not see the buffered DML, which is exactly why the kind rule rejects it — `INSERT` then
   `SELECT COUNT(*)` would return the *pre-insert* count), and **`execute_update` returns `None`**
   — the affected-row count is genuinely unknown until the buffered batch commits.
-- **DDL** is buffered too and applied at `commit()` as one `UpdateDatabaseDdl` batch (applied in
-  order — near-atomic, a mid-batch failure leaves earlier statements applied).
+
+**DDL is not transaction-aware** — the same no-special-handling approach as the ADBC BigQuery
+driver: it always executes immediately through the admin `UpdateDatabaseDdl` API (Spanner DDL is
+never transactional), whatever the transaction state, so DDL issued after buffered DML executes
+*before* it and `rollback()` cannot undo it.
 
 This is a deliberate, documented trade-off; genuine read-your-writes waits on the client exposing
 real begin/commit handles. For the full model see the [`SpannerConnection`

@@ -37,10 +37,10 @@ This driver defaults to autocommit; setting `adbc.connection.autocommit=false` e
 that **buffers** DML and applies it in one read/write transaction at `commit`. For a dbt
 materialization, that mode is the wrong tool, for three independent reasons:
 
-- **One kind of work per transaction.** A manual transaction is exactly one of **queries, DML, or
-  DDL**, fixed by its first statement; a statement of any other kind fails with `InvalidState`
-  until `commit`/`rollback`. A build that interleaves DDL and DML — which every table
-  materialization does — therefore cannot run inside one manual transaction at all.
+- **One kind of work per transaction.** A manual transaction is exactly one of **queries or DML**,
+  fixed by its first statement; a statement of the other kind fails with `InvalidState` until
+  `commit`/`rollback`. A build that interleaves reads and writes in one open transaction — which
+  every table materialization does — therefore cannot run inside one manual transaction.
 - **No read-your-writes.** In a DML transaction the writes are *buffered* until commit, so a query
   could never see them. An `INSERT … SELECT` into a staging table followed by a `SELECT`/`MERGE`
   reading that staging table would read the *pre-insert* state — so rather than silently returning
@@ -48,10 +48,10 @@ materialization, that mode is the wrong tool, for three independent reasons:
   loudly with `InvalidState` ("commit or roll back first"). A materialization that assumes it can
   read a table it just wrote in the same open transaction fails outright instead of being quietly
   wrong — but it still cannot work as written.
-- **DDL commits are only near-atomic.** A DDL manual transaction buffers its statements and
-  applies them on commit as one `UpdateDatabaseDdl` batch — applied *in order*, so a mid-batch
-  failure leaves the earlier statements applied ("roll back the transaction" cannot undo a
-  half-applied batch, and Spanner DDL is never transactional to begin with).
+- **DDL is not in the transaction at all.** DDL always executes immediately through the admin API
+  (Spanner DDL is never transactional): a `CREATE TABLE` issued *after* a buffered `INSERT`
+  actually runs *before* it, and "roll back the transaction" cannot undo it. A build cannot rely
+  on program order across DDL and buffered DML.
 
 Autocommit sidesteps all of this: **each statement commits before the next runs**, so a staging
 table that step *N* writes is fully visible to step *N+1*, and the sequence reads exactly like
@@ -61,9 +61,9 @@ step: an `ALTER TABLE … RENAME`.
 
 > **Do not do this:** do not set `adbc.connection.autocommit=false` around a multi-step
 > materialization expecting to read intermediate writes back. A manual transaction is one kind of
-> work (queries, DML, or DDL) — the first DDL/DML statement of the build fixes the kind, and the
-> next statement of another kind **fails with `InvalidState`**. Use autocommit + a rename swap
-> instead.
+> work (queries or DML) — the build's first DML fixes the kind, the next read **fails with
+> `InvalidState`**, DDL reorders ahead of buffered DML, and DDL is not in the transaction to roll
+> back. Use autocommit + a rename swap instead.
 
 ## Spanner SQL dialect notes the adapter must honour
 
@@ -252,9 +252,9 @@ Beyond credentials, several driver options are directly useful in a dbt profile 
 
 Spanner's lack of CTAS and its non-transactional DDL mean a dbt adapter cannot lean on
 transaction-wrapped builds, and this driver's manual mode (one kind of work per transaction —
-queries, DML, or DDL — with buffered DML/DDL and no read-your-writes, so a read-back or a mixed
-DDL/DML sequence fails loudly with `InvalidState`) makes wrapping a multi-step materialization in
-`autocommit=false` actively incorrect. The
+queries or DML — with buffered DML, no read-your-writes, and immediately-applied DDL that reorders
+ahead of the buffer, so a read-back fails loudly with `InvalidState`) makes wrapping a multi-step
+materialization in `autocommit=false` actively incorrect. The
 workable design — mirroring `dbt-bigquery` — runs entirely in **autocommit**, so each staged
 statement is committed and visible to the next, and derives atomicity/idempotency from an **atomic
 `ALTER TABLE … RENAME` swap** for tables and from **individually-complete `MERGE` statements** for

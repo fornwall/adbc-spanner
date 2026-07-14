@@ -531,10 +531,11 @@ fn query_while_dml_buffered_in_manual_txn_is_rejected() {
 /// transaction on ONE shared multi-use read-only transaction — the first statement begins it
 /// inline (a read-only `transaction.begin` selector on the wire), and later statements, from a
 /// *different* statement handle on the same connection, reference the begun transaction by id.
-/// While it is active, DML and DDL are rejected with `InvalidState` (kind-mixing); `commit` ends
-/// it **without any RPC** (a Spanner read-only transaction needs no commit — anything else would
+/// While it is active, DML is rejected with `InvalidState` (kind-mixing); `commit` ends it
+/// **without any RPC** (a Spanner read-only transaction needs no commit — anything else would
 /// hit the unscripted `Commit`/`Rollback` catch-alls and fail loudly); and the next transaction
-/// is fresh, so DML buffers again.
+/// is fresh, so DML buffers again. (DDL is not covered here: it is not transaction-aware — it
+/// always runs immediately through the admin API, which this data-plane mock does not serve.)
 #[test]
 fn manual_transaction_queries_share_one_read_only_transaction() {
     let _watchdog = Watchdog::arm(
@@ -617,15 +618,6 @@ fn manual_transaction_queries_share_one_read_only_transaction() {
         error.message
     );
 
-    // DDL too.
-    let mut ddl = connection.new_statement().expect("new statement");
-    ddl.set_sql_query("CREATE TABLE T2 (Id INT64) PRIMARY KEY (Id)")
-        .unwrap();
-    let Err(error) = ddl.execute_update() else {
-        panic!("DDL in a manual transaction that began with a query must be rejected");
-    };
-    assert_eq!(error.status, AdbcStatus::InvalidState);
-
     // Commit ends the read-only transaction locally: no RPC (unscripted Commit would fail).
     connection
         .commit()
@@ -644,112 +636,6 @@ fn manual_transaction_queries_share_one_read_only_transaction() {
         "after commit the connection must accept a DML-kind transaction again"
     );
     connection.rollback().expect("discard the buffered insert");
-}
-
-/// A manual transaction that begins with DDL **buffers** it — producing no RPC at all (this mock
-/// serves no admin API, and even the data-plane would reject anything unscripted) — extends the
-/// batch with further DDL, and rejects DML, bulk ingest and queries with `InvalidState`
-/// (kind-mixing) until `rollback` discards the batch. The commit side — one `UpdateDatabaseDdl`
-/// call applying the whole batch — needs a real admin API, so it is covered by the emulator
-/// integration test instead.
-#[test]
-fn manual_ddl_transaction_buffers_and_rejects_mixing() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "manual_ddl_transaction_buffers_and_rejects_mixing",
-    );
-
-    let server = MockServer::start(move |mock| {
-        // Served only for the post-rollback query; everything before it must stay off the wire.
-        serve_streaming_sql_begin_aware(mock, &["v1"], None);
-    });
-
-    let mut connection = server.connect();
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("false".into()),
-        )
-        .expect("disable autocommit");
-
-    // DDL buffers (returns None, no RPC — the admin client is never even built).
-    let mut ddl = connection.new_statement().expect("new statement");
-    ddl.set_sql_query("CREATE TABLE MockTable (c STRING(MAX)) PRIMARY KEY (c)")
-        .unwrap();
-    assert_eq!(
-        ddl.execute_update()
-            .expect("DDL buffers in a manual transaction"),
-        None,
-        "buffered DDL reports no count"
-    );
-    // More DDL joins the same UpdateDatabaseDdl batch.
-    let mut more_ddl = connection.new_statement().expect("new statement");
-    more_ddl
-        .set_sql_query("CREATE INDEX MockIndex ON MockTable (c)")
-        .unwrap();
-    assert_eq!(more_ddl.execute_update().expect("more DDL buffers"), None);
-
-    // DML is rejected: the transaction began with DDL.
-    let mut insert = connection.new_statement().expect("new statement");
-    insert
-        .set_sql_query("INSERT INTO MockTable (c) VALUES ('x')")
-        .unwrap();
-    let Err(error) = insert.execute_update() else {
-        panic!("DML in a manual transaction that began with DDL must be rejected");
-    };
-    assert_eq!(error.status, AdbcStatus::InvalidState);
-    assert!(
-        error.message.contains("began with DDL"),
-        "the rejection should name the active kind: {:?}",
-        error.message
-    );
-
-    // A bulk ingest (DML-kind work) is rejected the same way. `append` mode, so no create-DDL
-    // runs first (the mock has no admin API anyway).
-    let mut ingest = connection.new_statement().expect("new statement");
-    ingest
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("MockTable".into()),
-        )
-        .expect("set target table");
-    ingest
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .expect("set ingest mode append");
-    ingest.bind(ingest_batch(1)).expect("bind ingest data");
-    let Err(error) = ingest.execute_update() else {
-        panic!("a bulk ingest in a manual transaction that began with DDL must be rejected");
-    };
-    assert_eq!(error.status, AdbcStatus::InvalidState);
-
-    // A query is rejected too — it could not observe the buffered DDL.
-    let mut query = connection.new_statement().expect("new statement");
-    query.set_sql_query("SELECT c FROM MockTable").unwrap();
-    let Err(error) = query.execute() else {
-        panic!("a query in a manual transaction that began with DDL must be rejected");
-    };
-    assert_eq!(error.status, AdbcStatus::InvalidState);
-    assert!(
-        error.message.contains("began with DDL"),
-        "the rejection should name the active kind: {:?}",
-        error.message
-    );
-
-    // Rollback discards the buffered DDL; the next transaction is fresh, so a query runs.
-    connection
-        .rollback()
-        .expect("rollback discards buffered DDL");
-    let mut after = connection.new_statement().expect("new statement");
-    after.set_sql_query("SELECT c FROM MockTable").unwrap();
-    let batches: Vec<_> = after
-        .execute()
-        .expect("query after rollback must run")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect post-rollback batches");
-    assert_eq!(batches[0].num_rows(), 1);
 }
 
 /// COR-3 regression, autocommit half: `execute_update` on SQL that is neither DDL nor DML (a

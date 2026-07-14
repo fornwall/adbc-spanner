@@ -350,18 +350,18 @@ fn connect_via_connection_uri() {
     assert_eq!(ones.value(0), 1);
 }
 
-/// Manual transactions have a **kind** fixed by their first statement (queries, DML, or DDL);
-/// this covers the two kinds the older manual-transaction section of `query_and_dml_round_trip`
-/// does not:
+/// Manual transactions have a **kind** fixed by their first statement (queries or DML); this
+/// covers what the older manual-transaction section of `query_and_dml_round_trip` does not:
 ///
 /// - **Query-kind**: the first query opens one multi-use read-only transaction whose snapshot
 ///   every later query in the transaction shares — a row committed by a *second* connection
-///   mid-transaction stays invisible until commit/rollback ends the transaction — and DML/DDL
-///   inside it are rejected with `InvalidState`.
-/// - **DDL-kind**: DDL buffers (no count, nothing executed before commit — a second connection
-///   proves the table does not exist yet), extends into one `UpdateDatabaseDdl` batch, rejects
-///   DML and queries, applies the whole batch on commit (table *and* index exist afterwards),
-///   and is discarded by rollback.
+///   mid-transaction stays invisible until commit/rollback ends the transaction — and DML
+///   inside it is rejected with `InvalidState`.
+/// - **DDL is not transaction-aware** (matching the ADBC BigQuery driver, which never gates DDL
+///   on the transaction): it executes immediately whatever the transaction state — inside a
+///   query-kind transaction (without disturbing the pinned snapshot) and while DML is buffered
+///   (running *before* the buffered DML — the documented reorder) — and rollback never undoes
+///   it. A `;`-separated DDL batch still applies as one `UpdateDatabaseDdl` call.
 #[test]
 fn manual_transaction_kinds_round_trip() {
     let Some(target) = test_target() else {
@@ -390,7 +390,8 @@ fn manual_transaction_kinds_round_trip() {
     let mut setup = connection.new_statement().expect("new statement");
     setup
         .set_sql_query(
-            "DROP INDEX IF EXISTS AdbcDdlTxnIdx; \
+            "DROP INDEX IF EXISTS AdbcDdlBatchIdx; \
+             DROP TABLE IF EXISTS AdbcDdlBatch; \
              DROP TABLE IF EXISTS AdbcDdlTxn; \
              DROP TABLE IF EXISTS AdbcReadTxn; \
              CREATE TABLE AdbcReadTxn (Id INT64) PRIMARY KEY (Id)",
@@ -443,15 +444,28 @@ fn manual_transaction_kinds_round_trip() {
         error.message
     );
 
-    // DDL too.
+    // DDL, by contrast, is not transaction-aware: it executes immediately even inside the query
+    // transaction — the second connection sees the new table at once, no commit needed — and the
+    // pinned snapshot is undisturbed.
     let mut txn_ddl = connection.new_statement().expect("new statement");
     txn_ddl
-        .set_sql_query("CREATE TABLE AdbcReadTxnNever (Id INT64) PRIMARY KEY (Id)")
+        .set_sql_query("CREATE TABLE AdbcDdlTxn (Id INT64) PRIMARY KEY (Id)")
         .unwrap();
-    let Err(error) = txn_ddl.execute_update() else {
-        panic!("DDL in a manual transaction that began with a query must be rejected");
-    };
-    assert_eq!(error.status, Status::InvalidState);
+    assert_eq!(
+        txn_ddl.execute_update().expect("immediate DDL"),
+        None,
+        "DDL reports no count"
+    );
+    assert_eq!(
+        count_rows(&mut writer, "AdbcDdlTxn"),
+        0,
+        "DDL must apply immediately, visible to other connections before any commit"
+    );
+    assert_eq!(
+        count_rows(&mut connection, "AdbcReadTxn"),
+        1,
+        "immediate DDL must not disturb the query transaction's pinned snapshot"
+    );
 
     // Commit ends the transaction (a local no-op — read-only transactions need no commit RPC);
     // a fresh transaction sees the concurrently committed row.
@@ -479,64 +493,34 @@ fn manual_transaction_kinds_round_trip() {
         "rollback must end the snapshot"
     );
 
-    // --- DDL-kind transaction: buffered, applied as ONE UpdateDatabaseDdl batch on commit ---
+    // --- DDL while DML is buffered: executes immediately, before the buffered DML ---
 
-    let buffer_ddl = |connection: &mut SpannerConnection, sql: &str| {
-        let mut s = connection.new_statement().expect("new statement");
-        s.set_sql_query(sql).unwrap();
-        assert_eq!(
-            s.execute_update().expect("buffer DDL"),
-            None,
-            "buffered DDL reports no count"
-        );
-    };
-    buffer_ddl(
-        &mut connection,
-        "CREATE TABLE AdbcDdlTxn (Id INT64) PRIMARY KEY (Id)",
-    );
-    buffer_ddl(
-        &mut connection,
-        "CREATE INDEX AdbcDdlTxnIdx ON AdbcDdlTxn (Id)",
-    );
-
-    // Nothing has executed yet: the table is invisible to the second connection.
-    let mut probe = writer.new_statement().expect("new statement");
-    probe
-        .set_sql_query("SELECT COUNT(*) AS n FROM AdbcDdlTxn")
-        .unwrap();
-    assert!(
-        probe.execute().is_err(),
-        "buffered DDL must not execute before commit — the table must not exist yet"
-    );
-
-    // DML and queries are rejected in a DDL-kind transaction.
-    let mut mixed = connection.new_statement().expect("new statement");
-    mixed
+    let mut pending = connection.new_statement().expect("new statement");
+    pending
         .set_sql_query("INSERT INTO AdbcReadTxn (Id) VALUES (100)")
         .unwrap();
-    let Err(error) = mixed.execute_update() else {
-        panic!("DML in a manual transaction that began with DDL must be rejected");
-    };
-    assert_eq!(error.status, Status::InvalidState);
-    assert!(
-        error.message.contains("began with DDL"),
-        "the rejection should name the active kind: {:?}",
-        error.message
-    );
-    assert_query_guarded(&mut connection, "AdbcReadTxn");
+    assert_eq!(pending.execute_update().expect("buffered insert"), None);
 
-    // Commit applies the whole batch in one UpdateDatabaseDdl call: table AND index exist now.
-    connection.commit().expect("commit buffered DDL");
+    // A `;`-separated DDL batch still applies as ONE UpdateDatabaseDdl call — immediately, ahead
+    // of the buffered DML (the documented reorder), and untouched by the rollback below.
+    let mut ddl_batch = connection.new_statement().expect("new statement");
+    ddl_batch
+        .set_sql_query(
+            "CREATE TABLE AdbcDdlBatch (Id INT64) PRIMARY KEY (Id); \
+             CREATE INDEX AdbcDdlBatchIdx ON AdbcDdlBatch (Id)",
+        )
+        .unwrap();
     assert_eq!(
-        count_rows_ending_txn(&mut connection, "AdbcDdlTxn"),
-        0,
-        "the committed DDL must have created the table"
+        ddl_batch
+            .execute_update()
+            .expect("DDL while DML is buffered runs immediately"),
+        None
     );
-    let mut index_q = connection.new_statement().expect("new statement");
+    let mut index_q = writer.new_statement().expect("new statement");
     index_q
         .set_sql_query(
             "SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.INDEXES \
-             WHERE TABLE_NAME = 'AdbcDdlTxn' AND INDEX_NAME = 'AdbcDdlTxnIdx'",
+             WHERE TABLE_NAME = 'AdbcDdlBatch' AND INDEX_NAME = 'AdbcDdlBatchIdx'",
         )
         .unwrap();
     let batches: Vec<_> = index_q
@@ -552,24 +536,24 @@ fn manual_transaction_kinds_round_trip() {
             .unwrap()
             .value(0),
         1,
-        "the committed DDL batch must have created the index too"
+        "the `;`-batch must have applied table and index together, before any commit"
     );
+
+    // The DML transaction is still open (the DDL did not touch it): the query guard still fires,
+    // and rollback discards only the buffered insert — the DDL's table survives.
+    assert_query_guarded(&mut connection, "AdbcReadTxn");
     connection
         .rollback()
-        .expect("end the metadata query transaction");
-
-    // A rolled-back DDL transaction leaves no trace.
-    buffer_ddl(
-        &mut connection,
-        "CREATE TABLE AdbcDdlTxnRolled (Id INT64) PRIMARY KEY (Id)",
+        .expect("roll back the buffered insert");
+    assert_eq!(
+        count_rows_ending_txn(&mut connection, "AdbcReadTxn"),
+        3,
+        "rollback must discard the buffered DML"
     );
-    connection.rollback().expect("roll back buffered DDL");
-    let mut gone = writer.new_statement().expect("new statement");
-    gone.set_sql_query("SELECT COUNT(*) AS n FROM AdbcDdlTxnRolled")
-        .unwrap();
-    assert!(
-        gone.execute().is_err(),
-        "rolled-back DDL must never execute — the table must not exist"
+    assert_eq!(
+        count_rows(&mut writer, "AdbcDdlBatch"),
+        0,
+        "rollback must not undo immediately-applied DDL"
     );
 
     // Back to autocommit; drop the scratch tables so re-runs stay clean.
@@ -581,7 +565,10 @@ fn manual_transaction_kinds_round_trip() {
         .expect("re-enable autocommit");
     let mut cleanup = connection.new_statement().expect("new statement");
     cleanup
-        .set_sql_query("DROP INDEX AdbcDdlTxnIdx; DROP TABLE AdbcDdlTxn; DROP TABLE AdbcReadTxn")
+        .set_sql_query(
+            "DROP INDEX AdbcDdlBatchIdx; DROP TABLE AdbcDdlBatch; \
+             DROP TABLE AdbcDdlTxn; DROP TABLE AdbcReadTxn",
+        )
         .unwrap();
     cleanup.execute_update().expect("drop scratch tables");
 }

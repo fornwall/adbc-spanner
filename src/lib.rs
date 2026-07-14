@@ -53,9 +53,9 @@
 //! ## Transactions
 //!
 //! Connections are in **autocommit** mode by default. Setting `adbc.connection.autocommit` to
-//! `false` enters manual transaction mode. A manual transaction is exactly one of three kinds —
-//! **queries**, **DML**, or **DDL** — fixed by its *first* statement; a statement of any other
-//! kind is rejected with `InvalidState` until `commit` or `rollback` ends the transaction:
+//! `false` enters manual transaction mode. A manual transaction is exactly one of two kinds —
+//! **queries** or **DML** — fixed by its *first* statement; a statement of the other kind is
+//! rejected with `InvalidState` until `commit` or `rollback` ends the transaction:
 //!
 //! - **Queries** all run on one shared multi-use read-only transaction, so every read in the
 //!   transaction observes a single consistent snapshot (pinned at the first query's
@@ -67,9 +67,11 @@
 //!   in). Consequently a DML transaction has **no read-your-writes** — a data-returning query
 //!   inside it is rejected rather than silently returning a pre-insert result — and DML counts
 //!   report as unknown (`None`) until commit.
-//! - **DDL** is **buffered** and applied on `commit` as one `UpdateDatabaseDdl` batch
-//!   (near-atomic: Spanner applies the batch in order, so a mid-batch failure leaves earlier
-//!   statements applied).
+//!
+//! **DDL is not transaction-aware** (matching the ADBC BigQuery driver): it always executes
+//! immediately via the admin API — Spanner DDL is never transactional — regardless of the
+//! transaction state, so DDL issued after buffered DML executes *before* it, and `rollback`
+//! cannot undo it.
 //!
 //! See [`SpannerConnection`] for the full model.
 //!

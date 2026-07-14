@@ -174,13 +174,12 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   // model: it bulk-ingests a table inside an uncommitted transaction and then
   // expects to read it back on the same connection (read-your-writes). The
   // driver buffers a manual transaction's writes until commit — a manual
-  // transaction is one kind of work (queries, DML, or DDL), fixed by its first
+  // transaction is one kind of work (queries or DML), fixed by its first
   // statement — so that read-back is rejected with InvalidState rather than
   // served. Declaring DDL as implicitly committing makes the case self-skip
-  // (its own guard honours this quirk) rather than fail. (Buffered *user* DDL
-  // now does commit/roll back with the transaction, but an ingest's
-  // create-mode table DDL still applies immediately, so the quirk also stays
-  // literally true for the DDL this case issues.)
+  // (its own guard honours this quirk) rather than fail — and it is literally
+  // true: Spanner DDL goes through the admin UpdateDatabaseDdl API, applies
+  // immediately whatever the transaction state, and cannot be rolled back.
   bool ddl_implicit_commit_txn() const override { return true; }
   // Spanner has a single, unnamed catalog and default schema (both "", which base
   // catalog()/db_schema() return), so the connection reports them rather than NOT_FOUND.

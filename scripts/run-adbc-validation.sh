@@ -140,8 +140,8 @@ EXCLUDED=(
   'SpannerStatementTest.SqlQueryRowsAffectedDeleteStream'
   # Transactions is NOT excluded: it expects read-your-writes of an uncommitted
   # ingest, which the driver's buffer-and-commit manual transactions (one kind of
-  # work per transaction — queries, DML, or DDL) reject with InvalidState, so the
-  # case can never apply. The `ddl_implicit_commit_txn` quirk makes it self-skip
+  # work per transaction — queries or DML) reject with InvalidState, so the case
+  # can never apply. The `ddl_implicit_commit_txn` quirk makes it self-skip
   # (see the comment on the quirk in adbc-validation/spanner_validation.cc), which
   # the gate tolerates — no expected-failure bookkeeping needed.
 

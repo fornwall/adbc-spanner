@@ -79,15 +79,14 @@ Key design points:
 - **Sync-over-async bridge.** ADBC traits are synchronous; each method does `runtime.block_on`. Do
   not add a second runtime — reuse the shared one.
 - **Transactions.** Autocommit by default: queries use a single-use read-only transaction; DML
-  (including a `;`-separated batch via `ExecuteBatchDml`) uses a read/write runner; DDL runs
-  immediately via admin `UpdateDatabaseDdl`. Setting `adbc.connection.autocommit=false` enters
-  manual mode, where a transaction is exactly **one of three kinds — queries, DML, or DDL — fixed
-  by its first statement** (`ManualTxn` in `src/connection.rs`, an enum holding each kind's
-  payload so the kinds are mutually exclusive by construction; `TxnState` wraps it with the
-  autocommit flag). Work of any other kind is rejected with `InvalidState`
-  (`TxnState::check_kind_allowed`, whose error names both kinds + the rationale — the query
-  rejection keeps the "read-your-writes" wording tests assert on) until `commit`/`rollback` ends
-  the transaction:
+  (including a `;`-separated batch via `ExecuteBatchDml`) uses a read/write runner. Setting
+  `adbc.connection.autocommit=false` enters manual mode, where a transaction is exactly **one of
+  two kinds — queries or DML — fixed by its first statement** (`ManualTxn` in
+  `src/connection.rs`, an enum holding each kind's payload so the kinds are mutually exclusive by
+  construction; `TxnState` wraps it with the autocommit flag). Work of the other kind is rejected
+  with `InvalidState` (`TxnState::check_kind_allowed`, whose error names both kinds + the
+  rationale — the query rejection keeps the "read-your-writes" wording tests assert on) until
+  `commit`/`rollback` ends the transaction:
   - **Queries** (`ManualTxn::Read`): the first data-returning query opens one shared
     `MultiUseReadOnlyTransaction` (`SpannerStatement::manual_read_transaction` — inline begin, so
     no RPC until the first query executes; installed via `TxnState::start_read_txn`, which
@@ -95,7 +94,7 @@ Key design points:
     `spanner.read.staleness` via `multi_use_timestamp_bound` (bounded kinds pinned, as on the
     bound-query path; later statements' staleness is ignored — the snapshot is already pinned).
     Every later query — plain `execute`, the bound-query path (whose
-    `stream_bound_query`/`BoundQueryBatchReader` now take an `Arc<MultiUseReadOnlyTransaction>`),
+    `stream_bound_query`/`BoundQueryBatchReader` take an `Arc<MultiUseReadOnlyTransaction>`),
     and a query routed through `execute_update` — runs on it, so all reads share one snapshot.
     `commit`/`rollback` just drop it (read-only transactions need no commit/rollback RPC).
     `execute_partitions` is allowed in a query transaction but uses its own batch read-only
@@ -109,21 +108,23 @@ Key design points:
     No read-your-writes: a query inside a DML transaction is rejected (see above) rather than
     silently returning a pre-insert result. A `;`-batch on the DML paths must be **all-DML**
     (`check_all_dml_batch`): mixing DML with a query or DDL in one batch is `InvalidArguments` up
-    front, before anything is buffered. An ingest's **create-mode table DDL still runs
-    immediately** (`run_ddl_now`) — it is driver-generated, part of DML-kind work.
-  - **DDL** (`ManualTxn::Ddl`): user DDL **buffers** (`SpannerStatement::run_or_buffer_ddl` →
-    `TxnState::buffer_ddl`) and applies on `commit` as **one `UpdateDatabaseDdl` batch** (the free
-    `statement::run_ddl`, shared with the autocommit path). Near-atomic only: Spanner applies the
-    batch in order, so a mid-batch failure leaves earlier statements applied, and a replayed
-    commit re-runs every statement.
-  `Connection::commit` clones the state, applies it (`apply_manual_txn` dispatches on the kind),
-  and `TxnState::finish_commit` drains exactly the applied prefix (concurrently-buffered work
-  stays pending, keeping the kind) and resets a drained/read transaction to `Unset`; a failed
-  commit keeps the buffer replayable, and re-enabling autocommit commits pending work via
+    front, before anything is buffered.
+  - **DDL is not transaction-aware** — deliberately aligned with the ADBC BigQuery driver
+    (github.com/adbc-drivers/bigquery), which classifies nothing and sends every statement down
+    its one execution path. `SpannerStatement::run_ddl` always executes immediately via admin
+    `UpdateDatabaseDdl` (Spanner DDL is never transactional), whatever the transaction state: it
+    neither fixes a manual transaction's kind nor is rejected by it, `rollback` cannot undo it,
+    and DDL issued after buffered DML executes *before* it (the documented **DML/DDL reorder**
+    caveat). A `;`-separated DDL string still applies as ONE `UpdateDatabaseDdl` call
+    (`split_statements` → `run_ddl`); there is no cross-statement DDL batching or buffering.
+  `Connection::commit` clones the state, applies it (`apply_manual_txn`), and
+  `TxnState::finish_commit` drains exactly the applied prefix (concurrently-buffered work stays
+  pending, keeping the kind) and resets a drained/read transaction to `Unset`; a failed commit
+  keeps the buffer replayable, and re-enabling autocommit commits pending work via
   `enter_autocommit`/`restore_manual` (one-lock-acquisition flip+take, as before). All of this is
   documented user-facing (README.md Transactions bullet, python/README.md "Transactions" section
-  with a CI-executed example asserting the kind-mixing `ProgrammingError`s, `SpannerConnection`
-  rustdoc + connection.rs module doc + lib.rs crate docs). Genuine read-your-writes inside a DML
+  with a CI-executed example asserting the guard `ProgrammingError`, `SpannerConnection` rustdoc
+  + connection.rs module doc + lib.rs crate docs). Genuine read-your-writes inside a DML
   transaction still waits on the client exposing begin/commit handles. The standard
   `adbc.connection.transaction.isolation_level` option is honoured for read/write transactions:
   `serializable` and `repeatable_read` map to the client's `IsolationLevel` (applied via

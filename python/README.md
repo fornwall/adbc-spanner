@@ -109,7 +109,7 @@ best spelled with the `DatabaseOptions` / `ConnectionOptions` / `StatementOption
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
 | `db_kwargs=`   | Database-level options, keyed with the `DatabaseOptions` constants (credentials, emulator, endpoint, …). See the table below.               |
 | `conn_kwargs=` | Connection-level options, keyed with the `ConnectionOptions` constants (`adbc.connection.*` / `spanner.*`), e.g. `ConnectionOptions.READONLY`. |
-| `autocommit=`  | `False` (the DBAPI default) groups statements into manual transactions (queries, DML, or DDL — one kind each); `True` applies each immediately — see [Transactions](#transactions). |
+| `autocommit=`  | `False` (the DBAPI default) groups statements into manual transactions (queries or DML — one kind each; DDL always applies immediately); `True` applies each immediately — see [Transactions](#transactions). |
 
 A database URI is required; everything else is optional. The database-level credential and
 endpoint options are:
@@ -212,9 +212,8 @@ with spanner.connect(
 
 A DBAPI connection is **autocommit-off by default**, so statements run in manual transactions
 ended by `conn.commit()` (or discarded by `conn.rollback()`). A manual transaction is exactly one
-kind of work — **queries, DML, or DDL** — fixed by its *first* statement; a statement of any other
-kind raises `adbc_driver_manager.ProgrammingError` (ADBC `InvalidState`) until you commit or roll
-back:
+kind of work — **queries or DML** — fixed by its *first* statement; a statement of the other kind
+raises `adbc_driver_manager.ProgrammingError` (ADBC `InvalidState`) until you commit or roll back:
 
 - **Queries share one snapshot.** The first query opens a Spanner multi-use read-only
   transaction, and every query until `commit()`/`rollback()` reads from that same consistent
@@ -225,9 +224,11 @@ back:
   and apply atomically on `conn.commit()`. A query inside a DML transaction could not see the
   buffered writes, so it is rejected rather than silently returning a stale (*pre-insert*)
   result.
-- **DDL is buffered too.** `CREATE`/`ALTER`/`DROP` buffer and apply on `conn.commit()` as one
-  `UpdateDatabaseDdl` batch (applied in order — near-atomic, but a mid-batch failure leaves the
-  earlier statements applied); `conn.rollback()` discards the batch.
+- **DDL is not transaction-aware.** `CREATE`/`ALTER`/`DROP` always apply **immediately** (Spanner
+  DDL runs through the admin API and is never transactional — the same no-special-handling
+  approach as the ADBC BigQuery driver), regardless of the transaction: `commit()` is not needed
+  and `rollback()` cannot undo them, and DDL issued after buffered DML executes *before* it. A
+  `;`-separated DDL batch still applies as one `UpdateDatabaseDdl` call.
 
 Connect with `autocommit=True` if you want every statement to apply immediately.
 
@@ -240,19 +241,10 @@ with spanner.connect(
     db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
 ) as conn:  # DBAPI default: autocommit off => manual transactions
     with conn.cursor() as cur:
-        # This transaction's first statement is DDL, so it is a DDL transaction: both
-        # statements buffer into one UpdateDatabaseDdl batch...
+        # DDL applies immediately — no commit needed, and rollback cannot undo it.
         cur.execute("DROP TABLE IF EXISTS Albums")
         cur.execute("CREATE TABLE Albums (Id INT64 NOT NULL) PRIMARY KEY (Id)")
-        # ...and mixing in DML is rejected while the DDL is pending.
-        try:
-            cur.execute("INSERT INTO Albums (Id) VALUES (1)")
-            raise AssertionError("expected the mixed-kind statement to raise")
-        except ProgrammingError:
-            pass  # a transaction is queries, DML, or DDL — never a mix
-    conn.commit()  # applies the buffered DDL as one batch
 
-    with conn.cursor() as cur:
         cur.execute("INSERT INTO Albums (Id) VALUES (1)")  # a DML transaction: buffered
         # Querying while the INSERT is buffered is rejected (no read-your-writes) instead of
         # silently returning a stale count.
