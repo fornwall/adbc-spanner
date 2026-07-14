@@ -40,6 +40,7 @@ use crate::conversion::{
     BoundStatementSource, TimestampPrecision, result_set_to_batch, stream_bound_query, stream_query,
 };
 use crate::directed_read::DirectedRead;
+use crate::driver::SharedDatabaseAdmin;
 use crate::error::{
     err, from_builder, from_spanner, from_status_parts, invalid_argument, invalid_state,
     not_implemented,
@@ -116,6 +117,11 @@ pub struct SpannerStatement {
     client: DatabaseClient,
     spanner: Spanner,
     database: String,
+    /// The lazily-built Database Admin client for the DDL path (`run_ddl`, including the
+    /// `CREATE TABLE` a create-mode ingest issues), shared (`Arc`) across every connection and
+    /// statement minted from the database's cached client stack: the first DDL statement builds it
+    /// and later ones clone it (see [`SharedDatabaseAdmin`]).
+    admin: SharedDatabaseAdmin,
     /// The connection's `adbc.connection.readonly` flag, shared live (`Arc`) rather than
     /// snapshotted: each write path loads it at execution time, so toggling the option on the
     /// connection immediately affects this statement in both directions.
@@ -220,6 +226,7 @@ impl SpannerStatement {
         client: DatabaseClient,
         spanner: Spanner,
         database: String,
+        admin: SharedDatabaseAdmin,
         read_only: Arc<AtomicBool>,
         isolation: IsolationLevel,
         read_staleness: ReadStaleness,
@@ -236,6 +243,7 @@ impl SpannerStatement {
             client,
             spanner,
             database,
+            admin,
             read_only,
             isolation,
             txn,
@@ -1237,9 +1245,11 @@ impl SpannerStatement {
     /// transaction's kind nor is rejected by it (and it cannot be rolled back).
     ///
     /// DDL is issued through the write/update path, so the update timeout bounds the whole
-    /// change — the admin-client build, the `UpdateDatabaseDdl` call, **and** its long-running
-    /// operation poll loop (which otherwise polls without any bound). An expired deadline fails
-    /// with `Status::Timeout`; unset (the default) leaves the poll unbounded.
+    /// change — the admin-client build (first DDL on the database's client stack only; the built
+    /// client is cached in the shared [`SharedDatabaseAdmin`] cell and cloned thereafter), the
+    /// `UpdateDatabaseDdl` call, **and** its long-running operation poll loop (which otherwise
+    /// polls without any bound). An expired deadline fails with `Status::Timeout`; unset (the
+    /// default) leaves the poll unbounded.
     fn run_ddl(&self, statements: Vec<String>) -> Result<()> {
         if self.is_read_only() {
             return Err(invalid_state(
@@ -1247,6 +1257,7 @@ impl SpannerStatement {
             ));
         }
         let spanner = self.spanner.clone();
+        let admin_cell = self.admin.clone();
         let database = self.database.clone();
         block_on_cancellable(
             &self.runtime,
@@ -1255,11 +1266,19 @@ impl SpannerStatement {
                 self.timeouts.update_timeout(),
                 crate::OPTION_RPC_TIMEOUT_UPDATE,
                 async move {
-                    let admin = spanner
-                        .database_admin_builder()
-                        .build()
-                        .await
-                        .map_err(from_builder)?;
+                    // Build the Database Admin client once per cached client stack and reuse it:
+                    // like the data-plane client, it holds its connection pool behind an `Arc`, so
+                    // rebuilding it per DDL statement would redo the endpoint/credential setup for
+                    // nothing. A failed build stays uncached and the next DDL retries it.
+                    let admin = admin_cell
+                        .get_or_try_init(|| async {
+                            spanner
+                                .database_admin_builder()
+                                .build()
+                                .await
+                                .map_err(from_builder)
+                        })
+                        .await?;
                     admin
                         .update_database_ddl()
                         .set_database(database)

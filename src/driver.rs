@@ -12,7 +12,7 @@ use google_cloud_auth::credentials::user_account::Builder as UserAccountCredenti
 use google_cloud_auth::credentials::{
     CacheableResource, Credentials, CredentialsProvider, EntityTag,
 };
-use google_cloud_spanner::client::{DatabaseClient, Spanner};
+use google_cloud_spanner::client::{DatabaseAdmin, DatabaseClient, Spanner};
 use http::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use http::{Extensions, HeaderMap};
 
@@ -26,8 +26,9 @@ use crate::{
     OPTION_IMPERSONATE_LIFETIME, OPTION_IMPERSONATE_SCOPES, OPTION_IMPERSONATE_TARGET_PRINCIPAL,
     OPTION_KEYFILE, OPTION_KEYFILE_JSON, OPTION_QUOTA_PROJECT,
 };
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::OnceCell;
 
 /// The HTTP request header carrying the quota / billing project (`spanner.auth.quota_project`).
 /// Matches the `google-cloud-auth` `QUOTA_PROJECT_KEY` that its `with_quota_project_id` emits, so
@@ -471,6 +472,7 @@ impl SpannerDatabase {
                 client,
                 spanner,
                 database,
+                admin: Arc::new(OnceCell::new()),
             })
         })
     }
@@ -498,17 +500,32 @@ impl SpannerDatabase {
 }
 
 /// An established connection's handles: the data-plane [`DatabaseClient`], the [`Spanner`] client
-/// (used to reach the Database Admin API for DDL), and the resolved database path.
+/// (used to reach the Database Admin API for DDL), the resolved database path, and the shared
+/// [Database Admin client cell](SharedDatabaseAdmin).
 ///
 /// `Clone` is cheap by design — the client types share their channel pool and multiplexed session
-/// across clones — which is what lets [`SpannerDatabase`] cache one stack and hand a clone to
-/// every connection.
+/// across clones (and the admin cell its `Arc`) — which is what lets [`SpannerDatabase`] cache one
+/// stack and hand a clone to every connection.
 #[derive(Clone, Debug)]
 pub(crate) struct Connected {
     pub(crate) client: DatabaseClient,
     pub(crate) spanner: Spanner,
     pub(crate) database: String,
+    pub(crate) admin: SharedDatabaseAdmin,
 }
+
+/// The lazily-built [`DatabaseAdmin`] client (the DDL path — `UpdateDatabaseDdl`, including the
+/// `CREATE TABLE` a create-mode ingest issues), shared via `Arc` by every connection and statement
+/// minted from one cached [`Connected`] stack.
+///
+/// Like [`DatabaseClient`], `DatabaseAdmin` holds its connection pool behind an internal `Arc` and
+/// its docs advise creating one and reusing it, so it is built **once** on the first DDL statement
+/// (no admin connection is opened for workloads that never run DDL) and cheaply cloned thereafter.
+/// Living inside [`Connected`] ties its lifetime to the data-plane stack's: when a database option
+/// invalidates the cached stack, the rebuilt stack starts with a fresh empty cell, so the admin
+/// client is rebuilt from the new endpoint/credentials too. A failed build caches nothing
+/// (`get_or_try_init`), so the next DDL statement retries from scratch.
+pub(crate) type SharedDatabaseAdmin = Arc<OnceCell<DatabaseAdmin>>;
 
 impl Optionable for SpannerDatabase {
     type Option = OptionDatabase;
