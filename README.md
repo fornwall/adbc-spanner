@@ -12,65 +12,76 @@ An [ADBC](https://arrow.apache.org/adbc/) (Arrow Database Connectivity) driver f
 
 ## Status
 
-Early but working and tested end-to-end against the Spanner emulator.
+Early, tested end-to-end against the Spanner emulator.
 
-## Supported ADBC functionality
+## Spanner ADBC quirks
 
-- SQL queries (`execute`) are streamed back as typed Arrow `RecordBatch`es. Spanner does not support returning
-  columnar results directly - rows are pulled from Spanner and converted to Arrow in bounded chunks (with configurable
-  size) as the reader is iterated, so a large result set is never fully materialised in memory.
+- Spanner does not support returning columnar results directly - rows are pulled from Spanner and
+  converted to Arrow in bounded chunks (with configurable size).
 - DML: A `;`-separated batch (e.g. `DELETE; INSERT`) runs atomically in one read/write transaction using
   [batch DML](https://docs.cloud.google.com/spanner/docs/samples/spanner-dml-batch-update). A batch
   must be all-DML: mixing in a query or DDL is rejected up front with `InvalidArguments` (before
-  anything is buffered in a manual transaction).
+  anything is buffered in a manual transaction). TODO: Multiple DML in a transaction does the same?
 - DDL (`CREATE`/`ALTER`/`DROP`/`RENAME`/…): Routed to the Database Admin `UpdateDatabaseDdl` API. A
   `;`-separated batch (e.g. a intermediate-table build then rename swap) is submitted as a single
   [schema change](https://docs.cloud.google.com/spanner/docs/schema-updates) near-atomic (but not
-  truly atomic, as Spanner does not support atomic DDL) operation.
-- Transactions: In manual mode DML — and any bulk ingest's insert mutations — is buffered
-  and applied atomically in one read/write transaction on commit, so `execute_update` returns `None`
-  rather than an affected-row count — the count is unknown until the buffered batch commits (queries
-  and DDL still run immediately). Because only writes are buffered, a manual transaction has **no
-  read-your-writes** — a query runs immediately in a fresh read-only snapshot and cannot see
-  buffered writes. Rather than silently returning a *pre-insert* result, a data-returning query
-  (`execute`/`execute_partitions`, or a query routed through `execute_update` — which executes it
-  read-only and discards the rows) issued while any write is buffered is rejected with
-  `InvalidState`; commit or roll back first if a statement needs to see earlier writes. Writes also
-  **reorder relative to DDL**: DDL issued after buffered DML executes before it (Spanner DDL is
-  never transactional). This follows from the
-  preview client exposing read/write transactions only through a closure-based runner; it will be
-  fixed properly once the client exposes begin/commit handles. DML with
-  a [`THEN RETURN`](https://cloud.google.com/spanner/docs/dml-returning) clause returns its rows:
-  `execute()` yields them as an Arrow result (autocommit mode only — buffered manual transactions
-  cannot produce them).
+  truly atomic, as Spanner does not support atomic DDL) operation. TODO: Multiple DDL in a transactio
+  does the same?
+
+## Supported optional ADBC functionality
+
 - [Bulk ingestion](https://arrow.apache.org/adbc/current/format/specification.html#bulk-ingestion)
-  are supported through [insert mutations](https://docs.cloud.google.com/spanner/docs/modify-mutation-api).
-  The ingest commits in one transaction when it fits Spanner's
-  [per-commit limits](https://docs.cloud.google.com/spanner/quotas#limits-for). A larger ingest is
-  automatically split into chunks that fits those limits, in which case the ingestion is
-  **not atomic as a whole**: a mid-ingest failure leaves earlier chunks committed. In a manual
-  transaction (`adbc.connection.autocommit=false`) the mutations are buffered — unchunked — and
-  committed atomically with any buffered DML on `commit`; Spanner applies buffered mutations at
-  commit time, after the transaction's DML has executed. All four `adbc.ingest.mode` values are
-  supported:
-  `create` (the ADBC spec default — create the table first, failing if it exists), `append` (insert
-  into an existing table), `create_append` (create if absent, then insert) and `replace` (drop and
-  recreate).
-  The three create modes build the table from the ingest data's Arrow schema, adding a synthetic
-  `adbc_ingest_key` `STRING` primary key populated with a UUID per row, because Spanner requires
-  every table to have a primary key and the ingest data carries none. That column is a real column,
-  so it shows up in a later `SELECT *` from the table. To key on your own data instead, set
-  `spanner.ingest.primary_key` to one or more existing ingest columns (comma-separated for a
-  composite key, in key order) — those become the primary key and no synthetic column is added; a
-  named column absent from the data fails with `InvalidArguments`. For non-atomic,
-  high-throughput ("firehose") loads, set `spanner.ingest.batch_write=true` to route an autocommit
-  ingest's per-chunk mutations through Spanner's **BatchWrite** RPC instead of a write-only
-  transaction (insert/count/error semantics and chunking preserved; BatchWrite applies its mutation
-  groups non-atomically). It only affects autocommit ingests — a manual transaction ignores it and
-  still buffers and commits atomically — and, since BatchWrite carries no per-request commit options,
-  the priority / request-tag / `commit.max_delay` / `commit_stats` options do not apply on that path.
-  TODO: Move BatchWrite to section below. perhaps a dedicated bulk ingestion explaining everything around
-  that - supported moves, BatchWrite, transaction splitting, transaction behaviour, etc.
+  are supported.
+    - Maps to [insert mutations](https://docs.cloud.google.com/spanner/docs/modify-mutation-api).
+    - The ingest commits in one transaction when it fits Spanner's
+      [per-commit limits](https://docs.cloud.google.com/spanner/quotas#limits-for). A larger ingest
+      in autocommit mode is automatically split into chunks that fits those limits, in which case the
+      ingestion is **not atomic as a whole**. In a manual transaction the mutations are buffered —
+      unchunked — and committed atomically with any buffered DML on `commit`; but note the transaction
+      limits. TODO: Surprising/complex with auto-chunking in autocommit - perhaps opt-in through option
+      for non-atomic ingestion?
+    - All four `adbc.ingest.mode` values are supported: `create` (the ADBC spec default — create the
+    - table first, failing if it exists),
+      `append` (insert into an existing table), `create_append` (create if absent, then insert) and
+      `replace` (drop and recreate).
+      The three create modes build the table from the ingest data's Arrow schema, adding a synthetic
+      `adbc_ingest_key` `STRING` primary key populated with a UUID per row, because Spanner requires
+      every table to have a primary key and the ingest data carries none. That column is a real column,
+      so it shows up in a later `SELECT *` from the table. To key on your own data instead, set
+      `spanner.ingest.primary_key` to one or more existing ingest columns (comma-separated for a
+      composite key, in key order) — those become the primary key and no synthetic column is added; a
+      named column absent from the data fails with `InvalidArguments`. For non-atomic,
+      high-throughput ("firehose") loads, set `spanner.ingest.batch_write=true` to route an autocommit
+      ingest's per-chunk mutations through Spanner's **BatchWrite** RPC instead of a write-only
+      transaction (insert/count/error semantics and chunking preserved; BatchWrite applies its mutation
+      groups non-atomically). It only affects autocommit ingests — a manual transaction ignores it and
+      still buffers and commits atomically — and, since BatchWrite carries no per-request commit options,
+      the priority / request-tag / `commit.max_delay` / `commit_stats` options do not apply on that path.
+      TODO: Move BatchWrite to section below. perhaps a dedicated bulk ingestion explaining everything around
+      that - supported moves, BatchWrite, transaction splitting, transaction behaviour, etc.
+- Manual transactions (setting `adbc.connection.autocommit=false` plus `commit()`/`rollback()`:
+    -  Works for DDL and DML, not for querying data (querying data fails with TODO).
+    -  In manual mode DDL statements, DML statement and bulk ingestions are buffered and applied
+       atomically in one read/write transaction on commit, so `execute_update` returns `None`
+       rather than an affected-row count — the count is unknown until the buffered batch commits (queries
+       and DDL still run immediately). Because only writes are buffered, a manual transaction has **no
+      read-your-writes** — a query runs immediately in a fresh read-only snapshot and cannot see
+      buffered writes. Rather than silently returning a *pre-insert* result, a data-returning query
+      (`execute`/`execute_partitions`, or a query routed through `execute_update` — which executes it
+      read-only and discards the rows) issued while any write is buffered is rejected with
+      `InvalidState`; commit or roll back first if a statement needs to see earlier writes. Writes also
+      **reorder relative to DDL**: DDL issued after buffered DML executes before it (Spanner DDL is
+      never transactional). This follows from the
+      preview client exposing read/write transactions only through a closure-based runner; it will be
+      fixed properly once the client exposes begin/commit handles. DML with
+      a [`THEN RETURN`](https://cloud.google.com/spanner/docs/dml-returning) clause returns its rows:
+      `execute()` yields them as an Arrow result (autocommit mode only — buffered manual transactions
+      cannot produce them).
+- Transaction isolation level — the adbc.connection.transaction.isolation_level option is honored for serializable,
+  repeatable_read, and default. The four levels Spanner does not natively expose are promoted upward to the weakest
+  supported level that still satisfies them (read_uncommitted/read_committed → repeatable_read; snapshot/linearizable →
+  serializable), which is spec-permitted and safe; get_option reports the effective promoted level, and an unknown
+  level string is still rejected. TODO: Note the limitations of no reads in transactions.
 - Parameter binding: `bind`/`bind_stream` an Arrow batch whose columns become Spanner named
   parameters; each bound row runs the statement once. How columns pair with the query's `@name`
   parameters is set by the `adbc.statement.bind_by_name` statement option (the [SQLite reference
@@ -101,24 +112,15 @@ Early but working and tested end-to-end against the Spanner emulator.
   descriptor, and `Connection::read_partition()` streams one partition's rows back as Arrow.
   `spanner.data_boost` bakes [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview)
   into the descriptors; `spanner.partition.max_count` hints the partition count.
+- Read-only connections — `adbc.connection.readonly=true` is supported, making the connection reject all writes while still
+  allowing queries.
+- execute_schema() (ADBC 1.1.0) — returns a query's result schema without executing it, via Spanner's QueryMode::Plan.
+- Cancellation (ADBC 1.1.0) — both Connection::cancel() and Statement::cancel() interrupt an in-flight operation.
 
 TODO: Go over these and merge with above:
 
-- Manual transactions — setting adbc.connection.autocommit=false plus commit()/rollback() works (via the buffer-and-commit
-  scheme), rather than the driver rejecting non-autocommit mode.
-- Transaction isolation level — the adbc.connection.transaction.isolation_level option is honored for serializable,
-  repeatable_read, and default. The four levels Spanner does not natively expose are promoted upward to the weakest
-  supported level that still satisfies them (read_uncommitted/read_committed → repeatable_read; snapshot/linearizable →
-  serializable), which is spec-permitted and safe; get_option reports the effective promoted level, and an unknown
-  level string is still rejected.
-- Read-only connections — adbc.connection.readonly=true is supported, making the connection reject all writes while still
-  allowing queries.
-- execute_schema() (ADBC 1.1.0) — returns a query's result schema without executing it, via Spanner's QueryMode::Plan.
 - Bulk ingest — the full adbc.ingest.* surface (append/create/create_append/replace modes, plus target
-  catalog/db_schema/temporary) is implemented over native Spanner mutations.
-- Partitioned execution — execute_partitions() and read_partition() are supported, serializing Spanner batch-read partitions
-  into opaque ADBC descriptors.
-- Cancellation (ADBC 1.1.0) — both Connection::cancel() and Statement::cancel() interrupt an in-flight operation.
+  catalog/db_schema/temporary - TODO, what are those) is implemented over native Spanner mutations.
 - Statistics (ADBC 1.1.0) — get_statistics() returns exact row/null/distinct counts and get_statistic_names() returns a
   correctly-typed empty result.
 - Typed option getters (ADBC 1.1.0) — get_option_int(), get_option_double(), and get_option_bytes() are implemented alongside
@@ -188,9 +190,6 @@ TODO: Go over these and merge with above:
   matching the ADBC BigQuery driver, whose only fixed auth guidance is a re-authentication hint plus a
   doc link and names no roles either.) The guidance only augments the message; the status,
   `vendor_code` and forwarded details are unchanged.
-
-Not supported (returns `NotImplemented`, by nature of Spanner): **Substrait** — Spanner executes
-GoogleSQL/PostgreSQL text and has no Substrait support.
 
 ## Shared library (loadable driver)
 
