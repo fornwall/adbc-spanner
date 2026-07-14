@@ -272,6 +272,12 @@ Credentials are resolved in this order:
 4. **[Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)**
    otherwise (e.g. `GOOGLE_APPLICATION_CREDENTIALS`, gcloud login, or the metadata server).
 
+The two secret-holding options — `spanner.auth.keyfile_json` (a live private key) and
+`spanner.auth.access_token` (a live bearer token) — are **write-only**: reading either back via
+`get_option` always fails with `NotFound`, whether the option is set or not, so tooling that dumps
+connection options never prints a usable credential. `spanner.auth.keyfile` is a filesystem path,
+not a secret, and stays readable.
+
 #### OAuth access token
 
 Setting `spanner.auth.access_token` authenticates with a bearer token you have already obtained out of

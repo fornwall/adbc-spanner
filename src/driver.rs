@@ -107,7 +107,9 @@ impl Driver for SpannerDriver {
 /// `keyfile_json` — a full service-account private key — and `access_token` — a live OAuth bearer
 /// token) never render in cleartext: each is shown as `Some("<redacted>")` / `None`, exposing only
 /// presence, never the secret. This mirrors `StaticTokenCredentials`, whose token lives in a
-/// sensitive `HeaderValue` for the same reason.
+/// sensitive `HeaderValue` for the same reason. `get_option` matches: the two secret-*holding*
+/// options (`keyfile_json`, `access_token`) are write-only and always report `NotFound`, while
+/// `keyfile` — a path, not a secret — reads back normally.
 pub struct SpannerDatabase {
     runtime: SharedRuntime,
     database: Option<String>,
@@ -583,6 +585,20 @@ impl Optionable for SpannerDatabase {
     }
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
+        // The two secret-holding options are **write-only**: `spanner.auth.keyfile_json` is a full
+        // service-account private key and `spanner.auth.access_token` a live bearer token, so
+        // reading either back is always `NotFound` — whether set or not — and tooling that dumps
+        // connection options can never print a usable credential (SEC-1). This mirrors the `Debug`
+        // redaction of the same fields; `spanner.auth.keyfile` (a filesystem path, not a secret)
+        // stays readable.
+        if let OptionDatabase::Other(name) = &key
+            && (name == OPTION_KEYFILE_JSON || name == OPTION_ACCESS_TOKEN)
+        {
+            return Err(err(
+                format!("option {name} is write-only (it holds a secret) and cannot be read back"),
+                Status::NotFound,
+            ));
+        }
         let value = match &key {
             OptionDatabase::Uri => self.database.clone(),
             OptionDatabase::Other(name) if name == OPTION_ENDPOINT => self.endpoint.clone(),
@@ -590,7 +606,6 @@ impl Optionable for SpannerDatabase {
                 Some(self.emulator.to_string())
             }
             OptionDatabase::Other(name) if name == OPTION_KEYFILE => self.keyfile.clone(),
-            OptionDatabase::Other(name) if name == OPTION_KEYFILE_JSON => self.keyfile_json.clone(),
             OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_TARGET_PRINCIPAL => {
                 self.impersonate_target_principal.clone()
             }
@@ -604,9 +619,6 @@ impl Optionable for SpannerDatabase {
             OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_LIFETIME => {
                 self.impersonate_lifetime_secs.map(|secs| secs.to_string())
             }
-            // Round-trips verbatim, matching the keyfile_json convention (which likewise returns the
-            // stored secret unchanged); ADBC has no notion of a write-only option.
-            OptionDatabase::Other(name) if name == OPTION_ACCESS_TOKEN => self.access_token.clone(),
             OptionDatabase::Other(name) if name == OPTION_QUOTA_PROJECT => {
                 self.quota_project.clone()
             }
@@ -1286,16 +1298,20 @@ mod tests {
     }
 
     #[test]
-    fn keyfile_options_round_trip() {
+    fn keyfile_path_round_trips_but_inline_json_is_write_only() {
+        // SEC-1: `spanner.auth.keyfile` is a filesystem path (not a secret) and reads back
+        // verbatim; `spanner.auth.keyfile_json` holds a live private key, so `get_option` reports
+        // `NotFound` — never the key material — whether or not it is set.
         let mut db = new_database();
         db.set_option(
             OptionDatabase::Other(OPTION_KEYFILE.into()),
             OptionValue::String("/path/to/key.json".into()),
         )
         .unwrap();
+        let secret_json = r#"{"type":"service_account","private_key":"SUPER-SECRET-PRIVATE-KEY"}"#;
         db.set_option(
             OptionDatabase::Other(OPTION_KEYFILE_JSON.into()),
-            OptionValue::String("{\"type\":\"service_account\"}".into()),
+            OptionValue::String(secret_json.into()),
         )
         .unwrap();
         assert_eq!(
@@ -1303,11 +1319,18 @@ mod tests {
                 .unwrap(),
             "/path/to/key.json"
         );
-        assert_eq!(
-            db.get_option_string(OptionDatabase::Other(OPTION_KEYFILE_JSON.into()))
-                .unwrap(),
-            "{\"type\":\"service_account\"}"
+        let error = db
+            .get_option_string(OptionDatabase::Other(OPTION_KEYFILE_JSON.into()))
+            .unwrap_err();
+        assert_eq!(error.status, Status::NotFound);
+        assert!(error.message.contains("write-only"), "{}", error.message);
+        assert!(
+            !error.message.contains("SUPER-SECRET-PRIVATE-KEY"),
+            "keyfile_json leaked through get_option: {}",
+            error.message
         );
+        // The stored key is still in effect — only reading it back is refused.
+        assert_eq!(db.keyfile_json.as_deref(), Some(secret_json));
     }
 
     #[test]
@@ -1380,9 +1403,10 @@ mod tests {
     }
 
     #[test]
-    fn access_token_option_round_trips() {
-        // Matches the keyfile_json convention: the stored token round-trips verbatim through
-        // get_option (ADBC has no write-only option), and is unset by default.
+    fn access_token_is_write_only() {
+        // SEC-1: the token is a live bearer credential, so `get_option` reports `NotFound`
+        // whether the option is set or not — the token is never returned (matching the
+        // keyfile_json convention and the `Debug` redaction).
         let mut db = new_database();
         assert_eq!(
             db.get_option_string(OptionDatabase::Other(OPTION_ACCESS_TOKEN.into()))
@@ -1392,14 +1416,26 @@ mod tests {
         );
         db.set_option(
             OptionDatabase::Other(OPTION_ACCESS_TOKEN.into()),
-            OptionValue::String("ya29.a-bearer-token".into()),
+            OptionValue::String("ya29.LIVE-BEARER-TOKEN".into()),
         )
         .unwrap();
-        assert_eq!(
-            db.get_option_string(OptionDatabase::Other(OPTION_ACCESS_TOKEN.into()))
-                .unwrap(),
-            "ya29.a-bearer-token"
+        let error = db
+            .get_option_string(OptionDatabase::Other(OPTION_ACCESS_TOKEN.into()))
+            .unwrap_err();
+        assert_eq!(error.status, Status::NotFound);
+        assert!(error.message.contains("write-only"), "{}", error.message);
+        assert!(
+            !error.message.contains("ya29.LIVE-BEARER-TOKEN"),
+            "access_token leaked through get_option: {}",
+            error.message
         );
+        // The bytes getter funnels through the same guard.
+        let error = db
+            .get_option_bytes(OptionDatabase::Other(OPTION_ACCESS_TOKEN.into()))
+            .unwrap_err();
+        assert_eq!(error.status, Status::NotFound);
+        // The stored token is still in effect — only reading it back is refused.
+        assert_eq!(db.access_token.as_deref(), Some("ya29.LIVE-BEARER-TOKEN"));
     }
 
     #[test]

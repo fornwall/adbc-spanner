@@ -402,6 +402,11 @@ pub const OPTION_KEYFILE: &str = "spanner.auth.keyfile";
 ///
 /// When neither this nor [`OPTION_KEYFILE`] is set (and not connecting to an emulator), the driver
 /// falls back to Application Default Credentials.
+///
+/// **Write-only.** The value is a live private key, so `get_option` never returns it: reading this
+/// key back always fails with [`Status::NotFound`](adbc_core::error::Status::NotFound), whether the
+/// option is set or not (the same treatment as [`OPTION_ACCESS_TOKEN`]; [`OPTION_KEYFILE`], a
+/// filesystem path rather than a secret, stays readable).
 pub const OPTION_KEYFILE_JSON: &str = "spanner.auth.keyfile_json";
 
 /// Driver-specific database option: the service-account email to impersonate. Setting this **enables
@@ -442,6 +447,10 @@ pub const OPTION_IMPERSONATE_LIFETIME: &str = "spanner.auth.impersonate.lifetime
 /// combining it with any of them is refused at connect time with
 /// [`Status::InvalidState`](adbc_core::error::Status::InvalidState). Like the keyfile options, it
 /// also conflicts with emulator mode (which forces anonymous credentials).
+///
+/// **Write-only.** The value is a live bearer token, so `get_option` never returns it: reading this
+/// key back always fails with [`Status::NotFound`](adbc_core::error::Status::NotFound), whether the
+/// option is set or not (the same treatment as [`OPTION_KEYFILE_JSON`]).
 pub const OPTION_ACCESS_TOKEN: &str = "spanner.auth.access_token";
 
 /// Driver-specific database option: the **quota / billing project** charged for Spanner API usage,
