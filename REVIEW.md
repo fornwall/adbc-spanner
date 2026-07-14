@@ -84,8 +84,8 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 
 - [x] **SPEC-1 (Medium)** — covered by **COR-3** (execute_update vs `ExecuteQuery(out=NULL)` for result-producing statements). Tick there.
 
-- [ ] **SPEC-2 (Low)** — `adbc.statement.exec.incremental` rejected even at its spec default — `src/statement.rs:1271-1276`
-  Spec default is DISABLED; setting `"false"` should be an accept-default no-op (the `check_ingest_temporary` pattern at `statement.rs:1221-1226`), `"true"` → `NotImplemented`, and the getter should report `"false"` instead of `NotFound`. Generic clients that always write defaults currently break.
+- [x] **SPEC-2 (Low)** — `adbc.statement.exec.incremental` rejected even at its spec default — `src/statement.rs:1271-1276`
+  Spec default is DISABLED; setting `"false"` should be an accept-default no-op (the `check_ingest_temporary` pattern at `statement.rs:1221-1226`), `"true"` → `NotImplemented`, and the getter should report `"false"` instead of `NotFound`. Generic clients that always write defaults currently break. *Resolved:* `OptionStatement::Incremental` now mirrors the `Temporary` pattern — `check_exec_incremental` accepts any falsy boolean spelling as a no-op, rejects truthy values with `NotImplemented` (naming the option), and `get_option_string` reports the effective `"false"`. Unit-tested next to the temporary check plus an offline mock-server round-trip (`exec_incremental_spec_default_is_a_no_op`).
 
 - [ ] **SPEC-3 (Low)** — `execute_partitions` neither clears nor fully uses bound data — `src/statement.rs:1145-1157`
   Multi-row bound data is silently truncated to row 0 ("only the first bound row is used"), and bound rows survive the call on a reused handle — inconsistent with every other execute path. **Fix:** `InvalidArguments` on >1 bound rows (or document), and clear `bound` after partitioning.
