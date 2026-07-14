@@ -211,6 +211,7 @@ impl RequestConfig {
     }
 
     /// Apply the priority and request tag to a statement builder (queries and DML alike).
+    #[must_use]
     pub(crate) fn apply_to_statement(&self, mut builder: StatementBuilder) -> StatementBuilder {
         if let Some(priority) = self.priority {
             builder = builder.set_priority(priority.to_client());
@@ -224,6 +225,7 @@ impl RequestConfig {
     /// Apply the request tag to an `ExecuteBatchDml` batch builder. (The batch request carries a
     /// single request-level tag; the client exposes no batch-level priority setter — the runner's
     /// commit priority, from [`Self::apply_to_runner`], covers the transaction's commit instead.)
+    #[must_use]
     pub(crate) fn apply_to_batch_dml(&self, mut builder: BatchDmlBuilder) -> BatchDmlBuilder {
         if let Some(tag) = &self.request_tag {
             builder = builder.set_request_tag(tag.as_str());
@@ -233,6 +235,7 @@ impl RequestConfig {
 
     /// Apply the commit priority, transaction tag and commit delay to a read/write transaction
     /// runner builder.
+    #[must_use]
     pub(crate) fn apply_to_runner(
         &self,
         mut builder: TransactionRunnerBuilder,
@@ -254,6 +257,7 @@ impl RequestConfig {
 
     /// Apply the commit priority, transaction tag and commit delay to a write-only transaction
     /// builder (the mutation-based bulk-ingest commit path).
+    #[must_use]
     pub(crate) fn apply_to_write_only(
         &self,
         mut builder: WriteOnlyTransactionBuilder,

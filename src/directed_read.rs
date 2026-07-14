@@ -151,6 +151,7 @@ impl DirectedRead {
     }
 
     /// Apply the directed-read options to a read-only query statement builder. A no-op when unset.
+    #[must_use]
     pub(crate) fn apply_to_statement(&self, builder: StatementBuilder) -> StatementBuilder {
         match &self.spec {
             Some(spec) => builder.set_directed_read_options(spec.to_options()),

@@ -254,8 +254,8 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 - [ ] **IDIO-9 (Low)** — Three probe-remap sites, three behaviors on probe failure — `src/connection.rs:1001` vs `remap_ingest_create_error` / `remap_ingest_append_error`
   `get_table_schema`'s fallback drops the original error when the probe itself fails. Align on the `Ok(false) => NotFound, _ => original` shape.
 
-- [ ] **IDIO-10 (Low)** — Missing `#[must_use]` on the builder-threading `apply_to_*` family — `src/request.rs`, `src/retry.rs`, `src/directed_read.rs:154`, `src/query_options.rs:67`
-  A discarded return silently loses builder *and* config.
+- [x] **IDIO-10 (Low)** — Missing `#[must_use]` on the builder-threading `apply_to_*` family — `src/request.rs`, `src/retry.rs`, `src/directed_read.rs:154`, `src/query_options.rs:67`
+  A discarded return silently loses builder *and* config. *Resolved:* `#[must_use]` added to every by-value-builder-in/builder-out threading function: `RequestConfig::{apply_to_statement,apply_to_batch_dml,apply_to_runner,apply_to_write_only}` (`src/request.rs`), `RetryConfig::{apply_to_statement,apply_to_batch_dml,apply_to_runner,apply_to_write_only}` (`src/retry.rs`), `DirectedRead::apply_to_statement` (`src/directed_read.rs`), `QueryOptionsConfig::apply_to_statement` (`src/query_options.rs`), plus the same-shaped sibling `apply_isolation` (`src/connection.rs`). Attribute-only; all call sites already consume the return.
 
 - [ ] **IDIO-11 (Low)** — `explicit_credential_option` duplicates `conflicting_credential_with_access_token` — `src/driver.rs:255-282`
   Express one in terms of the other so a new credential option can't be added to only one.

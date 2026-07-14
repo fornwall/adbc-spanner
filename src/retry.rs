@@ -246,6 +246,7 @@ impl RetryConfig {
     }
 
     /// Apply the retry and backoff policies to a statement builder (queries and DML alike).
+    #[must_use]
     pub(crate) fn apply_to_statement(&self, mut builder: StatementBuilder) -> StatementBuilder {
         if let Some(policy) = self.retry_policy_arg() {
             builder = builder.with_retry_policy(policy);
@@ -257,6 +258,7 @@ impl RetryConfig {
     }
 
     /// Apply the retry and backoff policies to an `ExecuteBatchDml` batch builder.
+    #[must_use]
     pub(crate) fn apply_to_batch_dml(&self, mut builder: BatchDmlBuilder) -> BatchDmlBuilder {
         if let Some(policy) = self.retry_policy_arg() {
             builder = builder.with_retry_policy(policy);
@@ -270,6 +272,7 @@ impl RetryConfig {
     /// Apply the retry and backoff policies to a read/write transaction runner builder (its Begin
     /// and Commit RPCs). The transaction-level abort retry (Spanner's optimistic-concurrency re-run)
     /// is a separate policy left at the client default.
+    #[must_use]
     pub(crate) fn apply_to_runner(
         &self,
         mut builder: TransactionRunnerBuilder,
@@ -289,6 +292,7 @@ impl RetryConfig {
 
     /// Apply the retry and backoff policies to a write-only transaction builder (the bulk-ingest
     /// commit path): its Begin and Commit RPCs.
+    #[must_use]
     pub(crate) fn apply_to_write_only(
         &self,
         mut builder: WriteOnlyTransactionBuilder,
