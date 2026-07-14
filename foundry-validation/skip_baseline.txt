@@ -23,7 +23,7 @@
 tests/test_connection.py::TestConnection::test_get_objects_constraints_check[spanner:emulator]  # not implemented
 tests/test_connection.py::TestConnection::test_get_objects_constraints_foreign[spanner:emulator]  # not implemented
 tests/test_connection.py::TestConnection::test_get_objects_constraints_unique[spanner:emulator]  # not implemented
-tests/test_connection.py::TestConnection::test_get_table_schema_catalog[spanner:emulator]  # secondary_catalog not supported
+tests/test_connection.py::TestConnection::test_get_table_schema_catalog[spanner:emulator]  # secondary_catalog_schema not supported
 tests/test_connection.py::TestConnection::test_get_table_schema_schema[spanner:emulator]  # secondary_schema not supported
 tests/test_connection.py::TestConnection::test_set_current_catalog[spanner:emulator]  # not implemented
 tests/test_connection.py::TestConnection::test_set_current_schema[spanner:emulator]  # not implemented
@@ -74,8 +74,8 @@ tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/timestamp_
 tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/timestamp_ns]  # case binds timestamps outside Arrow's nanosecond range (~1677-2262), which the driver's nanosecond TIMESTAMP read path cannot represent
 tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/timestamp_s]  # case binds timestamps outside Arrow's nanosecond range (~1677-2262), which the driver's nanosecond TIMESTAMP read path cannot represent
 tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/timestamp_us]  # case binds timestamps outside Arrow's nanosecond range (~1677-2262), which the driver's nanosecond TIMESTAMP read path cannot represent
-tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/timestamptz_ms]  # case binds timestamps outside Arrow's nanosecond range (~1677-2262), which the driver's nanosecond TIMESTAMP read path cannot represent
-tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/timestamptz_s]  # case binds timestamps outside Arrow's nanosecond range (~1677-2262), which the driver's nanosecond TIMESTAMP read path cannot represent
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/timestamptz_ms]  # Spanner has one TIMESTAMP type; the driver reads it as Arrow Timestamp(Nanosecond) (default) or Timestamp(Microsecond) via spanner.max_timestamp_precision, never the case's Millisecond unit, so the read-back array unit never matches
+tests/test_query.py::TestQuery::test_query[spanner:emulator:type/bind/timestamptz_s]  # Spanner has one TIMESTAMP type; the driver reads it as Arrow Timestamp(Nanosecond) (default) or Timestamp(Microsecond) via spanner.max_timestamp_precision, never the case's Second unit, so the read-back array unit never matches
 tests/test_query.py::TestQuery::test_query[spanner:emulator:type/literal/decimal]  # Spanner NUMERIC is fixed precision/scale (38,9); it does not round-trip the case's NUMERIC(10,2)
 tests/test_query.py::TestQuery::test_query[spanner:emulator:type/literal/int16]  # Spanner has one 64-bit integer type; a SMALLINT literal reads back as INT64, not the case's Int16
 tests/test_query.py::TestQuery::test_query[spanner:emulator:type/literal/int32]  # Spanner has one 64-bit integer type; an INT literal reads back as INT64, not the case's Int32
