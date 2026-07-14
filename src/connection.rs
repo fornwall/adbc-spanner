@@ -575,8 +575,9 @@ pub(crate) type SharedTxn = Arc<Mutex<TxnState>>;
 ///   Spanner applies the batch in order, so a mid-batch failure leaves earlier statements
 ///   applied).
 ///
-/// See the [module documentation](self) for the full list of consequences (no read-your-writes,
-/// `None` DML counts before commit, commit-failure replay semantics).
+/// See the [crate documentation](crate) — and the fuller module-level notes in `connection.rs` —
+/// for the list of consequences (no read-your-writes, `None` DML counts before commit,
+/// commit-failure replay semantics).
 #[derive(Debug)]
 pub struct SpannerConnection {
     runtime: SharedRuntime,
