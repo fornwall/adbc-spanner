@@ -29,8 +29,11 @@ The script builds the cdylib and the harness, creates the emulator
 instance/database when needed, and runs the suite. Requirements beyond the Rust
 toolchain: a C++17 compiler, CMake (≥ 3.20) and git. Everything else — the
 arrow-adbc validation library, the ADBC driver manager, fmt, nanoarrow and
-GoogleTest — is fetched and built from source at a pinned arrow-adbc `main`
-revision (`ARROW_ADBC_TAG` in `CMakeLists.txt`). No system packages are required.
+GoogleTest — is fetched and built from source at a pinned arrow-adbc revision
+(`ARROW_ADBC_TAG` in `CMakeLists.txt` — an `apache/arrow-adbc` `main` revision
+carrying [apache/arrow-adbc#4514](https://github.com/apache/arrow-adbc/pull/4514),
+which routes the suite's hardcoded dialect-sensitive SQL through the
+`DriverQuirks::RewriteSql` hook). No system packages are required.
 
 The **driver** (cdylib) links the `adbc_core` / `adbc_ffi` crates from a git pin
 (an `apache/arrow-adbc` `main` revision — see `Cargo.toml`) that carries three FFI
@@ -44,9 +47,19 @@ The **C++** validation library and driver manager come from `ARROW_ADBC_TAG`;
 they interoperate with the driver over the C ABI.
 
 `SpannerQuirks` (in `spanner_validation.cc`) describes Spanner's capabilities to
-the suite — named `@p` parameters, DDL via the admin API, all four ingest modes,
-mandatory (NULL-permitting) primary keys — so tests that do not apply to
-Spanner's model self-skip rather than fail.
+the suite — named `@p` parameters, backtick identifier quoting, DDL via the admin
+API, all four ingest modes, mandatory (NULL-permitting) primary keys, the Arrow
+types Spanner widens on readback (`IngestSelectRoundTripType`) — so tests that do
+not apply to Spanner's model self-skip rather than fail. Its `RewriteSql`
+override substitutes GoogleSQL for the suite's dialect-sensitive default SQL per
+stable query id: Spanner-valid `CREATE TABLE`s (INT64/STRING(MAX) + PRIMARY
+KEY), `INSERT`s with the column list Spanner requires, ingest readbacks that
+select the ingested columns explicitly (dodging the synthetic `adbc_ingest_key`
+column) and drop the `NULLS FIRST`/`NULLS LAST` the emulator rejects (GoogleSQL's
+defaults match them anyway), and CASTs that give Spanner's parameter-type
+inference the context a bare `SELECT @p0, @p1` lacks. Every rewrite pins the
+upstream default SQL, so an `ARROW_ADBC_TAG` bump that changes a query fails
+loudly instead of silently rewriting the wrong thing.
 
 ## Sanitizers (ASan / UBSan)
 
@@ -130,20 +143,26 @@ silently-disarmed `rust-asan` leg goes red instead of green.
   autocommit/transaction options.
 - **The `SpannerStatementTest` cases that pass cleanly** — `execute` and
   `execute_schema` for int/string columns and their error paths, `prepare` /
-  `get_parameter_schema` / parameter-count / no-query validation, query error
+  `get_parameter_schema` / parameter-count / no-query validation, parameter
+  binding end-to-end (`SqlBind`, `SqlPrepareSelectParams`), query error
   handling, trailing-semicolon queries (`SELECT current_date;;;` — the driver
   strips trailing statement terminators on the query path, which Spanner's
-  single-use query API otherwise rejects), query cancellation, concurrent
-  statements, result independence/invalidation, and `AdbcError` compatibility
+  single-use query API otherwise rejects), query cancellation, DML row counts
+  (`SqlQueryRowsAffectedDelete{,Stream}`), manual-transaction rollback of
+  buffered DML (`SqlQueryInsertRollback`), concurrent statements, result
+  independence/invalidation, `AdbcError` compatibility
   (the exporter preserves a 1.0.0 caller's `private_data` — apache/arrow-adbc#4473,
-  in the pinned `adbc_ffi` rev), and the ingest **error paths** (`SqlIngestErrors`:
+  in the pinned `adbc_ffi` rev), the whole ingest **round-trip family** —
+  bool/int/float/string/binary/date/timestamp columns (including the
+  large/view Arrow layouts, dictionary-encoded strings and `List` columns) plus
+  the append/replace/create-append modes, multi-connection visibility and the
+  sample table — and the ingest **error paths** (`SqlIngestErrors`:
   ingest-without-bind → `INVALID_STATE`, append to a nonexistent table → error,
-  create over an existing table → error, incompatible-schema append → error — the
-  one `SqlIngest*` case with no non-Spanner DDL or `SELECT *` readback to block it).
+  create over an existing table → error, incompatible-schema append → error).
 
 The gate runs **every case except the documented `EXCLUDED` expected-failures**
-(see the next section), and they all pass or self-skip — today **58 cases: 52
-pass, 6 self-skip**. `DatabaseTest` and `ConnectionTest` pass in full; from `StatementTest`
+(see the next section), and they all pass or self-skip — today **89 cases: 82
+pass, 7 self-skip**. `DatabaseTest` and `ConnectionTest` pass in full; from `StatementTest`
 everything but the `EXCLUDED` list in `scripts/run-adbc-validation.sh` runs here.
 `SpannerQuirks::supports_bulk_ingest` declares
 all four ingest modes (append, create, create_append, replace — the create
@@ -191,11 +210,11 @@ guard — no emulator required — with:
 scripts/run-adbc-validation.sh --check-drift
 ```
 
-Today `EXCLUDED` holds **42** cases (58 non-excluded cases — 52 passing plus 6 that
-self-skip: `Transactions`, `SqlIngestFloat16`, and the four `SqlIngestTemporary*` —
-+ 42 excluded = 100 upstream cases total).
+Today `EXCLUDED` holds **11** cases (89 non-excluded cases — 82 passing plus 7 that
+self-skip: `Transactions`, `SqlIngestFloat16`, `SqlIngestPrimaryKey`, and the four
+`SqlIngestTemporary*` — + 11 excluded = 100 upstream cases total).
 
-Six cases are deliberately **not** excluded because they **self-skip**, which the
+Seven cases are deliberately **not** excluded because they **self-skip**, which the
 gate tolerates — so they need no expected-failure bookkeeping. Each is inapplicable
 to Spanner's model, so it can never "start passing", and a skip states the truth
 ("not applicable to Spanner") rather than implying the driver got it wrong:
@@ -207,51 +226,49 @@ to Spanner's model, so it can never "start passing", and a skip states the truth
   makes the case self-skip via its own guard.
 - `SqlIngestFloat16` — Spanner has no 16-bit float type (`supports_ingest_float16`
   is `false`).
+- `SqlIngestPrimaryKey` — the case append-ingests rows *omitting* the primary-key
+  column and expects the database to auto-assign ascending key values. Spanner has
+  no ordered auto-increment (a keyless insert mutation writes NULL, and a second
+  NULL key is a duplicate-PK error; SEQUENCEs are bit-reversed, so even a DEFAULT
+  key could not satisfy the case's `ORDER BY id` insertion-order readback), so
+  `PrimaryKeyIngestTableDdl` returns `nullopt` — the quirk's sanctioned way to
+  declare the feature absent.
 - `SqlIngestTemporary{,Append,Replace,Exclusive}` — Spanner has no temporary tables
   (`supports_bulk_ingest_temporary` is `false`; the driver also rejects
   `adbc.ingest.temporary=true` outright).
 
 The view-type and target-catalog/db-schema ingest variants are the *opposite* call:
 the driver genuinely supports those inputs, so their quirks are declared `true`
-rather than hiding the cases behind a false quirk. The two families then diverge:
-
-- `SqlIngestBinaryView` / `SqlIngestStringView` **run and fail** with the rest of the
-  ingest-readback family (below) — kept in `EXCLUDED` as expected failures that will
-  flip to passing once the readback is fixed.
-- `SqlIngestTargetCatalog` / `SqlIngestTargetSchema` / `SqlIngestTargetCatalogSchema`
-  only ingest and **never read back**, so with the create-mode default they pass
-  cleanly and are gate-enforced (not excluded).
+rather than hiding the cases behind a false quirk — and with the `RewriteSql`
+readbacks all five (`SqlIngestBinaryView`, `SqlIngestStringView`,
+`SqlIngestTargetCatalog`, `SqlIngestTargetSchema`, `SqlIngestTargetCatalogSchema`)
+pass cleanly and are gate-enforced.
 
 ## The `EXCLUDED` cases, by bucket
 
 Every excluded case (runnable individually via `--full`) fails **cleanly** (no
 aborts — see the note below) or self-skips; they fall into the following buckets,
-none of them incremental driver work:
+none of them fixable by rewriting SQL:
 
-- **Suite-internal non-Spanner DDL** — several cases issue hardcoded
-  `CREATE TABLE x (foo INT)` / `TEXT` / `FLOAT` with no primary key. There is no
-  quirks hook for the DDL text, and it is not valid Spanner DDL (which needs
-  `INT64`/`FLOAT64` and a `PRIMARY KEY`). Identifier *quoting* is no longer part
-  of the blocker: `DriverQuirks::QuoteIdentifier` (apache/arrow-adbc#4504,
-  overridden to GoogleSQL backticks in `spanner_validation.cc`) now feeds the
-  statements that used ANSI double quotes, but the type/primary-key problems
-  remain. Covers e.g. `SqlBind`, `SqlQueryEmpty`, `SqlQueryRowsAffectedDelete`.
-- **Ingest readback** — the driver supports create-mode ingest (with a
-  synthetic `adbc_ingest_key` UUID primary key, since Spanner mandates one),
-  and since the quirks declare it the `SqlIngest*` cases now *run* under
-  `--full` instead of skipping — but the readback cases remain blocked (the
-  error-path-only `SqlIngestErrors`, which needs no readback, is gated): their
-  `SELECT * FROM bulk_ingest …` readback is valid GoogleSQL now that
-  `DriverQuirks::QuoteIdentifier` backtick-quotes it, but `SELECT *` surfaces the
-  synthetic key column, breaking the single-column result assertions. Where the
-  value is separable — the ingest **identifier-escaping** tests (reserved-word
-  table/column names) — it is captured natively instead: the driver quotes
-  ingest identifiers (`bind::insert_sql`) and `tests/integration.rs` exercises
-  an append-mode ingest into a table `create` with a column `index`. The
-  view-type variants (`BinaryView`/`StringView`) ride in this bucket too — their
-  quirks are declared `true`, so they run and fail on the same readback (see the
-  note above for why the `TargetCatalog`/`TargetSchema` variants pass instead, and
-  why `Float16` / `Temporary*` self-skip).
+- **Insertion-order readbacks** — `SqlPrepareUpdate` / `SqlPrepareUpdateStream`
+  create `bulk_ingest` via create-mode ingest, `INSERT` more rows via bound
+  parameters, and assert the readback returns *all* rows in insertion order.
+  The `RewriteSql` overrides fix their SQL (the `INSERT` gets its required
+  column list, the readback dodges the synthetic key column), but no SQL can
+  recover insertion order from a Spanner table: rows come back in primary-key
+  order and the synthetic `adbc_ingest_key` is a random UUID. Only the final
+  row-order assertion still fails.
+- **Arrow types with no Spanner column mapping** — `SqlIngestUInt8/16/32/64`,
+  `SqlIngestDuration`, `SqlIngestInterval`, `SqlIngestFixedSizeBinary` fail at
+  ingest time with "cannot create a Spanner column for Arrow type …". UInt64
+  cannot fit INT64; UInt8/16/32 *could* widen losslessly but the driver has no
+  unsigned mapping yet; Duration/Interval(MonthDayNano)/FixedSizeBinary have no
+  bind/create mapping (Spanner INTERVAL is not wired up). Expected failures that
+  flip to gate-enforced passes as the driver grows each mapping.
+- **Empty-stream ingest** — `TestSqlIngestStreamZeroArrays` binds a stream with
+  zero batches and expects the ingest to succeed (creating an empty table); the
+  driver requires bound data and fails with `INVALID_STATE` "cannot ingest: no
+  data has been bound". A driver-side gap, no SQL involved.
 - **`ECANCELED` through the C stream** — `SqlQueryCancel` requires the result
   stream's `get_next` to return exactly `ECANCELED` (125) after a cancel, but
   arrow-rs's `FFI_ArrowArrayStream` exporter (which `adbc_ffi` uses to export
@@ -277,14 +294,44 @@ implements `execute_partitions`/`read_partition` and the `supports_partitioned_d
 quirk is `true`). Its round-trip is additionally covered natively by
 `execute_partitions_round_trip` in `tests/integration.rs`.
 
-`SqlQueryFloats` / `SqlSchemaFloats` were formerly part of the "suite-internal
+`SqlQueryFloats` / `SqlSchemaFloats` were formerly part of a "suite-internal
 non-Spanner DDL" bucket: both hardcoded `SELECT CAST(1.5 AS FLOAT)`, and GoogleSQL
 has no bare `FLOAT` type. apache/arrow-adbc#4496 added the generic
 `DriverQuirks::RewriteSql(query_id, default_sql)` hook (a per-query override in the
 spirit of the existing `BindParameter` dialect hook), which `SpannerQuirks`
 overrides to rewrite that query to `SELECT CAST(1.5 AS FLOAT64)`. With
-`ARROW_ADBC_TAG` on a `main` revision that carries the hook, both cases now pass
+`ARROW_ADBC_TAG` on a revision that carries the hook, both cases now pass
 and are **gate-enforced**.
+
+That hook then dissolved the two biggest former buckets wholesale.
+[apache/arrow-adbc#4514](https://github.com/apache/arrow-adbc/pull/4514) routes the
+rest of the statement tests' hardcoded SQL through `RewriteSql` under stable query
+ids, and the `SpannerQuirks` override substitutes GoogleSQL per id
+(see the table in `spanner_validation.cc`):
+
+- The **"suite-internal non-Spanner DDL"** bucket (`SqlBind`, `SqlQueryEmpty`,
+  `SqlQueryInsertRollback`, `SqlQueryRowsAffectedDelete{,Stream}`,
+  `SqlPrepareSelectParams`) — Spanner-valid `CREATE TABLE`s (`INT64` /
+  `STRING(MAX)` + `PRIMARY KEY`), `INSERT`s with the column list GoogleSQL
+  requires, and CASTs that give the parameter-type inference the context a bare
+  `SELECT @p0, @p1` lacks. All six now pass, gate-enforced.
+- The **"ingest readback"** bucket (the whole `SqlIngest*` type family plus
+  `Append`/`Replace`/`CreateAppend`/`MultipleConnections`/`Sample`) — the
+  `SELECT * FROM bulk_ingest … NULLS FIRST` readbacks used to trip over the
+  emulator's `NULLS FIRST`/`NULLS LAST` rejection first and the synthetic
+  `adbc_ingest_key` column second. The rewrites select the ingested column(s)
+  explicitly and drop the NULLS clause (GoogleSQL's ASC/DESC defaults are
+  exactly NULLS FIRST/NULLS LAST, so the semantics are unchanged); the
+  `TestSqlIngestType` query id carries the ingested Arrow type as a suffix, which
+  lets the two `List` cases order by `` `col`[SAFE_OFFSET(0)] `` instead (GoogleSQL
+  cannot `ORDER BY` an ARRAY column). Alongside, `IngestSelectRoundTripType`
+  declares Spanner's readback widenings (small/unsigned ints → `INT64`,
+  large/view strings → `STRING`, binary variants → `BYTES`) and the fixture's
+  `ValidateIngestedTemporalData` checks the timestamp values the driver returns
+  (any-unit Arrow timestamps → Spanner `TIMESTAMP` → `Timestamp(Nanosecond,
+  "UTC")`). Twenty-four ingest cases moved from excluded to gate-enforced (and
+  `SqlIngestPrimaryKey` to a quirk-sanctioned self-skip) — with the six DDL/DML
+  cases above, thirty newly enforced cases in all.
 
 The three `adbc_ffi` issues that previously blocked a whole swath of these — a
 non-idempotent error release (which aborted the process), a missing
