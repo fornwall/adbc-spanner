@@ -1792,14 +1792,15 @@ fn query_and_dml_round_trip() {
     let mut pq = connection.new_statement().expect("new statement");
     pq.set_sql_query("SELECT Name FROM AdbcBind WHERE Id = @Id")
         .unwrap();
-    // Before binding, get_parameter_schema derives the parameter names from the SQL; Spanner does
-    // not expose parameter types ahead of execution, so the type is Null (Arrow's "unknown").
+    // Before binding, get_parameter_schema derives the parameter names from the SQL and asks
+    // Spanner for the types the SQL context implies (a PLAN probe returning the statement's
+    // undeclared parameters): @Id compares against the INT64 `Id` column, so it comes back Int64.
     let ps = pq
         .get_parameter_schema()
         .expect("parameter schema from SQL");
     assert_eq!(ps.fields().len(), 1);
     assert_eq!(ps.field(0).name(), "Id");
-    assert_eq!(ps.field(0).data_type(), &DataType::Null);
+    assert_eq!(ps.field(0).data_type(), &DataType::Int64);
     pq.bind(param).expect("bind query param");
     // Once data is bound, the parameter schema reflects the bound column's real type.
     let ps = pq
@@ -1878,6 +1879,17 @@ fn query_and_dml_round_trip() {
     .expect("set bind_by_name=true");
     pu.set_sql_query("UPDATE AdbcBind SET Name = @Name WHERE Id = @Id")
         .unwrap();
+    // DML parameter typing: planning DML needs a read/write transaction (the probe's plan
+    // executes nothing and commits empty), and the parameters come back with their column types
+    // in SQL appearance order — @Name (STRING) before @Id (INT64).
+    let ps = pu
+        .get_parameter_schema()
+        .expect("parameter schema from DML");
+    assert_eq!(ps.fields().len(), 2);
+    assert_eq!(ps.field(0).name(), "Name");
+    assert_eq!(ps.field(0).data_type(), &DataType::Utf8);
+    assert_eq!(ps.field(1).name(), "Id");
+    assert_eq!(ps.field(1).data_type(), &DataType::Int64);
     pu.bind(upd).expect("bind update params");
     assert_eq!(pu.execute_update().expect("param update"), Some(1));
 

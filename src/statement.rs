@@ -16,6 +16,7 @@
 //! does not support `THEN RETURN`); through [`Statement::execute_update`] the rows are discarded
 //! and the affected-row count is reported from the result-set stats.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1272,6 +1273,105 @@ impl SpannerStatement {
         Ok(builder.build())
     }
 
+    /// Ask Spanner to type this statement's `@name` parameters: a `QueryMode::Plan` probe of the
+    /// SQL returns the statement's *undeclared parameters* — every parameter the request itself
+    /// did not declare, i.e. all of them here — with the type the surrounding SQL implies (e.g.
+    /// `INT64` for a parameter compared against an `INT64` column). Returns the name → type map;
+    /// a parameter whose type Spanner cannot pin down is simply absent from it.
+    ///
+    /// Queries plan in a single-use read-only transaction, the same probe surface as
+    /// `execute_schema`. DML can only be planned inside a read/write transaction (Spanner rejects
+    /// it read-only — see `check_schema_query`), so it runs through the transaction runner: the
+    /// plan executes nothing, and the transaction commits empty. On a read-only connection the
+    /// DML probe is skipped (no read/write transaction just to introspect) and DDL is never
+    /// planned (not plannable over ExecuteSql; Spanner DDL takes no query parameters anyway) —
+    /// both return an empty map, typing every parameter `Null`. Either probe is bounded by the
+    /// query timeout: introspection is a read-shaped operation regardless of the statement's verb.
+    fn plan_parameter_types(
+        &self,
+        sql: &str,
+    ) -> Result<BTreeMap<String, google_cloud_spanner::value::Type>> {
+        // The probe runs through the same ExecuteSql surface as `execute`, which rejects a
+        // trailing `;`, yet introspection callers routinely append one.
+        let sql = crate::sql::strip_trailing_terminators(sql);
+        if crate::sql::is_ddl(&sql) {
+            return Ok(BTreeMap::new());
+        }
+        // A new operation begins: clear any cancel aimed at a previous one (see `CancelSignal`).
+        self.cancel.reset();
+        if crate::sql::is_dml(&sql) {
+            if self.is_read_only() {
+                return Ok(BTreeMap::new());
+            }
+            return self.plan_dml_parameter_types(&sql);
+        }
+        let plan_builder = self.read_sql_builder(&sql).set_query_mode(QueryMode::Plan);
+        let client = self.client.clone();
+        block_on_cancellable(
+            &self.runtime,
+            &self.cancel,
+            with_timeout(
+                self.timeouts.query_timeout(),
+                crate::OPTION_RPC_TIMEOUT_QUERY,
+                async move {
+                    let transaction = client.single_use().build();
+                    let result_set = transaction
+                        .execute_query(plan_builder.build())
+                        .await
+                        .map_err(from_spanner)?;
+                    Ok(undeclared_parameter_types(result_set.metadata()))
+                },
+            ),
+        )
+    }
+
+    /// The DML arm of [`plan_parameter_types`](Self::plan_parameter_types): plan the statement in
+    /// a read/write transaction runner (the same builder chain as `execute_returning_dml`, minus
+    /// commit stats — an empty commit has none worth recording). The closure keeps the client's
+    /// own error type so a transaction abort still retries the plan.
+    fn plan_dml_parameter_types(
+        &self,
+        sql: &str,
+    ) -> Result<BTreeMap<String, google_cloud_spanner::value::Type>> {
+        let plan_stmt = self
+            .sql_builder(sql)
+            .set_query_mode(QueryMode::Plan)
+            .build();
+        let client = self.client.clone();
+        let isolation = self.isolation.clone();
+        let request = self.request.clone();
+        let retry = self.retry;
+        block_on_cancellable(
+            &self.runtime,
+            &self.cancel,
+            with_timeout(
+                self.timeouts.query_timeout(),
+                crate::OPTION_RPC_TIMEOUT_QUERY,
+                async move {
+                    let runner = retry
+                        .apply_to_runner(request.apply_to_runner(apply_isolation(
+                            client.read_write_transaction(),
+                            isolation,
+                        )))
+                        .build()
+                        .await
+                        .map_err(from_spanner)?;
+                    let outcome = runner
+                        .run(move |transaction: ReadWriteTransaction| {
+                            let statement = plan_stmt.clone();
+                            async move {
+                                let result_set = transaction.execute_query(statement).await?;
+                                Ok(undeclared_parameter_types(result_set.metadata()))
+                            }
+                        })
+                        .await
+                        .map_err(from_spanner)?;
+                    Ok(outcome.result)
+                },
+            ),
+        )
+    }
+
     /// Guard for [`execute`](Statement::execute) / [`execute_update`](Statement::execute_update)
     /// when data has been bound but there is nothing to apply it to — neither a SQL query nor a
     /// bulk-ingest target. Binding *before* setting `adbc.ingest.target_table` is legal (the bind
@@ -1791,15 +1891,40 @@ impl Statement for SpannerStatement {
         if let Some(batch) = self.bound.first() {
             return Ok((*batch.schema()).clone());
         }
-        // Otherwise derive the parameters from the statement's `@name` references. Spanner infers
-        // parameter types from the surrounding SQL at execution time and exposes no way to
-        // introspect them beforehand, so each parameter is typed as `Null` — Arrow's convention for
-        // an unknown/any type — with the parameter name preserved.
+        // Otherwise derive the parameter *names* from the statement's `@name` references and ask
+        // Spanner for their types via a PLAN probe (see `plan_parameter_types`). A parameter the
+        // probe cannot type — DDL (not plannable over ExecuteSql), DML on a read-only connection
+        // (planning DML needs a read/write transaction), a parameter whose type the SQL context
+        // doesn't pin down, or a failed probe (this is best-effort introspection; the execute
+        // paths surface real errors with full context) — is typed `Null`, ADBC's convention for
+        // "type cannot be determined" (`AdbcStatementGetParameterSchema` in adbc.h).
         let sql = self.sql()?;
-        let fields: Vec<Field> = crate::sql::named_parameters(&sql)
+        let names = crate::sql::named_parameters(&sql);
+        if names.is_empty() {
+            return Ok(Schema::new(Vec::<Field>::new()));
+        }
+        let types = self.plan_parameter_types(&sql).unwrap_or_default();
+        let fields: Vec<Field> = names
             .into_iter()
-            .map(|name| Field::new(name, DataType::Null, true))
-            .collect();
+            .map(|name| {
+                // GoogleSQL parameter names are case-insensitive, and the planner reports each
+                // parameter under the spelling the SQL used *first* — which may differ from this
+                // occurrence's. Match exactly, then case-insensitively.
+                let ty = types.get(&name).or_else(|| {
+                    types
+                        .iter()
+                        .find_map(|(k, v)| k.eq_ignore_ascii_case(&name).then_some(v))
+                });
+                match ty {
+                    // The field is built by the same mapping as result columns, so a `JSON`-typed
+                    // parameter carries the `arrow.json` extension tag the bind path understands.
+                    Some(ty) => {
+                        crate::conversion::arrow_field(&name, ty, true, self.timestamp_precision)
+                    }
+                    None => Ok(Field::new(name, DataType::Null, true)),
+                }
+            })
+            .collect::<Result<_>>()?;
         Ok(Schema::new(fields))
     }
 
@@ -1844,6 +1969,17 @@ impl Statement for SpannerStatement {
 
 fn string_option(value: OptionValue) -> Result<String> {
     crate::options::string_option(value, "statement option")
+}
+
+/// Extract the undeclared-parameter name → type map from a PLAN probe's result-set metadata.
+/// Metadata is delivered with the first partial result set and retained by the `ResultSet`, so it
+/// is available as soon as `execute_query` returns — a PLAN returns no rows to drain.
+fn undeclared_parameter_types(
+    metadata: Option<&google_cloud_spanner::result::ResultSetMetadata>,
+) -> BTreeMap<String, google_cloud_spanner::value::Type> {
+    metadata
+        .map(|m| m.undeclared_parameters().clone())
+        .unwrap_or_default()
 }
 
 /// Guard for `execute_schema`: only queries can be planned. The PLAN probe runs in a single-use
