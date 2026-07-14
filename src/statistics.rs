@@ -320,18 +320,20 @@ fn parse_table_statistics(
     Ok(out)
 }
 
-/// Whether a Spanner column type supports `COUNT(DISTINCT)`. `ARRAY`, `STRUCT`, `JSON`, `TOKENLIST`
-/// and `PROTO<...>` are not groupable, so distinct counts are skipped for them. The names are the
-/// `SPANNER_TYPE` strings from `INFORMATION_SCHEMA.COLUMNS`; a non-groupable column left in the
-/// aggregate `COUNT(DISTINCT)` scan would make the whole per-table query fail, so it is important
-/// this list stays complete.
+/// Whether a Spanner column type supports `COUNT(DISTINCT)`. `ARRAY`, `STRUCT`, `JSON`,
+/// `TOKENLIST`, `INTERVAL` and `PROTO<...>` are not groupable, so distinct counts are skipped for
+/// them. (`UUID` *is* groupable — it can even be a primary key — so it stays distinct-countable.)
+/// The names are the `SPANNER_TYPE` strings from `INFORMATION_SCHEMA.COLUMNS`; a non-groupable
+/// column left in the aggregate `COUNT(DISTINCT)` scan would make the whole per-table query fail,
+/// so it is important this list stays complete.
 fn is_groupable(spanner_type: &str) -> bool {
     let t = spanner_type.trim_start();
     !(t.starts_with("ARRAY")
         || t.starts_with("STRUCT")
         || t.starts_with("PROTO")
         || t == "JSON"
-        || t == "TOKENLIST")
+        || t == "TOKENLIST"
+        || t == "INTERVAL")
 }
 
 /// Build the single-catalog `get_statistics` record batch from per-schema statistics.
@@ -464,6 +466,8 @@ mod tests {
             "NUMERIC",
             "TIMESTAMP",
             "DATE",
+            // UUID is groupable (it can even be a primary key), verified on the emulator.
+            "UUID",
         ] {
             assert!(is_groupable(t), "{t} should be groupable");
         }
@@ -474,6 +478,7 @@ mod tests {
             "STRUCT<a INT64>",
             "JSON",
             "TOKENLIST",
+            "INTERVAL",
             "PROTO<examples.spanner.music.SingerInfo>",
         ] {
             assert!(!is_groupable(t), "{t} should not be groupable");
