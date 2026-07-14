@@ -764,9 +764,9 @@ fn isolation_to_adbc_string(isolation: &IsolationLevel) -> &'static str {
 /// (a single RPC), returning the total affected-row count.
 ///
 /// The runner may retry the closure on abort, so the (cloned) statement list is replayed on each
-/// attempt. Shared by autocommit `execute_update`, the manual-mode commit path, and each chunk of
-/// an autocommit DML bulk ingest (which calls this once per chunk so a retry only ever clones one
-/// chunk, not the whole ingest).
+/// attempt. This is the autocommit DML path: the batch is a complete transaction of its own,
+/// applied immediately. Batches that belong to a manual transaction (and may carry buffered
+/// mutations) go through [`run_batch_txn`] instead.
 ///
 /// `last_statement` optimization: an autocommit batch — whether a single statement or a
 /// multi-statement `;`-batch — is by construction the transaction's *entire* content: the runner

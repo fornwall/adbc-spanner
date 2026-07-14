@@ -248,8 +248,8 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 - [ ] **IDIO-7 (Low)** — Option-error labels inconsistently name the option — `src/statement.rs:1722,1790,1806,1811`, `src/connection.rs:1238`
   Some errors say which key failed; others say `"option expects a boolean"` or use a short name that isn't the key. Pass the full key as `what` everywhere.
 
-- [ ] **IDIO-8 (Low)** — Stale rustdoc on `run_batch_dml` — `src/connection.rs:436`
-  Claims three callers; verified only one (`run_or_buffer`). Trim to reality.
+- [x] **IDIO-8 (Low)** — Stale rustdoc on `run_batch_dml` — `src/connection.rs:436`
+  Claims three callers; verified only one (`run_or_buffer`). Trim to reality. *Resolved:* the stale "Shared by …" sentence (autocommit `execute_update` / manual-mode commit / ingest chunks — only the first was real; the manual commit calls `run_batch_txn` directly and ingest ships mutations, not DML) is replaced with a count-free description of *when* the function is used (the autocommit DML path; manual-transaction batches go through `run_batch_txn`), naming no caller count so the doc cannot go stale as callers change.
 
 - [ ] **IDIO-9 (Low)** — Three probe-remap sites, three behaviors on probe failure — `src/connection.rs:1001` vs `remap_ingest_create_error` / `remap_ingest_append_error`
   `get_table_schema`'s fallback drops the original error when the probe itself fails. Align on the `Ok(false) => NotFound, _ => original` shape.
