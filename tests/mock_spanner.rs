@@ -41,7 +41,7 @@ use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, Opti
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_spanner::{SpannerConnection, SpannerDriver};
 use arrow_array::cast::AsArray;
-use arrow_array::{Int64Array, RecordBatch, StringArray};
+use arrow_array::{Date32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use prost::Message;
 use spanner_grpc_mock::MockSpanner;
@@ -1244,6 +1244,90 @@ fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
     );
 }
 
+/// A new operation on the statement must not **un-cancel** a live streamed reader from an earlier
+/// `execute`. With the old shared resettable signal, the new operation's `reset()` cleared the
+/// latch a `cancel()` had set between two chunk fetches, so the old reader either resumed
+/// streaming or — if the prefetch task had already exited with a chunk still buffered — yielded
+/// that chunk and then a clean end-of-stream: a silently **truncated** result. With per-operation
+/// signals the old reader keeps its own latched signal forever, so its next fetch must fail with
+/// `Status::Cancelled`, while the new operation (on a fresh signal) runs to completion.
+#[test]
+fn new_operation_does_not_uncancel_an_earlier_streamed_reader() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "new_operation_does_not_uncancel_an_earlier_streamed_reader",
+    );
+
+    // Every query gets the same complete three-row stream; with one row per batch the first
+    // reader has fetches outstanding when the cancel lands (the prefetch buffers row 2 and is
+    // fetching/holding row 3 — exactly the full-channel shape of the truncation failure mode).
+    let server = MockServer::start(move |mock| {
+        mock.expect_execute_streaming_sql().returning(move |_| {
+            Ok(stream_of(vec![Ok(partial_result_set(
+                true,
+                &["v1", "v2", "v3"],
+                b"rt-1",
+                true,
+            ))]))
+        });
+    });
+
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionValue::Int(1),
+        )
+        .expect("set rows_per_batch");
+    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+    let mut old_reader = statement.execute().expect("first execute");
+
+    // The first batch was fetched by `execute` itself (it settles the schema) — consume it.
+    let first = old_reader
+        .next()
+        .expect("first batch exists")
+        .expect("first batch is clean");
+    assert_eq!(first.num_rows(), 1);
+
+    // Cancel between two chunk fetches of the old reader, then start a NEW operation on the same
+    // statement before the old reader observes the cancel.
+    statement.cancel().expect("cancel");
+    let new_batches: Vec<_> = statement
+        .execute()
+        .expect("a new operation after a cancel must start uncancelled")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("the new operation's reader must stream to completion");
+    assert_eq!(
+        new_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        3,
+        "the new reader must deliver the full result"
+    );
+
+    // The old reader must surface the cancel — not resume streaming (row 2 as a clean batch) and
+    // not end cleanly truncated (`None`).
+    let item = old_reader
+        .next()
+        .expect("the cancelled reader must yield an error item, not a clean end of stream");
+    let error = item.expect_err("the cancelled reader must not resume streaming rows");
+    let ArrowError::ExternalError(source) = &error else {
+        panic!("expected the reader to surface the driver error, got: {error}");
+    };
+    let adbc_error = source
+        .downcast_ref::<adbc_core::error::Error>()
+        .expect("the reader error wraps the ADBC error");
+    assert_eq!(
+        adbc_error.status,
+        AdbcStatus::Cancelled,
+        "got error: {adbc_error}"
+    );
+    // And the cancel is sticky for the old reader: iteration stays ended (no stale row 3).
+    assert!(
+        old_reader.next().is_none(),
+        "a cancelled reader must not yield further batches"
+    );
+}
+
 /// (d) **Self-healing bulk ingest.** An autocommit ingest chunk the driver sized as "safe"
 /// (rows × columns under its 20k budget) can still overshoot Spanner's *true* per-commit mutation
 /// cap once invisible secondary-index entries are counted. The mock rejects any `Commit` carrying
@@ -1382,6 +1466,131 @@ fn ingest_does_not_bisect_a_non_mutation_limit_error() {
         commits.load(Ordering::SeqCst),
         1,
         "a non-mutation-limit error must not trigger the bisect retry"
+    );
+}
+
+/// (d″) **Manual-mode ingest atomicity.** A manual-transaction ingest whose *later* row fails
+/// Arrow→Spanner conversion (row 1 here: a Date32 far outside Spanner's
+/// 0001-01-01..9999-12-31 range) must leave the transaction buffer completely untouched — not
+/// buffer rows `0..k` and then error, which a later `commit` would silently apply as a partial
+/// batch atomically with the rest of the transaction.
+///
+/// Three assertions pin the buffer state after the failed ingest, each deterministic offline:
+/// 1. a query runs — a partially-buffered batch would have fixed the transaction's kind to DML,
+///    and the kind-exclusive guard rejects queries in a DML transaction, so success proves the
+///    buffer is empty (the query fixes the kind to queries; the test rolls back afterwards so
+///    the re-ingest starts a fresh transaction);
+/// 2. a re-ingest of the fixed data buffers cleanly (`None`);
+/// 3. the `commit` reaches the mock with **exactly** the fixed batch's two mutations — no
+///    stragglers from the failed batch.
+///
+/// (In `append` mode the conversion failure is remapped by the ingest-append contract: the mock's
+/// unbounded query expectation also serves the remap's `table_exists` probe, whose one-row answer
+/// turns the error into the contract's `AlreadyExists` with the original out-of-range message
+/// folded in.)
+#[test]
+fn manual_ingest_conversion_failure_leaves_txn_buffer_untouched() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "manual_ingest_conversion_failure_leaves_txn_buffer_untouched",
+    );
+
+    let commit_sizes: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+    let sizes_in_mock = commit_sizes.clone();
+    let server = MockServer::start(move |mock| {
+        // Serves both the append remap's `table_exists` probe (one row → "exists") and the
+        // post-failure guard query — which begins the manual transaction's shared read-only
+        // transaction inline, so the helper echoes a transaction id back; unbounded times.
+        serve_streaming_sql_begin_aware(mock, &["v0"], None);
+        // The manual-mode commit begins a read/write transaction and commits the buffered
+        // mutations; record how many each commit carries.
+        serve_begin_transaction(mock);
+        mock.expect_commit().returning(move |request| {
+            sizes_in_mock
+                .lock()
+                .unwrap()
+                .push(request.into_inner().mutations.len());
+            commit_ok()
+        });
+    });
+
+    let mut connection = server.connect();
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("enter manual transaction mode");
+
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("MockTable".into()),
+        )
+        .expect("set target table");
+    statement
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .expect("set ingest mode append");
+
+    let date_schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, false)]));
+    // Row 0 converts fine (1970-01-01); row 1 is out of Spanner's DATE range, so the conversion
+    // fails only after the first row has already been built.
+    let poisoned = RecordBatch::try_new(
+        date_schema.clone(),
+        vec![Arc::new(Date32Array::from(vec![0, i32::MAX]))],
+    )
+    .expect("build poisoned ingest batch");
+    statement.bind(poisoned).expect("bind poisoned batch");
+
+    let error = statement
+        .execute_update()
+        .expect_err("an out-of-range date must fail the ingest");
+    assert!(
+        error.message.contains("out of range"),
+        "the conversion failure must surface (folded into the append remap): {}",
+        error.message
+    );
+
+    // 1. The buffer must be untouched: a partially-buffered batch would have fixed the
+    //    transaction's kind to DML, and the kind-exclusive guard rejects queries in a DML
+    //    transaction — so a successful query proves nothing from the failed batch was kept.
+    let mut probe = connection.new_statement().expect("new statement");
+    probe.set_sql_query("SELECT c FROM MockTable").unwrap();
+    let batches: Vec<_> = probe
+        .execute()
+        .expect("a query after the failed ingest must run — nothing may be buffered")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect probe batches");
+    assert_eq!(batches[0].num_rows(), 1);
+    // The probe fixed the transaction's kind to queries; end it so the re-ingest below starts a
+    // fresh transaction (a read-only transaction rolls back by drop, no RPC).
+    connection
+        .rollback()
+        .expect("end the probe's query transaction");
+
+    // 2. Re-ingest the fixed data (both dates in range); manual mode buffers it (`None`).
+    let fixed = RecordBatch::try_new(date_schema, vec![Arc::new(Date32Array::from(vec![0, 1]))])
+        .expect("build fixed ingest batch");
+    statement.bind(fixed).expect("bind fixed batch");
+    assert_eq!(
+        statement
+            .execute_update()
+            .expect("re-ingest of fixed data must buffer"),
+        None,
+        "a manual-mode ingest buffers (returns None), not commits"
+    );
+
+    // 3. Commit: the mock must see exactly one commit carrying exactly the fixed batch's two
+    //    mutations — any third mutation would be a straggler from the failed batch.
+    connection.commit().expect("commit the fixed batch");
+    assert_eq!(
+        *commit_sizes.lock().unwrap(),
+        [2],
+        "the commit must carry only the fixed batch's rows, none from the failed batch"
     );
 }
 
@@ -1985,4 +2194,121 @@ fn directed_read_reaches_the_wire_on_queries_but_never_on_dml() {
     );
     assert_eq!(batch_dml[0].statements.len(), 1);
     assert_eq!(batch_dml[0].statements[0].sql, INSERT_SQL);
+}
+
+// ---------------------------------------------------------------------------
+// Shared client stack (SPAN-1)
+// ---------------------------------------------------------------------------
+
+/// Like [`MockServer::start`], but with a **counting** `CreateSession` handler in place of
+/// [`serve_sessions`]: every session-creation RPC increments `sessions`. Since the pinned client
+/// issues exactly one `CreateSession` (its multiplexed session) when a `DatabaseClient` is built,
+/// the counter counts how many client stacks were actually built. No other RPC is scripted — the
+/// trailing catch-alls reject anything else.
+fn start_counting_sessions(sessions: Arc<AtomicUsize>) -> MockServer {
+    let mut mock = MockSpanner::new();
+    mock.expect_create_session().returning(move |request| {
+        sessions.fetch_add(1, Ordering::SeqCst);
+        let database = request.into_inner().database;
+        Ok(tonic::Response::new(v1::Session {
+            name: format!(
+                "{database}/sessions/mock-session-{}",
+                sessions.load(Ordering::SeqCst)
+            ),
+            multiplexed: true,
+            ..Default::default()
+        }))
+    });
+    reject_unscripted_rpcs(&mut mock);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build mock-server runtime");
+    let (endpoint, server) = runtime
+        .block_on(spanner_grpc_mock::start("127.0.0.1:0", mock))
+        .expect("start mock Spanner server");
+    MockServer {
+        endpoint,
+        server,
+        _runtime: runtime,
+    }
+}
+
+/// **SPAN-1** — connections share one client stack. Building the Spanner client stack is
+/// expensive (a 4-channel gRPC pool, credential resolution, a `CreateSession` RPC, and a
+/// background session-maintenance task), and it is a per-*database* cost: the `SpannerDatabase`
+/// caches the stack built for its first connection and hands cheap clones (shared session +
+/// channels) to every later one. Setting **any** database option invalidates the cache, since
+/// options affect the endpoint/credentials/database path the stack was built from. The
+/// `CreateSession` count observed by the mock is a direct proxy for "how many stacks were built".
+#[test]
+fn connections_share_one_client_stack_until_an_option_is_set() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "connections_share_one_client_stack_until_an_option_is_set",
+    );
+
+    let sessions = Arc::new(AtomicUsize::new(0));
+    let server = start_counting_sessions(sessions.clone());
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let mut database = driver
+        .new_database_with_opts([
+            (
+                OptionDatabase::Uri,
+                OptionValue::String(format!("spanner:///{DATABASE}")),
+            ),
+            (
+                OptionDatabase::Other(adbc_spanner::OPTION_ENDPOINT.into()),
+                OptionValue::String(server.endpoint.clone()),
+            ),
+            (
+                OptionDatabase::Other(adbc_spanner::OPTION_EMULATOR.into()),
+                OptionValue::String("true".into()),
+            ),
+        ])
+        .expect("create database");
+
+    // The stack is lazy: merely configuring the database builds nothing.
+    assert_eq!(
+        sessions.load(Ordering::SeqCst),
+        0,
+        "no client stack may be built before the first connection"
+    );
+
+    let _first = database.new_connection().expect("first connection");
+    let _second = database.new_connection().expect("second connection");
+    assert_eq!(
+        sessions.load(Ordering::SeqCst),
+        1,
+        "two connections on one database must share one client stack (one CreateSession)"
+    );
+
+    // The cached stack renders presence-only in Debug — never the client types' own Debug output.
+    let rendered = format!("{database:?}");
+    assert!(
+        rendered.contains(r#"connected: Some("<client stack>")"#),
+        "the cached stack must render presence-only: {rendered}"
+    );
+    assert!(
+        !rendered.contains("DatabaseClient"),
+        "Debug must not delegate to the client's own Debug: {rendered}"
+    );
+
+    // Setting any database option (here: re-setting the endpoint to the same value) invalidates
+    // the cache, so the next connection rebuilds the stack — a second CreateSession.
+    database
+        .set_option(
+            OptionDatabase::Other(adbc_spanner::OPTION_ENDPOINT.into()),
+            OptionValue::String(server.endpoint.clone()),
+        )
+        .expect("re-set endpoint");
+    let _third = database.new_connection().expect("third connection");
+    assert_eq!(
+        sessions.load(Ordering::SeqCst),
+        2,
+        "set_option must invalidate the cached stack (second CreateSession on the next connection)"
+    );
 }

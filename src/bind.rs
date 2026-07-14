@@ -18,7 +18,11 @@
 //! their nulls. `List`/`LargeList` of any of those scalar element types binds to a Spanner
 //! `ARRAY<...>` (`ARRAY<INT64|FLOAT64|BOOL|STRING|BYTES|DATE|TIMESTAMP|NUMERIC>`), preserving
 //! per-element nulls and typed null arrays; `ARRAY<ARRAY<…>>` and `ARRAY<STRUCT>` element types are
-//! rejected. Other Arrow types are rejected with an `InvalidArguments` error.
+//! rejected. A `Dictionary` column of any key type binds transparently as its **value** type —
+//! dictionary encoding is a representation of the same logical values, not a different logical
+//! type (it is what pandas categorical columns produce over the C data interface), so
+//! `Dictionary(Int32, Utf8)` binds exactly like `Utf8`, each cell's key selecting the dictionary
+//! value to bind. Other Arrow types are rejected with an `InvalidArguments` error.
 //!
 //! Spanner `TIMESTAMP` has **nanosecond** precision (up to nine fractional digits), so a
 //! `Timestamp` parameter is bound at its full source precision: a `Nanosecond` input formats up to
@@ -54,7 +58,7 @@ use arrow_array::types::{
     Int32Type, Int64Type, TimestampMicrosecondType, TimestampMillisecondType,
     TimestampNanosecondType, TimestampSecondType,
 };
-use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch, downcast_dictionary_array};
 use arrow_schema::{DataType, Field, TimeUnit};
 use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Utc};
 use google_cloud_spanner::mutation::Mutation;
@@ -219,6 +223,20 @@ fn cell_value(
             let elem = (!column.is_null(row)).then(|| column.as_list::<i64>().value(row));
             list_cell_value(name, item, elem)
         }
+        // A dictionary-encoded column is an index encoding of the same logical values, not a
+        // different logical type (the Arrow columnar format's "Dictionary-encoded Layout"; it is
+        // what pandas categoricals produce over the C data interface), so it binds as its *value*
+        // type: the key at `row` selects the dictionary value, which re-enters this same mapping —
+        // every bindable type, scalar or `ARRAY<...>`, is thereby accepted encoded, and an
+        // unsupported value type is rejected with the same error as its plain form. A null cell
+        // binds as NULL, its value type still validated so a bad schema fails loudly on every row.
+        DataType::Dictionary(_, _) => downcast_dictionary_array!(
+            column => match column.key(row) {
+                Some(value_row) => cell_value(name, field, column.values().as_ref(), value_row),
+                None => null_dictionary_value(name, column.values().data_type()),
+            },
+            _ => unreachable!("downcast_dictionary_array dispatched a non-dictionary {data_type:?}")
+        ),
         // Every scalar type funnels through the one [`scalar_binder`] mapping.
         _ => {
             let bind = scalar_binder(data_type).ok_or_else(|| {
@@ -375,6 +393,24 @@ fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
         _ => return None,
     };
     Some(bind)
+}
+
+/// The NULL bind for a null dictionary-encoded cell. The dictionary's *value* type is still
+/// validated — an unsupported value type is rejected on every row, null or not, matching the other
+/// arms of [`cell_value`] (the `Decimal128` scale precedent) — and a `List`-valued dictionary
+/// keeps [`list_cell_value`]'s typed-null-array handling.
+fn null_dictionary_value(name: &str, value_type: &DataType) -> Result<(Value, Option<Type>)> {
+    match value_type {
+        DataType::List(item) | DataType::LargeList(item) => list_cell_value(name, item, None),
+        _ => {
+            scalar_binder(value_type).ok_or_else(|| {
+                invalid_argument(format!(
+                    "cannot bind parameter {name:?}: unsupported Arrow type {value_type:?}"
+                ))
+            })?;
+            Ok((null_value(), None))
+        }
+    }
 }
 
 /// The Spanner SQL `NULL` wire value.
@@ -562,6 +598,9 @@ pub(crate) fn spanner_column_type(data_type: &DataType) -> Result<String> {
         DataType::List(field) | DataType::LargeList(field) => {
             format!("ARRAY<{}>", spanner_column_type(field.data_type())?)
         }
+        // The encoding is transparent (see [`cell_value`]): a dictionary-encoded ingest column
+        // creates a column of its value type.
+        DataType::Dictionary(_, value) => spanner_column_type(value)?,
         other => {
             return Err(invalid_argument(format!(
                 "cannot create a Spanner column for Arrow type {other:?}"
@@ -1327,6 +1366,147 @@ mod tests {
             vec![Arc::new(arrow_array::UInt64Array::from(vec![1u64]))],
         );
         assert!(bind_row(Statement::builder("SELECT @x"), &b, 0).is_err());
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Dictionary-encoded columns (pandas categoricals over the C data interface).
+    // ------------------------------------------------------------------------------------------
+
+    #[test]
+    fn binds_dictionary_encoded_columns_as_their_values() {
+        // A dictionary-encoded column binds its decoded values: the key at each row selects the
+        // dictionary value, which runs through the same mapping as its plain form — strings bind
+        // as STRING, Int32 values still widen to INT64, and a null cell binds NULL.
+        let strings: arrow_array::DictionaryArray<Int32Type> =
+            vec![Some("a"), None, Some("b"), Some("a")]
+                .into_iter()
+                .collect();
+        let ints = arrow_array::DictionaryArray::new(
+            arrow_array::Int8Array::from(vec![Some(1i8), None, Some(0), Some(1)]),
+            Arc::new(Int32Array::from(vec![7i32, 9])),
+        );
+        let b = batch(
+            vec![
+                Field::new("s", strings.data_type().clone(), true),
+                Field::new("i", ints.data_type().clone(), true),
+            ],
+            vec![Arc::new(strings), Arc::new(ints)],
+        );
+        let row0 = bound_params_debug(&b, 0);
+        assert!(
+            row0.contains(r#"StringValue("a")"#) && row0.contains(r#"StringValue("9")"#),
+            "row 0 must bind the decoded values: {row0}"
+        );
+        assert!(
+            !row0.contains("NumberValue"),
+            "dictionary Int32 values must widen to INT64: {row0}"
+        );
+        let row1 = bound_params_debug(&b, 1);
+        assert!(
+            row1.contains("NullValue"),
+            "null cells must bind NULL: {row1}"
+        );
+        let row2 = bound_params_debug(&b, 2);
+        assert!(
+            row2.contains(r#"StringValue("b")"#) && row2.contains(r#"StringValue("7")"#),
+            "row 2 must bind the decoded values: {row2}"
+        );
+    }
+
+    #[test]
+    fn binds_dictionary_encoded_array_cells() {
+        // The dictionary value type re-enters the full cell mapping, so an ARRAY<...> value type
+        // is accepted encoded too: key 0 selects the [1, NULL] cell.
+        let lists = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(1i64), None]),
+            Some(vec![Some(2)]),
+        ]);
+        let dict = arrow_array::DictionaryArray::new(
+            arrow_array::Int8Array::from(vec![Some(0i8), None]),
+            Arc::new(lists),
+        );
+        let b = batch(
+            vec![Field::new("tags", dict.data_type().clone(), true)],
+            vec![Arc::new(dict)],
+        );
+        let row0 = bound_params_debug(&b, 0);
+        assert!(
+            row0.contains(r#"StringValue("1")"#) && row0.contains("NullValue"),
+            "row 0 must bind the decoded array cell: {row0}"
+        );
+        // A null cell of a List-valued dictionary is a null array (a bare NullValue).
+        let row1 = bound_params_debug(&b, 1);
+        assert!(
+            row1.contains("NullValue") && !row1.contains("ListValue"),
+            "null cell must bind as a null array: {row1}"
+        );
+    }
+
+    #[test]
+    fn binds_dictionary_cells_of_a_sliced_batch_at_their_offset() {
+        // A sliced dictionary column reads its keys through the sliced view: slice row 0 is
+        // parent row 1 ("beta"), not the buffer-start "alpha".
+        let dict: arrow_array::DictionaryArray<Int32Type> = vec![Some("alpha"), Some("beta"), None]
+            .into_iter()
+            .collect();
+        let b = batch(
+            vec![Field::new("name", dict.data_type().clone(), true)],
+            vec![Arc::new(dict)],
+        );
+        let sliced = b.slice(1, 2);
+        let row0 = bound_params_debug(&sliced, 0);
+        assert!(
+            row0.contains(r#"StringValue("beta")"#) && !row0.contains("alpha"),
+            "row 0 was read from the unsliced buffer: {row0}"
+        );
+        let row1 = bound_params_debug(&sliced, 1);
+        assert!(
+            row1.contains("NullValue") && !row1.contains("beta"),
+            "row 1 was read from the unsliced buffer: {row1}"
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_dictionary_value_type() {
+        // An unsupported *value* type is rejected with the same error as its plain form — on a
+        // null cell too (the value type is validated on every row, like the other arms).
+        let dict = arrow_array::DictionaryArray::new(
+            arrow_array::Int32Array::from(vec![Some(0), None]),
+            Arc::new(arrow_array::UInt64Array::from(vec![1u64])),
+        );
+        let b = batch(
+            vec![Field::new("x", dict.data_type().clone(), true)],
+            vec![Arc::new(dict)],
+        );
+        for row in 0..2 {
+            let err = bind_row(Statement::builder("SELECT @x"), &b, row).unwrap_err();
+            assert!(
+                err.message.contains("unsupported Arrow type UInt64"),
+                "row {row}: unexpected error: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn ingests_dictionary_encoded_columns_decoded() {
+        // Mutation-based ingest shares `cell_value`, so a dictionary cell lands decoded; the
+        // create-mode DDL mapping likewise sees through the encoding to the value type.
+        let dict: arrow_array::DictionaryArray<Int32Type> =
+            vec![Some("Alice"), None].into_iter().collect();
+        let data_type = dict.data_type().clone();
+        let b = batch(
+            vec![Field::new("Name", data_type.clone(), true)],
+            vec![Arc::new(dict)],
+        );
+        let dbg = format!("{:?}", insert_mutation("Users", &b, 0).unwrap());
+        assert!(
+            dbg.contains(r#"StringValue("Alice")"#),
+            "mutation must carry the decoded value: {dbg}"
+        );
+        let dbg = format!("{:?}", insert_mutation("Users", &b, 1).unwrap());
+        assert!(dbg.contains("NullValue"), "no NULL for row 1: {dbg}");
+        assert_eq!(spanner_column_type(&data_type).unwrap(), "STRING(MAX)");
     }
 
     // ------------------------------------------------------------------------------------------

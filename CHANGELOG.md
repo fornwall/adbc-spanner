@@ -25,6 +25,12 @@ Releases are cut with [`cargo-release`](https://github.com/crate-ci/cargo-releas
 - Binding a `Null`-typed Arrow column (the shape a client builds from a `Null`-typed
   `get_parameter_schema` field, and what pyarrow infers for an all-`None` parameter set) now binds
   NULL per row instead of failing with "unsupported Arrow type Null" (REVIEW.md CONV-1).
+- Binding a dictionary-encoded column (Arrow `Dictionary` of any key type — what pandas
+  categorical columns produce over the C data interface) now binds each cell's decoded value
+  instead of failing with "unsupported Arrow type Dictionary(…)". The encoding is transparent
+  end to end: any bindable value type is accepted (scalars and `ARRAY<...>` alike),
+  mutation-based bulk ingest decodes the same way, and the ingest create modes map such a column
+  to its value type's Spanner column type (REVIEW.md CONV-2).
 
 ## [0.6.0] - 2026-07-08
 
