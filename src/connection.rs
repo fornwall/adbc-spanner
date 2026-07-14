@@ -83,7 +83,7 @@ pub(crate) struct TxnState {
     /// DML statements buffered while in manual mode, applied atomically on commit. Built
     /// statements (not raw SQL) so that parameterized DML — which carries bound values — buffers
     /// just like a plain `;`-batch does.
-    pending: Vec<SpannerSql>,
+    pending_dmls: Vec<SpannerSql>,
     /// Insert mutations buffered while in manual mode (a bulk ingest issued inside the manual
     /// transaction), committed atomically with [`Self::pending`] in the same read/write transaction. Spanner
     /// applies buffered mutations at commit time, so they land *after* every buffered DML
@@ -95,7 +95,7 @@ impl TxnState {
     fn new() -> Self {
         Self {
             autocommit: true,
-            pending: Vec::new(),
+            pending_dmls: Vec::new(),
             pending_mutations: Vec::new(),
         }
     }
@@ -107,12 +107,12 @@ impl TxnState {
     /// (see [`SpannerStatement::ensure_no_buffered_writes_for_query`]) rather than returning a
     /// pre-write result (no read-your-writes).
     pub(crate) fn query_would_miss_buffered_writes(&self) -> bool {
-        !self.autocommit && (!self.pending.is_empty() || !self.pending_mutations.is_empty())
+        !self.autocommit && (!self.pending_dmls.is_empty() || !self.pending_mutations.is_empty())
     }
 
     /// Buffer a DML statement to be applied on the next commit.
     pub(crate) fn buffer(&mut self, statement: SpannerSql) {
-        self.pending.push(statement);
+        self.pending_dmls.push(statement);
     }
 
     /// Buffer a mutation to be applied on the next commit (alongside any buffered DML).
@@ -131,7 +131,7 @@ impl TxnState {
     fn enter_autocommit(&mut self) -> (Vec<SpannerSql>, Vec<Mutation>) {
         self.autocommit = true;
         (
-            std::mem::take(&mut self.pending),
+            std::mem::take(&mut self.pending_dmls),
             std::mem::take(&mut self.pending_mutations),
         )
     }
@@ -143,7 +143,7 @@ impl TxnState {
     /// would survive even if that invariant ever changed.
     fn restore_manual(&mut self, pending: Vec<SpannerSql>, mutations: Vec<Mutation>) {
         self.autocommit = false;
-        self.pending.splice(0..0, pending);
+        self.pending_dmls.splice(0..0, pending);
         self.pending_mutations.splice(0..0, mutations);
     }
 }
@@ -161,7 +161,7 @@ mod txn_state_tests {
     }
 
     fn pending_sqls(st: &TxnState) -> Vec<&str> {
-        st.pending.iter().map(|s| s.sql()).collect()
+        st.pending_dmls.iter().map(|s| s.sql()).collect()
     }
 
     /// The mode flip and the buffer take must be one atomic step: after `enter_autocommit` the
@@ -177,7 +177,7 @@ mod txn_state_tests {
         st.buffer_mutation(mutation(1));
         let (taken, taken_mutations) = st.enter_autocommit();
         assert!(st.autocommit);
-        assert!(st.pending.is_empty());
+        assert!(st.pending_dmls.is_empty());
         assert!(st.pending_mutations.is_empty());
         assert_eq!(
             taken.iter().map(|s| s.sql()).collect::<Vec<_>>(),
@@ -1091,7 +1091,7 @@ impl Connection for SpannerConnection {
                     "commit invoked with autocommit enabled; no active transaction",
                 ));
             }
-            (st.pending.clone(), st.pending_mutations.clone())
+            (st.pending_dmls.clone(), st.pending_mutations.clone())
         };
         let applied = pending.len();
         let applied_mutations = mutations.len();
@@ -1099,7 +1099,7 @@ impl Connection for SpannerConnection {
         // Drain exactly the statements/mutations that were applied; anything buffered concurrently
         // while the commit RPC ran stays pending for the next commit.
         let mut st = self.txn.lock().unwrap();
-        st.pending.drain(..applied);
+        st.pending_dmls.drain(..applied);
         st.pending_mutations.drain(..applied_mutations);
         Ok(())
     }
@@ -1111,7 +1111,7 @@ impl Connection for SpannerConnection {
                 "rollback invoked with autocommit enabled; no active transaction",
             ));
         }
-        st.pending.clear();
+        st.pending_dmls.clear();
         st.pending_mutations.clear();
         Ok(())
     }
