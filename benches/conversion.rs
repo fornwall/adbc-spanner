@@ -95,6 +95,25 @@ fn bench_conversion(c: &mut Criterion) {
         });
     }
 
+    // BYTES chunk: base64-encoded payloads (48 decoded bytes per cell) — the per-cell decode arm
+    // (which reuses one scratch buffer across cells, PERF-2). A sprinkle of SQL NULLs keeps the
+    // null path honest.
+    {
+        use base64::Engine as _;
+        let bytes = column(|i| {
+            if i % 16 == 0 {
+                None::<String>.to_value()
+            } else {
+                let payload: Vec<u8> = (0..48).map(|j| ((i + j) % 256) as u8).collect();
+                base64::engine::general_purpose::STANDARD
+                    .encode(&payload)
+                    .to_value()
+            }
+        });
+        let columns = [(DataType::Binary, refs(&bytes))];
+        group.bench_function("bytes_binary", |b| b.iter(|| convert(&columns)));
+    }
+
     // Nested chunk: ARRAY<INT64> (8 elements per row) and STRUCT<id INT64, name STRING> (encoded
     // positionally, as on the wire) — the recursive list/struct assembly paths.
     {

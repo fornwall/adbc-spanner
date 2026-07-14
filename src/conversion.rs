@@ -892,17 +892,23 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
                     .map_err(arrow_err)?,
             )
         }
-        // Spanner encodes BYTES as base64.
+        // Spanner encodes BYTES as base64. One scratch buffer is reused across cells —
+        // `decode_vec` *appends* into it, so it is cleared per cell — avoiding a heap
+        // alloc/free per cell before `append_value` copies the bytes into the builder.
         DataType::Binary => {
             let mut builder = BinaryBuilder::new();
+            let mut scratch = Vec::new();
             for &value in values {
                 match present(value) {
                     None => builder.append_null(),
-                    Some(v) => builder.append_value(
-                        v.try_as_string()
-                            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
-                            .ok_or_else(|| decode_error("BYTES", v))?,
-                    ),
+                    Some(v) => {
+                        let s = v.try_as_string().ok_or_else(|| decode_error("BYTES", v))?;
+                        scratch.clear();
+                        base64::engine::general_purpose::STANDARD
+                            .decode_vec(s, &mut scratch)
+                            .map_err(|_| decode_error("BYTES", v))?;
+                        builder.append_value(&scratch);
+                    }
                 }
             }
             Arc::new(builder.finish())
