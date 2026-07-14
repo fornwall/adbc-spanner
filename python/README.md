@@ -176,7 +176,9 @@ The enums cover the full option surface for the `db_kwargs=` / `conn_kwargs=` /
 ### Read-only connections
 
 Pass `conn_kwargs={ConnectionOptions.READONLY.value: "true"}` to guarantee a connection can only
-read — any `INSERT`/`UPDATE`/`DELETE`, DDL, or bulk ingest raises, while queries still run:
+read — any `INSERT`/`UPDATE`/`DELETE`, DDL, or bulk ingest raises, while queries still run.
+(Changing the option while a manual transaction is active — a first statement has fixed the
+transaction's kind — raises `ProgrammingError`; commit or roll back first.)
 
 ```python
 # docs-test: skip

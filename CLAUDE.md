@@ -138,6 +138,11 @@ Key design points:
   option (default `false`) makes a connection reject all writes — DML/DDL/ingest fail with
   `InvalidState`, queries still run; the flag is a shared `Arc<AtomicBool>` that statements read at
   execution time, so toggling it on the connection immediately affects existing statements too.
+  *Changing* it while a manual transaction is active (`TxnState::in_active_manual_txn` — a first
+  statement has fixed the transaction's kind) is rejected with `InvalidState`, the JDBC
+  `setReadOnly` rule (the ADBC spec is silent; no other ADBC driver implements the option at all);
+  re-setting the current value is a no-op and allowed. The check-and-store happens under the
+  `SharedTxn` lock so a concurrent statement cannot fix the kind in between.
 - **Stale reads.** Read-only queries default to a strong bound. A single `spanner.read.staleness`
   option requests a non-strong `TimestampBound`; its value is one of four distinct prefixes —
   `exact:<duration>` / `max:<duration>` (relative) and `read:<rfc3339>` / `min:<rfc3339>` (absolute;

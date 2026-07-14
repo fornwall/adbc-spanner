@@ -235,6 +235,15 @@ impl TxnState {
         )))
     }
 
+    /// Whether a manual transaction is **active**: the connection is in manual mode *and* a
+    /// first statement has fixed the transaction's kind (a query opened the shared snapshot, or
+    /// DML/ingest buffered work). A fresh manual transaction with no statement yet is *not*
+    /// active — connection-level configuration is still free to change before the transaction
+    /// does anything.
+    pub(crate) fn in_active_manual_txn(&self) -> bool {
+        !self.autocommit && self.txn.kind().is_some()
+    }
+
     /// The manual transaction's shared read-only transaction, if one is active.
     pub(crate) fn read_txn(&self) -> Option<Arc<MultiUseReadOnlyTransaction>> {
         match &self.txn {
@@ -412,6 +421,35 @@ mod txn_state_tests {
         );
     }
 
+    /// `in_active_manual_txn` is what gates connection-level reconfiguration (the
+    /// `adbc.connection.readonly` toggle): false in autocommit mode and in a fresh manual
+    /// transaction, true once a first statement fixes the kind, false again once a commit
+    /// drains the transaction.
+    #[test]
+    fn active_manual_txn_tracks_the_fixed_kind() {
+        let mut st = TxnState::new();
+        assert!(
+            !st.in_active_manual_txn(),
+            "autocommit is never an active manual transaction"
+        );
+        st.autocommit = false;
+        assert!(
+            !st.in_active_manual_txn(),
+            "a fresh manual transaction with no statement yet is not active"
+        );
+        st.buffer_dml(vec![sql("UPDATE a")]).unwrap();
+        assert!(
+            st.in_active_manual_txn(),
+            "buffered DML fixes the kind — the transaction is active"
+        );
+        let applied = st.txn.clone();
+        st.finish_commit(&applied);
+        assert!(
+            !st.in_active_manual_txn(),
+            "a drained commit ends the transaction"
+        );
+    }
+
     /// An ingest mutation counts as DML for the transaction's kind: it mixes freely with DML,
     /// and queries are rejected against it exactly as against buffered DML.
     #[test]
@@ -524,7 +562,9 @@ pub struct SpannerConnection {
     database: String,
     /// The standard `adbc.connection.readonly` flag. Shared (`Arc`) with every statement the
     /// connection creates, and read by statements at *execution* time, so toggling the option
-    /// immediately affects existing statements in both directions.
+    /// immediately affects existing statements in both directions. *Changing* it while a manual
+    /// transaction is active is rejected in `set_option` (see there), so the flag cannot flip
+    /// under a transaction whose kind is already fixed.
     read_only: Arc<AtomicBool>,
     /// Isolation level applied to read/write transactions (autocommit DML and manual-mode commit),
     /// set via the standard ADBC `adbc.connection.transaction.isolation_level` option.
@@ -1077,7 +1117,24 @@ impl Optionable for SpannerConnection {
                 }
             }
             OptionConnection::ReadOnly => {
-                self.read_only.store(parse_bool(value)?, Ordering::Release)
+                let enable = parse_bool(value)?;
+                // Changing the read-only mode mid-transaction is rejected (the JDBC
+                // `setReadOnly` rule — the ADBC spec itself is silent): flipping to read-only
+                // with DML already buffered would otherwise leave a commit that writes on a
+                // "read-only" connection, and flipping to writable mid-way would change what a
+                // transaction's remaining statements are allowed to do. Holding the transaction
+                // lock across check + store keeps a concurrent statement from fixing the
+                // transaction's kind in between. Re-setting the *current* value is a no-op and
+                // stays allowed — nothing changes, so there is nothing to reject.
+                let st = self.txn.lock().unwrap();
+                if st.in_active_manual_txn() && self.read_only.load(Ordering::Acquire) != enable {
+                    return Err(invalid_state(
+                        "cannot change adbc.connection.readonly while a manual transaction is \
+                         active (its first statement has fixed the transaction's kind). Commit \
+                         or roll back the transaction first.",
+                    ));
+                }
+                self.read_only.store(enable, Ordering::Release);
             }
             OptionConnection::IsolationLevel => self.isolation = parse_isolation_level(value)?,
             // Connection-only: the transaction tag applies to the whole read/write transaction, so
