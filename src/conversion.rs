@@ -611,7 +611,7 @@ pub(crate) fn build_schema(
 /// Never fails today (every Spanner type maps to some Arrow type — `ENUM` → `Int64`, `PROTO` →
 /// `Binary`), but stays fallible so a future unmappable type can be rejected here without a
 /// signature change rippling through the schema-build path.
-fn arrow_field(
+pub(crate) fn arrow_field(
     name: impl Into<String>,
     ty: &Type,
     nullable: bool,

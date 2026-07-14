@@ -13,6 +13,18 @@ Releases are cut with [`cargo-release`](https://github.com/crate-ci/cargo-releas
 ### Changed
 
 - MSRV raised to 1.97.
+- `get_parameter_schema` now reports real Spanner-inferred parameter types instead of typing every
+  parameter `Null`: a `QueryMode: PLAN` probe returns the statement's undeclared parameters typed
+  from the surrounding SQL (queries plan in a read-only transaction; DML plans in a read/write
+  transaction that executes nothing and commits empty). A parameter the probe cannot type — DDL,
+  DML on a read-only connection, or a type the SQL context doesn't pin down — is still reported as
+  Arrow `Null`, ADBC's convention for an undetermined parameter type.
+
+### Fixed
+
+- Binding a `Null`-typed Arrow column (the shape a client builds from a `Null`-typed
+  `get_parameter_schema` field, and what pyarrow infers for an all-`None` parameter set) now binds
+  NULL per row instead of failing with "unsupported Arrow type Null" (REVIEW.md CONV-1).
 
 ## [0.6.0] - 2026-07-08
 

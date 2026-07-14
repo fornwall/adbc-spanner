@@ -1792,14 +1792,15 @@ fn query_and_dml_round_trip() {
     let mut pq = connection.new_statement().expect("new statement");
     pq.set_sql_query("SELECT Name FROM AdbcBind WHERE Id = @Id")
         .unwrap();
-    // Before binding, get_parameter_schema derives the parameter names from the SQL; Spanner does
-    // not expose parameter types ahead of execution, so the type is Null (Arrow's "unknown").
+    // Before binding, get_parameter_schema derives the parameter names from the SQL and asks
+    // Spanner for the types the SQL context implies (a PLAN probe returning the statement's
+    // undeclared parameters): @Id compares against the INT64 `Id` column, so it comes back Int64.
     let ps = pq
         .get_parameter_schema()
         .expect("parameter schema from SQL");
     assert_eq!(ps.fields().len(), 1);
     assert_eq!(ps.field(0).name(), "Id");
-    assert_eq!(ps.field(0).data_type(), &DataType::Null);
+    assert_eq!(ps.field(0).data_type(), &DataType::Int64);
     pq.bind(param).expect("bind query param");
     // Once data is bound, the parameter schema reflects the bound column's real type.
     let ps = pq
@@ -1878,8 +1879,55 @@ fn query_and_dml_round_trip() {
     .expect("set bind_by_name=true");
     pu.set_sql_query("UPDATE AdbcBind SET Name = @Name WHERE Id = @Id")
         .unwrap();
+    // DML parameter typing: planning DML needs a read/write transaction (the probe's plan
+    // executes nothing and commits empty), and the parameters come back with their column types
+    // in SQL appearance order — @Name (STRING) before @Id (INT64).
+    let ps = pu
+        .get_parameter_schema()
+        .expect("parameter schema from DML");
+    assert_eq!(ps.fields().len(), 2);
+    assert_eq!(ps.field(0).name(), "Name");
+    assert_eq!(ps.field(0).data_type(), &DataType::Utf8);
+    assert_eq!(ps.field(1).name(), "Id");
+    assert_eq!(ps.field(1).data_type(), &DataType::Int64);
     pu.bind(upd).expect("bind update params");
     assert_eq!(pu.execute_update().expect("param update"), Some(1));
+
+    // Null-typed bind column: a parameter column of Arrow type `Null` binds NULL per row. This is
+    // the shape ADBC's own contract produces — a client building its bind batch from
+    // get_parameter_schema gets `Null`-typed fields for undetermined parameters, and pyarrow
+    // infers `Null` for an all-None parameter set — so a driver advertising bind support must
+    // accept it rather than contradict its own reported schema.
+    let null_row = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("0", DataType::Int64, false),
+            Field::new("1", DataType::Null, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![7001])),
+            Arc::new(arrow_array::NullArray::new(1)),
+        ],
+    )
+    .unwrap();
+    let mut pn = connection.new_statement().expect("new statement");
+    pn.set_sql_query("INSERT INTO AdbcBind (Id, Name) VALUES (@p1, @p2)")
+        .unwrap();
+    pn.bind(null_row).expect("bind null-typed params");
+    assert_eq!(pn.execute_update().expect("null-typed insert"), Some(1));
+    let mut pn_check = connection.new_statement().expect("new statement");
+    pn_check
+        .set_sql_query("SELECT Name FROM AdbcBind WHERE Id = 7001")
+        .unwrap();
+    let pn_batches = pn_check
+        .execute()
+        .expect("read back null-typed insert")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(pn_batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    assert!(
+        pn_batches[0].column(0).is_null(0),
+        "the null-typed bind column must have inserted NULL"
+    );
 
     let mut drop_bind = connection.new_statement().expect("new statement");
     drop_bind.set_sql_query("DROP TABLE AdbcBind").unwrap();

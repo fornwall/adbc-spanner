@@ -101,7 +101,7 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 
 ## 4. Type conversion (correctness)
 
-- [ ] **CONV-1 (Medium)** — Null-typed bind columns rejected, contradicting the driver's own `get_parameter_schema` — `src/bind.rs:263-366`, `src/statement.rs:1678`
+- [x] **CONV-1 (Medium)** — Null-typed bind columns rejected, contradicting the driver's own `get_parameter_schema` — `src/bind.rs:263-366`, `src/statement.rs:1678`
   `get_parameter_schema` advertises every `@param` as `DataType::Null`, but `scalar_binder`/`cell_value` have no `Null` arm — a batch built from that very schema (or pyarrow's inferred `null` column for all-`None` params) fails `InvalidArguments`. **Fix:** add a `DataType::Null` arm returning `null_value()`.
 
 - [ ] **CONV-2 (Medium)** — No `Dictionary` (or `RunEndEncoded`) support on the Arrow→Spanner path — `src/bind.rs:263-366`

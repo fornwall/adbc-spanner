@@ -137,7 +137,14 @@ TODO: Go over these and merge with above:
   correctly-typed empty result.
 - Typed option getters (ADBC 1.1.0) — get_option_int(), get_option_double(), and get_option_bytes() are implemented alongside
   the string getter.
-- Parameter schema — get_parameter_schema() describes a parameterized statement's bind parameters.
+- Parameter schema — get_parameter_schema() describes a parameterized statement's bind parameters
+  with their real Spanner-inferred types: a `QueryMode: PLAN` probe returns the statement's
+  undeclared parameters typed from the surrounding SQL (an INSERT's `@p` targeting an `INT64`
+  column comes back as Arrow `Int64`, a `JSON` parameter carries the `arrow.json` extension tag).
+  Queries plan in a read-only transaction; DML plans in a read/write transaction (the plan executes
+  nothing and commits empty). A parameter the probe cannot type — DDL, DML on a read-only
+  connection, or a type the SQL context doesn't pin down — is reported as Arrow `Null`, ADBC's
+  convention for an undetermined parameter type.
 - get_objects with constraints — catalog/schema/table/column introspection including foreign-key constraint_column_usage, not
   just the minimal object listing.
 - Current catalog / schema options (ADBC 1.1.0) — adbc.connection.catalog / adbc.connection.db_schema are accepted, but only
