@@ -1893,6 +1893,42 @@ fn query_and_dml_round_trip() {
     pu.bind(upd).expect("bind update params");
     assert_eq!(pu.execute_update().expect("param update"), Some(1));
 
+    // Null-typed bind column: a parameter column of Arrow type `Null` binds NULL per row. This is
+    // the shape ADBC's own contract produces — a client building its bind batch from
+    // get_parameter_schema gets `Null`-typed fields for undetermined parameters, and pyarrow
+    // infers `Null` for an all-None parameter set — so a driver advertising bind support must
+    // accept it rather than contradict its own reported schema.
+    let null_row = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("0", DataType::Int64, false),
+            Field::new("1", DataType::Null, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![7001])),
+            Arc::new(arrow_array::NullArray::new(1)),
+        ],
+    )
+    .unwrap();
+    let mut pn = connection.new_statement().expect("new statement");
+    pn.set_sql_query("INSERT INTO AdbcBind (Id, Name) VALUES (@p1, @p2)")
+        .unwrap();
+    pn.bind(null_row).expect("bind null-typed params");
+    assert_eq!(pn.execute_update().expect("null-typed insert"), Some(1));
+    let mut pn_check = connection.new_statement().expect("new statement");
+    pn_check
+        .set_sql_query("SELECT Name FROM AdbcBind WHERE Id = 7001")
+        .unwrap();
+    let pn_batches = pn_check
+        .execute()
+        .expect("read back null-typed insert")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(pn_batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    assert!(
+        pn_batches[0].column(0).is_null(0),
+        "the null-typed bind column must have inserted NULL"
+    );
+
     let mut drop_bind = connection.new_statement().expect("new statement");
     drop_bind.set_sql_query("DROP TABLE AdbcBind").unwrap();
     drop_bind.execute_update().expect("drop bind table");

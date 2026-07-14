@@ -20,6 +20,12 @@ Releases are cut with [`cargo-release`](https://github.com/crate-ci/cargo-releas
   DML on a read-only connection, or a type the SQL context doesn't pin down — is still reported as
   Arrow `Null`, ADBC's convention for an undetermined parameter type.
 
+### Fixed
+
+- Binding a `Null`-typed Arrow column (the shape a client builds from a `Null`-typed
+  `get_parameter_schema` field, and what pyarrow infers for an all-`None` parameter set) now binds
+  NULL per row instead of failing with "unsupported Arrow type Null" (REVIEW.md CONV-1).
+
 ## [0.6.0] - 2026-07-08
 
 The bulk of this release lands the fixes from the multi-aspect repo review (`REVIEW.md`).

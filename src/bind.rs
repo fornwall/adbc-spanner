@@ -362,6 +362,16 @@ fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
                 numeric_string(a.as_primitive::<Decimal128Type>().value(i), scale)
             }))
         },
+        // A `Null`-typed column has no values by definition: every cell binds as NULL. This is
+        // the shape ADBC's own contract produces — `get_parameter_schema` types an undetermined
+        // parameter `Null` (adbc.h: "the type of the corresponding field will be NA"), so a
+        // client that builds its bind batch from the reported schema hands back `Null`-typed
+        // columns; pyarrow likewise infers `Null` for an all-None parameter set. The NULL goes
+        // on the wire untyped — `add_param` declares no parameter types for *any* bind — and
+        // Spanner infers the type from the SQL context, exactly as it does for a NULL cell of a
+        // typed column. Deliberately not `a.is_null(i)`: a `NullArray` carries no validity
+        // buffer, so Arrow's *physical* `is_null` reports `false` for its all-null cells.
+        DataType::Null => |_, _, _, _| Ok(null_value()),
         _ => return None,
     };
     Some(bind)
