@@ -104,7 +104,11 @@ Key design points:
     (`TxnState::buffer_dml`/`buffer_mutation` — each checks the kind and buffers under one lock
     acquisition) and apply atomically in one read/write transaction on `commit`. The client
     exposes no manual begin/commit handle, so buffer-and-replay is what makes DML transactions
-    both possible and retry-safe. `execute_update` returns `None` (count unknown until commit).
+    both possible and retry-safe. A **mutations-only** transaction (bulk ingests, no buffered
+    DML) commits via the replay-protected write-only path instead (`write_mutations_txn` in
+    `src/connection.rs`, shared with the ingest chunk commit; same
+    `apply_to_write_only` config, exactly-once even across ambiguous transport failures — SPAN-6).
+    `execute_update` returns `None` (count unknown until commit).
     No read-your-writes: a query inside a DML transaction is rejected (see above) rather than
     silently returning a pre-insert result. A `;`-batch on the DML paths must be **all-DML**
     (`check_all_dml_batch`): mixing DML with a query or DDL in one batch is `InvalidArguments` up
@@ -404,7 +408,9 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   buffer their
   mutations unchunked (`TxnState::pending_mutations`) and commit atomically **with** the buffered
   DML in one read/write transaction via `ReadWriteTransaction::buffer` — note Spanner applies
-  buffered mutations at commit, after the transaction's DML executes; the `spanner.ingest.batch_write`
+  buffered mutations at commit, after the transaction's DML executes (a manual transaction that
+  buffered **no** DML commits its mutations via the replay-protected write-only path instead —
+  `write_mutations_txn`, SPAN-6); the `spanner.ingest.batch_write`
   statement option [boolean via `ingest_batch_write_option` = `options::bool_option` with empty-string
   unsetting, default false, round-trips via `get_option`] instead routes each **autocommit** ingest
   chunk through Spanner's **BatchWrite** RPC — `DatabaseClient::batch_write_transaction().execute_streaming`,

@@ -35,7 +35,7 @@ use google_cloud_spanner::statement::{Statement as SpannerSql, StatementBuilder}
 use google_cloud_spanner::transaction::{MultiUseReadOnlyTransaction, ReadWriteTransaction};
 
 use crate::bind;
-use crate::connection::{SharedTxn, TxnKind, apply_isolation};
+use crate::connection::{SharedTxn, TxnKind, apply_isolation, write_mutations_txn};
 use crate::conversion::{
     BoundStatementSource, TimestampPrecision, result_set_to_batch, stream_bound_query, stream_query,
 };
@@ -751,45 +751,23 @@ impl SpannerStatement {
     /// Commit one ingest chunk in its own write-only transaction, returning its row count (`0` for
     /// an empty chunk, which sends nothing).
     ///
-    /// `WriteOnlyTransaction::write` carries the client's replay protection — on success the
-    /// mutations were applied exactly once, retrying internally on `ABORTED`. A commit reports no
-    /// affected-row count, but each insert mutation is exactly one row, so the chunk length is the
-    /// count.
+    /// Delegates to the shared [`write_mutations_txn`] commit (also the mutations-only
+    /// manual-commit path): `WriteOnlyTransaction::write` carries the client's replay protection —
+    /// on success the mutations were applied exactly once, retrying internally on `ABORTED`. A
+    /// commit reports no affected-row count, but each insert mutation is exactly one row, so the
+    /// chunk length is the count.
     fn write_mutation_chunk(&self, mutations: Vec<Mutation>) -> Result<i64> {
-        if mutations.is_empty() {
-            return Ok(0);
-        }
         let count = mutations.len() as i64;
-        let client = self.client.clone();
-        let request = self.request.clone();
-        let retry = self.retry;
-        let mutation_count = block_on_cancellable(
+        write_mutations_txn(
             &self.runtime,
+            &self.client,
             &self.cancel.current(),
-            with_timeout(
-                self.timeouts.update_timeout(),
-                crate::OPTION_RPC_TIMEOUT_UPDATE,
-                async move {
-                    let response = retry
-                        .apply_to_write_only(
-                            request.apply_to_write_only(client.write_only_transaction()),
-                        )
-                        .build()
-                        .write(mutations)
-                        .await
-                        .map_err(from_spanner)?;
-                    // The commit stats (only when `spanner.commit_stats` requested them) ride on the
-                    // write-only commit response.
-                    Ok::<Option<i64>, Error>(
-                        response
-                            .commit_stats
-                            .as_ref()
-                            .map(|stats| stats.mutation_count),
-                    )
-                },
-            ),
+            self.request.clone(),
+            self.retry,
+            self.timeouts.update_timeout(),
+            &self.commit_stats,
+            mutations,
         )?;
-        self.commit_stats.record(mutation_count);
         Ok(count)
     }
 

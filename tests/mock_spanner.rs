@@ -1619,6 +1619,192 @@ fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
     );
 }
 
+/// SPAN-6 regression (wire): a manual transaction that buffered **only mutations** (bulk ingests,
+/// no DML) must commit through the client's replay-protected **write-only** transaction —
+/// `WriteOnlyTransaction::write` begins the transaction with a `mutation_key` (the replay-
+/// protection marker) and never touches `ExecuteBatchDml` — while a transaction that buffered DML
+/// must keep the read/write runner (whose `ExecuteBatchDml` carries the statements and whose
+/// commit applies the buffered mutations).
+///
+/// Two commits on one connection, split on the wire:
+/// 1. **Mutations-only** (an `append` ingest): exactly one `BeginTransaction`, carrying a
+///    `mutation_key`, then a `Commit` by transaction id with the ingest's two mutations — and no
+///    `ExecuteBatchDml` at all (an unexpected one would also hit the unscripted-RPC catch-all).
+/// 2. **DML + mutations**: `ExecuteBatchDml` runs the buffered statement (inline-beginning the
+///    read/write transaction), and its `Commit` carries the buffered mutation; any explicit begin
+///    on this path has no `mutation_key`.
+#[test]
+fn mutations_only_manual_commit_uses_the_write_only_path() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "mutations_only_manual_commit_uses_the_write_only_path",
+    );
+
+    let begins: Arc<Mutex<Vec<v1::BeginTransactionRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let commits: Arc<Mutex<Vec<v1::CommitRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let batch_dml_count = Arc::new(AtomicUsize::new(0));
+    let record_begins = begins.clone();
+    let record_commits = commits.clone();
+    let record_batch_dml = batch_dml_count.clone();
+    let server = MockServer::start(move |mock| {
+        // The write-only path (and a runner electing an explicit begin) starts here; record the
+        // request — the write-only begin is recognizable by its `mutation_key`.
+        mock.expect_begin_transaction().returning(move |request| {
+            record_begins.lock().unwrap().push(request.into_inner());
+            Ok(tonic::Response::new(v1::Transaction {
+                id: b"mock-txn".to_vec(),
+                ..Default::default()
+            }))
+        });
+        // The read/write runner's DML batch; echo a transaction id when it inline-begins.
+        mock.expect_execute_batch_dml().returning(move |request| {
+            let request = request.into_inner();
+            record_batch_dml.fetch_add(1, Ordering::SeqCst);
+            let inline_begin = matches!(
+                request
+                    .transaction
+                    .as_ref()
+                    .and_then(|t| t.selector.as_ref()),
+                Some(v1::transaction_selector::Selector::Begin(_))
+            );
+            Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
+                result_sets: vec![v1::ResultSet {
+                    metadata: Some(v1::ResultSetMetadata {
+                        transaction: inline_begin.then(|| v1::Transaction {
+                            id: b"dml-txn".to_vec(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    stats: Some(v1::ResultSetStats {
+                        row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                status: Some(spanner_grpc_mock::google::rpc::Status {
+                    code: 0,
+                    message: "OK".into(),
+                    details: vec![],
+                }),
+                ..Default::default()
+            }))
+        });
+        mock.expect_commit().returning(move |request| {
+            record_commits.lock().unwrap().push(request.into_inner());
+            commit_ok()
+        });
+    });
+
+    let mut connection = server.connect();
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("enter manual transaction mode");
+
+    let mut ingest = connection.new_statement().expect("new statement");
+    ingest
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("MockTable".into()),
+        )
+        .expect("set target table");
+    ingest
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .expect("set ingest mode append");
+
+    // 1. Mutations-only: buffer a two-row ingest (`None` — manual mode buffers) and commit.
+    ingest.bind(ingest_batch(2)).expect("bind ingest rows");
+    assert_eq!(
+        ingest.execute_update().expect("manual-mode ingest buffers"),
+        None,
+        "a manual-mode ingest buffers (returns None), not commits"
+    );
+    connection
+        .commit()
+        .expect("commit the mutations-only transaction");
+
+    {
+        let begins = begins.lock().unwrap();
+        assert_eq!(
+            begins.len(),
+            1,
+            "a mutations-only commit begins exactly one (write-only) transaction"
+        );
+        assert!(
+            begins[0].mutation_key.is_some(),
+            "the write-only begin must carry a mutation_key — the replay-protection marker: {:?}",
+            begins[0]
+        );
+    }
+    assert_eq!(
+        batch_dml_count.load(Ordering::SeqCst),
+        0,
+        "a mutations-only commit must not issue ExecuteBatchDml"
+    );
+    {
+        let commits = commits.lock().unwrap();
+        assert_eq!(commits.len(), 1, "exactly one commit so far");
+        assert_eq!(
+            commits[0].mutations.len(),
+            2,
+            "the write-only commit must carry the ingest's two mutations"
+        );
+        assert!(
+            matches!(
+                commits[0].transaction,
+                Some(v1::commit_request::Transaction::TransactionId(_))
+            ),
+            "the replay-protected write commits by transaction id (never single-use): {:?}",
+            commits[0].transaction
+        );
+    }
+
+    // 2. DML + mutations: buffer an UPDATE and a one-row ingest, then commit — this transaction
+    //    has statements to execute, so it must keep the read/write runner.
+    let mut dml = connection.new_statement().expect("new statement");
+    dml.set_sql_query("UPDATE MockTable SET c = 'x' WHERE TRUE")
+        .expect("set DML");
+    assert_eq!(
+        dml.execute_update().expect("manual-mode DML buffers"),
+        None,
+        "manual-mode DML buffers (returns None), not commits"
+    );
+    ingest.bind(ingest_batch(1)).expect("bind second ingest");
+    assert_eq!(
+        ingest.execute_update().expect("second ingest buffers"),
+        None
+    );
+    connection.commit().expect("commit the DML transaction");
+
+    assert_eq!(
+        batch_dml_count.load(Ordering::SeqCst),
+        1,
+        "a commit with buffered DML must run it via ExecuteBatchDml (the read/write runner)"
+    );
+    {
+        let begins = begins.lock().unwrap();
+        assert!(
+            begins.iter().skip(1).all(|b| b.mutation_key.is_none()),
+            "only the write-only path begins with a mutation_key; the runner's begin has none"
+        );
+    }
+    {
+        let commits = commits.lock().unwrap();
+        assert_eq!(commits.len(), 2, "the DML transaction adds a second commit");
+        assert_eq!(
+            commits[1].mutations.len(),
+            1,
+            "the runner's commit must carry the second ingest's buffered mutation"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Read-option wire assertions: spanner.read.staleness + spanner.directed_read
 // ---------------------------------------------------------------------------

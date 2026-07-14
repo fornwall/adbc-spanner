@@ -73,6 +73,10 @@ Early, tested end-to-end against the Spanner emulator.
     - **DML**: DML statements and bulk-ingest insert mutations are buffered and applied
       atomically in one read/write transaction on commit, so `execute_update` returns `None`
       rather than an affected-row count — the count is unknown until the buffered batch commits.
+      A transaction that buffered **only mutations** (bulk ingests, no DML) commits through
+      Spanner's replay-protected write-only commit instead, which applies the mutations exactly
+      once even across ambiguous transport failures (a replayed read/write commit could apply
+      them twice).
       Because writes are buffered, a DML transaction has **no read-your-writes**; that is exactly
       why a query inside it is rejected rather than silently returning a *pre-insert* result. The
       buffer-and-commit shape follows from the preview client exposing read/write transactions

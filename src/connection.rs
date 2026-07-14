@@ -58,7 +58,10 @@
 //!   manual mode. On `ABORTED` (the retriable code preserved in `vendor_code`) the failed attempt
 //!   is guaranteed not to have committed, so the replay is exact; after an *ambiguous* transport
 //!   failure the usual Spanner caveat applies — the commit may have landed, so a replay can apply
-//!   the batch twice unless the DML is idempotent.
+//!   the batch twice unless the DML is idempotent. A **mutations-only** transaction (bulk ingests
+//!   that buffered no DML) is exempt: it commits through the client's replay-protected write-only
+//!   transaction ([`write_mutations_txn`]), which applies the mutations exactly once even across
+//!   ambiguous transport failures.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -507,7 +510,10 @@ pub(crate) type SharedTxn = Arc<Mutex<TxnState>>;
 ///   simply drop it (Spanner read-only transactions need no commit RPC).
 /// - **DML** — and the insert mutations of any bulk ingest — is *buffered* and applied atomically
 ///   in one read/write transaction on commit, because the Spanner client exposes read/write
-///   transactions only through a closure-based runner (no begin/commit handle).
+///   transactions only through a closure-based runner (no begin/commit handle). A transaction
+///   that buffered **only mutations** (bulk ingests, no DML) commits through the client's
+///   replay-protected write-only transaction instead, so an ambiguous transport failure cannot
+///   double-apply it.
 ///
 /// **DDL is not transaction-aware** (matching the ADBC BigQuery driver): it always executes
 /// immediately via the admin API — Spanner DDL is never transactional — and leaves the
@@ -602,8 +608,8 @@ impl SpannerConnection {
     }
 
     /// Apply the buffered work of a manual transaction: DML statements and ingest mutations
-    /// atomically in one read/write transaction. A read-only (or empty) transaction has nothing
-    /// to apply — its snapshot ends by being dropped when the caller clears the state.
+    /// atomically in one transaction. A read-only (or empty) transaction has nothing to apply —
+    /// its snapshot ends by being dropped when the caller clears the state.
     fn apply_manual_txn(&self, work: &ManualTxn) -> Result<()> {
         match work {
             ManualTxn::Unset | ManualTxn::Read(_) => Ok(()),
@@ -614,8 +620,14 @@ impl SpannerConnection {
         }
     }
 
-    /// Apply the buffered DML statements and mutations atomically in one read/write transaction,
-    /// discarding the affected-row count (a commit reports no count).
+    /// Apply the buffered DML statements and mutations atomically in one transaction, discarding
+    /// the affected-row count (a commit reports no count).
+    ///
+    /// A transaction with DML runs through the read/write runner ([`run_batch_txn`]); a
+    /// **mutations-only** transaction (bulk ingests that buffered no DML) commits through the
+    /// write-only path ([`write_mutations_txn`]) instead, whose commit is replay-protected —
+    /// applied exactly once even across ambiguous transport failures, where a replayed
+    /// read/write commit could double-apply (the module-doc caveat).
     fn apply_transaction(
         &self,
         statements: Vec<SpannerSql>,
@@ -625,6 +637,18 @@ impl SpannerConnection {
         // previous operation does not leak in — and so no later operation can un-cancel this one's
         // streamed reader (see `CancelSlot`).
         self.cancel.begin_operation();
+        if statements.is_empty() {
+            return write_mutations_txn(
+                &self.runtime,
+                &self.client,
+                &self.cancel.current(),
+                self.request.clone(),
+                self.retry,
+                self.timeouts.update_timeout(),
+                &self.commit_stats,
+                mutations,
+            );
+        }
         run_batch_txn(
             &self.runtime,
             &self.client,
@@ -862,6 +886,60 @@ pub(crate) fn run_batch_txn(
     )?;
     commit_stats.record(mutation_count);
     Ok(count)
+}
+
+/// Commit `mutations` alone — no DML — in one **write-only** transaction
+/// (`WriteOnlyTransaction::write`): the mutations-only manual-commit path, and (via the
+/// statement's `write_mutation_chunk`) each chunk of an autocommit bulk ingest.
+///
+/// Unlike the read/write runner — whose commit, replayed after an *ambiguous* transport failure,
+/// can apply the batch twice — `write` is replay-protected: it begins the transaction with a
+/// mutation key and retries internally on `ABORTED`, so on success the mutations were applied
+/// **exactly once** whatever the underlying network did. The same commit configuration as the
+/// runner path is applied via [`RequestConfig::apply_to_write_only`] /
+/// [`RetryConfig::apply_to_write_only`]: commit priority, transaction tag,
+/// `spanner.commit.max_delay`, `spanner.commit_stats` (the returned mutation count is recorded
+/// into `commit_stats`), and the retry/backoff tuning on the Begin/Commit RPCs. The isolation
+/// level does not apply here — the write-only builder exposes no isolation setter, and a
+/// transaction that performs no reads has no reads for a level to constrain.
+#[allow(clippy::too_many_arguments)] // threads one connection/statement config item per argument
+pub(crate) fn write_mutations_txn(
+    runtime: &SharedRuntime,
+    client: &DatabaseClient,
+    cancel: &CancelSignal,
+    request: RequestConfig,
+    retry: RetryConfig,
+    timeout: Option<Duration>,
+    commit_stats: &CommitStats,
+    mutations: Vec<Mutation>,
+) -> Result<()> {
+    if mutations.is_empty() {
+        return Ok(());
+    }
+    let client = client.clone();
+    let transaction = async move {
+        let response = retry
+            .apply_to_write_only(request.apply_to_write_only(client.write_only_transaction()))
+            .build()
+            .write(mutations)
+            .await
+            .map_err(from_spanner)?;
+        // The commit stats (only when `spanner.commit_stats` requested them) ride on the
+        // write-only commit response.
+        Ok::<Option<i64>, Error>(
+            response
+                .commit_stats
+                .as_ref()
+                .map(|stats| stats.mutation_count),
+        )
+    };
+    let mutation_count = block_on_cancellable(
+        runtime,
+        cancel,
+        with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_UPDATE, transaction),
+    )?;
+    commit_stats.record(mutation_count);
+    Ok(())
 }
 
 /// Validate a lookup's `catalog` argument. Spanner has a single, unnamed (`""`) catalog, so `None`
