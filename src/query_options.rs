@@ -64,6 +64,7 @@ impl QueryOptionsConfig {
 
     /// Apply the optimizer options to a query statement builder. A no-op when neither is set, so an
     /// unset config leaves the request's query options empty (the service default optimizer).
+    #[must_use]
     pub(crate) fn apply_to_statement(&self, builder: StatementBuilder) -> StatementBuilder {
         if self.optimizer_version.is_none() && self.optimizer_statistics_package.is_none() {
             return builder;

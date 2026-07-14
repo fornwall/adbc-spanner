@@ -694,6 +694,7 @@ impl SpannerConnection {
 /// [`IsolationLevel::Unspecified`] leaves the builder untouched so the client/database default
 /// (`SERIALIZABLE`) stands; a specific level is forwarded to
 /// [`TransactionRunnerBuilder::set_isolation_level`].
+#[must_use]
 pub(crate) fn apply_isolation(
     builder: TransactionRunnerBuilder,
     isolation: IsolationLevel,
