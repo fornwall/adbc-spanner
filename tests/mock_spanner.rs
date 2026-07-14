@@ -638,6 +638,89 @@ fn manual_transaction_queries_share_one_read_only_transaction() {
     connection.rollback().expect("discard the buffered insert");
 }
 
+/// Changing `adbc.connection.readonly` while a manual transaction is **active** — a first
+/// statement has fixed its kind — is rejected with `InvalidState`, in both directions and for
+/// both kinds (the JDBC `setReadOnly` rule; the ADBC spec is silent). Re-setting the *current*
+/// value is a no-op and stays allowed, a fresh manual transaction with no statement yet leaves
+/// the toggle free, and ending the transaction (rollback / commit) frees it again. This closes
+/// the hole where DML buffered while the connection was writable could still be committed after
+/// the connection was flipped read-only.
+#[test]
+fn readonly_toggle_is_rejected_in_an_active_manual_transaction() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "readonly_toggle_is_rejected_in_an_active_manual_transaction",
+    );
+
+    let server = MockServer::start(move |mock| {
+        // Served for the query that opens the read transaction below.
+        serve_streaming_sql_begin_aware(mock, &["v1"], None);
+    });
+
+    let mut connection = server.connect();
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("disable autocommit");
+    let set_readonly = |connection: &mut SpannerConnection, value: &str| {
+        connection.set_option(
+            OptionConnection::ReadOnly,
+            OptionValue::String(value.into()),
+        )
+    };
+
+    // A fresh manual transaction (no statement yet) is not active: the toggle is free.
+    set_readonly(&mut connection, "true").expect("toggle before any statement");
+    set_readonly(&mut connection, "false").expect("toggle back before any statement");
+
+    // DML transaction: buffering an insert fixes the kind...
+    let mut insert = connection.new_statement().expect("new statement");
+    insert
+        .set_sql_query("INSERT INTO MockTable (c) VALUES ('x')")
+        .unwrap();
+    assert_eq!(insert.execute_update().expect("buffered insert"), None);
+    // ...after which flipping to read-only is rejected (the buffered DML would otherwise
+    // commit on a "read-only" connection)...
+    let Err(error) = set_readonly(&mut connection, "true") else {
+        panic!("flipping to read-only with DML buffered must be rejected");
+    };
+    assert_eq!(error.status, AdbcStatus::InvalidState);
+    assert!(
+        error.message.contains("adbc.connection.readonly"),
+        "the error should name the option: {:?}",
+        error.message
+    );
+    // ...while re-setting the current value changes nothing and stays allowed.
+    set_readonly(&mut connection, "false").expect("no-op re-set of the current value");
+    // Rollback ends the transaction and frees the toggle.
+    connection.rollback().expect("rollback the buffered insert");
+    set_readonly(&mut connection, "true").expect("toggle after rollback");
+
+    // Query transaction: a query is allowed on a read-only connection and opens the shared
+    // read-only transaction, fixing the kind...
+    let mut query = connection.new_statement().expect("new statement");
+    query.set_sql_query("SELECT c FROM MockTable").unwrap();
+    let batches: Vec<_> = query
+        .execute()
+        .expect("query on a read-only connection")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect batches");
+    assert_eq!(batches[0].num_rows(), 1);
+    // ...after which flipping to writable mid-transaction is rejected too.
+    let Err(error) = set_readonly(&mut connection, "false") else {
+        panic!("flipping to writable inside a query transaction must be rejected");
+    };
+    assert_eq!(error.status, AdbcStatus::InvalidState);
+    set_readonly(&mut connection, "true").expect("no-op re-set of the current value");
+    // Commit ends the query transaction (locally, no RPC); the toggle is free again.
+    connection
+        .commit()
+        .expect("committing a query transaction needs no RPC");
+    set_readonly(&mut connection, "false").expect("toggle after commit");
+}
+
 /// COR-3 regression, autocommit half: `execute_update` on SQL that is neither DDL nor DML (a
 /// SELECT) must execute it through the **read-only query** machinery — `ExecuteStreamingSql`, not
 /// `ExecuteBatchDml` — drain and discard the rows, and report no count (`None`). `adbc.h`

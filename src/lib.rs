@@ -48,7 +48,10 @@
 //! DML, DDL and bulk ingest fail with [`Status::InvalidState`](adbc_core::error::Status::InvalidState),
 //! while read-only queries still run. It defaults to `false`, accepts `true`/`false`, and
 //! round-trips through `get_option`. The flag is live: statements check it at execution time, so
-//! toggling it takes effect immediately for existing statements as well as new ones.
+//! toggling it takes effect immediately for existing statements as well as new ones. Changing it
+//! while a **manual transaction is active** (a first statement has fixed the transaction's kind —
+//! see below) is rejected with `InvalidState`, the JDBC `setReadOnly` rule: commit or roll back
+//! first. Re-setting the current value is a no-op and always allowed.
 //!
 //! ## Transactions
 //!
