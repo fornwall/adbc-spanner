@@ -82,7 +82,7 @@ use google_cloud_spanner::transaction::{MultiUseReadOnlyTransaction, ReadWriteTr
 
 use crate::conversion::{TimestampPrecision, result_set_to_batch, stream_query};
 use crate::directed_read::DirectedRead;
-use crate::driver::Connected;
+use crate::driver::{Connected, SharedDatabaseAdmin};
 use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
 use crate::options::impl_shared_option_dispatch;
 use crate::query_options::QueryOptionsConfig;
@@ -522,6 +522,11 @@ pub struct SpannerConnection {
     client: DatabaseClient,
     spanner: Spanner,
     database: String,
+    /// The lazily-built Database Admin client for the DDL path, shared (`Arc`) with every statement
+    /// the connection creates — and, via the cached [`Connected`] stack, with every other connection
+    /// on the same database — so the first DDL statement builds it and later ones clone it (see
+    /// [`SharedDatabaseAdmin`]).
+    admin: SharedDatabaseAdmin,
     /// The standard `adbc.connection.readonly` flag. Shared (`Arc`) with every statement the
     /// connection creates, and read by statements at *execution* time, so toggling the option
     /// immediately affects existing statements in both directions.
@@ -586,6 +591,7 @@ impl SpannerConnection {
             client: connected.client,
             spanner: connected.spanner,
             database: connected.database,
+            admin: connected.admin,
             read_only: Arc::new(AtomicBool::new(false)),
             isolation: IsolationLevel::Unspecified,
             read_staleness: ReadStaleness::default(),
@@ -1181,6 +1187,7 @@ impl Connection for SpannerConnection {
             self.client.clone(),
             self.spanner.clone(),
             self.database.clone(),
+            self.admin.clone(),
             self.read_only.clone(),
             self.isolation.clone(),
             self.read_staleness.clone(),

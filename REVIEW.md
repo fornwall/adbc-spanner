@@ -177,8 +177,8 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 - [ ] **SPAN-9 (Low)** — Client features worth exposing as driver options — client `database_client.rs`, `transaction_runner.rs`
   `with_database_role` (FGAC → `spanner.database_role`), `with_leader_aware_routing(bool)`, `set_exclude_txn_from_change_streams` (ingest/ETL commits → `spanner.transaction.exclude_from_change_streams`; BatchWrite blocked on UP-5), `set_read_lock_mode` (pairs with `repeatable_read`), and documenting `SPANNER_NUM_CHANNELS` in a README tuning note.
 
-- [ ] **SPAN-10 (Low)** — A new Database Admin client is built per DDL statement (incl. create-mode ingests) — `src/statement.rs:1115-1119`
-  Cache it lazily on the connection and clone thereafter.
+- [x] **SPAN-10 (Low)** — A new Database Admin client is built per DDL statement (incl. create-mode ingests) — `src/statement.rs:1115-1119`
+  Cache it lazily on the connection and clone thereafter. *Resolved:* the admin client now lives in a shared `Arc<tokio::sync::OnceCell<DatabaseAdmin>>` on the database's cached `Connected` stack (`SharedDatabaseAdmin` in `src/driver.rs` — the SPAN-1 owner, so a `set_option` that invalidates the stack drops the admin client with it), threaded into every connection/statement; `run_ddl` builds it once via `get_or_try_init` (still inside the update timeout; a failed build stays uncached and retries) and reuses it thereafter.
 
 ## 7. Security
 
