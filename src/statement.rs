@@ -1503,6 +1503,12 @@ impl Optionable for SpannerStatement {
                 // rejected as unsupported.
                 check_ingest_temporary(value)?;
             }
+            OptionStatement::Incremental => {
+                // Incremental `execute_partitions` is not implemented. The spec default
+                // (`false`) is accepted as a no-op so generic clients that always set the option
+                // keep working; `true` is rejected as unsupported (the `Temporary` pattern).
+                check_exec_incremental(value)?;
+            }
             OptionStatement::IngestMode => {
                 // Append into an existing table, or create it (from the ingest data's Arrow schema,
                 // with a synthetic UUID primary key) in the create/replace modes.
@@ -1565,6 +1571,8 @@ impl Optionable for SpannerStatement {
             // Only the spec default (`false`) is ever accepted (see `check_ingest_temporary`), so
             // the driver's state is always `false` — report exactly that.
             OptionStatement::Temporary => Some(false.to_string()),
+            // Same shape: only `false` is ever accepted (see `check_exec_incremental`).
+            OptionStatement::Incremental => Some(false.to_string()),
             // Reported in the spec's canonical `adbc.ingest.mode.*` spelling; unset reports the
             // effective default, `create`.
             OptionStatement::IngestMode => {
@@ -2124,6 +2132,19 @@ fn check_ingest_temporary(value: OptionValue) -> Result<()> {
     }
 }
 
+/// Validate the `adbc.statement.exec.incremental` option. Incremental `execute_partitions` is not
+/// implemented, so only the spec default (`false`, DISABLED, in any of the shared boolean
+/// spellings) is accepted — as a no-op; `true` is rejected as unsupported.
+fn check_exec_incremental(value: OptionValue) -> Result<()> {
+    if bool_option(value)? {
+        Err(not_implemented(
+            "incremental statement execution (adbc.statement.exec.incremental)",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Parse a boolean statement option, accepted as a bool-ish string (`true`/`false`/`1`/`0`/…) or an
 /// integer (`0` = false, non-zero = true).
 fn bool_option(value: OptionValue) -> Result<bool> {
@@ -2438,6 +2459,25 @@ mod tests {
         assert_eq!(error.status, Status::NotImplemented);
         // Malformed values fail boolean coercion, not the temporary-table check.
         let error = check_ingest_temporary(OptionValue::String("maybe".into())).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+    }
+
+    #[test]
+    fn exec_incremental_accepts_false_and_rejects_true() {
+        // The spec default (`false`, in any accepted boolean spelling) is a no-op.
+        for falsy in ["false", "FALSE", "0", "no"] {
+            check_exec_incremental(OptionValue::String(falsy.into())).unwrap();
+        }
+        check_exec_incremental(OptionValue::Int(0)).unwrap();
+        // Incremental execution is not implemented: any truthy value is rejected as such.
+        for truthy in ["true", "TRUE", "1", "yes"] {
+            let error = check_exec_incremental(OptionValue::String(truthy.into())).unwrap_err();
+            assert_eq!(error.status, Status::NotImplemented);
+        }
+        let error = check_exec_incremental(OptionValue::Int(1)).unwrap_err();
+        assert_eq!(error.status, Status::NotImplemented);
+        // Malformed values fail boolean coercion, not the incremental check.
+        let error = check_exec_incremental(OptionValue::String("maybe".into())).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
     }
 

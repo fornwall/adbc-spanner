@@ -2533,3 +2533,54 @@ fn connections_share_one_client_stack_until_an_option_is_set() {
         "set_option must invalidate the cached stack (second CreateSession on the next connection)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SPEC-2: `adbc.statement.exec.incremental` accepts its spec default
+// ---------------------------------------------------------------------------
+
+/// `adbc.statement.exec.incremental` at its spec default (DISABLED, `"false"`) must be an
+/// accept-default no-op — generic clients (e.g. driver-manager shims) write every option's
+/// default unconditionally, so rejecting the default breaks them. Enabling it (`"true"`) stays
+/// `NotImplemented`, and the getter reports the effective `"false"` rather than `NotFound`
+/// (the `adbc.ingest.temporary` pattern). Options are handled entirely client-side, so no RPC
+/// beyond the connection's `CreateSession` is scripted.
+#[test]
+fn exec_incremental_spec_default_is_a_no_op() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "exec_incremental_spec_default_is_a_no_op",
+    );
+
+    let server = MockServer::start(|_| {});
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().expect("new statement");
+
+    // The spec default (`false`) is accepted as a no-op.
+    statement
+        .set_option(
+            OptionStatement::Incremental,
+            OptionValue::String("false".into()),
+        )
+        .expect("setting adbc.statement.exec.incremental=false is a no-op");
+
+    // The getter reports the (only possible) effective value instead of NotFound.
+    assert_eq!(
+        statement
+            .get_option_string(OptionStatement::Incremental)
+            .expect("incremental getter must report the default"),
+        "false"
+    );
+
+    // Enabling incremental execution stays NotImplemented, and the message names the option.
+    let error = statement
+        .set_option(
+            OptionStatement::Incremental,
+            OptionValue::String("true".into()),
+        )
+        .expect_err("adbc.statement.exec.incremental=true must be rejected");
+    assert_eq!(error.status, AdbcStatus::NotImplemented);
+    assert!(
+        error.message.contains("adbc.statement.exec.incremental"),
+        "{error}"
+    );
+}
