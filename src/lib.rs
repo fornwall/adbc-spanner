@@ -179,9 +179,10 @@ pub mod fuzzing {
         crate::connection::like_match(pattern, value)
     }
     /// The first SQL keyword, uppercased — skipping whitespace, comments, and `@{…}` statement
-    /// hints.
+    /// hints. (The driver-internal function returns the keyword borrowed from the input in its
+    /// original case; the uppercasing here keeps the fuzz oracle's historical shape.)
     pub fn first_keyword(sql: &str) -> Option<String> {
-        crate::sql::first_keyword(sql)
+        crate::sql::first_keyword(sql).map(str::to_ascii_uppercase)
     }
     /// Whether the SQL begins with a DML statement (`INSERT`/`UPDATE`/`DELETE`).
     pub fn is_dml(sql: &str) -> bool {

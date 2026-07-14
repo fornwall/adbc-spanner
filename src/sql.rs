@@ -32,7 +32,7 @@ const DML_KEYWORDS: &[&str] = &["INSERT", "UPDATE", "DELETE"];
 
 /// Return `true` if `sql` begins with a DDL statement (ignoring leading whitespace and comments).
 pub(crate) fn is_ddl(sql: &str) -> bool {
-    first_keyword(sql).is_some_and(|kw| DDL_KEYWORDS.contains(&kw.as_str()))
+    first_keyword(sql).is_some_and(|kw| DDL_KEYWORDS.iter().any(|k| kw.eq_ignore_ascii_case(k)))
 }
 
 /// Return `true` if `sql` begins with a DML statement (`INSERT`/`UPDATE`/`DELETE`).
@@ -41,7 +41,7 @@ pub(crate) fn is_ddl(sql: &str) -> bool {
 /// does, since the C ABI exposes only `ExecuteQuery` — onto the read/write transaction path instead
 /// of a read-only single-use one, which Spanner rejects for DML.
 pub(crate) fn is_dml(sql: &str) -> bool {
-    first_keyword(sql).is_some_and(|kw| DML_KEYWORDS.contains(&kw.as_str()))
+    first_keyword(sql).is_some_and(|kw| DML_KEYWORDS.iter().any(|k| kw.eq_ignore_ascii_case(k)))
 }
 
 /// Return `true` if `sql` contains a top-level `THEN RETURN` clause — DML that returns rows
@@ -145,9 +145,9 @@ pub(crate) fn consume_quoted(
 /// A single GoogleSQL lexeme produced by [`lex`]. The pieces partition the input with no gaps or
 /// overlaps: concatenating `Word`/`Quoted`/`Comment` slices and `Other` chars in order reproduces
 /// the source byte-for-byte. That lets a *copying* consumer ([`split_statements`]) rebuild the text
-/// while *skipping* consumers ([`is_dml_returning`], [`named_parameters`])
-/// ignore the lexeme kinds they do not care about — all three sharing one lexer instead of a
-/// hand-rolled comment/quote walker each.
+/// while *skipping* consumers ([`is_dml_returning`], [`named_parameters`], [`first_keyword`])
+/// ignore the lexeme kinds they do not care about — all of them sharing this one lexer instead of
+/// a hand-rolled comment/quote walker each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Lexeme<'a> {
     /// A maximal run of identifier characters (`[A-Za-z0-9_]`): a keyword, identifier or number.
@@ -164,7 +164,8 @@ pub(crate) enum Lexeme<'a> {
 }
 
 /// Tokenize `sql` into [`Lexeme`]s under GoogleSQL's lexical rules (the string/comment structure
-/// shared by DDL/DML batch splitting, `THEN RETURN` detection and `@name` extraction). The lexer
+/// shared by DDL/DML batch splitting, statement classification, `THEN RETURN` detection and
+/// `@name` extraction). The lexer
 /// tracks the trailing identifier run itself so it can recognise raw-literal prefixes (`r'…'`) —
 /// callers never need to; see [`consume_quoted`].
 pub(crate) fn lex(sql: &str) -> Lexer<'_> {
@@ -309,69 +310,56 @@ fn push_statement(statements: &mut Vec<String>, current: &mut String) {
     // batch with `INVALID_ARGUMENT` (silently buffered until commit in manual mode), and would make
     // `strip_trailing_terminators` see two statements for `SELECT 1; -- done`. A segment with real
     // SQL followed by a comment (`SELECT 1 -- done`) still has a leading keyword, so it is kept.
-    if !skip_leading_whitespace_and_comments(trimmed).is_empty() {
+    let has_statement = lex(trimmed).any(|lexeme| match lexeme {
+        Lexeme::Comment(_) => false,
+        Lexeme::Other(c) => !c.is_whitespace(),
+        Lexeme::Word(_) | Lexeme::Quoted(_) => true,
+    });
+    if has_statement {
         statements.push(trimmed.to_string());
     }
     current.clear();
 }
 
-/// Return `sql` with any leading whitespace and `--`/`#`/`/* … */` comments removed, repeatedly,
-/// until the first character is neither whitespace nor the start of a comment (or the input is
-/// exhausted). Shared by [`first_keyword`] and [`push_statement`]; an unterminated comment consumes
-/// the rest of the input, mirroring the lexer in [`split_statements`].
-fn skip_leading_whitespace_and_comments(sql: &str) -> &str {
-    let mut rest = sql.trim_start();
-    loop {
-        if let Some(after) = rest.strip_prefix("--").or_else(|| rest.strip_prefix('#')) {
-            rest = after
-                .find('\n')
-                .map_or("", |i| &after[i + 1..])
-                .trim_start();
-        } else if let Some(after) = rest.strip_prefix("/*") {
-            rest = after
-                .find("*/")
-                .map_or("", |i| &after[i + 2..])
-                .trim_start();
-        } else {
-            break;
-        }
-    }
-    rest
-}
-
-/// The first SQL keyword, uppercased, skipping leading whitespace, `--`/`#`/`/* */` comments, and
+/// The first SQL keyword — the leading ASCII-alphabetic run of the first word, borrowed from
+/// `sql` in its original case (callers compare case-insensitively, so classification allocates
+/// nothing) — skipping leading whitespace, `--`/`#`/`/* */` comments, and
 /// [statement hints](https://cloud.google.com/spanner/docs/reference/standard-sql/query-syntax#statement_hints)
 /// (`@{HINT=value, …}`), which GoogleSQL allows before the statement proper — so hinted DML/DDL is
 /// classified by its real leading keyword, not misread as "no keyword" and routed to the wrong
 /// execution path.
-pub(crate) fn first_keyword(sql: &str) -> Option<String> {
-    let mut rest = skip_leading_whitespace_and_comments(sql);
-    while let Some(after) = rest.strip_prefix("@{") {
-        rest = skip_leading_whitespace_and_comments(skip_hint_body(after));
-    }
-    let word: String = rest.chars().take_while(char::is_ascii_alphabetic).collect();
-    (!word.is_empty()).then(|| word.to_ascii_uppercase())
-}
-
-/// Skip the body of a statement hint whose opening `@{` has already been consumed, returning the
-/// remainder after the matching `}`. A `}` inside a string literal within the hint (hint values
-/// may be literals) does not close it — literals are consumed via [`consume_quoted`]. An
-/// unterminated hint consumes the rest of the input, mirroring how unterminated comments are
-/// handled above.
-fn skip_hint_body(after: &str) -> &str {
-    let mut chars = after.chars().peekable();
-    let mut consumed = 0usize;
-    while let Some(c) = chars.next() {
-        consumed += c.len_utf8();
-        match c {
-            '}' => return &after[consumed..],
-            '\'' | '"' | '`' => {
-                consume_quoted(&mut chars, c, false, |ch| consumed += ch.len_utf8());
+///
+/// The scan is delegated to the shared [`lex`] tokenizer (the same rules as
+/// [`split_statements`]/[`named_parameters`]): a hint body is lexed normally, so a `}` inside a
+/// string literal in the hint does not close it, and an unterminated hint or comment consumes the
+/// rest of the input — no keyword. Anything else before the first word — a quoted
+/// identifier/literal, punctuation, a bare `@param`/`@@var` — means the input does not start with
+/// a keyword, as does a first word that does not start with an ASCII letter.
+pub(crate) fn first_keyword(sql: &str) -> Option<&str> {
+    let mut lexemes = lex(sql).peekable();
+    while let Some(lexeme) = lexemes.next() {
+        match lexeme {
+            Lexeme::Comment(_) => {}
+            Lexeme::Other(c) if c.is_whitespace() => {}
+            // A statement hint `@{…}` (the two markers are adjacent by construction — each
+            // `Other` is a single character): skip through its closing `}`.
+            Lexeme::Other('@') if lexemes.peek() == Some(&Lexeme::Other('{')) => {
+                for hint_lexeme in lexemes.by_ref() {
+                    if hint_lexeme == Lexeme::Other('}') {
+                        break;
+                    }
+                }
             }
-            _ => {}
+            Lexeme::Word(word) => {
+                let end = word
+                    .find(|c: char| !c.is_ascii_alphabetic())
+                    .unwrap_or(word.len());
+                return (end > 0).then(|| &word[..end]);
+            }
+            Lexeme::Quoted(_) | Lexeme::Other(_) => return None,
         }
     }
-    ""
+    None
 }
 
 /// Extract the distinct named parameters (`@name`) referenced by `sql`, in order of first
@@ -532,6 +520,35 @@ mod tests {
         assert!(!is_dml(hinted_query) && !is_ddl(hinted_query));
         // An unterminated hint swallows the rest — no keyword, like an unterminated comment.
         assert!(!is_dml("@{oops UPDATE t SET c = 1"));
+    }
+
+    #[test]
+    fn first_keyword_edge_cases() {
+        // The keyword is borrowed from the input in its original case (callers compare
+        // case-insensitively), after skipping whitespace, all comment forms, and hints.
+        assert_eq!(first_keyword("select 1"), Some("select"));
+        assert_eq!(first_keyword("-- c\n# h\n/* b */ Update t"), Some("Update"));
+        assert_eq!(
+            first_keyword("@{A=1} @{B='}'} DELETE FROM t"),
+            Some("DELETE")
+        );
+        // Empty / whitespace / comment-only / unterminated-comment input has no keyword.
+        for sql in ["", "  \n\t", "-- only\n /* comments */", "/* unterminated"] {
+            assert_eq!(first_keyword(sql), None, "no keyword in {sql:?}");
+        }
+        // A leading quoted identifier or literal is not a keyword.
+        assert_eq!(first_keyword("`select` 1"), None);
+        assert_eq!(first_keyword("'select'"), None);
+        // Only the leading ASCII-alphabetic run counts: a digit or `_` ends it, and a word that
+        // does not *start* with an ASCII letter carries no keyword at all.
+        assert_eq!(first_keyword("select_into x"), Some("select"));
+        assert_eq!(first_keyword("_select 1"), None);
+        assert_eq!(first_keyword("9select 1"), None);
+        // A bare `@param` / `@@var` (not a `@{…}` hint) is not a keyword, and a space between
+        // `@` and `{` is not a hint either.
+        assert_eq!(first_keyword("@p"), None);
+        assert_eq!(first_keyword("@@seed UPDATE t"), None);
+        assert_eq!(first_keyword("@ {A=1} SELECT 1"), None);
     }
 
     #[test]
