@@ -949,7 +949,16 @@ fn build_list(field: &FieldRef, values: &[Option<&Value>]) -> Result<ArrayRef> {
             }
             Some(v) => return Err(decode_error("ARRAY", v)),
         }
-        offsets.push(children.len() as i32);
+        // Checked, mirroring `nested::list_of_nullable`: `children.len()` is the running element
+        // total, so a failed conversion is the offset accumulation overflowing i32 — error out
+        // rather than wrap silently.
+        let offset = i32::try_from(children.len()).map_err(|_| {
+            err(
+                "ARRAY result exceeds the i32 offset range",
+                Status::Internal,
+            )
+        })?;
+        offsets.push(offset);
     }
     let child = build_array(field.data_type(), &children)?;
     let list = ListArray::try_new(

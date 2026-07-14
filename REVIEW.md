@@ -110,8 +110,8 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 - [ ] **CONV-3 (Medium)** — `INTERVAL` missing from `is_groupable`'s non-groupable list can break `get_statistics` for the whole database — `src/statistics.rs:328-335`
   `COUNT(DISTINCT interval_col)` fails the per-table aggregate and the error propagates out of `collect_statistics`, so one INTERVAL column anywhere fails the entire call. The function's own doc says the list must stay complete. **Fix:** add `INTERVAL` (excluding a groupable type is always safe; the reverse fails the whole scan). Check `UUID` on the emulator while at it.
 
-- [ ] **CONV-4 (Low)** — Unchecked `children.len() as i32` offset cast in `build_list`, inconsistent with `nested.rs` — `src/conversion.rs:948`
-  `nested.rs:76-89` does checked `i32::try_from` + `checked_add`; `build_list` wraps silently. Practically unreachable, but it's the silent-corruption class the file otherwise eliminates. **Fix:** mirror the checked pattern.
+- [x] **CONV-4 (Low)** — Unchecked `children.len() as i32` offset cast in `build_list`, inconsistent with `nested.rs` — `src/conversion.rs:948`
+  `nested.rs:76-89` does checked `i32::try_from` + `checked_add`; `build_list` wraps silently. Practically unreachable, but it's the silent-corruption class the file otherwise eliminates. **Fix:** mirror the checked pattern. *Resolved:* `build_list` now pushes each offset via `i32::try_from(children.len())` (the running total, so one checked conversion is the whole check) and errors with `Status::Internal` ("ARRAY result exceeds the i32 offset range"), mirroring `nested::list_of_nullable`; happy-path offsets stay covered by the existing list round-trip tests.
 
 - [ ] **CONV-5 (Low)** — Write-back asymmetry for ENUM / PROTO / INTERVAL / UUID is undocumented (unlike JSON's) — `src/conversion.rs:691-694`, `src/bind.rs`
   Values read from these columns can't be bound back via DML params (untyped params infer INT64/BYTES/STRING; Spanner won't coerce), though mutation-based ingest works. JSON got the `arrow.json` mechanism + docs; these got neither. **Fix:** at minimum document the `CAST(@p AS …)` workaround in the type-mapping docs.
