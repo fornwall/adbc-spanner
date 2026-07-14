@@ -127,8 +127,8 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 - [ ] **PERF-1 (Medium)** — Bound-query stream has no prefetch; fetch and conversion fully serialized — `src/conversion.rs:514-553`
   Unlike `SpannerBatchReader`, `BoundQueryBatchReader::next` fetches inline, so chunk N+1's fetch waits for chunk N's conversion *and* consumption — the `executemany`-style SELECT case degrades to strictly alternating I/O and CPU. **Fix:** implement `ChunkSource` over `(transaction, statements, result_set)` and route through `spawn_prefetch` like `stream_query`.
 
-- [ ] **PERF-2 (Low)** — One heap `Vec` allocated and freed per BYTES cell — `src/conversion.rs:892-904`
-  `STANDARD.decode(s)` allocates per cell, then `append_value` copies again. **Fix:** a reused scratch `Vec` + `decode_vec` (buffer *reuse*, not the pre-sizing that previously regressed).
+- [x] **PERF-2 (Low)** — One heap `Vec` allocated and freed per BYTES cell — `src/conversion.rs:892-904`
+  `STANDARD.decode(s)` allocates per cell, then `append_value` copies again. **Fix:** a reused scratch `Vec` + `decode_vec` (buffer *reuse*, not the pre-sizing that previously regressed). *Resolved:* the `DataType::Binary` arm of `build_array` hoists one scratch `Vec<u8>` above the row loop and decodes each cell via `STANDARD.decode_vec` (cleared per cell — `decode_vec` appends), keeping the strict decode-error semantics; nested ARRAY/STRUCT recurse through the same arm. Measured ~11% faster on the new `bytes_binary` bench in `benches/conversion.rs` (8192 rows × 48 decoded bytes: 242 µs → 214 µs/chunk).
 
 - [ ] **PERF-3 (Low)** — Residual chrono cost per DATE/TIMESTAMP cell — `src/conversion.rs:1052-1054` + timestamp arms
   Each DATE cell builds two `NaiveDate`s (value + re-derived epoch); each TIMESTAMP runs the full ymd/hms/nanos chain. **Ideas:** days-from-civil formula (or `num_days_from_ce() - 719_162`) for dates; memoize the last 10-byte date prefix → epoch-days for timestamps (result sets cluster on one day). Bench with `bench_support` before/after.
