@@ -127,6 +127,14 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
     return "@p" + std::to_string(index);
   }
 
+  // GoogleSQL quotes identifiers with backticks, not ANSI double quotes (which
+  // GoogleSQL reserves for string literals). The hook (apache/arrow-adbc#4504)
+  // feeds the suite's ingest/prepare readback and DDL statements, so they are
+  // valid GoogleSQL instead of failing on the quoting itself.
+  std::string QuoteIdentifier(std::string_view name) const override {
+    return "`" + std::string(name) + "`";
+  }
+
   // GoogleSQL has no bare `FLOAT` type. The suite's float cases default to
   // `SELECT CAST(1.5 AS FLOAT)`, which Spanner rejects; rewrite them to the
   // GoogleSQL 64-bit floating-point type `FLOAT64` (the generic per-query
@@ -186,9 +194,10 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   // unnamed catalog "", and has named-schema support), so declare them rather than
   // hiding the cases behind a false quirk. The two families then diverge:
   //   - SqlIngest{BinaryView,StringView} *run* and fail with the rest of the
-  //     ingest-readback family (blocked by the suite's hardcoded `SELECT *`
-  //     readback) — an excluded expected-failure that flips to passing once that
-  //     readback is fixed.
+  //     ingest-readback family (the suite's `SELECT *` readback also surfaces
+  //     the driver's synthetic `adbc_ingest_key` column, breaking the
+  //     single-column assertions) — an excluded expected-failure that flips to
+  //     passing once that readback is fixed.
   //   - SqlIngest{TargetCatalog,TargetSchema,TargetCatalogSchema} only ingest and
   //     never read back, so they pass cleanly and are gate-enforced (not excluded).
   bool supports_ingest_view_types() const override { return true; }

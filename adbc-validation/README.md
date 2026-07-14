@@ -142,8 +142,8 @@ silently-disarmed `rust-asan` leg goes red instead of green.
   one `SqlIngest*` case with no non-Spanner DDL or `SELECT *` readback to block it).
 
 The gate runs **every case except the documented `EXCLUDED` expected-failures**
-(see the next section), and they all pass or self-skip — today **45 cases, 0
-self-skip**. `DatabaseTest` and `ConnectionTest` pass in full; from `StatementTest`
+(see the next section), and they all pass or self-skip — today **58 cases: 52
+pass, 6 self-skip**. `DatabaseTest` and `ConnectionTest` pass in full; from `StatementTest`
 everything but the `EXCLUDED` list in `scripts/run-adbc-validation.sh` runs here.
 `SpannerQuirks::supports_bulk_ingest` declares
 all four ingest modes (append, create, create_append, replace — the create
@@ -191,9 +191,9 @@ guard — no emulator required — with:
 scripts/run-adbc-validation.sh --check-drift
 ```
 
-Today `EXCLUDED` holds **45** cases (55 non-excluded cases — 49 passing plus 6 that
+Today `EXCLUDED` holds **42** cases (58 non-excluded cases — 52 passing plus 6 that
 self-skip: `Transactions`, `SqlIngestFloat16`, and the four `SqlIngestTemporary*` —
-+ 45 excluded = 100 upstream cases total).
++ 42 excluded = 100 upstream cases total).
 
 Six cases are deliberately **not** excluded because they **self-skip**, which the
 gate tolerates — so they need no expected-failure bookkeeping. Each is inapplicable
@@ -229,19 +229,20 @@ aborts — see the note below) or self-skips; they fall into the following bucke
 none of them incremental driver work:
 
 - **Suite-internal non-Spanner DDL** — several cases issue hardcoded
-  `CREATE TABLE x (foo INT)` / `TEXT` / `FLOAT` with no primary key and
-  double-quoted identifiers. There is no quirks hook for these, and they are not
-  valid Spanner DDL (which needs `INT64`/`FLOAT64`, a `PRIMARY KEY`, backtick
-  quoting). Covers e.g. `SqlBind`, `SqlQueryEmpty`,
-  `SqlQueryRowsAffectedDelete`.
+  `CREATE TABLE x (foo INT)` / `TEXT` / `FLOAT` with no primary key. There is no
+  quirks hook for the DDL text, and it is not valid Spanner DDL (which needs
+  `INT64`/`FLOAT64` and a `PRIMARY KEY`). Identifier *quoting* is no longer part
+  of the blocker: `DriverQuirks::QuoteIdentifier` (apache/arrow-adbc#4504,
+  overridden to GoogleSQL backticks in `spanner_validation.cc`) now feeds the
+  statements that used ANSI double quotes, but the type/primary-key problems
+  remain. Covers e.g. `SqlBind`, `SqlQueryEmpty`, `SqlQueryRowsAffectedDelete`.
 - **Ingest readback** — the driver supports create-mode ingest (with a
   synthetic `adbc_ingest_key` UUID primary key, since Spanner mandates one),
   and since the quirks declare it the `SqlIngest*` cases now *run* under
   `--full` instead of skipping — but the readback cases remain blocked (the
-  error-path-only `SqlIngestErrors`, which needs no readback, is gated): they read
-  the data
-  back via a hardcoded double-quoted `SELECT * FROM "bulk_ingest" ORDER BY "col" …`
-  (not valid GoogleSQL, no quirks hook), and `SELECT *` would also surface the
+  error-path-only `SqlIngestErrors`, which needs no readback, is gated): their
+  `SELECT * FROM bulk_ingest …` readback is valid GoogleSQL now that
+  `DriverQuirks::QuoteIdentifier` backtick-quotes it, but `SELECT *` surfaces the
   synthetic key column, breaking the single-column result assertions. Where the
   value is separable — the ingest **identifier-escaping** tests (reserved-word
   table/column names) — it is captured natively instead: the driver quotes
