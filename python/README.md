@@ -120,8 +120,8 @@ endpoint options are:
 | `ENDPOINT`                     | `spanner.endpoint`                            | Explicit gRPC endpoint (e.g. an emulator at `localhost:9010`); defaults to production Spanner.   |
 | `EMULATOR`                     | `spanner.emulator`                            | `"true"` to connect with anonymous credentials for the emulator.                                |
 | `KEYFILE`                      | `spanner.auth.keyfile`                        | Path to a service-account / credential JSON file (default: Application Default Credentials).     |
-| `KEYFILE_JSON`                 | `spanner.auth.keyfile_json`                   | The same credential JSON passed inline as a string instead of a file path.                      |
-| `ACCESS_TOKEN`                 | `spanner.auth.access_token`                   | OAuth 2.0 bearer token sent verbatim (no refresh); mutually exclusive with the keyfile / impersonation options. |
+| `KEYFILE_JSON`                 | `spanner.auth.keyfile_json`                   | The same credential JSON passed inline as a string instead of a file path. Write-only: never readable back via `get_option`. |
+| `ACCESS_TOKEN`                 | `spanner.auth.access_token`                   | OAuth 2.0 bearer token sent verbatim (no refresh); mutually exclusive with the keyfile / impersonation options. Write-only: never readable back via `get_option`. |
 | `IMPERSONATE_TARGET_PRINCIPAL` | `spanner.auth.impersonate.target_principal`   | Service account to impersonate on top of the base credentials.                                  |
 | `IMPERSONATE_DELEGATES`        | `spanner.auth.impersonate.delegates`          | Delegation chain for impersonation — a comma-separated string of emails.                         |
 | `IMPERSONATE_SCOPES`           | `spanner.auth.impersonate.scopes`             | OAuth scopes for the impersonated token (comma-separated; default cloud-platform).              |
