@@ -69,14 +69,21 @@ jobs:
         # first; the committed seed corpus is passed read-alongside so runs with a cold
         # cache still start with meaningful coverage. Not every target has seeds (e.g.
         # `options`).
+        #
+        # Expressions are passed through `env:` rather than interpolated into the script,
+        # so no `${{ }}` value (in particular the workflow_dispatch input) is ever
+        # substituted into shell source.
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+          MAX_TOTAL_TIME: ${{ github.event.inputs.max_total_time || '1200' }}
         run: |
-          mkdir -p "fuzz/corpus/${{ matrix.target }}"
-          seeds="fuzz/seeds/${{ matrix.target }}"
+          mkdir -p "fuzz/corpus/$FUZZ_TARGET"
+          seeds="fuzz/seeds/$FUZZ_TARGET"
           [ -d "$seeds" ] || seeds=""
-          cargo +nightly fuzz run ${{ matrix.target }} \
+          cargo +nightly fuzz run "$FUZZ_TARGET" \
             --target x86_64-unknown-linux-gnu \
-            "fuzz/corpus/${{ matrix.target }}" $seeds -- \
-            -max_total_time=${{ github.event.inputs.max_total_time || '1200' }} \
+            "fuzz/corpus/$FUZZ_TARGET" ${seeds:+"$seeds"} -- \
+            -max_total_time="$MAX_TOTAL_TIME" \
             -rss_limit_mb=4096
 
       - name: Upload any crash artifacts

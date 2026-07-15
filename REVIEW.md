@@ -194,8 +194,8 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 - [ ] **SEC-3 (Low)** — Partition-descriptor "executable, unauthenticated" caveat is rustdoc-only — `README.md` partitioned-execution bullet, `python/README.md`
   The primary consumers of descriptors-as-bytes (Python/driver-manager users) never see the `read_partition` `# Security` rustdoc. One sentence in each README.
 
-- [ ] **SEC-4 (Low)** — `workflow_dispatch` input interpolated directly into a shell script — `.github/workflows/fuzz.yml:79`
-  `-max_total_time=${{ github.event.inputs.max_total_time || '1200' }}` in `run:`. Requires dispatch access and the job is `contents: read`, but it's the one deviation from otherwise clean expression hygiene. **Fix:** pass via `env:`.
+- [x] **SEC-4 (Low)** — `workflow_dispatch` input interpolated directly into a shell script — `.github/workflows/fuzz.yml:79`
+  `-max_total_time=${{ github.event.inputs.max_total_time || '1200' }}` in `run:`. Requires dispatch access and the job is `contents: read`, but it's the one deviation from otherwise clean expression hygiene. **Fix:** pass via `env:`. *Resolved:* the fuzz step now passes both expressions through step-level `env:` (`MAX_TOTAL_TIME` for the dispatch input, `FUZZ_TARGET` for the — repo-controlled, but same hygiene — matrix value) and the script references only quoted `"$VAR"` expansions, matching the `report-failure` job's existing style; no `${{ }}` remains inside any `run:` block in the workflow.
 
 - [ ] **SEC-5 (Low)** — No driver-side depth cap on nested STRUCT/ARRAY type recursion from the server — `src/conversion.rs:658-696`
   A hostile endpoint (attacker-controlled `SPANNER_EMULATOR_HOST`) returning pathological `STRUCT<STRUCT<…>>` metadata could drive stack exhaustion (abort, not corruption — but it kills the host app embedding the cdylib). Likely bounded in practice by prost's decode recursion limit (default 100) — **verify that limit holds on the pinned transport, or add a cheap depth check in `arrow_type`**. Re-verify on every `google-cloud-rust` rev bump.
