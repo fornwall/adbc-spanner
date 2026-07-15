@@ -1282,6 +1282,34 @@ mod tests {
     }
 
     #[test]
+    fn boolean_options_reject_int_typed_sets() {
+        // COR-4: boolean options take the strings "true"/"false", never OptionValue::Int — an
+        // int set would not round-trip through the getters (which serve the canonical string),
+        // and no surveyed ADBC driver accepts SetOptionInt for a boolean option.
+        let mut db = new_database();
+        let emulator = || OptionDatabase::Other(OPTION_EMULATOR.into());
+
+        for i in [0, 1] {
+            let error = db.set_option(emulator(), OptionValue::Int(i)).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "Int({i})");
+            assert!(error.message.contains(OPTION_EMULATOR), "{}", error.message);
+            assert!(
+                error.message.contains("\"true\"/\"false\""),
+                "{}",
+                error.message
+            );
+        }
+
+        // The string forms still work and read back canonically.
+        db.set_option(emulator(), OptionValue::String("true".into()))
+            .unwrap();
+        assert_eq!(db.get_option_string(emulator()).unwrap(), "true");
+        db.set_option(emulator(), OptionValue::String("false".into()))
+            .unwrap();
+        assert_eq!(db.get_option_string(emulator()).unwrap(), "false");
+    }
+
+    #[test]
     fn connecting_without_a_database_path_is_an_error() {
         let db = new_database();
         let error = db.connect().unwrap_err();

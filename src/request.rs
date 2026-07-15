@@ -159,7 +159,7 @@ impl RequestConfig {
     }
 
     /// Handle a `set_option` for `spanner.commit_stats`. An empty string unsets it (back to the
-    /// default of not requesting stats); otherwise a bool-ish value (`true`/`false`/`1`/`0`/…).
+    /// default of not requesting stats); otherwise a bool-ish string (`true`/`false`/`1`/`0`/…).
     pub(crate) fn set_commit_stats(&mut self, value: OptionValue) -> Result<()> {
         if let OptionValue::String(s) = &value
             && s.trim().is_empty()
@@ -488,12 +488,14 @@ mod tests {
         // Default is off, always reported as an effective boolean.
         assert_eq!(config.commit_stats_string(), "false");
 
-        // Accepts the shared bool-ish spellings (string and integer).
+        // Accepts the shared bool-ish string spellings.
         for truthy in ["true", "1", "yes", "TRUE"] {
             config.set_commit_stats(s(truthy)).unwrap();
             assert_eq!(config.commit_stats_string(), "true", "{truthy}");
         }
-        config.set_commit_stats(OptionValue::Int(1)).unwrap();
+        // An int-typed set is rejected (COR-4) and leaves the stored value untouched.
+        let error = config.set_commit_stats(OptionValue::Int(1)).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
         assert_eq!(config.commit_stats_string(), "true");
         for falsy in ["false", "0", "no"] {
             config.set_commit_stats(s(falsy)).unwrap();

@@ -45,7 +45,7 @@ use crate::error::{
     err, from_builder, from_spanner, from_status_parts, invalid_argument, invalid_state,
     not_implemented,
 };
-use crate::options::impl_shared_option_dispatch;
+use crate::options::{bool_option, impl_shared_option_dispatch};
 use crate::query_options::QueryOptionsConfig;
 use crate::request::{CommitStats, RequestConfig};
 use crate::retry::RetryConfig;
@@ -1537,7 +1537,7 @@ impl Optionable for SpannerStatement {
                 self.rows_per_batch = rows_per_batch_option(value)?;
             }
             OptionStatement::Other(k) if k == crate::OPTION_DATA_BOOST => {
-                self.data_boost = bool_option(value)?;
+                self.data_boost = bool_option(value, "option spanner.data_boost")?;
             }
             OptionStatement::Other(k) if k == crate::OPTION_MAX_PARTITIONS => {
                 self.max_partitions = Some(max_partitions_option(value)?);
@@ -2140,7 +2140,7 @@ fn ingest_mode_option(value: OptionValue) -> Result<IngestMode> {
 /// default (`false`, in any of the shared boolean spellings) is accepted — as a no-op; `true` is
 /// rejected as unsupported.
 fn check_ingest_temporary(value: OptionValue) -> Result<()> {
-    if bool_option(value)? {
+    if bool_option(value, "option adbc.ingest.temporary")? {
         Err(not_implemented(
             "temporary ingest target tables: Spanner has no temporary tables",
         ))
@@ -2153,7 +2153,7 @@ fn check_ingest_temporary(value: OptionValue) -> Result<()> {
 /// implemented, so only the spec default (`false`, DISABLED, in any of the shared boolean
 /// spellings) is accepted — as a no-op; `true` is rejected as unsupported.
 fn check_exec_incremental(value: OptionValue) -> Result<()> {
-    if bool_option(value)? {
+    if bool_option(value, "option adbc.statement.exec.incremental")? {
         Err(not_implemented(
             "incremental statement execution (adbc.statement.exec.incremental)",
         ))
@@ -2162,15 +2162,9 @@ fn check_exec_incremental(value: OptionValue) -> Result<()> {
     }
 }
 
-/// Parse a boolean statement option, accepted as a bool-ish string (`true`/`false`/`1`/`0`/…) or an
-/// integer (`0` = false, non-zero = true).
-fn bool_option(value: OptionValue) -> Result<bool> {
-    crate::options::bool_option(value, "option")
-}
-
 /// Parse the `spanner.ingest.batch_write` statement option. Like the driver's other unset-able
 /// booleans (`spanner.commit_stats`), an empty/whitespace string unsets it (back to `false`, the
-/// write-only-transaction path); otherwise it is a bool-ish value.
+/// write-only-transaction path); otherwise it is a bool-ish string.
 fn ingest_batch_write_option(value: OptionValue) -> Result<bool> {
     match &value {
         OptionValue::String(s) if s.trim().is_empty() => Ok(false),
@@ -2466,17 +2460,17 @@ mod tests {
         for falsy in ["false", "FALSE", "0", "no"] {
             check_ingest_temporary(OptionValue::String(falsy.into())).unwrap();
         }
-        check_ingest_temporary(OptionValue::Int(0)).unwrap();
         // Spanner has no temporary tables: any truthy value is rejected as unimplemented.
         for truthy in ["true", "TRUE", "1", "yes"] {
             let error = check_ingest_temporary(OptionValue::String(truthy.into())).unwrap_err();
             assert_eq!(error.status, Status::NotImplemented);
         }
-        let error = check_ingest_temporary(OptionValue::Int(1)).unwrap_err();
-        assert_eq!(error.status, Status::NotImplemented);
-        // Malformed values fail boolean coercion, not the temporary-table check.
-        let error = check_ingest_temporary(OptionValue::String("maybe".into())).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
+        // Malformed values fail boolean coercion, not the temporary-table check — and so do
+        // int-typed sets (boolean options take strings only; COR-4).
+        for bad in [OptionValue::String("maybe".into()), OptionValue::Int(0)] {
+            let error = check_ingest_temporary(bad).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+        }
     }
 
     #[test]
@@ -2485,37 +2479,38 @@ mod tests {
         for falsy in ["false", "FALSE", "0", "no"] {
             check_exec_incremental(OptionValue::String(falsy.into())).unwrap();
         }
-        check_exec_incremental(OptionValue::Int(0)).unwrap();
         // Incremental execution is not implemented: any truthy value is rejected as such.
         for truthy in ["true", "TRUE", "1", "yes"] {
             let error = check_exec_incremental(OptionValue::String(truthy.into())).unwrap_err();
             assert_eq!(error.status, Status::NotImplemented);
         }
-        let error = check_exec_incremental(OptionValue::Int(1)).unwrap_err();
-        assert_eq!(error.status, Status::NotImplemented);
-        // Malformed values fail boolean coercion, not the incremental check.
-        let error = check_exec_incremental(OptionValue::String("maybe".into())).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
+        // Malformed values fail boolean coercion, not the incremental check — and so do int-typed
+        // sets (boolean options take strings only; COR-4).
+        for bad in [OptionValue::String("maybe".into()), OptionValue::Int(0)] {
+            let error = check_exec_incremental(bad).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+        }
     }
 
     #[test]
     fn ingest_batch_write_option_coerces_and_unsets_on_empty() {
-        // Every accepted truthy / falsy spelling coerces, as a string or an int.
+        // Every accepted truthy / falsy string spelling coerces.
         for truthy in ["true", "TRUE", "1", "yes"] {
             assert!(ingest_batch_write_option(OptionValue::String(truthy.into())).unwrap());
         }
         for falsy in ["false", "FALSE", "0", "no"] {
             assert!(!ingest_batch_write_option(OptionValue::String(falsy.into())).unwrap());
         }
-        assert!(ingest_batch_write_option(OptionValue::Int(1)).unwrap());
-        assert!(!ingest_batch_write_option(OptionValue::Int(0)).unwrap());
         // Empty / whitespace unsets it, back to the default (false) — never an error.
         for empty in ["", "   "] {
             assert!(!ingest_batch_write_option(OptionValue::String(empty.into())).unwrap());
         }
-        // A non-bool string is rejected with InvalidArguments (the shared boolean coercion).
-        let error = ingest_batch_write_option(OptionValue::String("maybe".into())).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
+        // A non-bool string — or an int-typed set (COR-4) — is rejected with InvalidArguments
+        // (the shared boolean coercion).
+        for bad in [OptionValue::String("maybe".into()), OptionValue::Int(1)] {
+            let error = ingest_batch_write_option(bad).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+        }
     }
 
     #[test]
@@ -2644,30 +2639,32 @@ mod tests {
     }
 
     #[test]
-    fn bool_option_parses_bool_ish_strings_and_ints() {
+    fn bool_option_parses_bool_ish_strings() {
         // Accepted truthy / falsy spellings, case-insensitive.
         for truthy in ["true", "TRUE", "True", "1", "yes", "YES"] {
-            assert!(bool_option(OptionValue::String(truthy.into())).unwrap());
+            assert!(bool_option(OptionValue::String(truthy.into()), "option o").unwrap());
         }
         for falsy in ["false", "FALSE", "False", "0", "no", "NO"] {
-            assert!(!bool_option(OptionValue::String(falsy.into())).unwrap());
+            assert!(!bool_option(OptionValue::String(falsy.into()), "option o").unwrap());
         }
-        // Integers: zero is false, any non-zero is true.
-        assert!(!bool_option(OptionValue::Int(0)).unwrap());
-        assert!(bool_option(OptionValue::Int(1)).unwrap());
-        assert!(bool_option(OptionValue::Int(-1)).unwrap());
     }
 
     #[test]
     fn bool_option_rejects_non_bool_values() {
         // A string that is not a recognised boolean spelling.
         for bad in ["maybe", "", "2", "t", "on"] {
-            let error = bool_option(OptionValue::String(bad.into())).unwrap_err();
+            let error = bool_option(OptionValue::String(bad.into()), "option o").unwrap_err();
             assert_eq!(error.status, Status::InvalidArguments);
         }
-        // A non-string, non-int value kind is rejected outright.
-        let error = bool_option(OptionValue::Double(1.0)).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
+        // Non-string value kinds — including int-typed sets (COR-4) — are rejected outright.
+        for bad in [
+            OptionValue::Int(0),
+            OptionValue::Int(1),
+            OptionValue::Double(1.0),
+        ] {
+            let error = bool_option(bad, "option o").unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+        }
     }
 
     #[test]
@@ -2677,15 +2674,19 @@ mod tests {
         let what = "option adbc.statement.bind_by_name";
         assert!(crate::options::bool_option(OptionValue::String("true".into()), what).unwrap());
         assert!(!crate::options::bool_option(OptionValue::String("false".into()), what).unwrap());
-        assert!(crate::options::bool_option(OptionValue::Int(1), what).unwrap());
-        let error =
-            crate::options::bool_option(OptionValue::String("maybe".into()), what).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
-        assert!(
-            error.message.contains("adbc.statement.bind_by_name"),
-            "{}",
-            error.message
-        );
+        for bad in [
+            OptionValue::String("maybe".into()),
+            // An int-typed set is rejected like any other non-string value (COR-4).
+            OptionValue::Int(1),
+        ] {
+            let error = crate::options::bool_option(bad, what).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+            assert!(
+                error.message.contains("adbc.statement.bind_by_name"),
+                "{}",
+                error.message
+            );
+        }
     }
 
     #[test]
