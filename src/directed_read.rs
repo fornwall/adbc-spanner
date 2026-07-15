@@ -52,6 +52,7 @@ use google_cloud_spanner::model::directed_read_options::{
 use google_cloud_spanner::statement::StatementBuilder;
 
 use crate::error::invalid_argument;
+use crate::options::string_option;
 
 /// The replica-selection mode: an ordered *include* preference or an *exclude* set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,7 +133,7 @@ pub(crate) struct DirectedRead {
 impl DirectedRead {
     /// Handle a `set_option` for `spanner.directed_read`. An empty value unsets it.
     pub(crate) fn set(&mut self, value: OptionValue) -> Result<()> {
-        let raw = as_string(value)?;
+        let raw = string_option(value, crate::OPTION_DIRECTED_READ)?;
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             self.raw = None;
@@ -157,16 +158,6 @@ impl DirectedRead {
             Some(spec) => builder.set_directed_read_options(spec.to_options()),
             None => builder,
         }
-    }
-}
-
-/// Extract a string from an option value, erroring on any other value kind.
-fn as_string(value: OptionValue) -> Result<String> {
-    match value {
-        OptionValue::String(s) => Ok(s),
-        _ => Err(invalid_argument(
-            "spanner.directed_read requires a string value",
-        )),
     }
 }
 
