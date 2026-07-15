@@ -3462,3 +3462,206 @@ fn exec_incremental_spec_default_is_a_no_op() {
         "{error}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Retry-limit accounting per RPC path (UP-14)
+// ---------------------------------------------------------------------------
+
+// The pinned client runs two *different* retry loops, and they account for attempts differently —
+// so `spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds` do not mean the same thing
+// on every path. These tests pin the exact, observed numbers on one path of each kind, so the
+// asymmetry is a checked fact rather than a claim in a comment, and so a `google-cloud-rust` rev
+// bump that fixes it upstream (UP-14) fails here loudly instead of silently changing what a
+// caller's option means. See `src/retry.rs`'s module doc for the user-facing statement of this.
+//
+// - **Unary** RPCs (`ExecuteBatchDml`, `ExecuteSql`, `BeginTransaction`, `Commit`) go through gax's
+//   `retry_loop`, which increments `RetryState::attempt_count` *before* each attempt and pins
+//   `RetryState::start` to the real loop start. Both limits are then exact.
+// - **Server-streaming** `ExecuteStreamingSql` is dispatched outside `retry_loop`; the client
+//   hand-rolls stream resumption in `ResultSet::check_retry`, seeding `RetryState` with its own
+//   `retry_count` (retries *so far* — 0 on the first failure) and a fresh `Instant::now()` start.
+//   So the attempt limit permits one attempt too many, and the elapsed-time limit never fires.
+
+/// How many attempts each probe's mock serves before giving up with a permanent error. A retry
+/// limit that never fires stops here rather than hanging the test.
+const RETRY_PROBE_CAP: usize = 20;
+
+/// Set the retry knobs a probe shares: a constant 10ms backoff, so an attempt budget is spent in
+/// milliseconds rather than the client's default 1s-doubling backoff.
+fn set_constant_backoff(statement: &mut impl Statement) {
+    for (key, value) in [
+        (adbc_spanner::OPTION_RETRY_BACKOFF_INITIAL_SECONDS, 0.01),
+        (adbc_spanner::OPTION_RETRY_BACKOFF_MULTIPLIER, 1.0),
+    ] {
+        statement
+            .set_option(
+                OptionStatement::Other(key.into()),
+                OptionValue::Double(value),
+            )
+            .expect("set backoff knob");
+    }
+}
+
+/// Count the `ExecuteStreamingSql` attempts a query makes when every attempt fails, under the
+/// retry option `key` = `value`.
+///
+/// The fault is delivered **inside** the result stream, and that is load-bearing: the pinned client
+/// dispatches server-streaming RPCs outside gax's retry loop (`server_streaming/builder.rs`'s
+/// `send()` issues the RPC with no retry loop of its own), so an `UNAVAILABLE` returned as the
+/// *initial* RPC status is never retried no matter what the policy says — scripting it that way
+/// would make this probe vacuous. Only a status arriving mid-stream reaches `ResultSet::check_retry`
+/// and therefore the configured policy.
+fn streaming_attempts(key: &str, value: OptionValue) -> usize {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_in_mock = calls.clone();
+    let server = MockServer::start(move |mock| {
+        mock.expect_execute_streaming_sql().returning(move |_| {
+            let n = calls_in_mock.fetch_add(1, Ordering::SeqCst);
+            if n >= RETRY_PROBE_CAP {
+                return Err(tonic::Status::internal("mock server: probe cap reached"));
+            }
+            // One row, then the stream dies. Spanner sends the row type exactly once, on the first
+            // message of the first attempt — a resumed stream must not repeat it.
+            Ok(stream_of(vec![
+                Ok(partial_result_set(n == 0, &["v1"], b"rt-1", false)),
+                Err(tonic::Status::unavailable(
+                    "mock server: connection lost mid-stream",
+                )),
+            ]))
+        });
+    });
+
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(OptionStatement::Other(key.into()), value)
+        .expect("set retry option");
+    set_constant_backoff(&mut statement);
+    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+    statement
+        .execute()
+        .err()
+        .expect("every attempt fails, so the query must fail");
+    calls.load(Ordering::SeqCst)
+}
+
+/// Count the `ExecuteBatchDml` attempts a DML statement makes when every attempt fails with an
+/// `UNAVAILABLE`, under the retry option `key` = `value`. `ExecuteBatchDml` is unary, so the
+/// initial status *is* what the gax retry loop sees — the mirror image of [`streaming_attempts`].
+fn unary_attempts(key: &str, value: OptionValue) -> usize {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_in_mock = calls.clone();
+    let server = MockServer::start(move |mock| {
+        mock.expect_execute_batch_dml().returning(move |_| {
+            let n = calls_in_mock.fetch_add(1, Ordering::SeqCst);
+            if n >= RETRY_PROBE_CAP {
+                return Err(tonic::Status::internal("mock server: probe cap reached"));
+            }
+            Err(tonic::Status::unavailable(
+                "mock server: backend unavailable",
+            ))
+        });
+    });
+
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(OptionStatement::Other(key.into()), value)
+        .expect("set retry option");
+    set_constant_backoff(&mut statement);
+    statement
+        .set_sql_query("UPDATE MockTable SET c = 'x' WHERE TRUE")
+        .unwrap();
+    statement
+        .execute_update()
+        .expect_err("every attempt fails, so the DML must fail");
+    calls.load(Ordering::SeqCst)
+}
+
+/// On the **unary** RPC paths `spanner.retry.max_attempts` means exactly what it says: `N` permits
+/// `N` attempts, and `1` really does disable retrying.
+#[test]
+fn retry_max_attempts_is_exact_on_unary_rpcs() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "retry_max_attempts_is_exact_on_unary_rpcs",
+    );
+
+    for max_attempts in [1_i64, 2, 3] {
+        let attempts = unary_attempts(
+            adbc_spanner::OPTION_RETRY_MAX_ATTEMPTS,
+            OptionValue::Int(max_attempts),
+        );
+        assert_eq!(
+            attempts, max_attempts as usize,
+            "max_attempts={max_attempts} must permit exactly {max_attempts} ExecuteBatchDml attempts"
+        );
+    }
+}
+
+/// On the **streaming** query path the same option permits `N + 1` attempts — one too many — because
+/// the client seeds the retry policy with its own `retry_count` (retries so far, `0` on the first
+/// failure) where gax's own loop would pass the 1-based attempt count. `1` therefore does *not*
+/// disable retrying here. Upstream bug (UP-14), pinned here as observed behaviour; `src/retry.rs`
+/// documents it. The `N + 1` shape (not a constant) is what proves the option reaches the streaming
+/// retry loop at all rather than being ignored.
+#[test]
+fn retry_max_attempts_permits_one_extra_attempt_on_the_streaming_path() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "retry_max_attempts_permits_one_extra_attempt_on_the_streaming_path",
+    );
+
+    for max_attempts in [1_i64, 2, 3] {
+        let attempts = streaming_attempts(
+            adbc_spanner::OPTION_RETRY_MAX_ATTEMPTS,
+            OptionValue::Int(max_attempts),
+        );
+        assert_eq!(
+            attempts,
+            max_attempts as usize + 1,
+            "max_attempts={max_attempts} currently permits {} ExecuteStreamingSql attempts \
+             (UP-14); a change here means the pinned client's stream-resume accounting moved — \
+             update src/retry.rs, docs/options.md and REVIEW.md's UP-14 to match",
+            max_attempts + 1
+        );
+    }
+}
+
+/// `spanner.retry.max_elapsed_seconds` bounds the unary paths, but is **inert** on the streaming
+/// query path: the client builds a fresh `RetryState` (hence `start = Instant::now()`) for every
+/// resume decision, so the gax elapsed-time decorator always compares now against a deadline one
+/// budget in the future and never exhausts. Same upstream root cause as the attempt off-by-one
+/// (UP-14). A streaming caller who wants a wall-clock bound has a working one in the separate
+/// `spanner.rpc.timeout_seconds.{query,fetch}` family.
+#[test]
+fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_path() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(240),
+        "retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_path",
+    );
+
+    // A 50ms budget against a 10ms backoff: the unary loop gives up well inside the probe cap.
+    let unary = unary_attempts(
+        adbc_spanner::OPTION_RETRY_MAX_ELAPSED_SECONDS,
+        OptionValue::Double(0.05),
+    );
+    assert!(
+        unary < RETRY_PROBE_CAP,
+        "a 50ms elapsed budget must exhaust the unary retry loop, but it ran {unary} attempts \
+         (the probe cap is {RETRY_PROBE_CAP})"
+    );
+
+    // The streaming loop runs until the mock stops it: the budget never fires.
+    let streaming = streaming_attempts(
+        adbc_spanner::OPTION_RETRY_MAX_ELAPSED_SECONDS,
+        OptionValue::Double(0.05),
+    );
+    assert_eq!(
+        streaming,
+        RETRY_PROBE_CAP + 1,
+        "a 50ms elapsed budget currently never exhausts the streaming retry loop (UP-14), so the \
+         mock's own cap is what stops it; a change here means the pinned client's stream-resume \
+         accounting moved — update src/retry.rs, docs/options.md and REVIEW.md's UP-14 to match"
+    );
+}

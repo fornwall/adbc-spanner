@@ -108,8 +108,8 @@ path, not the original URI.
 | `spanner.rpc.timeout_seconds.query` | finite, non-negative seconds (fractions allowed); `0` disables; `""` unsets (see [RPC timeouts](#rpc-timeouts)) | unset (no deadline) | yes, when set (also via `get_option_double`) | Overall deadline on a query's **initial execution**: the `ExecuteStreamingSql` call plus the first chunk of the streamed result, the `execute_schema` / `execute_partitions` probes, and `read_partition`'s initial fetch. Also bounds the driver-internal metadata **reads** (`get_objects`, `get_statistics`, `get_table_schema`, the ingest table-exists probe). Expiry fails with `Timeout`. Becomes the default for statements this connection creates (statements may override). |
 | `spanner.rpc.timeout_seconds.update` | as `…query` | unset (no deadline) | yes, when set (also via `get_option_double`) | Overall deadline on each **write** operation: an autocommit DML / batch-DML transaction, the manual-mode commit, each bulk-ingest commit chunk, and a DDL change (the admin `UpdateDatabaseDdl` call **and** its long-running-operation poll loop) — covering any retries the client performs within it. A commit whose confirmation the driver stopped waiting for may still have landed server-side — the usual ambiguity of any timed-out commit (a timed-out DDL likewise may already have applied). Same inheritance as `…query`. |
 | `spanner.rpc.timeout_seconds.fetch` | as `…query` | unset (no deadline) | yes, when set (also via `get_option_double`) | Overall deadline on **each subsequent chunk fetch** of a streamed result (after the first, which `…query` covers), enforced inside the background prefetch task so a stalled stream fails the consumer's next batch with `Timeout`. Same inheritance as `…query`. |
-| `spanner.retry.max_attempts` | positive integer; `""` unsets (see [Retry tuning](#retry-tuning)) | unset (client default, no cap) | yes, when set (also via `get_option_int`) | Cap on the number of attempts (first try + retries) the client makes for a retryable RPC; `1` disables retrying. Bounds the client's default retry policy without dropping its transport-error-on-idempotent retrying. Becomes the default for statements this connection creates (statements may override). |
-| `spanner.retry.max_elapsed_seconds` | finite, strictly positive seconds (fractions allowed); `""` unsets (see [Retry tuning](#retry-tuning)) | unset (client default, no cap) | yes, when set (also via `get_option_double`) | Cap on the total wall-clock time spent retrying a retryable RPC before the last error is surfaced. Combines with `spanner.retry.max_attempts` (whichever limit fires first wins). Same inheritance as `…max_attempts`. |
+| `spanner.retry.max_attempts` | positive integer; `""` unsets (see [Retry tuning](#retry-tuning)) | unset (client default: no cap on unary RPCs, 10 retries on queries) | yes, when set (also via `get_option_int`) | Cap on the number of attempts (first try + retries) the client makes for a retryable RPC; `1` disables retrying. Bounds the client's default retry policy without dropping its transport-error-on-idempotent retrying. **Exact on unary RPCs; permits one attempt too many on streaming queries** — see [What the two limits actually deliver](#what-the-two-limits-actually-deliver-per-rpc-path). Becomes the default for statements this connection creates (statements may override). |
+| `spanner.retry.max_elapsed_seconds` | finite, strictly positive seconds (fractions allowed); `""` unsets (see [Retry tuning](#retry-tuning)) | unset (client default, no cap) | yes, when set (also via `get_option_double`) | Cap on the total wall-clock time spent retrying a retryable RPC before the last error is surfaced. Combines with `spanner.retry.max_attempts` (whichever limit fires first wins). **Bounds unary RPCs only — inert on streaming queries**, which `spanner.rpc.timeout_seconds.query` bounds instead; see [What the two limits actually deliver](#what-the-two-limits-actually-deliver-per-rpc-path). Same inheritance as `…max_attempts`. |
 | `spanner.retry.backoff.initial_seconds` | finite, strictly positive seconds (fractions allowed); `""` unsets (see [Retry tuning](#retry-tuning)) | unset (client default, 1s) | yes, when set (also via `get_option_double`) | Initial delay of the client's exponential backoff between retry attempts. Setting any `spanner.retry.backoff.*` knob replaces the client's default backoff (unset knobs take the client defaults 1s / 60s / ×2, clamped to the gax recommended ranges). Independent of the attempt / elapsed-time caps. Same inheritance as `…max_attempts`. |
 | `spanner.retry.backoff.max_seconds` | finite, strictly positive seconds (fractions allowed); `""` unsets (see [Retry tuning](#retry-tuning)) | unset (client default, 60s) | yes, when set (also via `get_option_double`) | Ceiling the growing backoff delay is truncated at. Raised to the effective initial delay if set below it. Same combination / inheritance as `…backoff.initial_seconds`. |
 | `spanner.retry.backoff.multiplier` | finite, strictly positive number; `""` unsets (see [Retry tuning](#retry-tuning)) | unset (client default, `2.0`) | yes, when set (also via `get_option_double`) | Per-attempt growth factor for the backoff delay. A value below `1.0` is floored to `1.0` (constant delay). Same combination / inheritance as `…backoff.initial_seconds`. |
@@ -140,8 +140,8 @@ one.
 | `spanner.rpc.timeout_seconds.query` | as the connection option; `0` disables; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement query-timeout override (see [RPC timeouts](#rpc-timeouts)). |
 | `spanner.rpc.timeout_seconds.update` | as the connection option; `0` disables; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement update-timeout override. |
 | `spanner.rpc.timeout_seconds.fetch` | as the connection option; `0` disables; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement fetch-timeout override. |
-| `spanner.retry.max_attempts` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_int`) | Per-statement retry-attempt-cap override (see [Retry tuning](#retry-tuning)). |
-| `spanner.retry.max_elapsed_seconds` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement retry-elapsed-cap override. |
+| `spanner.retry.max_attempts` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_int`) | Per-statement retry-attempt-cap override, with the same per-RPC-path caveats (see [Retry tuning](#retry-tuning)). |
+| `spanner.retry.max_elapsed_seconds` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement retry-elapsed-cap override, with the same per-RPC-path caveats. |
 | `spanner.retry.backoff.initial_seconds` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement backoff-initial-delay override. |
 | `spanner.retry.backoff.max_seconds` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement backoff-maximum-delay override. |
 | `spanner.retry.backoff.multiplier` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement (also via `get_option_double`) | Per-statement backoff-multiplier override. |
@@ -303,11 +303,11 @@ covers DDL — so no driver-side network path is left able to hang unboundedly.
 
 Every data-plane RPC the driver issues is retried by the Spanner client under a default policy —
 strict [AIP-194](https://google.aip.dev/194), additionally retrying transport / IO errors on
-idempotent requests (which all the driver's data-plane RPCs are). That default has **no** attempt or
-elapsed-time cap, so a persistently `UNAVAILABLE` backend is retried until the operation-wide [RPC
-timeout](#rpc-timeouts) (if any) fires. The two `spanner.retry.*` options — available at connection
-*and* statement level — let you *bound* that retrying instead, mirroring the gax
-`RetryPolicyExt::with_attempt_limit` / `with_time_limit` knobs:
+idempotent requests (which all the driver's data-plane RPCs are). On the unary RPC paths that default
+has **no** attempt or elapsed-time cap, so a persistently `UNAVAILABLE` backend is retried until the
+operation-wide [RPC timeout](#rpc-timeouts) (if any) fires. The two `spanner.retry.*` options —
+available at connection *and* statement level — let you *bound* that retrying instead, mirroring the
+gax `RetryPolicyExt::with_attempt_limit` / `with_time_limit` knobs:
 
 - **`spanner.retry.max_attempts`** — the maximum number of attempts, the first try plus retries, as
   a positive integer (accepted as an integer, a whole-valued double, or a numeric string). `1`
@@ -340,15 +340,36 @@ double, round-trips through `get_option` / `get_option_double`, and an empty str
 backoff knobs are **orthogonal** to the attempt / elapsed-time caps above — either family may be set
 on its own — and inherit connection→statement the same way.
 
-When **neither** is set the client keeps its default (unbounded) policy, so the feature is purely
-opt-in and by default changes nothing. When either is set, the driver applies a bounded policy that
-still retries transport / IO errors on idempotent requests exactly like the client's default — the
+When **neither** is set the client keeps its own default policy, so the feature is purely opt-in and
+by default changes nothing. When either is set, the driver applies a bounded policy that still
+retries transport / IO errors on idempotent requests exactly like the client's default — the
 attempt / elapsed limits are layered on top rather than replacing that behaviour — to every user
 query/DML statement, the read/write transaction runner's begin+commit RPCs, the bulk-ingest
 write-only transaction, and the `ExecuteBatchDml` batch. This tunes the *per-attempt* retry loop;
 the [RPC timeout](#rpc-timeouts) family bounds the *overall* per-operation wall time — the two are
 complementary. The transaction-level abort retry (Spanner's optimistic-concurrency re-run on
 `ABORTED`) is a separate policy and stays at the client default.
+
+### What the two limits actually deliver, per RPC path
+
+The Spanner client runs **two different retry loops**, and they count attempts differently — so both
+limits land differently depending on which RPC carries the work. This is an upstream defect that the
+driver cannot correct (the same policy object feeds both loops, and they would need *different*
+limits to deliver the same guarantee), so it is documented rather than compensated:
+
+| | Unary RPCs — DML, `ExecuteBatchDml`, begin, commit | Streaming queries — `ExecuteStreamingSql` |
+| --- | --- | --- |
+| `spanner.retry.max_attempts = N` | exactly `N` attempts; `1` disables retrying | **`N + 1`** attempts; `1` does **not** disable retrying |
+| `spanner.retry.max_elapsed_seconds` | bounds the loop as documented | **inert** — never fires |
+| client default when unset | uncapped | capped at 10 retries (11 attempts, per the row above) |
+
+The cause is that the streaming query path is dispatched outside gax's retry loop and hand-rolls its
+stream resumption, seeding the retry policy with the count of *retries so far* (`0` on the first
+failure, hence the off-by-one) and a freshly-taken start instant (hence the never-firing elapsed
+budget). If you need a wall-clock bound on a **query**, use the
+[RPC timeout](#rpc-timeouts) family (`spanner.rpc.timeout_seconds.query` /
+`…fetch`) — it does bound that path. The exact numbers above are pinned by tests
+(`retry_max_attempts_*` / `retry_max_elapsed_seconds_*` in `tests/mock_spanner.rs`).
 
 ## Environment
 
