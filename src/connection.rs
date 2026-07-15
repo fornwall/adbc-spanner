@@ -52,6 +52,14 @@
 //!   applied by Spanner as part of the commit itself — after every buffered DML statement in the
 //!   transaction has executed, regardless of issue order — so DML in the same transaction cannot
 //!   observe the ingested rows.
+//! - **A read-only connection cannot commit buffered writes.** `adbc.connection.readonly` rejects
+//!   *all* writes, and the commit that applies buffered DML / ingest mutations is one: with the
+//!   flag set, [`Connection::commit`] — and enabling `adbc.connection.autocommit`, which commits
+//!   any pending work as a side effect — fails with [`Status::InvalidState`] and leaves the
+//!   transaction open and replayable (clear the flag and commit again to apply it). Ending a
+//!   transaction that writes nothing is never gated: a query transaction commits (its snapshot is
+//!   just dropped) and [`Connection::rollback`] always works, since discarding buffered work
+//!   writes nothing.
 //! - A **failed** commit keeps the buffer and the transaction open: the caller can retry
 //!   [`Connection::commit`] (replaying the batch) or [`Connection::rollback`] to discard it. The
 //!   same holds when re-enabling autocommit fails to commit the buffer: the connection stays in
@@ -356,11 +364,37 @@ impl TxnState {
     }
 }
 
+/// Enforce `adbc.connection.readonly` on the commit paths: a read-only connection rejects **all**
+/// writes, and a commit of buffered DML / ingest mutations is a write like any other — the flag
+/// would otherwise be a statement-path-only guard that `commit()` (or the autocommit toggle, which
+/// commits pending work as a side effect) silently walks around.
+///
+/// `read_only` is the flag's live value; `work` is the state the caller is about to apply. Only
+/// work that would actually *write* is rejected, so ending a transaction that writes nothing still
+/// succeeds on a read-only connection: an `Unset` transaction and a query transaction
+/// ([`ManualTxn::Read`]) apply nothing — their commit only drops the snapshot.
+///
+/// The rejection leaves the buffer with the caller (`commit` never reaches `finish_commit`; the
+/// autocommit toggle restores the taken state via [`TxnState::restore_manual`]), so the
+/// transaction stays open and replayable — the same shape as any other failed commit. Clearing
+/// `adbc.connection.readonly` and committing again applies exactly the buffered work; `rollback`
+/// is never gated by the flag, since discarding buffered work writes nothing.
+fn check_commit_writable(read_only: bool, work: &ManualTxn) -> Result<()> {
+    if read_only && work.has_pending_work() {
+        return Err(invalid_state(
+            "cannot commit buffered DML: the connection is read-only. The buffered work is kept \
+             and stays replayable: clear adbc.connection.readonly and commit again to apply it, \
+             or roll back to discard it.",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod txn_state_tests {
     use adbc_core::error::Status;
 
-    use super::{ManualTxn, Mutation, SpannerSql, TxnKind, TxnState};
+    use super::{ManualTxn, Mutation, SpannerSql, TxnKind, TxnState, check_commit_writable};
 
     fn sql(s: &str) -> SpannerSql {
         SpannerSql::builder(s).build()
@@ -490,6 +524,55 @@ mod txn_state_tests {
         st.finish_commit(&applied);
         assert!(matches!(st.txn, ManualTxn::Unset));
     }
+
+    /// `adbc.connection.readonly` rejects the commit paths too, not just the statement write
+    /// paths: buffered DML — and buffered ingest mutations — are writes, so applying them on a
+    /// read-only connection must fail with `InvalidState` rather than sneak a write through
+    /// `commit()` / the autocommit toggle.
+    #[test]
+    fn read_only_rejects_a_commit_that_would_write() {
+        for work in [
+            ManualTxn::Dml {
+                statements: vec![sql("UPDATE a SET x = 1 WHERE y = 2")],
+                mutations: Vec::new(),
+            },
+            ManualTxn::Dml {
+                statements: Vec::new(),
+                mutations: vec![mutation(1)],
+            },
+        ] {
+            let error = check_commit_writable(true, &work)
+                .expect_err("a read-only connection must not commit buffered writes");
+            assert_eq!(error.status, Status::InvalidState);
+            assert!(
+                error.message.contains("read-only"),
+                "the rejection should name the read-only flag: {}",
+                error.message
+            );
+            // The same work commits fine once the flag is clear.
+            check_commit_writable(false, &work)
+                .expect("a writable connection commits the buffered work");
+        }
+    }
+
+    /// The guard gates *writes*, not the act of ending a transaction: a transaction with nothing
+    /// to apply — never started, or fully drained by a previous commit — still commits cleanly on
+    /// a read-only connection. (A query transaction, `ManualTxn::Read`, is likewise pending-work
+    /// free; its client-owned snapshot cannot be built offline, so the wire-level proof that a
+    /// read-only connection can still commit one lives in `tests/mock_spanner.rs`.)
+    #[test]
+    fn read_only_allows_a_commit_with_nothing_to_write() {
+        for work in [
+            ManualTxn::Unset,
+            ManualTxn::Dml {
+                statements: Vec::new(),
+                mutations: Vec::new(),
+            },
+        ] {
+            check_commit_writable(true, &work)
+                .expect("committing nothing writes nothing, so read-only must allow it");
+        }
+    }
 }
 
 /// A handle to a connection's transaction state, shared with its statements.
@@ -518,6 +601,11 @@ pub(crate) type SharedTxn = Arc<Mutex<TxnState>>;
 /// **DDL is not transaction-aware** (matching the ADBC BigQuery driver): it always executes
 /// immediately via the admin API — Spanner DDL is never transactional — and leaves the
 /// transaction state untouched, so DDL issued after buffered DML executes *before* it.
+///
+/// A connection set `adbc.connection.readonly` rejects the *commit* of buffered DML/ingest work
+/// too — not just the statements that buffer it — with [`Status::InvalidState`], keeping the
+/// transaction replayable; committing a query transaction and [`Connection::rollback`] stay
+/// available (neither writes).
 ///
 /// See the [crate documentation](crate) — and the fuller module-level notes in `connection.rs` —
 /// for the list of consequences (no read-your-writes, `None` DML counts before commit,
@@ -613,10 +701,21 @@ impl SpannerConnection {
         }
     }
 
+    /// The *live* value of this connection's `adbc.connection.readonly` flag — the same shared
+    /// flag the statement write paths load at execution time.
+    fn is_read_only(&self) -> bool {
+        self.read_only.load(Ordering::Acquire)
+    }
+
     /// Apply the buffered work of a manual transaction: DML statements and ingest mutations
     /// atomically in one transaction. A read-only (or empty) transaction has nothing to apply —
     /// its snapshot ends by being dropped when the caller clears the state.
+    ///
+    /// Rejected outright when the connection is `adbc.connection.readonly` and there *is*
+    /// buffered work to apply (see [`check_commit_writable`]); the caller keeps the buffer, so
+    /// the transaction stays replayable exactly as after any other failed commit.
     fn apply_manual_txn(&self, work: &ManualTxn) -> Result<()> {
+        check_commit_writable(self.is_read_only(), work)?;
         match work {
             ManualTxn::Unset | ManualTxn::Read(_) => Ok(()),
             ManualTxn::Dml {

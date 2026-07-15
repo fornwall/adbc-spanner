@@ -189,6 +189,14 @@ with spanner.connect(db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/
     # any INSERT/UPDATE/DELETE, DDL or adbc_ingest raises
 ```
 
+The guarantee also covers `conn.commit()`: in the default manual-transaction mode DML buffers
+until commit (see [Transactions](#transactions)), so a connection turned read-only *after* some
+DML was buffered raises `ProgrammingError` on `conn.commit()` — and on switching the connection to
+autocommit, which commits pending work — instead of writing. The transaction stays open and
+replayable: clear
+the flag and commit again to apply it, or `conn.rollback()` (never gated — discarding buffered work
+writes nothing) to discard it. Committing a query transaction is likewise always allowed.
+
 ### Smaller result batches
 
 Results stream back as Arrow record batches. Lower `spanner.rows_per_batch` on the cursor to cap

@@ -1853,6 +1853,191 @@ fn mutations_only_manual_commit_uses_the_write_only_path() {
     }
 }
 
+/// (f) `adbc.connection.readonly` must gate the **commit** paths, not just the statement write
+/// paths: DML buffered *before* the flag is set must not reach the wire through `commit()` — nor
+/// through re-enabling `adbc.connection.autocommit`, which commits pending work as a side effect.
+///
+/// This is a wire assertion by necessity: the driver-side rejection is unit-tested in
+/// `src/connection.rs` (`read_only_rejects_a_commit_that_would_write`), but only the mock proves
+/// that *no* `ExecuteBatchDml`/`Commit` leaves the driver — the whole point of the guard. It also
+/// pins the surrounding contract the fix must not break: the buffer stays replayable (clearing the
+/// flag and committing again applies exactly it), `rollback` is never gated, and a read-only
+/// connection still commits a query transaction (which writes nothing) and still runs queries.
+#[test]
+fn read_only_connection_rejects_the_commit_of_buffered_dml() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "read_only_connection_rejects_the_commit_of_buffered_dml",
+    );
+
+    let batch_dml: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let commits = Arc::new(AtomicUsize::new(0));
+    let record_batch_dml = batch_dml.clone();
+    let count_commits = commits.clone();
+    let server = MockServer::start(move |mock| {
+        // The read-only connection's queries (and the query transaction below, which inline-begins
+        // its shared multi-use read-only transaction).
+        serve_streaming_sql_begin_aware(mock, &["v0"], None);
+        serve_begin_transaction(mock);
+        mock.expect_execute_batch_dml().returning(move |request| {
+            let request = request.into_inner();
+            // The runner begins its read/write transaction inline with the batch; the client needs
+            // the created transaction's id echoed back in the first result set's metadata.
+            let inline_begin = matches!(
+                request
+                    .transaction
+                    .as_ref()
+                    .and_then(|t| t.selector.as_ref()),
+                Some(v1::transaction_selector::Selector::Begin(_))
+            );
+            record_batch_dml.lock().unwrap().extend(
+                request
+                    .statements
+                    .into_iter()
+                    .map(|statement| statement.sql),
+            );
+            Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
+                result_sets: vec![v1::ResultSet {
+                    metadata: Some(v1::ResultSetMetadata {
+                        transaction: inline_begin.then(|| v1::Transaction {
+                            id: b"dml-txn".to_vec(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    stats: Some(v1::ResultSetStats {
+                        row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                status: Some(spanner_grpc_mock::google::rpc::Status {
+                    code: 0,
+                    message: "OK".into(),
+                    details: vec![],
+                }),
+                ..Default::default()
+            }))
+        });
+        mock.expect_commit().returning(move |_| {
+            count_commits.fetch_add(1, Ordering::SeqCst);
+            commit_ok()
+        });
+    });
+
+    let mut connection = server.connect();
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("enter manual transaction mode");
+
+    // 1. Buffer DML while the connection is still writable, then turn it read-only.
+    let mut dml = connection.new_statement().expect("new statement");
+    dml.set_sql_query("UPDATE MockTable SET c = 'x' WHERE TRUE")
+        .expect("set DML");
+    assert_eq!(
+        dml.execute_update().expect("manual-mode DML buffers"),
+        None,
+        "manual-mode DML buffers (returns None), not commits"
+    );
+    let set_read_only = |connection: &mut SpannerConnection, value: &str| {
+        connection
+            .set_option(
+                OptionConnection::ReadOnly,
+                OptionValue::String(value.into()),
+            )
+            .expect("set adbc.connection.readonly");
+    };
+    set_read_only(&mut connection, "true");
+
+    // 2. `commit()` must be rejected, with nothing on the wire.
+    let error = connection
+        .commit()
+        .expect_err("a read-only connection must not commit buffered DML");
+    assert_eq!(error.status, AdbcStatus::InvalidState);
+    assert!(
+        error.message.contains("read-only"),
+        "the rejection must name the read-only flag: {}",
+        error.message
+    );
+
+    // 3. So must re-enabling autocommit, which would otherwise commit the pending work as a side
+    //    effect — and the failure must leave the connection in manual mode, transaction intact.
+    let error = connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("true".into()),
+        )
+        .expect_err("enabling autocommit must not commit buffered DML on a read-only connection");
+    assert_eq!(error.status, AdbcStatus::InvalidState);
+    assert_eq!(
+        connection
+            .get_option_string(OptionConnection::AutoCommit)
+            .expect("read back autocommit"),
+        "false",
+        "a rejected toggle must leave the connection in manual mode"
+    );
+
+    assert!(
+        batch_dml.lock().unwrap().is_empty(),
+        "no DML may reach the wire while the connection is read-only: {:?}",
+        batch_dml.lock().unwrap()
+    );
+    assert_eq!(
+        commits.load(Ordering::SeqCst),
+        0,
+        "no CommitRequest may reach the wire while the connection is read-only"
+    );
+
+    // 4. The buffer stayed replayable: clearing the flag and committing applies exactly it.
+    set_read_only(&mut connection, "false");
+    connection
+        .commit()
+        .expect("a writable connection commits the still-buffered DML");
+    assert_eq!(
+        *batch_dml.lock().unwrap(),
+        ["UPDATE MockTable SET c = 'x' WHERE TRUE"],
+        "the commit must replay exactly the DML buffered before the flag was set"
+    );
+    assert_eq!(commits.load(Ordering::SeqCst), 1, "exactly one commit");
+
+    // 5. `rollback` is never gated — discarding buffered work writes nothing.
+    dml.execute_update().expect("buffer DML again");
+    set_read_only(&mut connection, "true");
+    connection
+        .rollback()
+        .expect("rollback must work on a read-only connection");
+
+    // 6. A read-only connection still queries, and still commits the resulting query transaction:
+    //    it applies nothing (the snapshot is simply dropped).
+    let mut query = connection.new_statement().expect("new statement");
+    query
+        .set_sql_query("SELECT c FROM MockTable")
+        .expect("set query");
+    let batches: Vec<_> = query
+        .execute()
+        .expect("queries still run on a read-only connection")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect query batches");
+    assert_eq!(batches[0].num_rows(), 1);
+    connection
+        .commit()
+        .expect("committing a query transaction writes nothing, so read-only must allow it");
+
+    assert_eq!(
+        *batch_dml.lock().unwrap(),
+        ["UPDATE MockTable SET c = 'x' WHERE TRUE"],
+        "the rolled-back DML must never reach the wire"
+    );
+    assert_eq!(
+        commits.load(Ordering::SeqCst),
+        1,
+        "neither the rollback nor the query transaction's commit issues a CommitRequest"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Read-option wire assertions: spanner.read.staleness + spanner.directed_read
 // ---------------------------------------------------------------------------

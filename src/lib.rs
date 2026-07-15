@@ -48,7 +48,11 @@
 //! DML, DDL and bulk ingest fail with [`Status::InvalidState`](adbc_core::error::Status::InvalidState),
 //! while read-only queries still run. It defaults to `false`, accepts `true`/`false`, and
 //! round-trips through `get_option`. The flag is live: statements check it at execution time, so
-//! toggling it takes effect immediately for existing statements as well as new ones.
+//! toggling it takes effect immediately for existing statements as well as new ones. The commit
+//! paths honour it too: with the flag set, committing a manual transaction's buffered DML/ingest
+//! work — through `commit` or by re-enabling `adbc.connection.autocommit` — is rejected as the
+//! write it is, leaving the transaction open and replayable, while `rollback` and committing a
+//! query transaction (neither writes) still work.
 //!
 //! ## Transactions
 //!
