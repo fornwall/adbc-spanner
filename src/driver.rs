@@ -1981,6 +1981,17 @@ mod tests {
     }
 
     #[test]
+    fn the_documented_quickstart_uri_example_parses() {
+        // The exact `uri=` example string shown in the quickstart docs (src/ffi.rs module doc,
+        // docs/adbc.md, python/adbc_driver_spanner/dbapi.py) must stay a form the driver accepts,
+        // so the docs can't silently rot into a rejected spelling again (IDIO-1).
+        let mut db = new_database();
+        set_uri(&mut db, "spanner:///projects/p/instances/i/databases/d").unwrap();
+        assert_eq!(db.database.as_deref(), Some(DB_PATH));
+        assert_eq!(db.endpoint, None);
+    }
+
+    #[test]
     fn a_scheme_uri_without_two_slashes_is_rejected() {
         // `spanner://` is required — the scheme-only (`spanner:path`) and single-slash
         // (`spanner:/path`) spellings are rejected.
