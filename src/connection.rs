@@ -95,7 +95,7 @@ use crate::conversion::{TimestampPrecision, result_set_to_batch, stream_query};
 use crate::directed_read::DirectedRead;
 use crate::driver::{Connected, SharedDatabaseAdmin};
 use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
-use crate::options::impl_shared_option_dispatch;
+use crate::options::{impl_shared_option_dispatch, impl_typed_option_getters};
 use crate::query_options::QueryOptionsConfig;
 use crate::request::{CommitStats, RequestConfig};
 use crate::retry::RetryConfig;
@@ -1390,19 +1390,7 @@ impl Optionable for SpannerConnection {
         }
     }
 
-    fn get_option_bytes(&self, key: Self::Option) -> Result<Vec<u8>> {
-        Ok(self.get_option_string(key)?.into_bytes())
-    }
-
-    fn get_option_int(&self, key: Self::Option) -> Result<i64> {
-        let what = format!("option {}", connection_option_name(&key));
-        crate::options::int_from_stored_string(self.get_option_string(key), &what)
-    }
-
-    fn get_option_double(&self, key: Self::Option) -> Result<f64> {
-        let what = format!("option {}", connection_option_name(&key));
-        crate::options::double_from_stored_string(self.get_option_string(key), &what)
-    }
+    impl_typed_option_getters!();
 }
 
 impl Connection for SpannerConnection {
