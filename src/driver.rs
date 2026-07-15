@@ -285,6 +285,10 @@ impl SpannerDatabase {
     /// *not* reported — they are the environment's business, not an explicit driver option, and
     /// must not prevent emulator use. The remaining `spanner.auth.impersonate.*` options are inert
     /// without a target principal, so they do not count either.
+    ///
+    /// The ladder's order is load-bearing: [`OPTION_ACCESS_TOKEN`] comes last so that
+    /// [`conflicting_credential_with_access_token`](Self::conflicting_credential_with_access_token)
+    /// is this same ladder with the token filtered out.
     fn explicit_credential_option(&self) -> Option<&'static str> {
         if self.keyfile_json.is_some() {
             Some(OPTION_KEYFILE_JSON)
@@ -302,16 +306,13 @@ impl SpannerDatabase {
     /// The name of the other explicit credential option that conflicts with an
     /// [`OPTION_ACCESS_TOKEN`], if any: a keyfile (path or inline JSON) or an impersonation target.
     /// An access token is a complete credential, so combining it with any of these is refused.
+    ///
+    /// This is [`explicit_credential_option`](Self::explicit_credential_option) minus the token
+    /// itself: that ladder reports [`OPTION_ACCESS_TOKEN`] *last*, hence only when no other
+    /// credential option is set, so any other name it yields is by definition a conflict.
     fn conflicting_credential_with_access_token(&self) -> Option<&'static str> {
-        if self.keyfile_json.is_some() {
-            Some(OPTION_KEYFILE_JSON)
-        } else if self.keyfile.is_some() {
-            Some(OPTION_KEYFILE)
-        } else if self.impersonate_target_principal.is_some() {
-            Some(OPTION_IMPERSONATE_TARGET_PRINCIPAL)
-        } else {
-            None
-        }
+        self.explicit_credential_option()
+            .filter(|option| *option != OPTION_ACCESS_TOKEN)
     }
 
     /// Resolve the effective configuration and establish a connection.
