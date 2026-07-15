@@ -405,7 +405,7 @@ jobs:
       - name: Publish release assets
         # Pinned to a commit: this step runs with contents: write and publishes the release
         # assets users download — a hijacked v3 tag must not be able to replace them.
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           # dist/* now also includes the generated SHA256SUMS file.
           files: dist/*
