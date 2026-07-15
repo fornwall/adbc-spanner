@@ -23,7 +23,7 @@ use arrow_array::{
     new_null_array,
 };
 use arrow_schema::{DataType, Fields, SchemaRef};
-use futures_util::stream::{self, StreamExt};
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::Statement as SpannerSql;
 
@@ -140,9 +140,8 @@ pub(crate) fn collect_statistics(
     }
 
     // Prepare each matching table's aggregate query up front, in deterministic `table_batch`
-    // order. The scans themselves run concurrently below, so the order the *results* arrive in is
-    // non-deterministic — we keep this prepared list as the canonical order and reassemble against
-    // it, so the output (tables, schemas and their statistics) is identical to the old sequential
+    // order. The scans run concurrently below but their results are yielded back in this same
+    // order, so the output (tables, schemas and their statistics) is identical to a sequential
     // loop regardless of completion order.
     let bound = read_staleness.timestamp_bound()?;
     // The `LIKE` patterns are loop-invariant, so compile each once and reuse it across every row.
@@ -177,18 +176,17 @@ pub(crate) fn collect_statistics(
     }
 
     // Run the per-table aggregate scans with bounded concurrency on the one shared runtime.
-    // `buffer_unordered` yields results as they finish (out of order), so tag each with its input
-    // index and slot it back into deterministic order. The whole stream is driven inside a single
-    // `block_on_cancellable`, so a `cancel` still interrupts an in-flight batch of scans, and any
-    // scan error propagates out (via `?`) as an overall `Err`.
+    // `buffered` polls up to `STATISTICS_SCAN_CONCURRENCY` of them at once yet yields their results
+    // in input order, so the deterministic `prepared` order is preserved without reassembly. The
+    // whole stream is driven inside a single `block_on_cancellable`, so a `cancel` still interrupts
+    // an in-flight batch of scans, and any scan error ends the collect as an overall `Err`.
     // The whole concurrent scan phase is one query-side operation, bounded by the same query
     // timeout (so a stalled aggregate scan cannot hang the collector unboundedly).
     let batches: Vec<RecordBatch> = block_on_cancellable(
         runtime,
         cancel,
         with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async {
-            let mut slots: Vec<Option<RecordBatch>> = vec![None; prepared.len()];
-            let mut scans = stream::iter(prepared.iter().enumerate().map(|(idx, p)| {
+            stream::iter(prepared.iter().map(|p| {
                 let client = client.clone();
                 let sql = p.sql.clone();
                 // The aggregate scans the user table, so honour the connection's read staleness.
@@ -206,16 +204,12 @@ pub(crate) fn collect_statistics(
                         crate::conversion::TimestampPrecision::default(),
                     )
                     .await?;
-                    Ok::<_, Error>((idx, batch))
+                    Ok::<_, Error>(batch)
                 }
             }))
-            .buffer_unordered(STATISTICS_SCAN_CONCURRENCY);
-            while let Some(result) = scans.next().await {
-                let (idx, batch) = result?;
-                slots[idx] = Some(batch);
-            }
-            // Every prepared table produced exactly one batch (the loop consumed the whole stream).
-            Ok::<_, Error>(slots.into_iter().map(|b| b.unwrap()).collect())
+            .buffered(STATISTICS_SCAN_CONCURRENCY)
+            .try_collect()
+            .await
         }),
     )?;
 
