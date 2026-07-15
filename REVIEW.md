@@ -10,7 +10,7 @@ being listed.
 Each finding is a checkbox — tick it when fixed (or explicitly decided against, noting
 why next to the item). IDs are stable for cross-referencing.
 
-**Severity counts:** High 5 · Medium 19 · Low ~55 · Upstream 13.
+**Severity counts:** High 5 · Medium 19 · Low ~55 · Upstream 12.
 
 **Overall shape:** the codebase is in unusually good health — centralized identifier
 quoting with hostile-name tests, bound-parameter metadata filters, exact ADBC result
@@ -301,7 +301,7 @@ Things to file or PR against `apache/arrow-adbc` or `googleapis/google-cloud-rus
 
 - [ ] **UP-1** — `StatementBuilder::add_param` / `ValueBinder::to` take `&T: ToValue`, deep-cloning every cell (`impl ToValue for Value` = `self.clone()`, `to_value.rs:54`) — a second full copy of every string/bytes/array payload on every bound-DML row and ingest cell. Ask for by-value overloads (`impl Into<Value>`).
 - [ ] **UP-2** — No `impl ToValue for &[u8]` (only `Vec<u8>`), forcing `.to_vec()` per binary cell in `src/bind.rs:314-328` (slice → Vec → base64 String → UP-1's clone = 3 copies).
-- [ ] **UP-3** — `SpannerRetryPolicy` is private, forcing the driver's byte-for-byte behavioral copy (`src/retry.rs:85`) that can silently drift on a rev bump. Ask to export it, or for a hook to bound the default policy.
+- [x] **UP-3** — `SpannerRetryPolicy` is private, forcing the driver's byte-for-byte behavioral copy (`src/retry.rs:85`) that can silently drift on a rev bump. Ask to export it, or for a hook to bound the default policy. *Resolved:* asked and landed upstream — googleapis/google-cloud-rust#6048 (`feat(spanner): export SpannerRetryPolicy`, merged `367b678`) makes the `retry_policy` module and `SpannerRetryPolicy::new()` public, with rustdoc pointing at exactly our use case (decorate with `RetryPolicyExt` rather than re-implement the classification). The rationale that carried it: every other official Spanner client (Go/Java/Python/Node) exposes its default retry config as tunable. The driver's copy is deleted; `RetryConfig::retry_policy_arg` now bounds `google_cloud_spanner::retry_policy::SpannerRetryPolicy::new()` itself, so the drift risk is gone by construction. The `base_policy_retries_io_errors_only_when_idempotent` unit test is kept (now exercising the client's type) as a rev-bump guard on the transport-error-on-idempotent behaviour the bounded policy depends on. Required the `google-cloud-rust` pin bump to `deac9e2f` (the family's one rev, moved in lockstep per the revert checklist).
 - [ ] **UP-4** — `BatchDmlBuilder` has no priority setter though `ExecuteBatchDmlRequest.request_options` carries one (it already stores `Option<RequestOptions>` internally). Blocks SPAN-8.
 - [ ] **UP-5** — `BatchWriteTransactionBuilder` exposes no setters though the proto has `request_options` *and* `exclude_txn_from_change_streams`. Blocks tags/priority/change-stream-exclusion on the firehose ingest path.
 - [ ] **UP-6** — No public begin/commit read-write transaction handle — the root cause of buffer-and-replay manual transactions and the no-read-your-writes guard. File the feature request.

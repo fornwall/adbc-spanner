@@ -3,8 +3,7 @@
 //!
 //! Every data-plane RPC the driver issues is retried by the pinned Spanner client under a default
 //! policy — AIP-194 strict, additionally retrying transport / IO errors on idempotent requests (the
-//! client's private `SpannerRetryPolicy`, see
-//! `.../google-cloud-rust-*/src/spanner/src/retry_policy.rs`). On the unary RPC paths that default
+//! client's [`SpannerRetryPolicy`]). On the unary RPC paths that default
 //! has **no** attempt or elapsed-time cap, so a persistently `UNAVAILABLE` backend is retried until
 //! the operation-wide [RPC timeout](crate::timeout) (if any) fires. These two options let a caller
 //! *bound* the client's retrying instead — mirroring the gax convention of an attempt count and an
@@ -54,7 +53,7 @@
 //!     (`spanner.rpc.timeout_seconds.{query,fetch}`), which does bound this path.
 //!
 //!   The client's default policy on this path is *not* uncapped either — it is
-//!   `SpannerRetryPolicy.with_attempt_limit(10)` (`result_set.rs`'s `apply_defaults`), i.e. 11
+//!   `SpannerRetryPolicy::new().with_attempt_limit(10)` (`result_set.rs`'s `apply_defaults`), i.e. 11
 //!   attempts under the same off-by-one — so setting `max_attempts` here replaces a cap rather than
 //!   introducing one.
 //!
@@ -76,9 +75,10 @@
 //! other.
 //!
 //! **Preserving the client's behaviour under a limit.** Setting a policy on a request builder
-//! *replaces* the client's default `SpannerRetryPolicy`, so to keep the transport-error-on-idempotent
-//! retrying while adding a bound, the base policy applied here re-implements that same decoration
-//! ([`SpannerRetryPolicy`] below) and layers the configured
+//! *replaces* the client's default [`SpannerRetryPolicy`], so to keep the
+//! transport-error-on-idempotent retrying while adding a bound, the base policy applied here is that
+//! very same client policy (exported since googleapis/google-cloud-rust#6048 — the driver used to
+//! carry a behavioural copy of the then-private type), with the configured
 //! [`with_attempt_limit`](google_cloud_gax::retry_policy::RetryPolicyExt::with_attempt_limit) /
 //! [`with_time_limit`](google_cloud_gax::retry_policy::RetryPolicyExt::with_time_limit) wrappers on
 //! top. The policy is applied to every user statement/DML builder, the read/write transaction
@@ -96,54 +96,15 @@ use std::time::Duration;
 use adbc_core::error::Result;
 use adbc_core::options::OptionValue;
 use google_cloud_gax::backoff_policy::BackoffPolicyArg;
-use google_cloud_gax::error::Error as GaxError;
 use google_cloud_gax::exponential_backoff::ExponentialBackoffBuilder;
-use google_cloud_gax::retry_policy::{
-    Aip194Strict, RetryPolicy, RetryPolicyArg, RetryPolicyExt as _,
-};
-use google_cloud_gax::retry_result::RetryResult;
-use google_cloud_gax::retry_state::RetryState;
-use google_cloud_gax::throttle_result::ThrottleResult;
+use google_cloud_gax::retry_policy::{RetryPolicyArg, RetryPolicyExt as _};
 use google_cloud_spanner::builder::{
     BatchDmlBuilder, TransactionRunnerBuilder, WriteOnlyTransactionBuilder,
 };
+use google_cloud_spanner::retry_policy::SpannerRetryPolicy;
 use google_cloud_spanner::statement::StatementBuilder;
 
 use crate::error::invalid_argument;
-
-/// A driver-local copy of the pinned client's private `SpannerRetryPolicy`
-/// (`.../src/spanner/src/retry_policy.rs`): AIP-194 strict, but additionally retrying transport / IO
-/// errors on **idempotent** requests.
-///
-/// Replicated here because setting a retry policy on a request builder *replaces* the client's
-/// default one, and we want opting into an attempt / elapsed-time limit to keep — not silently drop
-/// — the client's transport-error-on-idempotent retrying. The attempt / time-limit wrappers are
-/// then layered on top of this base.
-#[derive(Clone, Debug, Default)]
-struct SpannerRetryPolicy;
-
-impl RetryPolicy for SpannerRetryPolicy {
-    fn on_error(&self, state: &RetryState, error: GaxError) -> RetryResult {
-        match Aip194Strict.on_error(state, error) {
-            // AIP-194 classifies a post-headers transport/IO error as permanent; Spanner allows
-            // retrying it when the request is idempotent (all the driver's data-plane RPCs are).
-            RetryResult::Permanent(error)
-                if state.idempotent && (error.is_transport() || error.is_io()) =>
-            {
-                RetryResult::Continue(error)
-            }
-            other => other,
-        }
-    }
-
-    fn on_throttle(&self, state: &RetryState, error: GaxError) -> ThrottleResult {
-        Aip194Strict.on_throttle(state, error)
-    }
-
-    fn remaining_time(&self, state: &RetryState) -> Option<Duration> {
-        Aip194Strict.remaining_time(state)
-    }
-}
 
 /// The retry-tuning configuration held by a connection or statement
 /// (`spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds` and the backoff knobs
@@ -237,15 +198,21 @@ impl RetryConfig {
     }
 
     /// The gax retry policy for this configuration, or `None` when neither knob is set (leaving the
-    /// client's default `SpannerRetryPolicy` in place). When either is set the driver's equivalent
-    /// base policy is bounded by the configured attempt / elapsed-time limits.
+    /// client's default [`SpannerRetryPolicy`] in place). When either is set that same policy is
+    /// re-applied explicitly, bounded by the configured attempt / elapsed-time limits.
     pub(crate) fn retry_policy_arg(&self) -> Option<RetryPolicyArg> {
         match (self.max_attempts, self.max_elapsed_duration()) {
             (None, None) => None,
-            (Some(attempts), None) => Some(SpannerRetryPolicy.with_attempt_limit(attempts).into()),
-            (None, Some(elapsed)) => Some(SpannerRetryPolicy.with_time_limit(elapsed).into()),
+            (Some(attempts), None) => Some(
+                SpannerRetryPolicy::new()
+                    .with_attempt_limit(attempts)
+                    .into(),
+            ),
+            (None, Some(elapsed)) => {
+                Some(SpannerRetryPolicy::new().with_time_limit(elapsed).into())
+            }
             (Some(attempts), Some(elapsed)) => Some(
-                SpannerRetryPolicy
+                SpannerRetryPolicy::new()
                     .with_time_limit(elapsed)
                     .with_attempt_limit(attempts)
                     .into(),
@@ -620,31 +587,6 @@ mod tests {
         assert_eq!(
             connection.max_elapsed_seconds_string().as_deref(),
             Some("20")
-        );
-    }
-
-    /// The driver's base policy mirrors the client's private `SpannerRetryPolicy`: transport / IO
-    /// errors are retried on idempotent requests and treated as permanent otherwise. (Uses an IO
-    /// error, which `Aip194Strict` also classifies as permanent, so the decoration is exercised
-    /// without depending on the `http` crate for a transport error's header map.)
-    #[test]
-    fn base_policy_retries_io_errors_only_when_idempotent() {
-        let policy = SpannerRetryPolicy;
-        let io = || {
-            GaxError::io(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
-                "closed",
-            ))
-        };
-        assert!(
-            policy.on_error(&RetryState::new(true), io()).is_continue(),
-            "idempotent IO error should be retried"
-        );
-        assert!(
-            policy
-                .on_error(&RetryState::new(false), io())
-                .is_permanent(),
-            "non-idempotent IO error should be permanent"
         );
     }
 
