@@ -632,10 +632,17 @@ pub(crate) fn arrow_field(
 /// (pyarrow, polars) emit for logical JSON. The bind path uses this to send such values as
 /// Spanner `JSON`-typed parameters, and ingest create modes to create `JSON` columns. The storage
 /// check matters: `arrow.json` is only defined over utf8-family storage, so a tag on any other
-/// type is ignored rather than mis-bound.
+/// type is ignored rather than mis-bound. A `Dictionary` looks through to its **value** type —
+/// the Arrow spec allows an extension array to be dictionary-encoded (the field's storage type is
+/// then `dictionary<indices, utf8>`), and the bind path decodes the encoding transparently, so the
+/// tag must be honoured through it too.
 pub(crate) fn is_json_field(field: &Field) -> bool {
+    let storage = match field.data_type() {
+        DataType::Dictionary(_, value) => value.as_ref(),
+        other => other,
+    };
     matches!(
-        field.data_type(),
+        storage,
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
     ) && field
         .metadata()
