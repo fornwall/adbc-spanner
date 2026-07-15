@@ -22,8 +22,11 @@
 //! wire protos match. The harness here ([`MockServer`]) binds it to an ephemeral localhost port
 //! and points the driver at it via `spanner.endpoint` + `spanner.emulator=true` (anonymous
 //! credentials over plaintext HTTP/2 — the same path a real emulator uses). Only **data-plane**
-//! RPCs exist here: the driver's admin clients (DDL) are never built, so the client's
-//! emulator-only `9010`→`9020` admin-endpoint remap never applies to these tests.
+//! RPCs are scripted here: the mock speaks `google.spanner.v1.Spanner`, not the REST admin API the
+//! driver's DDL path uses. Because the harness binds an ephemeral port, the client's emulator-only
+//! `:9010`→`:9020` admin-endpoint remap never applies, so an admin client built in these tests
+//! targets the harness's own socket — which [`GatedEndpoint`] exploits to bound the DDL path
+//! deterministically without serving admin RPCs at all.
 //!
 //! Scripting rules (mockall matches expectations in FIFO order):
 //! - the harness always serves `CreateSession` (the client creates one multiplexed session per
@@ -195,6 +198,98 @@ impl Watchdog {
 impl Drop for Watchdog {
     fn drop(&mut self) {
         self.disarmed.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A TCP gate in front of a [`MockServer`], used to make the driver's **admin** (DDL) endpoint
+/// unanswerable *by construction* — the one thing this data-plane mock cannot script itself.
+///
+/// The client derives the admin endpoint from the data-plane one, remapping the port only for an
+/// endpoint ending in `:9010` (`map_emulator_admin_endpoint` in the pinned client); the harness
+/// binds an *ephemeral* port, so the remap never applies and **both clients target this one
+/// socket**. That is what lets a DDL test run offline: the driver reaches the mock through the
+/// gate, and once it is [switched silent](Self::go_silent) every *new* connection is accepted and
+/// then never answered — a black hole. Accepted sockets are deliberately **held open** rather than
+/// dropped: a closed socket would surface as a transport *error*, whereas the point here is a
+/// request that hangs.
+///
+/// Ordering is explicit at the call site: connect first (letting `CreateSession` through), then go
+/// silent, then issue the DDL — whose admin client dials a *fresh* HTTP/1.1 connection (a separate
+/// pool from the already-established h2c data-plane channel) and waits forever.
+struct GatedEndpoint {
+    /// Plaintext endpoint (`http://127.0.0.1:<port>`) to hand to `spanner.endpoint`.
+    endpoint: String,
+    silent: Arc<AtomicBool>,
+}
+
+impl GatedEndpoint {
+    /// Start a gate forwarding to `upstream` (a `MockServer` endpoint).
+    fn start(upstream: &str) -> Self {
+        let upstream = upstream.trim_start_matches("http://").to_string();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind gate listener");
+        let address = listener.local_addr().expect("gate address");
+        let silent = Arc::new(AtomicBool::new(false));
+
+        let gate_silent = silent.clone();
+        std::thread::spawn(move || {
+            // Sockets accepted while silent are parked here: held open (so the peer sees a live
+            // connection that simply never replies) until the process exits.
+            let mut parked = Vec::new();
+            for client in listener.incoming() {
+                let Ok(client) = client else { continue };
+                if gate_silent.load(Ordering::SeqCst) {
+                    parked.push(client);
+                    continue;
+                }
+                let Ok(server) = std::net::TcpStream::connect(&upstream) else {
+                    continue;
+                };
+                // Pump both directions; each half ends when its side closes.
+                for (mut from, mut to) in [
+                    (
+                        client.try_clone().expect("clone client socket"),
+                        server.try_clone().expect("clone server socket"),
+                    ),
+                    (server, client),
+                ] {
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut from, &mut to);
+                    });
+                }
+            }
+        });
+
+        Self {
+            endpoint: format!("http://{address}"),
+            silent,
+        }
+    }
+
+    /// Black-hole every subsequent connection. Already-established ones keep flowing.
+    fn go_silent(&self) {
+        self.silent.store(true, Ordering::SeqCst);
+    }
+
+    /// Connect the driver through the gate, exactly as [`MockServer::connect`] does directly.
+    fn connect(&self) -> SpannerConnection {
+        let mut driver = SpannerDriver::try_new().expect("create driver");
+        let database = driver
+            .new_database_with_opts([
+                (
+                    OptionDatabase::Uri,
+                    OptionValue::String(format!("spanner:///{DATABASE}")),
+                ),
+                (
+                    OptionDatabase::Other(adbc_spanner::OPTION_ENDPOINT.into()),
+                    OptionValue::String(self.endpoint.clone()),
+                ),
+                (
+                    OptionDatabase::Other(adbc_spanner::OPTION_EMULATOR.into()),
+                    OptionValue::String("true".into()),
+                ),
+            ])
+            .expect("create database");
+        database.new_connection().expect("connect through the gate")
     }
 }
 
@@ -1239,6 +1334,71 @@ fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
     assert!(
         cancel_latency < Duration::from_secs(10),
         "cancel took {cancel_latency:?} to unblock the reader"
+    );
+}
+
+/// (c′) The timeout twin of the silent-stream cancel test above, on the **DDL** path:
+/// `spanner.rpc.timeout_seconds.update` bounds `run_ddl` — the admin `UpdateDatabaseDdl` call and
+/// its long-running-operation poll loop, which sit inside the same `with_timeout`, so bounding the
+/// wrapper bounds the poll loop that used to run unbounded.
+///
+/// This is the deterministic replacement for an emulator assertion that raced (TEST-12). There, a
+/// *microsecond* deadline was pitted against a real `UpdateDatabaseDdl` on the premise that no
+/// real RPC could beat it. Both halves of that premise are wrong: tokio's timer wheel has ~1ms
+/// granularity, so a sub-millisecond deadline actually fires up to ~1ms late, while the emulator
+/// answers DDL over a warm local connection in well under that. Whichever won decided the result.
+///
+/// Here there is nothing to race. The admin endpoint is a black hole ([`GatedEndpoint`]), so the
+/// DDL can never complete and the driver's deadline is the *only* way the call can return quickly
+/// — the deadline's value affects how long the test takes, not whether it passes. Unwiring the
+/// update timeout from `run_ddl` fails this test on the status assertion: the request then falls
+/// through to the admin client's *own* ~60s default request deadline and surfaces as `Internal`,
+/// not `Timeout` (the `Watchdog` is only a backstop for a genuine hang).
+#[test]
+fn ddl_update_timeout_fires_on_a_silent_admin_endpoint() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "ddl_update_timeout_fires_on_a_silent_admin_endpoint",
+    );
+    // No RPC is scripted: the DDL path never touches the data plane, and `CreateSession` (served
+    // by the harness) is the only thing that must get through before the gate closes.
+    let server = MockServer::start(|_mock| {});
+    let gate = GatedEndpoint::start(&server.endpoint);
+    let mut connection = gate.connect();
+    // From here on nothing can ever answer the admin client.
+    gate.go_silent();
+
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_RPC_TIMEOUT_UPDATE.into()),
+            OptionValue::Double(0.25),
+        )
+        .expect("set the update deadline");
+    statement
+        .set_sql_query("CREATE TABLE T (Id INT64) PRIMARY KEY (Id)")
+        .unwrap();
+
+    let started = Instant::now();
+    let error = statement
+        .execute_update()
+        .expect_err("an unanswerable DDL must expire its update deadline");
+    let elapsed = started.elapsed();
+
+    assert_eq!(error.status, AdbcStatus::Timeout, "got error: {error}");
+    assert!(
+        error
+            .message
+            .contains(adbc_spanner::OPTION_RPC_TIMEOUT_UPDATE),
+        "the DDL timeout error must name the update option: {}",
+        error.message
+    );
+    // The deadline — not some unrelated transport failure racing it — is what ended the call: a
+    // connection-refused or reset would come back in single-digit milliseconds.
+    assert!(
+        elapsed >= Duration::from_millis(250),
+        "returned in {elapsed:?}, before the 0.25s deadline could fire — the DDL failed for some \
+         other reason"
     );
 }
 

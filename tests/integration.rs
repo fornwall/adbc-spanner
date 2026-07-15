@@ -7821,6 +7821,9 @@ fn zero_row_schema_fidelity() {
 /// override, validation of bad values, generous deadlines leaving real operations untouched, and —
 /// the point of the feature — a deadline that actually fires against a live RPC surfacing ADBC
 /// `Timeout` (instead of the pre-existing behaviour, blocking until `cancel`).
+///
+/// The DDL path's deadline is proved in `tests/mock_spanner.rs` rather than here; see the comment
+/// at the DDL step below for why the emulator cannot assert it without racing.
 #[test]
 fn rpc_timeouts() {
     use adbc_core::error::Status;
@@ -8103,37 +8106,14 @@ fn rpc_timeouts() {
     );
 
     // The update deadline also bounds DDL — the admin `UpdateDatabaseDdl` call plus its
-    // long-running-operation poll loop, which used to poll unboundedly. A microsecond update
-    // deadline on the statement makes even a trivial DDL fail fast with `Timeout` naming the
-    // option, rather than hanging in the poller.
-    let mut tiny_ddl = connection.new_statement().expect("new statement");
-    tiny_ddl
-        .set_option(
-            stmt_key(OPTION_RPC_TIMEOUT_UPDATE),
-            OptionValue::String("0.000001".into()),
-        )
-        .expect("set a microsecond update deadline for DDL");
-    tiny_ddl
-        .set_sql_query("CREATE TABLE AdbcRpcTimeoutDdl (Id INT64) PRIMARY KEY (Id)")
-        .unwrap();
-    let error = tiny_ddl
-        .execute_update()
-        .expect_err("a microsecond update deadline must expire on DDL");
-    assert_eq!(error.status, Status::Timeout, "{error:?}");
-    assert!(
-        error.message.contains(OPTION_RPC_TIMEOUT_UPDATE),
-        "the DDL timeout error must name the update option: {}",
-        error.message
-    );
-    // Best-effort cleanup in case the DDL nonetheless applied server-side before the poll gave up
-    // (a timed-out LRO may still complete): drop it if present, ignoring any error.
-    let mut drop_ddl = connection.new_statement().expect("new statement");
-    if drop_ddl
-        .set_sql_query("DROP TABLE IF EXISTS AdbcRpcTimeoutDdl")
-        .is_ok()
-    {
-        let _ = drop_ddl.execute_update();
-    }
+    // long-running-operation poll loop — but that is deliberately *not* asserted here: proving a
+    // deadline fires needs an RPC slower than it, and the emulator answers DDL in well under the
+    // ~1ms granularity of tokio's timer wheel, so the two are inseparable and any deadline small
+    // enough to fire is also small enough to lose (TEST-12). The DML/query cases above keep their
+    // margin (several gRPC round trips each); the DDL case is proved deterministically instead, on
+    // an admin endpoint that can never answer at all, by
+    // `ddl_update_timeout_fires_on_a_silent_admin_endpoint` in tests/mock_spanner.rs. The generous
+    // 30-second deadline covering the `run` DDL above is what this suite asserts about DDL.
 
     // The query deadline bounds the driver-internal metadata reads too. A microsecond query
     // deadline on the connection makes `get_objects` fail with `Timeout` rather than blocking in
