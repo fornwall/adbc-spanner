@@ -101,6 +101,40 @@ pub(crate) fn double_from_stored_string(stored: Result<String>, what: &str) -> R
         .map_err(|_| invalid_argument(format!("{what} value {value:?} is not a double")))
 }
 
+/// Generate the three typed `Optionable` getters — `get_option_bytes`, `get_option_int` and
+/// `get_option_double` — that `SpannerDatabase`, `SpannerConnection` and `SpannerStatement` share
+/// verbatim.
+///
+/// Every gettable option has a canonical string form, so each level's typed getters are pure
+/// reinterpretations of its own `get_option_string`: bytes are its UTF-8, ints and doubles are it
+/// parsed by [`int_from_stored_string`] / [`double_from_stored_string`] (which propagate the string
+/// lookup's `NotFound` unchanged and report a set-but-unparsable value as `InvalidArguments`). Only
+/// `get_option_string` differs per level, so these three bodies were identical in all but the
+/// option-key type — `Self::Option`, whose `AsRef<str>` names the key for the error message.
+///
+/// This deliberately covers only the *typed* getters. The read-only
+/// `spanner.commit_stats.mutation_count` key and friends live in `get_option_string` (via
+/// [`impl_shared_option_dispatch`]) and so are served through these bodies without any per-level
+/// special-casing here.
+macro_rules! impl_typed_option_getters {
+    () => {
+        fn get_option_bytes(&self, key: Self::Option) -> Result<Vec<u8>> {
+            Ok(self.get_option_string(key)?.into_bytes())
+        }
+
+        fn get_option_int(&self, key: Self::Option) -> Result<i64> {
+            let what = format!("option {}", key.as_ref());
+            crate::options::int_from_stored_string(self.get_option_string(key), &what)
+        }
+
+        fn get_option_double(&self, key: Self::Option) -> Result<f64> {
+            let what = format!("option {}", key.as_ref());
+            crate::options::double_from_stored_string(self.get_option_string(key), &what)
+        }
+    };
+}
+pub(crate) use impl_typed_option_getters;
+
 /// Generate the two shared option-dispatch helpers that `SpannerConnection` and `SpannerStatement`
 /// share verbatim.
 ///
