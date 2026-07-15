@@ -125,20 +125,46 @@ mod referential_constraints_col {
     pub(super) const UNIQUE_CONSTRAINT_NAME: usize = 3;
 }
 
+/// The filters `get_objects` was called with: an ADBC `LIKE` pattern for each of the schema, table
+/// and column names, plus an exact-match list of table types. `None` means "no filter" — which,
+/// for `table_type`, is not the same as an empty list (that one matches nothing).
+///
+/// Each is applied twice: pushed down into the `INFORMATION_SCHEMA` query as a bound-parameter
+/// predicate, and applied authoritatively client-side in [`assemble_objects`].
+pub(crate) struct ObjectFilters<'a> {
+    pub db_schema: Option<&'a str>,
+    pub table_name: Option<&'a str>,
+    pub table_type: Option<&'a [&'a str]>,
+    pub column_name: Option<&'a str>,
+}
+
+/// The `INFORMATION_SCHEMA` batches [`collect_objects`] fetches, as handed to [`assemble_objects`].
+/// The five optional ones are `None` at a depth that does not populate them — no query was issued.
+struct ObjectBatches {
+    schemata: RecordBatch,
+    tables: Option<RecordBatch>,
+    columns: Option<RecordBatch>,
+    constraints: Option<RecordBatch>,
+    key_columns: Option<RecordBatch>,
+    referential: Option<RecordBatch>,
+}
+
 /// Query `INFORMATION_SCHEMA` and assemble the schema→table→column hierarchy for `get_objects`,
 /// applying the ADBC `LIKE`/type filters and the requested depth.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_objects(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
     cancel: &CancelSignal,
     timeout: Option<Duration>,
     depth: ObjectDepth,
-    db_schema: Option<&str>,
-    table_name: Option<&str>,
-    table_type: &Option<Vec<&str>>,
-    column_name: Option<&str>,
+    filters: &ObjectFilters<'_>,
 ) -> Result<Vec<DbSchema>> {
+    let ObjectFilters {
+        db_schema,
+        table_name,
+        column_name,
+        ..
+    } = *filters;
     // At catalog depth the result is just the single unnamed catalog with a null db_schemas
     // list — `build` ignores the collected schemas entirely — so skip INFORMATION_SCHEMA
     // (and any RPC) altogether. The remaining depths each fetch only what they populate:
@@ -222,14 +248,7 @@ pub(crate) fn collect_objects(
         .build()
     });
 
-    let (
-        schema_batch,
-        table_batch,
-        column_batch,
-        constraint_batch,
-        key_column_batch,
-        referential_batch,
-    ) = block_on_cancellable(
+    let batches = block_on_cancellable(
         runtime,
         cancel,
         // The whole `get_objects` metadata fetch is one query-side operation, bounded by the
@@ -248,34 +267,54 @@ pub(crate) fn collect_objects(
                 .build()
                 .await
                 .map_err(from_spanner)?;
-            try_join!(
+            let (schemata, tables, columns, constraints, key_columns, referential) = try_join!(
                 query_txn(&txn, schemata_stmt),
                 query_txn_opt(&txn, tables_stmt),
                 query_txn_opt(&txn, columns_stmt),
                 query_txn_opt(&txn, constraints_stmt),
                 query_txn_opt(&txn, key_columns_stmt),
                 query_txn_opt(&txn, referential_stmt),
-            )
+            )?;
+            Ok(ObjectBatches {
+                schemata,
+                tables,
+                columns,
+                constraints,
+                key_columns,
+                referential,
+            })
         }),
     )?;
 
-    let schema_names = str_col(&schema_batch, schemata_col::SCHEMA_NAME)?;
+    assemble_objects(&batches, filters)
+}
+
+/// Assemble the schema→table→column hierarchy from the fetched `INFORMATION_SCHEMA` batches,
+/// applying the ADBC filters.
+///
+/// Split from [`collect_objects`] because it is the whole of `get_objects`' *logic* — the
+/// authoritative client-side filtering, the depth-gated skeleton, and the foreign-key usage
+/// resolution — with none of its I/O, so it is unit-testable offline (the fetch it is split from
+/// is only reachable against a live database).
+fn assemble_objects(batches: &ObjectBatches, filters: &ObjectFilters<'_>) -> Result<Vec<DbSchema>> {
+    let schema_batch = &batches.schemata;
+    let schema_names = str_col(schema_batch, schemata_col::SCHEMA_NAME)?;
 
     // Group each INFORMATION_SCHEMA batch ONCE into lookup maps keyed by (schema, table) — and
     // the key/referential batches by (constraint_schema, constraint_name) — so the assembly
     // below is a series of hash lookups rather than a full rescan of each batch per table (which
     // was quadratic for large schemas). This mirrors `collect_statistics`. The per-group `Vec`s
     // keep batch (i.e. `ORDER BY`) order, so column and key-column ordering is preserved exactly.
-    let tables_by_schema = group_opt(table_batch.as_ref(), group_tables)?;
-    let columns_by_table = group_opt(column_batch.as_ref(), group_columns)?;
-    let constraints_by_table = group_opt(constraint_batch.as_ref(), group_constraints)?;
-    let key_columns_by_constraint = group_opt(key_column_batch.as_ref(), group_key_columns)?;
-    let referential_by_constraint = group_opt(referential_batch.as_ref(), group_referential)?;
+    let tables_by_schema = group_opt(batches.tables.as_ref(), group_tables)?;
+    let columns_by_table = group_opt(batches.columns.as_ref(), group_columns)?;
+    let constraints_by_table = group_opt(batches.constraints.as_ref(), group_constraints)?;
+    let key_columns_by_constraint = group_opt(batches.key_columns.as_ref(), group_key_columns)?;
+    let referential_by_constraint = group_opt(batches.referential.as_ref(), group_referential)?;
 
     // The `LIKE` patterns are loop-invariant, so compile each once and reuse it across every row.
-    let db_schema_matcher = db_schema.map(LikeMatcher::new);
-    let table_name_matcher = table_name.map(LikeMatcher::new);
-    let column_name_matcher = column_name.map(LikeMatcher::new);
+    let db_schema_matcher = filters.db_schema.map(LikeMatcher::new);
+    let table_name_matcher = filters.table_name.map(LikeMatcher::new);
+    let column_name_matcher = filters.column_name.map(LikeMatcher::new);
 
     let mut result = Vec::new();
     for i in 0..schema_batch.num_rows() {
@@ -299,8 +338,8 @@ pub(crate) fn collect_objects(
             }
             // Filter on the borrowed type name; only a kept row pays for the `String`.
             let ttype = table.table_type;
-            if table_type
-                .as_ref()
+            if filters
+                .table_type
                 .is_some_and(|types| !types.contains(&ttype))
             {
                 continue;
@@ -1275,5 +1314,249 @@ mod tests {
 
         // An absent batch — that depth never issued the query — groups to an empty map.
         assert!(group_opt(None, group_tables).unwrap().is_empty());
+    }
+
+    /// A batch of string columns, listed in the `SELECT` order the `*_col` modules index. `None`
+    /// is a SQL NULL.
+    fn str_batch(columns: &[(&str, Vec<Option<&str>>)]) -> RecordBatch {
+        RecordBatch::try_from_iter(columns.iter().map(|(name, values)| {
+            (
+                *name,
+                Arc::new(StringArray::from(values.clone())) as ArrayRef,
+            )
+        }))
+        .unwrap()
+    }
+
+    /// The six `INFORMATION_SCHEMA` batches of a small database, as an `All`-depth fetch returns
+    /// them: the unnamed user schema holds `Users` and `Orgs`, with a two-column foreign key from
+    /// `Users` to `Orgs`' two-column primary key; `INFORMATION_SCHEMA` holds one view.
+    ///
+    /// The foreign key is deliberately *cross-ordered*: its first key column (`OrgId`) references
+    /// the referenced key's **second** column (`Orgs.Id`) and vice versa, so a `usages` list built
+    /// in the referenced constraint's own key order — rather than mapped through
+    /// `POSITION_IN_UNIQUE_CONSTRAINT` — comes out reversed and fails.
+    fn sample_batches() -> ObjectBatches {
+        /// A present (non-NULL) cell of a [`str_batch`] column.
+        fn s(value: &str) -> Option<&str> {
+            Some(value)
+        }
+        ObjectBatches {
+            schemata: str_batch(&[("SCHEMA_NAME", vec![s(""), s("INFORMATION_SCHEMA")])]),
+            tables: Some(str_batch(&[
+                ("TABLE_SCHEMA", vec![s(""), s(""), s("INFORMATION_SCHEMA")]),
+                ("TABLE_NAME", vec![s("Users"), s("Orgs"), s("TABLES")]),
+                (
+                    "TABLE_TYPE",
+                    vec![s("BASE TABLE"), s("BASE TABLE"), s("VIEW")],
+                ),
+            ])),
+            columns: Some(
+                RecordBatch::try_from_iter([
+                    (
+                        "TABLE_SCHEMA",
+                        Arc::new(StringArray::from(vec![""; 5])) as ArrayRef,
+                    ),
+                    (
+                        "TABLE_NAME",
+                        Arc::new(StringArray::from(vec![
+                            "Users", "Users", "Users", "Orgs", "Orgs",
+                        ])) as ArrayRef,
+                    ),
+                    (
+                        "COLUMN_NAME",
+                        Arc::new(StringArray::from(vec![
+                            "Id",
+                            "OrgRegion",
+                            "OrgId",
+                            "Region",
+                            "Id",
+                        ])) as ArrayRef,
+                    ),
+                    (
+                        "ORDINAL_POSITION",
+                        Arc::new(Int64Array::from(vec![1, 2, 3, 1, 2])) as ArrayRef,
+                    ),
+                    (
+                        "IS_NULLABLE",
+                        Arc::new(StringArray::from(vec!["NO", "YES", "YES", "NO", "NO"]))
+                            as ArrayRef,
+                    ),
+                    (
+                        "SPANNER_TYPE",
+                        Arc::new(StringArray::from(vec![
+                            "INT64",
+                            "STRING(MAX)",
+                            "INT64",
+                            "STRING(MAX)",
+                            "INT64",
+                        ])) as ArrayRef,
+                    ),
+                ])
+                .unwrap(),
+            ),
+            constraints: Some(str_batch(&[
+                ("TABLE_SCHEMA", vec![s(""), s(""), s("")]),
+                ("TABLE_NAME", vec![s("Users"), s("Users"), s("Orgs")]),
+                (
+                    "CONSTRAINT_NAME",
+                    vec![s("PK_Users"), s("FK_Users_Orgs"), s("PK_Orgs")],
+                ),
+                (
+                    "CONSTRAINT_TYPE",
+                    vec![s("PRIMARY KEY"), s("FOREIGN KEY"), s("PRIMARY KEY")],
+                ),
+            ])),
+            // Ordered by (CONSTRAINT_SCHEMA, CONSTRAINT_NAME, ORDINAL_POSITION), as the query's
+            // `ORDER BY` guarantees.
+            key_columns: Some(str_batch(&[
+                ("CONSTRAINT_SCHEMA", vec![s(""); 5]),
+                (
+                    "CONSTRAINT_NAME",
+                    vec![
+                        s("FK_Users_Orgs"),
+                        s("FK_Users_Orgs"),
+                        s("PK_Orgs"),
+                        s("PK_Orgs"),
+                        s("PK_Users"),
+                    ],
+                ),
+                ("TABLE_SCHEMA", vec![s(""); 5]),
+                (
+                    "TABLE_NAME",
+                    vec![s("Users"), s("Users"), s("Orgs"), s("Orgs"), s("Users")],
+                ),
+                (
+                    "COLUMN_NAME",
+                    vec![s("OrgId"), s("OrgRegion"), s("Region"), s("Id"), s("Id")],
+                ),
+                (
+                    "ORDINAL_POSITION",
+                    vec![s("1"), s("2"), s("1"), s("2"), s("1")],
+                ),
+                (
+                    "POSITION_IN_UNIQUE_CONSTRAINT",
+                    vec![s("2"), s("1"), None, None, None],
+                ),
+            ])),
+            referential: Some(str_batch(&[
+                ("CONSTRAINT_SCHEMA", vec![s("")]),
+                ("CONSTRAINT_NAME", vec![s("FK_Users_Orgs")]),
+                ("UNIQUE_CONSTRAINT_SCHEMA", vec![s("")]),
+                ("UNIQUE_CONSTRAINT_NAME", vec![s("PK_Orgs")]),
+            ])),
+        }
+    }
+
+    /// No filters: every schema, table and column is kept.
+    fn no_filters() -> ObjectFilters<'static> {
+        ObjectFilters {
+            db_schema: None,
+            table_name: None,
+            table_type: None,
+            column_name: None,
+        }
+    }
+
+    #[test]
+    fn assemble_objects_builds_the_hierarchy_in_batch_order() {
+        let schemas = assemble_objects(&sample_batches(), &no_filters()).unwrap();
+
+        let names: Vec<_> = schemas.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["", "INFORMATION_SCHEMA"]);
+        let tables: Vec<_> = schemas[0].tables.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(tables, ["Users", "Orgs"]);
+        assert_eq!(schemas[1].tables[0].table_type, "VIEW");
+
+        // Columns keep the query's ORDINAL_POSITION order, with their type and nullability.
+        let users = &schemas[0].tables[0];
+        let columns: Vec<_> = users.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(columns, ["Id", "OrgRegion", "OrgId"]);
+        assert_eq!(users.columns[1].type_name, "STRING(MAX)");
+        assert_eq!(users.columns[1].ordinal, 2);
+        assert!(!users.columns[0].nullable);
+        assert!(users.columns[1].nullable);
+    }
+
+    #[test]
+    fn assemble_objects_orders_foreign_key_usages_by_position_in_unique_constraint() {
+        let schemas = assemble_objects(&sample_batches(), &no_filters()).unwrap();
+        let users = &schemas[0].tables[0];
+
+        let pk = &users.constraints[0];
+        assert_eq!(pk.constraint_type, "PRIMARY KEY");
+        assert_eq!(pk.columns, ["Id"]);
+        assert!(pk.usages.is_empty(), "a primary key references nothing");
+
+        // The FK's own key columns come out in ORDINAL_POSITION order, and each usage is the
+        // column its POSITION_IN_UNIQUE_CONSTRAINT points at in the referenced key — *not* the
+        // referenced key's own order, which here is the reverse (`Orgs(Region, Id)`).
+        let fk = &users.constraints[1];
+        assert_eq!(fk.name.as_deref(), Some("FK_Users_Orgs"));
+        assert_eq!(fk.columns, ["OrgId", "OrgRegion"]);
+        let usages: Vec<_> = fk
+            .usages
+            .iter()
+            .map(|u| (u.db_schema.as_str(), u.table.as_str(), u.column.as_str()))
+            .collect();
+        assert_eq!(usages, [("", "Orgs", "Id"), ("", "Orgs", "Region")]);
+    }
+
+    #[test]
+    fn assemble_objects_applies_every_filter_client_side() {
+        // The `LIKE` push-down only cuts transferred rows; these client-side passes are the
+        // authoritative filter, so they must hold even on an unfiltered batch (as here).
+        let types = ["BASE TABLE"];
+        let schemas = assemble_objects(
+            &sample_batches(),
+            &ObjectFilters {
+                db_schema: Some(""),
+                table_name: Some("User%"),
+                table_type: Some(&types),
+                column_name: Some("Org%"),
+            },
+        )
+        .unwrap();
+        assert_eq!(schemas.len(), 1, "INFORMATION_SCHEMA is filtered out");
+        assert_eq!(schemas[0].name, "");
+        let tables: Vec<_> = schemas[0].tables.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(tables, ["Users"], "Orgs does not match `User%`");
+        let columns: Vec<_> = schemas[0].tables[0]
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(columns, ["OrgRegion", "OrgId"], "Id does not match `Org%`");
+
+        // A table_type filter matching nothing keeps the schema skeleton with no tables (`build`
+        // turns that into the spec's EMPTY — never NULL — list).
+        let types = ["NO SUCH TYPE"];
+        let schemas = assemble_objects(
+            &sample_batches(),
+            &ObjectFilters {
+                table_type: Some(&types),
+                ..no_filters()
+            },
+        )
+        .unwrap();
+        assert_eq!(schemas.len(), 2);
+        assert!(schemas.iter().all(|s| s.tables.is_empty()));
+    }
+
+    #[test]
+    fn assemble_objects_yields_bare_schemas_when_only_schemata_was_fetched() {
+        // Schemas depth issues the SCHEMATA query alone, leaving every other batch `None`: each
+        // schema comes out with no tables, without the assembly ever noticing the difference.
+        let batches = ObjectBatches {
+            tables: None,
+            columns: None,
+            constraints: None,
+            key_columns: None,
+            referential: None,
+            ..sample_batches()
+        };
+        let schemas = assemble_objects(&batches, &no_filters()).unwrap();
+        assert_eq!(schemas.len(), 2);
+        assert!(schemas.iter().all(|s| s.tables.is_empty()));
     }
 }
