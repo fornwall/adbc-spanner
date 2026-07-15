@@ -188,28 +188,40 @@ pub(crate) fn collect_statistics(
         cancel,
         with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async {
             let mut slots: Vec<Option<RecordBatch>> = vec![None; prepared.len()];
-            let mut scans = stream::iter(prepared.iter().enumerate().map(|(idx, p)| {
-                let client = client.clone();
-                let sql = p.sql.clone();
-                // The aggregate scans the user table, so honour the connection's read staleness.
-                let bound = bound.clone();
-                async move {
-                    let transaction = crate::staleness::single_use(&client, bound);
-                    let result_set = transaction
-                        .execute_query(SpannerSql::builder(sql).build())
-                        .await
-                        .map_err(from_spanner)?;
-                    // The aggregate scan returns only INT64 counts, never a TIMESTAMP column, so the
-                    // default timestamp precision is fine here.
-                    let (_schema, batch) = result_set_to_batch(
-                        result_set,
-                        crate::conversion::TimestampPrecision::default(),
-                    )
-                    .await?;
-                    Ok::<_, Error>((idx, batch))
-                }
-            }))
-            .buffer_unordered(STATISTICS_SCAN_CONCURRENCY);
+            // Build the scan futures eagerly into a `Vec` rather than letting `stream::iter` hold
+            // the lazy `prepared.iter()` chain. Each future captures only owned data (`sql` was
+            // cloned per scan anyway), so collecting first drops the `&PreparedTable` borrow — and
+            // with it the closure's higher-ranked lifetime, which otherwise defeats the compiler's
+            // `Send` check on the surrounding async block ("implementation of `FnOnce` is not
+            // general enough"). `block_on_cancellable` needs that `Send` so it can drive this on a
+            // scoped thread when the caller sits inside a current-thread runtime (see
+            // `crate::runtime`).
+            let scans: Vec<_> = prepared
+                .iter()
+                .enumerate()
+                .map(|(idx, p)| {
+                    let client = client.clone();
+                    let sql = p.sql.clone();
+                    // The aggregate scans the user table, so honour the connection's read staleness.
+                    let bound = bound.clone();
+                    async move {
+                        let transaction = crate::staleness::single_use(&client, bound);
+                        let result_set = transaction
+                            .execute_query(SpannerSql::builder(sql).build())
+                            .await
+                            .map_err(from_spanner)?;
+                        // The aggregate scan returns only INT64 counts, never a TIMESTAMP column,
+                        // so the default timestamp precision is fine here.
+                        let (_schema, batch) = result_set_to_batch(
+                            result_set,
+                            crate::conversion::TimestampPrecision::default(),
+                        )
+                        .await?;
+                        Ok::<_, Error>((idx, batch))
+                    }
+                })
+                .collect();
+            let mut scans = stream::iter(scans).buffer_unordered(STATISTICS_SCAN_CONCURRENCY);
             while let Some(result) = scans.next().await {
                 let (idx, batch) = result?;
                 slots[idx] = Some(batch);

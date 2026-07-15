@@ -20,7 +20,7 @@ use crate::connection::SpannerConnection;
 use crate::error::{
     err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
 };
-use crate::runtime::{SharedRuntime, new_runtime};
+use crate::runtime::{SharedRuntime, block_on_bridged, new_runtime};
 use crate::{
     OPTION_ACCESS_TOKEN, OPTION_EMULATOR, OPTION_ENDPOINT, OPTION_IMPERSONATE_DELEGATES,
     OPTION_IMPERSONATE_LIFETIME, OPTION_IMPERSONATE_SCOPES, OPTION_IMPERSONATE_TARGET_PRINCIPAL,
@@ -399,7 +399,10 @@ impl SpannerDatabase {
                 .unwrap_or(DEFAULT_IMPERSONATION_LIFETIME_SECS),
         );
 
-        self.runtime.block_on(async move {
+        // The one bridged call outside `block_on_cancellable` (connecting is not cancellable):
+        // `block_on_bridged`, not a bare `block_on`, so entering the driver from an async context
+        // does not panic across the FFI boundary. See `crate::runtime`.
+        block_on_bridged(&self.runtime, async move {
             let mut builder = Spanner::builder();
             if let Some(endpoint) = endpoint {
                 builder = builder.with_endpoint(endpoint);

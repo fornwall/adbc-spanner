@@ -5,20 +5,110 @@
 //! [`Arc`], with every database, connection and statement it spawns. Holding the [`Arc`] keeps the
 //! runtime — and therefore any background tasks the Spanner client spawns (such as the session
 //! maintainer) — alive for as long as any handle exists.
+//!
+//! # Being entered from an async context
+//!
+//! Because the bridge is `block_on`, every driver call **blocks the calling thread** until the
+//! operation completes. Tokio permits that only on threads that are not currently *running* a
+//! runtime, and *panics* otherwise — both when blocking ("Cannot block the current thread from
+//! within a runtime") and when dropping a runtime ("Cannot drop a runtime in a context where
+//! blocking is not allowed"). For a cdylib that is worse than it sounds: the panic unwinds across
+//! the C FFI boundary and poisons the driver handle.
+//!
+//! Neither panic is predictable through Tokio's public API — [`Handle::try_current`] is `Ok` on a
+//! runtime worker (blocking panics) *and* inside [`tokio::task::spawn_blocking`] (blocking is
+//! legal, and is the sanctioned way to call a driver like this one). Guarding on it would
+//! therefore reject the very workaround it would have to recommend. So instead of predicting,
+//! each site uses a construction that is legal in every context it can be reached from:
+//!
+//! - **Calls** go through [`block_on_bridged`] (used by [`block_on_cancellable`] and by
+//!   `SpannerDatabase::connect`'s plain `block_on`), which picks per runtime flavour between
+//!   blocking directly, `block_in_place`, and a scoped thread.
+//! - **Drops** go through [`DriverRuntime`], whose `Drop` falls back to
+//!   [`Runtime::shutdown_background`] when a runtime context is detected — a *safe*
+//!   over-approximation, unlike the call case: shutting down in the background where a blocking
+//!   shutdown would also have worked costs nothing but the wait. This matters because a streamed
+//!   [`SpannerBatchReader`](crate::conversion::SpannerBatchReader) can outlive every other handle
+//!   and be dropped anywhere.
+//!
+//! The caller's thread still blocks — that is what a synchronous driver does, and what the caller
+//! asked for. Prefer [`tokio::task::spawn_blocking`] so it is not an async worker that parks.
 
 use std::future::Future;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use adbc_core::error::{Error, Result, Status};
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::error::err;
 
 /// A reference-counted handle to the driver's Tokio runtime.
-pub(crate) type SharedRuntime = Arc<Runtime>;
+pub(crate) type SharedRuntime = Arc<DriverRuntime>;
+
+/// The driver's Tokio runtime, wrapped so that dropping the last handle **from inside another
+/// Tokio runtime does not panic**.
+///
+/// [`Runtime`]'s own `Drop` blocks the current thread while the runtime's worker threads wind
+/// down, which Tokio refuses to do in an async context ("Cannot drop a runtime in a context where
+/// blocking is not allowed"). The driver cannot prevent that placement: a streamed
+/// [`SpannerBatchReader`](crate::conversion::SpannerBatchReader) holds a [`SharedRuntime`] and may
+/// well be the last holder, dropped wherever the consumer happens to release it — including on a
+/// Tokio worker thread. So `Drop` here detects a runtime context and shuts the runtime down in the
+/// background (non-blocking) instead of waiting for it.
+///
+/// [`Handle::try_current`] over-approximates (it is also `Ok` inside `spawn_blocking`, where a
+/// blocking drop would have been fine), but here that is harmless: the false positive only skips
+/// the wait for already-idle worker threads. Contrast [`block_on_bridged`], where the same
+/// over-approximation would have turned working calls into errors.
+///
+/// Deref-ing to [`Runtime`] keeps every call site (`block_on`, `spawn`) unchanged.
+pub(crate) struct DriverRuntime(
+    /// Always `Some` until `Drop`, which takes the runtime out to shut it down by value.
+    Option<Runtime>,
+);
+
+impl DriverRuntime {
+    fn new(runtime: Runtime) -> Self {
+        Self(Some(runtime))
+    }
+}
+
+impl Deref for DriverRuntime {
+    type Target = Runtime;
+
+    fn deref(&self) -> &Runtime {
+        // Only `Drop` ever takes the runtime out, and nothing can deref afterwards.
+        self.0.as_ref().expect("runtime taken only by Drop")
+    }
+}
+
+impl std::fmt::Debug for DriverRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("DriverRuntime").field(&self.0).finish()
+    }
+}
+
+impl Drop for DriverRuntime {
+    fn drop(&mut self) {
+        let Some(runtime) = self.0.take() else {
+            return;
+        };
+        if Handle::try_current().is_ok() {
+            // Dropping by value here would panic. Shut down without waiting instead: tasks are not
+            // polled again and the worker threads are detached to exit on their own. Nothing is
+            // lost that a blocking drop would have kept — the driver only ever runs *completed*
+            // operations' futures on this runtime plus the prefetch tasks, whose readers are gone
+            // by the time the last handle drops.
+            runtime.shutdown_background();
+        } else {
+            drop(runtime);
+        }
+    }
+}
 
 /// A **sticky, per-operation** cancellation signal shared between one operation (and any streamed
 /// reader it produces) and the `cancel()` call aimed at it.
@@ -145,12 +235,64 @@ fn cancelled_err() -> Error {
     err("operation cancelled", Status::Cancelled)
 }
 
+/// Block the calling thread on `future`, driving it on `runtime`, **from any thread context** —
+/// including from inside somebody else's Tokio runtime, where a bare
+/// [`Runtime::block_on`] would panic with "Cannot block the current thread from within a runtime".
+///
+/// Tokio permits blocking only on threads that are not currently *running* a runtime, and there is
+/// no public API that reports that: [`Handle::try_current`] is `Ok` both on a runtime worker
+/// (where blocking panics) *and* inside [`tokio::task::spawn_blocking`] / [`block_in_place`]
+/// (where it is perfectly legal — those are the sanctioned ways to block). So this does not
+/// *predict* whether blocking is allowed; it picks, per runtime flavour, a construction that is
+/// legal in **every** context that flavour can present:
+///
+/// - **No runtime context** — an ordinary application thread, the overwhelmingly common case for a
+///   synchronous ADBC driver. Block right here; nothing to work around.
+/// - **A multi-threaded runtime** — [`block_in_place`] is exactly Tokio's answer to "this thread is
+///   about to block": on a worker it hands the core to another thread first, so the caller's runtime
+///   keeps its full capacity; on a `spawn_blocking` thread (not *running* the runtime) it is a plain
+///   pass-through. Legal either way, and it never spawns a thread.
+/// - **A current-thread runtime** — `block_in_place` panics there (there is no other worker to hand
+///   the core to), and a `spawn_blocking` thread of a current-thread runtime is indistinguishable
+///   from its one worker. So drive the future on a scoped thread, which carries no Tokio context at
+///   all and may therefore always block. [`std::thread::scope`] borrows, so the future needs no
+///   `'static`; the calling thread parks in `join` exactly as it would in `block_on`.
+///
+/// The caller's thread blocks in all three cases — that is inherent in bridging a synchronous API
+/// onto an async client, and it is what the caller asked for by invoking a blocking driver. What is
+/// avoided is the *panic*, which for a cdylib would unwind across the C FFI boundary and poison the
+/// driver handle. A panic from `future` itself is still a genuine bug and is re-raised unchanged.
+pub(crate) fn block_on_bridged<F>(runtime: &Runtime, future: F) -> F::Output
+where
+    F: Future + Send,
+    F::Output: Send,
+{
+    use tokio::runtime::RuntimeFlavor;
+    use tokio::task::block_in_place;
+
+    match Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Err(_) => runtime.block_on(future),
+        Ok(RuntimeFlavor::MultiThread) => block_in_place(|| runtime.block_on(future)),
+        // `RuntimeFlavor` is `#[non_exhaustive]`; the scoped thread is legal for *any* flavour, so
+        // it is also the right fallback for one that does not exist yet.
+        Ok(_) => std::thread::scope(|scope| {
+            match scope.spawn(|| runtime.block_on(future)).join() {
+                Ok(output) => output,
+                // Propagate a panic from the future itself unchanged, as a bare `block_on` would.
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }),
+    }
+}
+
 /// Run `future` on `runtime`, returning [`Status::Cancelled`] if `cancel` is signalled before it
 /// completes — or if it was already signalled (and not reset) when the call began.
-pub(crate) fn block_on_cancellable<T>(
+///
+/// Safe to call from any thread, async context included — see [`block_on_bridged`].
+pub(crate) fn block_on_cancellable<T: Send>(
     runtime: &Runtime,
     cancel: &CancelSignal,
-    future: impl Future<Output = Result<T>>,
+    future: impl Future<Output = Result<T>> + Send,
 ) -> Result<T> {
     // Box the operation future onto the heap. `block_on` polls it on the *calling* thread's stack
     // (in ADBC that is the application's own thread, whose stack size the driver cannot control),
@@ -161,7 +303,7 @@ pub(crate) fn block_on_cancellable<T>(
     // of the operation's size, at the cost of one allocation per bridged call — negligible against
     // the RPC it wraps.
     let future = Box::pin(future);
-    runtime.block_on(async move {
+    block_on_bridged(runtime, async move {
         tokio::select! {
             // Check/register the cancellation waiter before polling the operation.
             biased;
@@ -261,7 +403,7 @@ pub(crate) fn new_runtime() -> Result<SharedRuntime> {
                 Status::Internal,
             )
         })?;
-    Ok(Arc::new(runtime))
+    Ok(Arc::new(DriverRuntime::new(runtime)))
 }
 
 #[cfg(test)]
@@ -275,6 +417,129 @@ mod tests {
         let cancel = CancelSignal::new();
         let result: Result<i32> = block_on_cancellable(&runtime, &cancel, async { Ok(42) });
         assert_eq!(result.unwrap(), 42);
+    }
+
+    /// Stand-ins for an application's own runtime, from inside which the driver is entered. Both
+    /// flavours matter and take different paths through [`block_on_bridged`]: `#[tokio::main]`
+    /// defaults to multi-thread, while `#[tokio::test]` and `flavor = "current_thread"` do not.
+    fn multi_thread_caller() -> Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn current_thread_caller() -> Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    // CON-1, the call half. Every context a driver call can be reached from must work — rather than
+    // panic with "Cannot block the current thread from within a runtime", which for the cdylib
+    // would unwind across the C FFI boundary and poison the driver handle.
+    //
+    // The `spawn_blocking` cases are the ones that make `Handle::try_current()` — the obvious
+    // guard, and the one CON-1 suggested — unusable: it reports `Ok` there just as it does on a
+    // worker thread, so a guard built on it would reject the very workaround the driver has to
+    // recommend, in the default `#[tokio::main]` (multi-thread) setup. These cases pin that down.
+    fn assert_call_works(runtime: &SharedRuntime, label: &str) {
+        let result: Result<i32> =
+            block_on_cancellable(runtime, &CancelSignal::new(), async { Ok(1) });
+        assert_eq!(result.unwrap(), 1, "bridged call failed in {label}");
+    }
+
+    #[test]
+    fn a_bridged_call_works_from_every_context() {
+        let runtime = new_runtime().unwrap();
+
+        // No runtime context: the ordinary synchronous ADBC caller.
+        assert_call_works(&runtime, "a plain thread");
+
+        // Multi-threaded runtime: worker threads (`block_on` body and a spawned task) go through
+        // `block_in_place`; a `spawn_blocking` thread is not running the runtime, so it passes
+        // straight through.
+        multi_thread_caller().block_on({
+            let runtime = runtime.clone();
+            async move {
+                assert_call_works(&runtime, "a multi-thread block_on body");
+                let rt = runtime.clone();
+                tokio::spawn(async move { assert_call_works(&rt, "a multi-thread task") })
+                    .await
+                    .unwrap();
+                let rt = runtime.clone();
+                tokio::task::spawn_blocking(move || {
+                    assert_call_works(&rt, "a multi-thread spawn_blocking")
+                })
+                .await
+                .unwrap();
+            }
+        });
+
+        // Current-thread runtime: `block_in_place` would panic here, so these go via a scoped
+        // thread — including `spawn_blocking`, which is indistinguishable from the one worker.
+        current_thread_caller().block_on({
+            let runtime = runtime.clone();
+            async move {
+                assert_call_works(&runtime, "a current-thread block_on body");
+                let rt = runtime.clone();
+                tokio::spawn(async move { assert_call_works(&rt, "a current-thread task") })
+                    .await
+                    .unwrap();
+                let rt = runtime.clone();
+                tokio::task::spawn_blocking(move || {
+                    assert_call_works(&rt, "a current-thread spawn_blocking")
+                })
+                .await
+                .unwrap();
+            }
+        });
+    }
+
+    // Cancellation still works when the call was bridged off the caller's thread (the scoped-thread
+    // path), so the rescue does not quietly cost the driver its `cancel()` contract.
+    #[test]
+    fn a_bridged_call_is_still_cancellable_from_an_async_context() {
+        let runtime = new_runtime().unwrap();
+        let cancel = CancelSignal::new();
+        let signaller = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            signaller.signal();
+        });
+        let error = current_thread_caller()
+            .block_on(async {
+                block_on_cancellable(&runtime, &cancel, async {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    Ok(())
+                })
+            })
+            .unwrap_err();
+        assert_eq!(error.status, Status::Cancelled);
+    }
+
+    // CON-1, the drop half. Dropping the last handle on a Tokio worker thread — what happens when a
+    // streamed reader outlives every other handle and its consumer releases it from async code —
+    // must not panic with "Cannot drop a runtime in a context where blocking is not allowed".
+    #[test]
+    fn dropping_the_last_handle_from_an_async_context_does_not_panic() {
+        for (label, caller) in [
+            ("multi-thread", multi_thread_caller()),
+            ("current-thread", current_thread_caller()),
+        ] {
+            let runtime = new_runtime().unwrap();
+            // Give the runtime a task to wind down, so the drop is not vacuously fine.
+            runtime.spawn(async { std::future::pending::<()>().await });
+            caller.block_on(async move {
+                assert_eq!(
+                    Arc::strong_count(&runtime),
+                    1,
+                    "{label}: must be the last handle"
+                );
+                drop(runtime);
+            });
+        }
     }
 
     #[test]
