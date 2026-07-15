@@ -106,6 +106,33 @@ use google_cloud_spanner::statement::StatementBuilder;
 
 use crate::error::invalid_argument;
 
+/// Emit an `apply_to_*` method applying the retry and backoff policies to the Begin and Commit RPCs
+/// of one of the client's commit builders.
+///
+/// [`TransactionRunnerBuilder`] and [`WriteOnlyTransactionBuilder`] expose these four setters with
+/// identical signatures but share no common trait, so the two methods were byte-identical copies
+/// naming different types. The body now lives here once — the same reasoning as the macro of the
+/// same name in `request.rs`, kept file-local since the two bodies apply different settings.
+macro_rules! apply_to_commit_builder {
+    ($(#[$attr:meta])* $name:ident($builder:ty)) => {
+        $(#[$attr])*
+        #[must_use]
+        pub(crate) fn $name(&self, mut builder: $builder) -> $builder {
+            if let Some(policy) = self.retry_policy_arg() {
+                builder = builder
+                    .with_begin_retry_policy(policy.clone())
+                    .with_commit_retry_policy(policy);
+            }
+            if let Some(backoff) = self.backoff_policy_arg() {
+                builder = builder
+                    .with_begin_backoff_policy(backoff.clone())
+                    .with_commit_backoff_policy(backoff);
+            }
+            builder
+        }
+    };
+}
+
 /// The retry-tuning configuration held by a connection or statement
 /// (`spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds` and the backoff knobs
 /// `spanner.retry.backoff.{initial_seconds,max_seconds,multiplier}`).
@@ -274,45 +301,17 @@ impl RetryConfig {
         builder
     }
 
-    /// Apply the retry and backoff policies to a read/write transaction runner builder (its Begin
-    /// and Commit RPCs). The transaction-level abort retry (Spanner's optimistic-concurrency re-run)
-    /// is a separate policy left at the client default.
-    #[must_use]
-    pub(crate) fn apply_to_runner(
-        &self,
-        mut builder: TransactionRunnerBuilder,
-    ) -> TransactionRunnerBuilder {
-        if let Some(policy) = self.retry_policy_arg() {
-            builder = builder
-                .with_begin_retry_policy(policy.clone())
-                .with_commit_retry_policy(policy);
-        }
-        if let Some(backoff) = self.backoff_policy_arg() {
-            builder = builder
-                .with_begin_backoff_policy(backoff.clone())
-                .with_commit_backoff_policy(backoff);
-        }
-        builder
+    apply_to_commit_builder! {
+        /// Apply the retry and backoff policies to a read/write transaction runner builder (its
+        /// Begin and Commit RPCs). The transaction-level abort retry (Spanner's
+        /// optimistic-concurrency re-run) is a separate policy left at the client default.
+        apply_to_runner(TransactionRunnerBuilder)
     }
 
-    /// Apply the retry and backoff policies to a write-only transaction builder (the bulk-ingest
-    /// commit path): its Begin and Commit RPCs.
-    #[must_use]
-    pub(crate) fn apply_to_write_only(
-        &self,
-        mut builder: WriteOnlyTransactionBuilder,
-    ) -> WriteOnlyTransactionBuilder {
-        if let Some(policy) = self.retry_policy_arg() {
-            builder = builder
-                .with_begin_retry_policy(policy.clone())
-                .with_commit_retry_policy(policy);
-        }
-        if let Some(backoff) = self.backoff_policy_arg() {
-            builder = builder
-                .with_begin_backoff_policy(backoff.clone())
-                .with_commit_backoff_policy(backoff);
-        }
-        builder
+    apply_to_commit_builder! {
+        /// Apply the retry and backoff policies to a write-only transaction builder (the bulk-ingest
+        /// commit path): its Begin and Commit RPCs.
+        apply_to_write_only(WriteOnlyTransactionBuilder)
     }
 }
 

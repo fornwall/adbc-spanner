@@ -100,6 +100,35 @@ pub(crate) fn parse_priority(value: &str) -> Result<RequestPriority> {
     }
 }
 
+/// Emit an `apply_to_*` method applying the commit priority, transaction tag, commit delay and
+/// commit-stats flag to one of the client's commit builders.
+///
+/// [`TransactionRunnerBuilder`] and [`WriteOnlyTransactionBuilder`] expose these four setters with
+/// identical signatures but share no common trait, so the two methods were byte-identical copies
+/// naming different types — every new commit setting had to be added to both. The body now lives
+/// here once; each method still names its own concrete builder type.
+macro_rules! apply_to_commit_builder {
+    ($(#[$attr:meta])* $name:ident($builder:ty)) => {
+        $(#[$attr])*
+        #[must_use]
+        pub(crate) fn $name(&self, mut builder: $builder) -> $builder {
+            if let Some(priority) = self.priority {
+                builder = builder.set_commit_priority(priority.to_client());
+            }
+            if let Some(tag) = &self.transaction_tag {
+                builder = builder.set_transaction_tag(tag.as_str());
+            }
+            if let Some(delay) = self.commit_delay() {
+                builder = builder.set_max_commit_delay(delay);
+            }
+            if self.return_commit_stats {
+                builder = builder.set_return_commit_stats(true);
+            }
+            builder
+        }
+    };
+}
+
 /// The request priority / tag configuration held by a connection or statement.
 ///
 /// A connection's value is cloned into each statement it creates (which may then override the
@@ -235,48 +264,16 @@ impl RequestConfig {
         builder
     }
 
-    /// Apply the commit priority, transaction tag and commit delay to a read/write transaction
-    /// runner builder.
-    #[must_use]
-    pub(crate) fn apply_to_runner(
-        &self,
-        mut builder: TransactionRunnerBuilder,
-    ) -> TransactionRunnerBuilder {
-        if let Some(priority) = self.priority {
-            builder = builder.set_commit_priority(priority.to_client());
-        }
-        if let Some(tag) = &self.transaction_tag {
-            builder = builder.set_transaction_tag(tag.as_str());
-        }
-        if let Some(delay) = self.commit_delay() {
-            builder = builder.set_max_commit_delay(delay);
-        }
-        if self.return_commit_stats {
-            builder = builder.set_return_commit_stats(true);
-        }
-        builder
+    apply_to_commit_builder! {
+        /// Apply the commit priority, transaction tag and commit delay to a read/write transaction
+        /// runner builder.
+        apply_to_runner(TransactionRunnerBuilder)
     }
 
-    /// Apply the commit priority, transaction tag and commit delay to a write-only transaction
-    /// builder (the mutation-based bulk-ingest commit path).
-    #[must_use]
-    pub(crate) fn apply_to_write_only(
-        &self,
-        mut builder: WriteOnlyTransactionBuilder,
-    ) -> WriteOnlyTransactionBuilder {
-        if let Some(priority) = self.priority {
-            builder = builder.set_commit_priority(priority.to_client());
-        }
-        if let Some(tag) = &self.transaction_tag {
-            builder = builder.set_transaction_tag(tag.as_str());
-        }
-        if let Some(delay) = self.commit_delay() {
-            builder = builder.set_max_commit_delay(delay);
-        }
-        if self.return_commit_stats {
-            builder = builder.set_return_commit_stats(true);
-        }
-        builder
+    apply_to_commit_builder! {
+        /// Apply the commit priority, transaction tag and commit delay to a write-only transaction
+        /// builder (the mutation-based bulk-ingest commit path).
+        apply_to_write_only(WriteOnlyTransactionBuilder)
     }
 }
 
