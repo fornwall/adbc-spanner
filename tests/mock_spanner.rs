@@ -1851,6 +1851,155 @@ fn max_commit_delay_reaches_the_wire_on_runner_commits() {
     );
 }
 
+/// TEST-3 (wire): the standard `adbc.connection.transaction.isolation_level` option is parse- and
+/// round-trip-tested offline (`src/connection.rs`), but nothing proved a level — least of all a
+/// **promoted** one — ever leaves the driver. `apply_isolation` puts the level on the read/write
+/// runner, whose transaction the client begins *inline*, so it rides the `TransactionOptions` of the
+/// `ExecuteBatchDml` request's `transaction.begin` selector — which is what this test captures off
+/// an autocommit DML, one per case, on one connection, in this order:
+///
+/// 1. **Unset** (the negative that makes the rest meaningful): with no isolation level set, the
+///    begin must carry `ISOLATION_LEVEL_UNSPECIFIED` — the database default stands. Without it, an
+///    assertion that a level is populated could never fail.
+/// 2. **Natively supported**: `serializable` and `repeatable_read` map 1:1 onto Spanner's own two
+///    levels.
+/// 3. **Promoted** (SPEC-4, the deliberate deviation worth pinning): each of the four spec levels
+///    Spanner does not expose arrives as the weakest supported level that satisfies it —
+///    `read_uncommitted`/`read_committed` → `REPEATABLE_READ`, `snapshot`/`linearizable` →
+///    `SERIALIZABLE`. Nothing on the wire is ever an unsupported level, and nothing is dropped.
+/// 4. **Back to `default`**: it resets the connection, so the begin is unspecified again.
+///
+/// Every case asserts the exact wire enum value, not mere presence.
+#[test]
+fn isolation_level_reaches_transaction_options_on_the_begin() {
+    use adbc_core::constants::*;
+    use v1::transaction_options::IsolationLevel;
+
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "isolation_level_reaches_transaction_options_on_the_begin",
+    );
+
+    const DML_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
+
+    // Every ExecuteBatchDml the server saw, in order — the isolation level rides its inline begin.
+    let batches: Arc<Mutex<Vec<v1::ExecuteBatchDmlRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let record = batches.clone();
+    let server = MockServer::start(move |mock| {
+        // In case the client begins the read/write transaction explicitly rather than inline.
+        serve_begin_transaction(mock);
+        mock.expect_execute_batch_dml().returning(move |request| {
+            let request = request.into_inner();
+            let inline_begin = matches!(
+                request
+                    .transaction
+                    .as_ref()
+                    .and_then(|t| t.selector.as_ref()),
+                Some(v1::transaction_selector::Selector::Begin(_))
+            );
+            record.lock().unwrap().push(request);
+            Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
+                result_sets: vec![v1::ResultSet {
+                    metadata: Some(v1::ResultSetMetadata {
+                        transaction: inline_begin.then(|| v1::Transaction {
+                            id: b"dml-txn".to_vec(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    stats: Some(v1::ResultSetStats {
+                        row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                status: Some(spanner_grpc_mock::google::rpc::Status {
+                    code: 0,
+                    message: "OK".into(),
+                    details: vec![],
+                }),
+                ..Default::default()
+            }))
+        });
+        mock.expect_commit().returning(|_| commit_ok());
+    });
+
+    // The requested ADBC level (`None` = never set) and the level its transaction must begin with.
+    let cases: [(Option<&str>, IsolationLevel); 8] = [
+        (None, IsolationLevel::Unspecified),
+        (
+            Some(ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE),
+            IsolationLevel::Serializable,
+        ),
+        (
+            Some(ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ),
+            IsolationLevel::RepeatableRead,
+        ),
+        (
+            Some(ADBC_OPTION_ISOLATION_LEVEL_READ_UNCOMMITTED),
+            IsolationLevel::RepeatableRead,
+        ),
+        (
+            Some(ADBC_OPTION_ISOLATION_LEVEL_READ_COMMITTED),
+            IsolationLevel::RepeatableRead,
+        ),
+        (
+            Some(ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT),
+            IsolationLevel::Serializable,
+        ),
+        (
+            Some(ADBC_OPTION_ISOLATION_LEVEL_LINEARIZABLE),
+            IsolationLevel::Serializable,
+        ),
+        (
+            Some(ADBC_OPTION_ISOLATION_LEVEL_DEFAULT),
+            IsolationLevel::Unspecified,
+        ),
+    ];
+
+    let mut connection = server.connect();
+    for (requested, _) in &cases {
+        if let Some(level) = requested {
+            connection
+                .set_option(
+                    OptionConnection::IsolationLevel,
+                    OptionValue::String((*level).into()),
+                )
+                .expect("set the connection's isolation level");
+        }
+        // Statements inherit the connection's isolation level at creation.
+        let mut statement = connection.new_statement().expect("new statement");
+        statement.set_sql_query(DML_SQL).unwrap();
+        assert_eq!(
+            statement.execute_update().expect("autocommit DML"),
+            Some(1),
+            "the scripted DML affects one row"
+        );
+    }
+
+    let batches = batches.lock().unwrap();
+    assert_eq!(
+        batches.len(),
+        cases.len(),
+        "one ExecuteBatchDml per autocommit DML"
+    );
+    for ((requested, expected), request) in cases.iter().zip(batches.iter()) {
+        let Some(v1::transaction_selector::Selector::Begin(options)) = request
+            .transaction
+            .as_ref()
+            .and_then(|t| t.selector.as_ref())
+        else {
+            panic!("an autocommit DML must begin its read/write transaction inline: {request:?}");
+        };
+        assert_eq!(
+            options.isolation_level,
+            *expected as i32,
+            "isolation level {requested:?} must reach TransactionOptions as {}",
+            expected.as_str_name()
+        );
+    }
+}
+
 /// SPAN-6 regression (wire): a manual transaction that buffered **only mutations** (bulk ingests,
 /// no DML) must commit through the client's replay-protected **write-only** transaction —
 /// `WriteOnlyTransaction::write` begins the transaction with a `mutation_key` (the replay-
