@@ -785,8 +785,8 @@ pub const OPTION_MAX_COMMIT_DELAY: &str = "spanner.commit.max_delay";
 /// Driver-specific connection **and** statement option: whether to request Spanner return **commit
 /// statistics** for the read/write commits the driver builds (see Spanner's
 /// [commit statistics](https://docs.cloud.google.com/spanner/docs/commit-statistics)). A boolean,
-/// `false` by default; accepted as a bool-ish string (`true`/`false`/`1`/`0`/`yes`/`no`) or an
-/// integer, and an empty string unsets it (back to `false`). Round-trips through `get_option` (the
+/// `false` by default; accepted as a bool-ish string (`true`/`false`/`1`/`0`/`yes`/`no`), and an
+/// empty string unsets it (back to `false`). Round-trips through `get_option` (the
 /// effective boolean is always reported).
 ///
 /// When enabled it is applied at every read/write commit the driver builds — autocommit DML, the
