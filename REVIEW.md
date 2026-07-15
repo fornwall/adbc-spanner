@@ -272,8 +272,8 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 - [ ] **IDIO-11 (Low)** — `explicit_credential_option` duplicates `conflicting_credential_with_access_token` — `src/driver.rs:255-282`
   Express one in terms of the other so a new credential option can't be added to only one.
 
-- [ ] **IDIO-12 (Low)** — Five copy-pasted `match`-on-`Option` grouping blocks — `src/objects.rs:269-288`
-  `x_batch.as_ref().map(group_x).transpose()?.unwrap_or_default()`.
+- [x] **IDIO-12 (Low)** — Five copy-pasted `match`-on-`Option` grouping blocks — `src/objects.rs:269-288`
+  `x_batch.as_ref().map(group_x).transpose()?.unwrap_or_default()`. *Resolved:* via a three-line `group_opt(batch, group)` helper in `src/objects.rs` rather than the suggested inline chain. The chain is the right *shape*, but written out at each of the five sites it does not fit the 100-column style: rustfmt breaks every one into a five-line method chain, turning the 20 lines into 25 — longer than what it replaced, and with the meaningful part (*which* grouping function) buried mid-chain. Naming the chain once instead keeps each site a single line reading `group_opt(table_batch.as_ref(), group_tables)?`, so the five blocks collapse to five lines (net −4 lines, and −20 in `collect_objects` itself, which IDIO-18 wants smaller). The helper is generic only over the return type — all five `group_*` functions already share the shape `fn(&RecordBatch) -> Result<HashMap<..>>`, so it needs no trait beyond `T: Default` and each call site still names its own grouping function. Pure refactor, behaviour identical (`None` → empty map, as before): every existing `get_objects` test, including the emulator hierarchy and foreign-key `constraint_column_usage` coverage, passes unmodified.
 
 - [ ] **IDIO-13 (Low)** — Typed-getter boilerplate repeated at all three levels — `src/driver.rs:549-561`, `src/connection.rs:858-870`, `src/statement.rs:1332-1344`
   A sibling `impl_typed_option_getters!` macro in options.rs absorbs it. (COR-4 was resolved on the set side, so the getter helpers are untouched and this stands alone.)
@@ -289,7 +289,7 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 
 - [ ] **IDIO-17 (Low)** — Stale "the three driver options" count in module doc — `src/request.rs:8` (five are documented below it). Reword count-free.
 
-- [ ] **IDIO-18 (Low)** — Oversized functions worth a seam — `src/driver.rs:289` (`connect` ~160 lines: extract the testable five-way credential ladder), `src/objects.rs:131` (`collect_objects` ~220 lines: the pure assemble loop at `:291-349` extracts cleanly and becomes offline-testable; also `&Option<T>` → `Option<&T>` params). The other >100-line functions are exhaustive dispatch tables and fine.
+- [ ] **IDIO-18 (Low)** — Oversized functions worth a seam — `src/driver.rs:289` (`connect` ~160 lines: extract the testable five-way credential ladder), `src/objects.rs:131` (`collect_objects` ~200 lines: the pure assemble loop at `:276-334` extracts cleanly and becomes offline-testable; also `&Option<T>` → `Option<&T>` params). The other >100-line functions are exhaustive dispatch tables and fine.
 
 - [ ] **IDIO-19 (Low)** — Micro-fix while nearby — `src/conversion.rs:975`: `children.iter_mut().for_each(|c| c.push(None))` → a plain `for` loop.
 
