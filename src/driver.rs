@@ -41,6 +41,34 @@ const QUOTA_PROJECT_HEADER: &str = "x-goog-user-project";
 /// `impersonated` builder's own default (and gcloud's `--lifetime` default).
 const DEFAULT_IMPERSONATION_LIFETIME_SECS: u64 = 3600;
 
+/// Which of the five mutually exclusive credential flows a [`SpannerDatabase`] uses, as selected
+/// from its configured options by [`SpannerDatabase::credential_choice`] and built by
+/// [`SpannerDatabase::build_credentials`].
+///
+/// Naming the choice splits the *ladder* — the precedence rules, pure and unit-tested offline —
+/// from building the credential it names, which reaches for the ambient environment (a key file on
+/// disk, Application Default Credentials, a Tokio context) and so cannot be tested the same way.
+/// Deliberately payload-free: every variant's input is re-read from the database, so a bearer token
+/// never lands in a `Debug`-derived type.
+#[derive(Debug, PartialEq, Eq)]
+enum CredentialChoice {
+    /// Emulator mode: anonymous credentials over plaintext `http://`. Wins outright — the guards in
+    /// [`SpannerDatabase::connect`] refuse emulator mode combined with any credential option, so
+    /// nothing below it can be configured at the same time.
+    Anonymous,
+    /// [`OPTION_ACCESS_TOKEN`]: the caller's own bearer token. Outranks the two below only
+    /// nominally — `connect` refuses that combination outright, so it is reachable alone.
+    AccessToken,
+    /// [`OPTION_IMPERSONATE_TARGET_PRINCIPAL`]: a keyfile-or-ADC base credential, wrapped to mint
+    /// short-lived tokens for the target principal. Outranks [`Keyfile`](Self::Keyfile), which it
+    /// *uses* as its base credential when both are set.
+    Impersonate,
+    /// [`OPTION_KEYFILE_JSON`] / [`OPTION_KEYFILE`]: an explicit credential built from key JSON.
+    Keyfile,
+    /// Application Default Credentials — no credential option was configured.
+    Adc,
+}
+
 /// The Spanner ADBC driver — the entry point for creating [`SpannerDatabase`] instances.
 ///
 /// The driver owns the shared Tokio runtime used to drive the asynchronous Spanner client, so a
@@ -316,6 +344,116 @@ impl SpannerDatabase {
             .filter(|option| *option != OPTION_ACCESS_TOKEN)
     }
 
+    /// Which credential flow this configuration selects; see [`CredentialChoice`]. `emulator` is
+    /// the **resolved** emulator mode — the [`OPTION_EMULATOR`] option *or* `SPANNER_EMULATOR_HOST`
+    /// — not the raw option.
+    fn credential_choice(&self, emulator: bool) -> CredentialChoice {
+        if emulator {
+            CredentialChoice::Anonymous
+        } else if self.access_token.is_some() {
+            CredentialChoice::AccessToken
+        } else if self.impersonate_target_principal.is_some() {
+            CredentialChoice::Impersonate
+        } else if self.keyfile_json.is_some() || self.keyfile.is_some() {
+            CredentialChoice::Keyfile
+        } else {
+            CredentialChoice::Adc
+        }
+    }
+
+    /// Build the credential [`credential_choice`](Self::credential_choice) selects — the *how* to
+    /// that ladder's *which* — or `None` to leave the client to resolve Application Default
+    /// Credentials itself. `credentials_json` is the already-read key JSON
+    /// ([`credentials_json`](Self::credentials_json)); the credential *flow* it describes is
+    /// detected from its `"type"` in [`build_credentials_from_json`].
+    ///
+    /// Must run inside the Tokio runtime: the `google-cloud-auth` builders spawn token-cache tasks.
+    /// None of them does I/O here — the first token is only fetched on use.
+    ///
+    /// Each arm's option is `Some` by construction, since the ladder selected the arm by matching
+    /// on it; the `map(..).transpose()`s below re-read it so that stays total, with no unreachable
+    /// branch to keep honest.
+    fn build_credentials(
+        &self,
+        emulator: bool,
+        credentials_json: Option<String>,
+    ) -> Result<Option<Credentials>> {
+        // The quota / billing project, attached to whichever non-emulator credential wins below via
+        // `with_quota_project_id` (ADC / keyfile / impersonation) or the `x-goog-user-project`
+        // header (access token). `None` leaves the credential's own project in charge.
+        let quota_project = self.quota_project.as_deref();
+        match self.credential_choice(emulator) {
+            // Emulator mode: anonymous credentials over plaintext `http://`. The guard in
+            // `connect` has already refused every credential option, so nothing is dropped here.
+            CredentialChoice::Anonymous => Ok(Some(AnonymousCredentials::new().build())),
+            // A caller-supplied OAuth2 bearer token, sent verbatim with no refresh (plus the
+            // quota-project header, if any). Mutual exclusion with the keyfile/impersonation
+            // options is checked in `connect`.
+            CredentialChoice::AccessToken => self
+                .access_token
+                .as_deref()
+                .map(|token| build_static_token_credentials(token, quota_project))
+                .transpose(),
+            CredentialChoice::Impersonate => self
+                .impersonate_target_principal
+                .as_deref()
+                .map(|target| {
+                    // Build the base credential exactly as the non-impersonated path does — an
+                    // explicit keyfile, or ADC when none is given — then wrap it so it is only used
+                    // to mint a short-lived token for `target` (optionally through a delegation
+                    // chain). The quota project rides on the impersonated builder, not the source.
+                    let source = match &credentials_json {
+                        Some(json) => build_credentials_from_json(json, None)?,
+                        None => AdcCredentials::default().build().map_err(|e| {
+                            err(
+                                format!(
+                                    "failed to build Application Default Credentials to \
+                                     impersonate {target:?}: {}",
+                                    scrub_credential_error(&e)
+                                ),
+                                Status::InvalidArguments,
+                            )
+                        })?,
+                    };
+                    build_impersonated_credentials(
+                        source,
+                        target,
+                        &self.impersonate_delegates,
+                        &self.impersonate_scopes,
+                        Duration::from_secs(
+                            self.impersonate_lifetime_secs
+                                .unwrap_or(DEFAULT_IMPERSONATION_LIFETIME_SECS),
+                        ),
+                        quota_project,
+                    )
+                })
+                .transpose(),
+            CredentialChoice::Keyfile => credentials_json
+                .map(|json| build_credentials_from_json(&json, quota_project))
+                .transpose(),
+            // With a quota (billing) project, Application Default Credentials must be built
+            // *explicitly* so `with_quota_project_id` can attach the `x-goog-user-project` header;
+            // without one, `None` lets the client resolve ADC itself, with nothing to attach.
+            CredentialChoice::Adc => quota_project
+                .map(|project| {
+                    AdcCredentials::default()
+                        .with_quota_project_id(project)
+                        .build()
+                        .map_err(|e| {
+                            err(
+                                format!(
+                                    "failed to build Application Default Credentials with quota \
+                                     project {project:?}: {}",
+                                    scrub_credential_error(&e)
+                                ),
+                                Status::InvalidArguments,
+                            )
+                        })
+                })
+                .transpose(),
+        }
+    }
+
     /// Resolve the effective configuration and establish a connection.
     ///
     /// Emulator handling: if `SPANNER_EMULATOR_HOST` is set it supplies the endpoint (unless one was
@@ -381,93 +519,21 @@ impl SpannerDatabase {
             )));
         }
 
-        // Resolve the credential JSON up front (reads the key file, if any); the flow is detected
-        // from its `"type"` below. In emulator mode the guard above guarantees these are unset, so
-        // both resolve to `None` and anonymous credentials win.
+        // Read the key file, if any, before entering the runtime (blocking I/O). In emulator mode
+        // the guard above guarantees the credential options are unset, so this stays `None` and
+        // anonymous credentials win.
         let credentials_json = self.credentials_json()?;
-        let access_token = self.access_token.clone();
-
-        // The quota / billing project, attached to whichever non-emulator credential wins below via
-        // `with_quota_project_id` (ADC / keyfile / impersonation) or the `x-goog-user-project`
-        // header (access token). `None` leaves the credential's own project in charge.
-        let quota_project = self.quota_project.clone();
-
-        // Impersonation config, applied on top of the base credentials below when a target is set.
-        let impersonate_target = self.impersonate_target_principal.clone();
-        let impersonate_delegates = self.impersonate_delegates.clone();
-        let impersonate_scopes = self.impersonate_scopes.clone();
-        let impersonate_lifetime = Duration::from_secs(
-            self.impersonate_lifetime_secs
-                .unwrap_or(DEFAULT_IMPERSONATION_LIFETIME_SECS),
-        );
 
         self.runtime.block_on(async move {
             let mut builder = Spanner::builder();
             if let Some(endpoint) = endpoint {
                 builder = builder.with_endpoint(endpoint);
             }
-            if emulator {
-                builder = builder.with_credentials(AnonymousCredentials::new().build());
-            } else if let Some(token) = access_token {
-                // A caller-supplied OAuth2 bearer token, sent verbatim with no refresh (plus the
-                // quota-project header, if any). Mutual exclusion with the keyfile/impersonation
-                // options was checked above.
-                builder = builder.with_credentials(build_static_token_credentials(
-                    &token,
-                    quota_project.as_deref(),
-                )?);
-            } else if let Some(target) = impersonate_target {
-                // Build the base credential exactly as the non-impersonated path does — an explicit
-                // keyfile, or ADC when none is given — then wrap it so it is only used to mint a
-                // short-lived token for `target` (optionally through a delegation chain).
-                let source = match credentials_json {
-                    Some(json) => build_credentials_from_json(&json, None)?,
-                    None => AdcCredentials::default().build().map_err(|e| {
-                        err(
-                            format!(
-                                "failed to build Application Default Credentials to impersonate \
-                                 {target:?}: {}",
-                                scrub_credential_error(&e)
-                            ),
-                            Status::InvalidArguments,
-                        )
-                    })?,
-                };
-                let credentials = build_impersonated_credentials(
-                    source,
-                    &target,
-                    &impersonate_delegates,
-                    &impersonate_scopes,
-                    impersonate_lifetime,
-                    quota_project.as_deref(),
-                )?;
-                builder = builder.with_credentials(credentials);
-            } else if let Some(json) = credentials_json {
-                builder = builder.with_credentials(build_credentials_from_json(
-                    &json,
-                    quota_project.as_deref(),
-                )?);
-            } else if let Some(project) = quota_project.as_deref() {
-                // No explicit credential option, but a quota (billing) project was requested: build
-                // Application Default Credentials *explicitly* so `with_quota_project_id` can attach
-                // the `x-goog-user-project` header (otherwise the client would resolve ADC itself,
-                // with no place to hang the quota project on).
-                let credentials = AdcCredentials::default()
-                    .with_quota_project_id(project)
-                    .build()
-                    .map_err(|e| {
-                        err(
-                            format!(
-                                "failed to build Application Default Credentials with quota \
-                                 project {project:?}: {}",
-                                scrub_credential_error(&e)
-                            ),
-                            Status::InvalidArguments,
-                        )
-                    })?;
+            // Inside the runtime on purpose — see `build_credentials`. `None` means no explicit
+            // credential: Application Default Credentials, resolved by the client.
+            if let Some(credentials) = self.build_credentials(emulator, credentials_json)? {
                 builder = builder.with_credentials(credentials);
             }
-            // Otherwise: Application Default Credentials, resolved by the client.
             let spanner = builder.build().await.map_err(from_builder)?;
             let client = spanner
                 .database_client(database.clone())
@@ -1695,6 +1761,53 @@ mod tests {
         assert_eq!(db.explicit_credential_option(), None);
         db.keyfile = Some("/path/to/key.json".into());
         assert_eq!(db.explicit_credential_option(), Some(OPTION_KEYFILE));
+    }
+
+    #[test]
+    fn the_credential_ladder_selects_one_flow_in_precedence_order() {
+        // Nothing configured: ambient Application Default Credentials.
+        let mut db = new_database();
+        assert_eq!(db.credential_choice(false), CredentialChoice::Adc);
+        // A quota project does not select a flow — it rides on whichever one wins (here ADC,
+        // which `build_credentials` then builds explicitly to attach the header to).
+        db.quota_project = Some("billing-project".into());
+        assert_eq!(db.credential_choice(false), CredentialChoice::Adc);
+
+        // A keyfile — by path, or inline JSON — selects the keyfile flow.
+        db.keyfile = Some("/path/to/key.json".into());
+        assert_eq!(db.credential_choice(false), CredentialChoice::Keyfile);
+        db.keyfile = None;
+        db.keyfile_json = Some("{\"type\":\"authorized_user\"}".into());
+        assert_eq!(db.credential_choice(false), CredentialChoice::Keyfile);
+
+        // Impersonation outranks the keyfile rather than conflicting with it: the keyfile becomes
+        // the *source* credential that the impersonated one wraps.
+        db.impersonate_target_principal = Some("target@p.iam.gserviceaccount.com".into());
+        assert_eq!(db.credential_choice(false), CredentialChoice::Impersonate);
+
+        // An access token outranks both — though only nominally: `connect` refuses that
+        // combination up front (`access_token_conflicts_with_other_credential_options`).
+        db.access_token = Some("ya29.token".into());
+        assert_eq!(db.credential_choice(false), CredentialChoice::AccessToken);
+
+        // Resolved emulator mode wins outright over everything configured above. `connect`'s guard
+        // refuses that combination first, so the ladder never silently drops a credential — but it
+        // must not silently *use* one either.
+        assert_eq!(db.credential_choice(true), CredentialChoice::Anonymous);
+    }
+
+    #[test]
+    fn the_credential_ladder_ignores_impersonation_options_without_a_target() {
+        // The `impersonate.*` knobs are inert without a target principal (as
+        // `explicit_credential_option` also holds), so the flow stays ADC — or the keyfile's, with
+        // no impersonation wrapped around it.
+        let mut db = new_database();
+        db.impersonate_delegates = vec!["delegate@p.iam.gserviceaccount.com".into()];
+        db.impersonate_scopes = vec!["https://www.googleapis.com/auth/cloud-platform".into()];
+        db.impersonate_lifetime_secs = Some(900);
+        assert_eq!(db.credential_choice(false), CredentialChoice::Adc);
+        db.keyfile = Some("/path/to/key.json".into());
+        assert_eq!(db.credential_choice(false), CredentialChoice::Keyfile);
     }
 
     #[test]

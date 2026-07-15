@@ -1469,10 +1469,12 @@ impl Connection for SpannerConnection {
             &self.cancel.current(),
             self.timeouts.query_timeout(),
             depth,
-            db_schema,
-            table_name,
-            &table_type,
-            column_name,
+            &crate::objects::ObjectFilters {
+                db_schema,
+                table_name,
+                table_type: table_type.as_deref(),
+                column_name,
+            },
         )?;
         let batch = crate::objects::build(depth, schemas)?;
         Ok(Box::new(RecordBatchIterator::new(
