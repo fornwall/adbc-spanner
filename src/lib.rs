@@ -83,6 +83,29 @@
 //!
 //! See [`SpannerConnection`] for the full model.
 //!
+//! ## Calling from async code
+//!
+//! The ADBC traits are **synchronous** while the underlying Spanner client is async, so the driver
+//! runs every operation on its own Tokio runtime and **blocks the calling thread** until it
+//! finishes. That is true of every entry point, including
+//! [`RecordBatchReader::next`](arrow_array::RecordBatchReader) on a streamed result, which fetches
+//! lazily and so blocks too.
+//!
+//! Calling the driver from inside a Tokio runtime (an `async fn`, a `#[tokio::main]` body, a
+//! spawned task) is supported and will not panic — the driver detects the context and bridges
+//! accordingly. It still *blocks*, though, which is a poor use of an async worker thread, so
+//! prefer to move driver work onto a blocking thread with
+//! [`tokio::task::spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html):
+//!
+//! ```text
+//! let batches = tokio::task::spawn_blocking(move || {
+//!     let reader = statement.execute()?;
+//!     reader.collect::<Result<Vec<_>, _>>()
+//! }).await??;
+//! ```
+//!
+//! Driver objects (and any reader they produce) may likewise be dropped anywhere.
+//!
 //! ## Example
 //!
 //! ```no_run

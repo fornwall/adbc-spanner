@@ -3001,3 +3001,68 @@ fn exec_incremental_spec_default_is_a_no_op() {
         "{error}"
     );
 }
+
+/// CON-1: the driver must survive being entered from inside somebody else's Tokio runtime.
+///
+/// The ADBC traits are synchronous, so every call blocks the caller on the driver's own runtime —
+/// and Tokio panics ("Cannot block the current thread from within a runtime") when a thread that is
+/// *running* a runtime tries to block. For the cdylib that panic unwinds across the C FFI boundary
+/// and poisons the driver handle, so it must not happen. `crate::runtime::block_on_bridged` avoids
+/// it per runtime flavour; this exercises the whole stack — `new_connection` (the plain bridged
+/// `block_on` in `connect`), `execute` and `RecordBatchReader::next` (both `block_on_cancellable`)
+/// — from inside **both** flavours, which take different paths (`block_in_place` vs a scoped
+/// thread). Every one of these panicked before the fix.
+///
+/// Note the mock server is started *outside* the caller runtimes: its own `start` blocks too.
+#[test]
+fn driver_entered_from_an_async_context_does_not_panic() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "driver_entered_from_an_async_context_does_not_panic",
+    );
+
+    let server = MockServer::start(move |mock| {
+        mock.expect_execute_streaming_sql().returning(move |_| {
+            Ok(stream_of(vec![Ok(partial_result_set(
+                true,
+                &["v1", "v2"],
+                b"async-1",
+                true,
+            ))]))
+        });
+    });
+
+    // A full connect → execute → drain round trip, run entirely on the calling thread.
+    let round_trip = || {
+        let mut connection = server.connect();
+        let mut statement = connection.new_statement().expect("new statement");
+        statement
+            .set_sql_query("SELECT c FROM MockTable")
+            .expect("set query");
+        let batches: Vec<_> = statement
+            .execute()
+            .expect("query against mock server")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect batches");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
+        // Drop the reader, statement and connection here, inside the async context, too: the last
+        // `Arc<DriverRuntime>` holder may well be dropped on a Tokio worker thread, which panics
+        // ("Cannot drop a runtime in a context where blocking is not allowed") on a bare `Runtime`.
+    };
+
+    // `#[tokio::main]`'s default flavour: the call is rescued with `block_in_place`.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build multi-thread caller runtime")
+        .block_on(async { round_trip() });
+
+    // `#[tokio::test]`'s / `flavor = "current_thread"`'s: `block_in_place` would panic, so the call
+    // is driven on a scoped thread instead.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread caller runtime")
+        .block_on(async { round_trip() });
+}

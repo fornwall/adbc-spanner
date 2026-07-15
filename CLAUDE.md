@@ -48,7 +48,8 @@ SpannerDriver ──▶ SpannerDatabase ──▶ SpannerConnection ──▶ Sp
   `spawn_prefetch` in `src/runtime.rs`; cancel aborts the task, drop aborts its `JoinHandle`).
 - `src/runtime.rs` — a shared Tokio runtime; the ADBC traits are sync while the Spanner client is
   async, so every call bridges via `runtime.block_on(...)`. The runtime is created once by the
-  driver and shared via `Arc` into every database/connection/statement.
+  driver and shared via `Arc` into every database/connection/statement (`SharedRuntime =
+  Arc<DriverRuntime>`).
 - `src/ffi.rs` — `adbc_ffi::export_driver!(AdbcSpannerInit, SpannerDriver)`; the C entrypoint of the
   shared library. Gated behind the default `ffi` feature.
 - `src/error.rs` — helpers to build `adbc_core` errors. `from_spanner` takes the concrete
@@ -77,7 +78,32 @@ SpannerDriver ──▶ SpannerDatabase ──▶ SpannerConnection ──▶ Sp
 Key design points:
 
 - **Sync-over-async bridge.** ADBC traits are synchronous; each method does `runtime.block_on`. Do
-  not add a second runtime — reuse the shared one.
+  not add a second runtime — reuse the shared one. **Entering the driver from an async context must
+  not panic** (CON-1): `block_on` blocks the calling thread, which Tokio permits only on a thread
+  that is not *running* a runtime and *panics* on otherwise — and for the cdylib that panic unwinds
+  across the C FFI boundary and poisons the driver handle. Note there is **no public Tokio API that
+  predicts this**: `Handle::try_current()` is `Ok` both on a runtime worker (blocking panics) and
+  inside `spawn_blocking`/`block_in_place` (blocking is legal — the sanctioned way to call this
+  driver), so the obvious guard would reject the very workaround it must recommend, under the
+  default multi-thread `#[tokio::main]`. So the driver does not predict; `runtime::block_on_bridged`
+  picks, per `Handle::try_current().map(runtime_flavor)`, a construction legal in *every* context
+  that flavour can present: no context → plain `block_on`; `MultiThread` → `block_in_place` (hands
+  the core off on a worker, plain pass-through on a `spawn_blocking` thread); anything else
+  (`CurrentThread`, where `block_in_place` panics, and future `#[non_exhaustive]` flavours) → a
+  `std::thread::scope` thread, which carries no Tokio context and so may always block (this is why
+  `block_on_cancellable` requires `Send` — it forced hoisting the per-table SQL clone out of
+  `statistics.rs`'s stream closure, whose higher-ranked `&PreparedTable` argument defeated the
+  compiler's `Send` check). Both bridge sites — `block_on_cancellable` and `SpannerDatabase::connect`
+  — go through it. The matching **drop** panic ("Cannot drop a runtime in a context where blocking
+  is not allowed") is handled by the `DriverRuntime` newtype the `Arc` now wraps: it `Deref`s to
+  `Runtime` so call sites are unchanged, and its `Drop` uses `shutdown_background()` (non-blocking)
+  when `Handle::try_current()` succeeds, plain drop otherwise — here the over-approximation is
+  *safe* (it only skips a wait), unlike on the call path. This matters because a streamed
+  `SpannerBatchReader` holds a `SharedRuntime` and can be the last holder, dropped anywhere. The
+  caller's thread still blocks either way — inherent to a sync API — so `spawn_blocking` is still
+  what users should do; documented user-facing in the lib.rs "Calling from async code" crate-doc
+  section. Covered by `runtime.rs` unit tests over all six contexts plus the end-to-end
+  `driver_entered_from_an_async_context_does_not_panic` in `tests/mock_spanner.rs`.
 - **Transactions.** Autocommit by default: queries use a single-use read-only transaction; DML
   (including a `;`-separated batch via `ExecuteBatchDml`) uses a read/write runner. Setting
   `adbc.connection.autocommit=false` enters manual mode, where a transaction is exactly **one of
