@@ -1569,7 +1569,7 @@ impl Optionable for SpannerStatement {
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
         match &key {
             OptionStatement::TargetTable => {
-                self.target_table = Some(string_option(value)?);
+                self.target_table = Some(string_option(&key, value)?);
                 // Mutually exclusive with a SQL query (see `set_sql_query`): setting an ingest
                 // target clears any query left on a reused handle — e.g. the DBAPI `Cursor` reuses
                 // one statement, so `cur.execute("CREATE TABLE …")` then `cur.adbc_ingest(…)` would
@@ -1579,11 +1579,11 @@ impl Optionable for SpannerStatement {
             OptionStatement::TargetDbSchema => {
                 // Named schema for the ingest target table; qualifies the INSERT / CREATE TABLE via
                 // `qualified_table` (empty selects Spanner's default, unnamed schema).
-                self.target_db_schema = Some(string_option(value)?);
+                self.target_db_schema = Some(string_option(&key, value)?);
             }
             OptionStatement::TargetCatalog => {
                 // Spanner exposes a single, unnamed catalog, so only the empty catalog is accepted.
-                self.target_catalog = Some(check_target_catalog(string_option(value)?)?);
+                self.target_catalog = Some(check_target_catalog(string_option(&key, value)?)?);
             }
             OptionStatement::Temporary => {
                 // Spanner has no temporary tables. The spec default (`false`) is accepted as a
@@ -1600,13 +1600,13 @@ impl Optionable for SpannerStatement {
             OptionStatement::IngestMode => {
                 // Append into an existing table, or create it (from the ingest data's Arrow schema,
                 // with a synthetic UUID primary key) in the create/replace modes.
-                self.ingest_mode = Some(ingest_mode_option(value)?);
+                self.ingest_mode = Some(ingest_mode_option(&key, value)?);
             }
             OptionStatement::Other(k) if k == crate::OPTION_INGEST_PRIMARY_KEY => {
                 // Comma-separated existing column names; `""` (or all-whitespace) unsets, back to the
                 // synthetic key. Column existence and Spanner key-type validity are checked when the
                 // CREATE TABLE is built (`bind::create_table_sql`) / by Spanner at DDL time.
-                let cols: Vec<String> = string_option(value)?
+                let cols: Vec<String> = string_option(&key, value)?
                     .split(',')
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
@@ -2016,8 +2016,10 @@ impl Statement for SpannerStatement {
     }
 }
 
-fn string_option(value: OptionValue) -> Result<String> {
-    crate::options::string_option(value, "statement option")
+/// Parse a plain string statement option, naming `key` in the error (the `driver.rs`
+/// `string_value` pattern: the label is the option's own key, so it can never drift — IDIO-7).
+fn string_option(key: &OptionStatement, value: OptionValue) -> Result<String> {
+    crate::options::string_option(value, &format!("option {}", key.as_ref()))
 }
 
 /// Extract the undeclared-parameter name → type map from a PLAN probe's result-set metadata.
@@ -2133,12 +2135,12 @@ fn check_target_catalog(catalog: String) -> Result<String> {
 /// are rejected here — at `set_option` time — which is what lets the ingest paths
 /// ([`SpannerStatement::build_ingest_table_ddl`]) match the enum exhaustively, with no fallback arm
 /// to drift.
-fn ingest_mode_option(value: OptionValue) -> Result<IngestMode> {
+fn ingest_mode_option(key: &OptionStatement, value: OptionValue) -> Result<IngestMode> {
     use adbc_core::constants::{
         ADBC_INGEST_OPTION_MODE_APPEND, ADBC_INGEST_OPTION_MODE_CREATE,
         ADBC_INGEST_OPTION_MODE_CREATE_APPEND, ADBC_INGEST_OPTION_MODE_REPLACE,
     };
-    match string_option(value)?.as_str() {
+    match string_option(key, value)?.as_str() {
         ADBC_INGEST_OPTION_MODE_APPEND | "append" => Ok(IngestMode::Append),
         ADBC_INGEST_OPTION_MODE_CREATE | "create" => Ok(IngestMode::Create),
         ADBC_INGEST_OPTION_MODE_CREATE_APPEND | "create_append" => Ok(IngestMode::CreateAppend),
@@ -2183,9 +2185,10 @@ fn ingest_batch_write_option(value: OptionValue) -> Result<bool> {
     }
 }
 
-/// Parse a positive batch-size option, accepted as either an integer or a numeric string.
+/// Parse the positive `spanner.rows_per_batch` option, accepted as either an integer or a numeric
+/// string.
 fn rows_per_batch_option(value: OptionValue) -> Result<usize> {
-    crate::options::positive_usize(value, "rows_per_batch")
+    crate::options::positive_usize(value, "option spanner.rows_per_batch")
 }
 
 /// Annotate a failed chunk commit of a multi-chunk autocommit ingest with the number of rows the
@@ -2440,6 +2443,7 @@ mod tests {
 
     #[test]
     fn ingest_mode_parses_both_spellings_and_rejects_unknown() {
+        let key = OptionStatement::IngestMode;
         // Both the spec's canonical `adbc.ingest.mode.*` spelling and the bare short form parse to
         // the same mode, and the mode reports back (`get_option`) in canonical form.
         for (canonical, short, mode) in [
@@ -2454,7 +2458,7 @@ mod tests {
         ] {
             for spelling in [canonical, short] {
                 assert_eq!(
-                    ingest_mode_option(OptionValue::String(spelling.into())).unwrap(),
+                    ingest_mode_option(&key, OptionValue::String(spelling.into())).unwrap(),
                     mode,
                     "spelling {spelling:?}"
                 );
@@ -2462,12 +2466,13 @@ mod tests {
             assert_eq!(String::from(mode), canonical);
         }
         // Unknown modes are rejected at set_option time, as unimplemented.
-        let error = ingest_mode_option(OptionValue::String("upsert".into())).unwrap_err();
+        let error = ingest_mode_option(&key, OptionValue::String("upsert".into())).unwrap_err();
         assert_eq!(error.status, Status::NotImplemented);
         assert!(error.message.contains("ingest mode \"upsert\""), "{error}");
-        // Non-string values fail string coercion.
-        let error = ingest_mode_option(OptionValue::Int(1)).unwrap_err();
+        // Non-string values fail string coercion, naming the option's full key (IDIO-7).
+        let error = ingest_mode_option(&key, OptionValue::Int(1)).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("adbc.ingest.mode"), "{error}");
     }
 
     #[test]
@@ -2641,14 +2646,21 @@ mod tests {
 
     #[test]
     fn string_option_requires_a_string_value() {
+        let key = OptionStatement::TargetTable;
         assert_eq!(
-            string_option(OptionValue::String("hi".into())).unwrap(),
+            string_option(&key, OptionValue::String("hi".into())).unwrap(),
             "hi"
         );
-        // A non-string value kind is rejected as an invalid argument.
+        // A non-string value kind is rejected as an invalid argument, and the error names the
+        // offending option's full key rather than a generic "statement option" (IDIO-7).
         for value in [OptionValue::Int(1), OptionValue::Double(1.0)] {
-            let error = string_option(value).unwrap_err();
+            let error = string_option(&key, value).unwrap_err();
             assert_eq!(error.status, Status::InvalidArguments);
+            assert!(
+                error.message.contains("adbc.ingest.target_table"),
+                "{}",
+                error.message
+            );
         }
     }
 
