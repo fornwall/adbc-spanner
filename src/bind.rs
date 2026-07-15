@@ -49,7 +49,10 @@
 //! `JSON` column fails with a type mismatch (the untagged workaround is `PARSE_JSON(@doc)` in the
 //! SQL). Tagged values therefore round-trip: what `execute` reads from a `JSON` column can be
 //! bound straight back into one. Unlike the untyped strings above, this uses `add_typed_param`,
-//! which sends an explicit `JSON` param type alongside the string-encoded value.
+//! which sends an explicit `JSON` param type alongside the string-encoded value. The tag is
+//! honoured through dictionary encoding too — the Arrow spec allows an extension array to be
+//! dictionary-encoded, so a tagged `Dictionary(_, Utf8)` column binds as `JSON` like its plain
+//! form (null cells included).
 
 use adbc_core::error::Result;
 use arrow_array::cast::AsArray;
@@ -233,7 +236,7 @@ fn cell_value(
         DataType::Dictionary(_, _) => downcast_dictionary_array!(
             column => match column.key(row) {
                 Some(value_row) => cell_value(name, field, column.values().as_ref(), value_row),
-                None => null_dictionary_value(name, column.values().data_type()),
+                None => null_dictionary_value(name, field, column.values().data_type()),
             },
             _ => unreachable!("downcast_dictionary_array dispatched a non-dictionary {data_type:?}")
         ),
@@ -398,8 +401,14 @@ fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
 /// The NULL bind for a null dictionary-encoded cell. The dictionary's *value* type is still
 /// validated — an unsupported value type is rejected on every row, null or not, matching the other
 /// arms of [`cell_value`] (the `Decimal128` scale precedent) — and a `List`-valued dictionary
-/// keeps [`list_cell_value`]'s typed-null-array handling.
-fn null_dictionary_value(name: &str, value_type: &DataType) -> Result<(Value, Option<Type>)> {
+/// keeps [`list_cell_value`]'s typed-null-array handling. `field` is the dictionary column's own
+/// field: an `arrow.json` tag on it keeps the explicit `JSON` param type on the null, exactly as
+/// the plain scalar arm does for a typed null.
+fn null_dictionary_value(
+    name: &str,
+    field: &Field,
+    value_type: &DataType,
+) -> Result<(Value, Option<Type>)> {
     match value_type {
         DataType::List(item) | DataType::LargeList(item) => list_cell_value(name, item, None),
         _ => {
@@ -408,7 +417,7 @@ fn null_dictionary_value(name: &str, value_type: &DataType) -> Result<(Value, Op
                     "cannot bind parameter {name:?}: unsupported Arrow type {value_type:?}"
                 ))
             })?;
-            Ok((null_value(), None))
+            Ok((null_value(), is_json_field(field).then(types::json)))
         }
     }
 }
@@ -826,11 +835,17 @@ mod tests {
                 DataType::List(Arc::new(json_field("item", DataType::Utf8))),
                 true,
             ),
+            // The tag is honoured through dictionary encoding too (see `cell_value`), so a
+            // dictionary-encoded JSON column creates JSON, not the value type's STRING(MAX).
+            json_field(
+                "cat",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            ),
             Field::new("plain", DataType::Utf8, true),
         ]);
         let sql = create_table_sql("t", None, &schema, false, None).unwrap();
         assert!(
-            sql.contains("`doc` JSON, `docs` ARRAY<JSON>, `plain` STRING(MAX)"),
+            sql.contains("`doc` JSON, `docs` ARRAY<JSON>, `cat` JSON, `plain` STRING(MAX)"),
             "unexpected DDL: {sql}"
         );
     }
@@ -1463,6 +1478,76 @@ mod tests {
         assert!(
             row1.contains("NullValue") && !row1.contains("beta"),
             "row 1 was read from the unsliced buffer: {row1}"
+        );
+    }
+
+    #[test]
+    fn binds_non_null_key_pointing_at_null_dictionary_value_as_null() {
+        // The second way a dictionary cell can be null: the key is valid but selects a null entry
+        // *inside the values array* (the null-key form is covered above). The delegated scalar
+        // binder's own null check must fire on the values array — this exact case stayed latent
+        // for years in the ADBC postgres driver's already-supported string dictionaries
+        // (apache/arrow-adbc, "insufficient data left in message"), so lock it in.
+        let dict = arrow_array::DictionaryArray::new(
+            arrow_array::Int8Array::from(vec![Some(0i8), Some(1)]), // both keys valid
+            Arc::new(StringArray::from(vec![None, Some("a")])),     // values[0] is null
+        );
+        let b = batch(
+            vec![Field::new("s", dict.data_type().clone(), true)],
+            vec![Arc::new(dict)],
+        );
+        let row0 = bound_params_debug(&b, 0);
+        assert!(
+            row0.contains("NullValue") && !row0.contains("StringValue"),
+            "key 0 selects a null dictionary value and must bind NULL: {row0}"
+        );
+        let row1 = bound_params_debug(&b, 1);
+        assert!(
+            row1.contains(r#"StringValue("a")"#),
+            "key 1 selects a present value: {row1}"
+        );
+    }
+
+    #[test]
+    fn binds_json_tagged_dictionary_strings_as_json_params() {
+        // The `arrow.json` tag is honoured through dictionary encoding (the Arrow spec allows an
+        // extension array to be dictionary-encoded, so its storage type is
+        // `dictionary<indices, utf8>`): a present cell binds with the explicit JSON param type via
+        // the plain-path delegation, and a null cell keeps it — the typed-null rule of the plain
+        // path (`binds_json_tagged_strings_as_json_params`).
+        let dict = arrow_array::DictionaryArray::new(
+            arrow_array::Int8Array::from(vec![Some(0i8), None]),
+            Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#)])),
+        );
+        let b = batch(
+            vec![json_field("doc", dict.data_type().clone())],
+            vec![Arc::new(dict)],
+        );
+        for row in 0..2 {
+            let dbg = bound_params_debug(&b, row);
+            assert!(
+                dbg.contains(r#""p0": Type(Type { code: Json"#),
+                "row {row} lost the JSON param type: {dbg}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_tag_is_ignored_on_non_string_dictionary_values() {
+        // `json_tag_is_ignored_on_non_string_storage`, through the encoding: `arrow.json` is only
+        // defined over string storage, so a tagged Dictionary(_, Int64) still binds as INT64.
+        let dict = arrow_array::DictionaryArray::new(
+            arrow_array::Int8Array::from(vec![Some(0i8)]),
+            Arc::new(Int64Array::from(vec![7i64])),
+        );
+        let b = batch(
+            vec![json_field("n", dict.data_type().clone())],
+            vec![Arc::new(dict)],
+        );
+        let dbg = bound_params_debug(&b, 0);
+        assert!(
+            !dbg.contains("Json"),
+            "tagged Int64 dictionary mis-bound as JSON: {dbg}"
         );
     }
 
