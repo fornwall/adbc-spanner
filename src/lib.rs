@@ -38,6 +38,10 @@
 //! actually carries. Unknown query keys are rejected; values are percent-decoded (RFC 3986).
 //! `get_option("uri")` returns the stored database path, not the original URI.
 //!
+//! The two secret-holding options, [`OPTION_KEYFILE_JSON`] and [`OPTION_ACCESS_TOKEN`], are **not**
+//! accepted as query parameters (a URI is routinely logged — shell history, process listings,
+//! tracing spans); set them as options directly. [`OPTION_KEYFILE`], a path, is fine in a URI.
+//!
 //! To talk to a Spanner emulator, either set the `SPANNER_EMULATOR_HOST` environment variable (the
 //! driver picks it up automatically and uses anonymous credentials) or set the [`OPTION_ENDPOINT`]
 //! and [`OPTION_EMULATOR`] options explicitly.
@@ -408,6 +412,12 @@ pub const OPTION_KEYFILE: &str = "spanner.auth.keyfile";
 /// key back always fails with [`Status::NotFound`](adbc_core::error::Status::NotFound), whether the
 /// option is set or not (the same treatment as [`OPTION_ACCESS_TOKEN`]; [`OPTION_KEYFILE`], a
 /// filesystem path rather than a secret, stays readable).
+///
+/// **Not a URI query parameter.** For the same reason, a `spanner://` connection URI may not carry
+/// this key — a URI is routinely logged (shell history, process listings, tracing spans) — and one
+/// that does is rejected with
+/// [`Status::InvalidArguments`](adbc_core::error::Status::InvalidArguments). Set it as a database
+/// option instead, or point at a key file with [`OPTION_KEYFILE`], which a URI may carry.
 pub const OPTION_KEYFILE_JSON: &str = "spanner.auth.keyfile_json";
 
 /// Driver-specific database option: the service-account email to impersonate. Setting this **enables
@@ -452,6 +462,12 @@ pub const OPTION_IMPERSONATE_LIFETIME: &str = "spanner.auth.impersonate.lifetime
 /// **Write-only.** The value is a live bearer token, so `get_option` never returns it: reading this
 /// key back always fails with [`Status::NotFound`](adbc_core::error::Status::NotFound), whether the
 /// option is set or not (the same treatment as [`OPTION_KEYFILE_JSON`]).
+///
+/// **Not a URI query parameter.** For the same reason, a `spanner://` connection URI may not carry
+/// this key — a URI is routinely logged (shell history, process listings, tracing spans) — and one
+/// that does is rejected with
+/// [`Status::InvalidArguments`](adbc_core::error::Status::InvalidArguments). Set it as a database
+/// option instead (again matching [`OPTION_KEYFILE_JSON`]).
 pub const OPTION_ACCESS_TOKEN: &str = "spanner.auth.access_token";
 
 /// Driver-specific database option: the **quota / billing project** charged for Spanner API usage,

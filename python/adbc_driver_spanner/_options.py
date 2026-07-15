@@ -44,10 +44,12 @@ class DatabaseOptions(enum.Enum):
     #: Path to a service-account / credential JSON file.
     KEYFILE = "spanner.auth.keyfile"
     #: The same credential JSON passed inline as a string. Write-only: never
-    #: readable back via ``get_option``.
+    #: readable back via ``get_option``, and not accepted as a ``URI`` query
+    #: parameter (URIs get logged) — pass it here instead.
     KEYFILE_JSON = "spanner.auth.keyfile_json"
     #: A caller-supplied OAuth 2.0 bearer token, sent verbatim (no refresh).
-    #: Write-only: never readable back via ``get_option``.
+    #: Write-only: never readable back via ``get_option``, and not accepted as a
+    #: ``URI`` query parameter (URIs get logged) — pass it here instead.
     ACCESS_TOKEN = "spanner.auth.access_token"
     #: Service account to impersonate; setting it enables impersonation.
     IMPERSONATE_TARGET_PRINCIPAL = "spanner.auth.impersonate.target_principal"

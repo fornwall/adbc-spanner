@@ -250,6 +250,9 @@ database path; an optional `//host:port` authority becomes `spanner.endpoint`
 (write `spanner:///projects/…`, with three slashes, when no
 endpoint host is intended). Query parameters must be database-level option names (unknown
 keys are rejected); values are percent-decoded per RFC 3986 (`+` is a literal plus, not a space).
+The two secret-holding options, `spanner.auth.keyfile_json` and `spanner.auth.access_token`, are
+**not** accepted as query parameters — a URI is routinely logged (shell history, process listings,
+tracing spans), so set those as options directly; `spanner.auth.keyfile`, a path, is fine in a URI.
 The URI is expanded into the individual options immediately when it is set, so precedence is
 plain last-writer-wins: an option set after the URI overrides it, and a URI set after an option
 overwrites only the fields the URI actually carries. `get_option("uri")` returns the stored
@@ -275,8 +278,10 @@ Credentials are resolved in this order:
 The two secret-holding options — `spanner.auth.keyfile_json` (a live private key) and
 `spanner.auth.access_token` (a live bearer token) — are **write-only**: reading either back via
 `get_option` always fails with `NotFound`, whether the option is set or not, so tooling that dumps
-connection options never prints a usable credential. `spanner.auth.keyfile` is a filesystem path,
-not a secret, and stays readable.
+connection options never prints a usable credential. They likewise cannot be passed as `uri` query
+parameters — a connection URI is the most-logged configuration artifact there is — so they must be
+set as options directly. `spanner.auth.keyfile` is a filesystem path, not a secret: it stays
+readable and remains valid in a URI.
 
 #### OAuth access token
 
