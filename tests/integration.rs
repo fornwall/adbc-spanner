@@ -6676,6 +6676,55 @@ fn execute_partitions_round_trip() {
     assert_eq!(*seen.iter().next().unwrap(), 1);
     assert_eq!(*seen.iter().next_back().unwrap(), 200);
 
+    // A single bound parameter row still partitions (SPEC-3 allows exactly one): the row binds as
+    // `@max` and every partition honours it.
+    let mut bound_stmt = connection.new_statement().expect("new statement");
+    bound_stmt
+        .set_sql_query("SELECT Id FROM AdbcPartition WHERE Id <= @max")
+        .unwrap();
+    let param_schema = Arc::new(Schema::new(vec![Field::new("max", DataType::Int64, false)]));
+    let one_row =
+        RecordBatch::try_new(param_schema, vec![Arc::new(Int64Array::from(vec![50_i64]))])
+            .expect("build parameter batch");
+    bound_stmt.bind(one_row).expect("bind one parameter row");
+    let partitioned = bound_stmt
+        .execute_partitions()
+        .expect("execute_partitions with one bound row");
+    let mut seen: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    for token in &partitioned.partitions {
+        let reader = connection.read_partition(token).expect("read_partition");
+        for batch in reader {
+            let batch = batch.expect("partition batch");
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..ids.len() {
+                assert!(seen.insert(ids.value(i)), "duplicate id {}", ids.value(i));
+            }
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        50,
+        "the bound @max = 50 filter must be honoured"
+    );
+    assert_eq!(*seen.iter().next_back().unwrap(), 50);
+    // The call consumed the bound row (the DML-path convention): on the reused handle, a new
+    // parameter-free query sees no leftover bound data — `get_parameter_schema` derives from the
+    // SQL's `@name` references (none) instead of reflecting the stale bound batch's schema (which
+    // `set_sql_query` deliberately does not clear).
+    bound_stmt.set_sql_query("SELECT 1").unwrap();
+    let params = bound_stmt
+        .get_parameter_schema()
+        .expect("parameter schema after partitioning");
+    assert_eq!(
+        params.fields().len(),
+        0,
+        "the bound row must not survive execute_partitions on a reused statement handle"
+    );
+
     let mut drop = connection.new_statement().expect("new statement");
     drop.set_sql_query("DROP TABLE AdbcPartition").unwrap();
     drop.execute_update().expect("drop partition table");
