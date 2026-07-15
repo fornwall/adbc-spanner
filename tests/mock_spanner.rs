@@ -3665,3 +3665,298 @@ fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_pat
          accounting moved — update src/retry.rs, docs/options.md and REVIEW.md's UP-14 to match"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SPAN-3: the get_statistics aggregate scans carry the connection's read options
+// ---------------------------------------------------------------------------
+//
+// `get_statistics` runs one full-table `COUNT(*)`/`COUNTIF`/`COUNT(DISTINCT)` scan per matching
+// table — by far the heaviest queries the driver issues on its own, and the only driver-internal
+// ones that read *user data*. They must therefore carry the connection's request priority / request
+// tag, directed-read replica selection and retry bound, exactly like a user query would. The
+// `INFORMATION_SCHEMA` discovery queries that feed them stay ordinary metadata reads, unconfigured
+// like every other one — the deliberate scope line, asserted below as the matching negative.
+
+/// The single table `statistics_discovery_response` reports (in the unnamed default schema, with a
+/// single STRING column `c`).
+const STATS_TABLE: &str = "MockTable";
+
+/// Result metadata for the given `(column name, type code)` columns.
+fn typed_column_metadata(columns: &[(&str, v1::TypeCode)]) -> v1::ResultSetMetadata {
+    v1::ResultSetMetadata {
+        row_type: Some(v1::StructType {
+            fields: columns
+                .iter()
+                .map(|(name, code)| v1::struct_type::Field {
+                    name: (*name).to_string(),
+                    r#type: Some(v1::Type {
+                        code: *code as i32,
+                        ..Default::default()
+                    }),
+                })
+                .collect(),
+        }),
+        ..Default::default()
+    }
+}
+
+/// The scripted answer to one of the two `INFORMATION_SCHEMA` discovery queries
+/// `collect_statistics` issues: one base table [`STATS_TABLE`] in the unnamed default schema, with
+/// one groupable STRING column `c`. `None` for any other SQL — i.e. for the per-table aggregate
+/// scan, which [`statistics_scan_response`] answers.
+fn statistics_discovery_response(sql: &str) -> Option<v1::PartialResultSet> {
+    let (columns, values): (Vec<(&str, v1::TypeCode)>, Vec<&str>) =
+        if sql.contains("INFORMATION_SCHEMA.TABLES") {
+            (
+                vec![
+                    ("TABLE_SCHEMA", v1::TypeCode::String),
+                    ("TABLE_NAME", v1::TypeCode::String),
+                ],
+                vec!["", STATS_TABLE],
+            )
+        } else if sql.contains("INFORMATION_SCHEMA.COLUMNS") {
+            (
+                vec![
+                    ("TABLE_SCHEMA", v1::TypeCode::String),
+                    ("TABLE_NAME", v1::TypeCode::String),
+                    ("COLUMN_NAME", v1::TypeCode::String),
+                    ("SPANNER_TYPE", v1::TypeCode::String),
+                ],
+                vec!["", STATS_TABLE, "c", "STRING(MAX)"],
+            )
+        } else {
+            return None;
+        };
+    Some(v1::PartialResultSet {
+        metadata: Some(typed_column_metadata(&columns)),
+        values: values.iter().map(|v| string_value(v)).collect(),
+        resume_token: b"stats-meta".to_vec(),
+        last: true,
+        ..Default::default()
+    })
+}
+
+/// The scripted result of the per-table aggregate scan: the one row of `COUNT(*)`,
+/// `COUNTIF(c IS NULL)` and `COUNT(DISTINCT c)` counts. Spanner encodes INT64 as a *string* value,
+/// so the counts ride `string_value` under an INT64 row type.
+fn statistics_scan_response() -> v1::PartialResultSet {
+    v1::PartialResultSet {
+        metadata: Some(typed_column_metadata(&[
+            ("", v1::TypeCode::Int64),
+            ("", v1::TypeCode::Int64),
+            ("", v1::TypeCode::Int64),
+        ])),
+        values: ["7", "2", "5"].iter().map(|v| string_value(v)).collect(),
+        resume_token: b"stats-scan".to_vec(),
+        last: true,
+        ..Default::default()
+    }
+}
+
+/// SPAN-3 (wire): the `get_statistics` aggregate scans must carry the connection's
+/// `spanner.request.priority` + `spanner.request.tag` (as `ExecuteSqlRequest.request_options`) and
+/// its `spanner.directed_read` (as `ExecuteSqlRequest.directed_read_options`) — the scans read user
+/// tables, so a connection that asked for low-priority, tagged, replica-pinned reads must get them
+/// for its statistics too. The negative in the same test pins the deliberate scope line: the two
+/// `INFORMATION_SCHEMA` discovery queries feeding the scans are plain metadata reads and carry
+/// neither (like `get_objects` / `get_table_schema`).
+#[test]
+fn statistics_scans_carry_the_connections_request_options_and_directed_read() {
+    use v1::directed_read_options as dro;
+
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "statistics_scans_carry_the_connections_request_options_and_directed_read",
+    );
+
+    /// `(sql, request_options, directed_read_options)` of one `ExecuteStreamingSql` the server saw.
+    type SeenSql = (
+        String,
+        Option<v1::RequestOptions>,
+        Option<v1::DirectedReadOptions>,
+    );
+    let seen: Arc<Mutex<Vec<SeenSql>>> = Arc::new(Mutex::new(Vec::new()));
+    let record = seen.clone();
+    let server = MockServer::start(move |mock| {
+        mock.expect_execute_streaming_sql()
+            .returning(move |request| {
+                let request = request.into_inner();
+                record.lock().unwrap().push((
+                    request.sql.clone(),
+                    request.request_options.clone(),
+                    request.directed_read_options.clone(),
+                ));
+                let message = statistics_discovery_response(&request.sql)
+                    .unwrap_or_else(statistics_scan_response);
+                Ok(stream_of(vec![Ok(message)]))
+            });
+    });
+
+    let mut connection = server.connect();
+    for (key, value) in [
+        (adbc_spanner::OPTION_REQUEST_PRIORITY, "low"),
+        (adbc_spanner::OPTION_REQUEST_TAG, "nightly-stats"),
+        (
+            adbc_spanner::OPTION_DIRECTED_READ,
+            "include:us-east1:read_only",
+        ),
+    ] {
+        connection
+            .set_option(
+                OptionConnection::Other(key.into()),
+                OptionValue::String(value.into()),
+            )
+            .unwrap_or_else(|error| panic!("set connection-level {key}: {error}"));
+    }
+
+    let batches = connection
+        .get_statistics(None, None, None, false)
+        .expect("get_statistics against the mock server")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect get_statistics batches");
+    assert_eq!(batches.len(), 1, "get_statistics returns one catalog batch");
+
+    let seen = seen.lock().unwrap();
+    let (discovery, scans): (Vec<&SeenSql>, Vec<&SeenSql>) = seen
+        .iter()
+        .partition(|(sql, ..)| sql.contains("INFORMATION_SCHEMA"));
+    assert_eq!(
+        discovery.len(),
+        2,
+        "both INFORMATION_SCHEMA discovery queries must run, saw: {:?}",
+        seen.iter().map(|(sql, ..)| sql).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        scans.len(),
+        1,
+        "exactly one aggregate scan for the one discovered table, saw: {:?}",
+        seen.iter().map(|(sql, ..)| sql).collect::<Vec<_>>()
+    );
+
+    let (sql, request_options, directed) = scans[0];
+    assert!(
+        sql.starts_with("SELECT COUNT(*)"),
+        "the scan must be the aggregate query, got: {sql}"
+    );
+    assert_eq!(
+        request_options.clone(),
+        Some(v1::RequestOptions {
+            priority: v1::request_options::Priority::Low as i32,
+            request_tag: "nightly-stats".to_string(),
+            ..Default::default()
+        }),
+        "the connection's priority + request tag must reach the aggregate scan's ExecuteSqlRequest"
+    );
+    assert_eq!(
+        directed.clone(),
+        Some(v1::DirectedReadOptions {
+            replicas: Some(dro::Replicas::IncludeReplicas(dro::IncludeReplicas {
+                replica_selections: vec![dro::ReplicaSelection {
+                    location: "us-east1".to_string(),
+                    r#type: dro::replica_selection::Type::ReadOnly as i32,
+                }],
+                auto_failover_disabled: false,
+            })),
+        }),
+        "the connection's directed read must reach the aggregate scan's ExecuteSqlRequest"
+    );
+
+    // The scope line: the discovery reads of INFORMATION_SCHEMA are ordinary driver-internal
+    // metadata queries and stay unconfigured — only the user-table scans take the options.
+    for (sql, request_options, directed) in discovery {
+        assert_eq!(
+            request_options.as_ref(),
+            None,
+            "the INFORMATION_SCHEMA discovery query must stay untagged: {sql}"
+        );
+        assert_eq!(
+            directed.as_ref(),
+            None,
+            "the INFORMATION_SCHEMA discovery query must carry no directed read: {sql}"
+        );
+    }
+}
+
+/// SPAN-3 (wire, retry): the `get_statistics` aggregate scans must run under the connection's
+/// `spanner.retry.max_attempts` / `spanner.retry.backoff.*`. A retry policy is client-side, so what
+/// "reaches the wire" is the *attempt count*: the scan's result stream fails twice with a retryable
+/// `UNAVAILABLE` and would succeed on a third attempt.
+///
+/// - Bounded by the connection's `max_attempts = 1` (what this test asserts): the client restarts
+///   the stream once, the second failure is exhausted, and the error surfaces after **2** attempts.
+///   (The client counts restarts, not attempts — it seeds the gax retry state with its own
+///   `retry_count`, which is 0 on the first failure — so a limit of `n` permits `n + 1` attempts on
+///   this streaming path. The test pins the observable behaviour, not that off-by-one.)
+/// - Unbounded (the client's own default `SpannerRetryPolicy` with a 10-attempt limit — see the
+///   pinned client's `result_set.rs::apply_defaults`): the third attempt is reached and the scan
+///   *succeeds*.
+///
+/// So dropping the retry config from the scans flips this from `Err`/2 attempts to `Ok`/3.
+/// (Only errors delivered *inside* the result stream are retried — an initial RPC status is not
+/// retried by this client at all, whatever the policy — so the failures are scripted as stream
+/// items.)
+#[test]
+fn statistics_scans_honour_the_connections_retry_bound() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "statistics_scans_honour_the_connections_retry_bound",
+    );
+
+    /// How many of the scripted aggregate-scan attempts fail before one would succeed.
+    const SCRIPTED_FAILURES: usize = 2;
+
+    // How many aggregate scans (i.e. non-INFORMATION_SCHEMA queries) the server saw.
+    let scan_attempts = Arc::new(AtomicUsize::new(0));
+    let count = scan_attempts.clone();
+    let server = MockServer::start(move |mock| {
+        mock.expect_execute_streaming_sql()
+            .returning(move |request| {
+                let request = request.into_inner();
+                if let Some(message) = statistics_discovery_response(&request.sql) {
+                    return Ok(stream_of(vec![Ok(message)]));
+                }
+                // The aggregate scan: the first `SCRIPTED_FAILURES` attempts fail the stream with a
+                // retryable status; any later attempt succeeds. A driver that honours the
+                // connection's attempt limit never reaches the success.
+                let attempt = count.fetch_add(1, Ordering::SeqCst);
+                if attempt < SCRIPTED_FAILURES {
+                    return Ok(stream_of(vec![Err(tonic::Status::unavailable(format!(
+                        "scan stream attempt {attempt} unavailable"
+                    )))]));
+                }
+                Ok(stream_of(vec![Ok(statistics_scan_response())]))
+            });
+    });
+
+    let mut connection = server.connect();
+    for (key, value) in [
+        (adbc_spanner::OPTION_RETRY_MAX_ATTEMPTS, "1"),
+        // Keep the (bounded) inter-attempt sleeps out of the test's runtime. These ride the same
+        // `RetryConfig::apply_to_statement` call as the attempt limit, so they only take effect if
+        // the scans honour the config at all — the assertions below do not depend on them.
+        (adbc_spanner::OPTION_RETRY_BACKOFF_INITIAL_SECONDS, "0.001"),
+        (adbc_spanner::OPTION_RETRY_BACKOFF_MAX_SECONDS, "1"),
+    ] {
+        connection
+            .set_option(
+                OptionConnection::Other(key.into()),
+                OptionValue::String(value.into()),
+            )
+            .unwrap_or_else(|error| panic!("set connection-level {key}: {error}"));
+    }
+
+    let error = connection
+        .get_statistics(None, None, None, false)
+        .err()
+        .expect("the exhausted UNAVAILABLE scan must surface, not be retried into success");
+    assert!(
+        error.message.contains("unavailable"),
+        "the scan's error must reach the caller, got: {error}"
+    );
+    assert_eq!(
+        scan_attempts.load(Ordering::SeqCst),
+        2,
+        "the connection's retry bound must stop the aggregate scan's stream restarts before the \
+         scripted third (successful) attempt"
+    );
+}

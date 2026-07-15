@@ -33,8 +33,11 @@
 //! Like the read-staleness options, the connection's values become the default for statements it
 //! creates (which may override them), setting an empty string unsets a value, and every option
 //! round-trips through `get_option`. Driver-internal metadata queries (`get_objects`,
-//! `get_table_schema` probes, …) are deliberately left untagged — the options cover the user's own
-//! statements.
+//! `get_table_schema` probes, the `INFORMATION_SCHEMA` reads, …) are deliberately left untagged —
+//! the options cover the user's own statements. The one exception is the `get_statistics` aggregate
+//! scans (SPAN-3): they are full scans of *user tables* rather than catalog bookkeeping, so they
+//! take the connection's priority / request tag like a user query would — see
+//! [`ScanConfig`](crate::statistics::ScanConfig).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
