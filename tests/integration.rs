@@ -2108,6 +2108,49 @@ fn query_and_dml_round_trip() {
     assert_eq!((a.value(0), a.value(1)), (1, 2));
     assert_eq!((b.value(0), b.value(1)), ("x", "y"));
 
+    // A STRUCT may repeat a field name and leave a field unnamed — both legal in Spanner, since a
+    // STRUCT is positional, not a map. Every field must keep its own value: decoding by name would
+    // collapse the two `x`es onto one value (CONV-6).
+    let mut dup_struct_q = connection.new_statement().expect("new statement");
+    dup_struct_q
+        .set_sql_query("SELECT ARRAY(SELECT AS STRUCT 1 AS x, 2 AS x, 3) AS arr")
+        .unwrap();
+    let dup_struct_reader = dup_struct_q
+        .execute()
+        .expect("duplicate-field struct query");
+
+    // Field names arrive verbatim: the duplicate `x` twice, then the anonymous field as "".
+    match dup_struct_reader.schema().field(0).data_type() {
+        DataType::List(field) => match field.data_type() {
+            DataType::Struct(fields) => {
+                let names: Vec<_> = fields.iter().map(|f| f.name().as_str()).collect();
+                assert_eq!(names, ["x", "x", ""]);
+            }
+            other => panic!("expected List<Struct>, got List<{other:?}>"),
+        },
+        other => panic!("expected List, got {other:?}"),
+    }
+
+    let dup_struct_batches = dup_struct_reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect duplicate-field struct");
+    let dup_list = dup_struct_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let dup_inner = dup_list.value(0);
+    let dup_inner = dup_inner.as_any().downcast_ref::<StructArray>().unwrap();
+    let dup_col = |i: usize| {
+        dup_inner
+            .column(i)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    };
+    assert_eq!((dup_col(0), dup_col(1), dup_col(2)), (1, 2, 3));
+
     // --- Batched multi-statement DML in one execute_update (atomic DELETE; INSERT) ---
 
     let mut batch_ddl = connection.new_statement().expect("new statement");
