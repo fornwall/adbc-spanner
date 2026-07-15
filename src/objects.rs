@@ -266,26 +266,11 @@ pub(crate) fn collect_objects(
     // below is a series of hash lookups rather than a full rescan of each batch per table (which
     // was quadratic for large schemas). This mirrors `collect_statistics`. The per-group `Vec`s
     // keep batch (i.e. `ORDER BY`) order, so column and key-column ordering is preserved exactly.
-    let tables_by_schema = match &table_batch {
-        Some(batch) => group_tables(batch)?,
-        None => HashMap::new(),
-    };
-    let columns_by_table = match &column_batch {
-        Some(batch) => group_columns(batch)?,
-        None => HashMap::new(),
-    };
-    let constraints_by_table = match &constraint_batch {
-        Some(batch) => group_constraints(batch)?,
-        None => HashMap::new(),
-    };
-    let key_columns_by_constraint = match &key_column_batch {
-        Some(batch) => group_key_columns(batch)?,
-        None => HashMap::new(),
-    };
-    let referential_by_constraint = match &referential_batch {
-        Some(batch) => group_referential(batch)?,
-        None => HashMap::new(),
-    };
+    let tables_by_schema = group_opt(table_batch.as_ref(), group_tables)?;
+    let columns_by_table = group_opt(column_batch.as_ref(), group_columns)?;
+    let constraints_by_table = group_opt(constraint_batch.as_ref(), group_constraints)?;
+    let key_columns_by_constraint = group_opt(key_column_batch.as_ref(), group_key_columns)?;
+    let referential_by_constraint = group_opt(referential_batch.as_ref(), group_referential)?;
 
     // The `LIKE` patterns are loop-invariant, so compile each once and reuse it across every row.
     let db_schema_matcher = db_schema.map(LikeMatcher::new);
@@ -459,6 +444,17 @@ struct KeyColumnRow<'a> {
     table: &'a str,
     ordinal: &'a str,
     position: Option<&'a str>,
+}
+
+/// Apply one of the `group_*` functions below to a batch that may not have been fetched.
+///
+/// A `None` batch means that depth never issued the query, which groups to an empty map — so the
+/// assembly in [`collect_objects`] simply finds nothing at that depth.
+fn group_opt<'a, T: Default>(
+    batch: Option<&'a RecordBatch>,
+    group: impl FnOnce(&'a RecordBatch) -> Result<T>,
+) -> Result<T> {
+    Ok(batch.map(group).transpose()?.unwrap_or_default())
 }
 
 /// Group `INFORMATION_SCHEMA.TABLES` rows by `TABLE_SCHEMA`, preserving batch order within a schema.
@@ -1257,5 +1253,27 @@ mod tests {
         assert_eq!(ctype.value(1), "FOREIGN KEY");
         assert!(usage.is_valid(1));
         assert_eq!(usage.value(1).len(), 1);
+    }
+
+    #[test]
+    fn group_opt_groups_a_present_batch_and_defaults_an_absent_one() {
+        let col = |vals: [&str; 3]| Arc::new(StringArray::from(vals.to_vec())) as ArrayRef;
+        // A TABLES batch, in the `SELECT` order `tables_col` indexes.
+        let batch = RecordBatch::try_from_iter([
+            ("TABLE_SCHEMA", col(["", "", "INFORMATION_SCHEMA"])),
+            ("TABLE_NAME", col(["Users", "Orgs", "TABLES"])),
+            ("TABLE_TYPE", col(["BASE TABLE", "BASE TABLE", "VIEW"])),
+        ])
+        .unwrap();
+
+        let grouped = group_opt(Some(&batch), group_tables).unwrap();
+        assert_eq!(grouped.len(), 2);
+        // Batch (i.e. `ORDER BY`) order is preserved within a schema.
+        let names: Vec<_> = grouped[""].iter().map(|t| t.name).collect();
+        assert_eq!(names, ["Users", "Orgs"]);
+        assert_eq!(grouped["INFORMATION_SCHEMA"][0].table_type, "VIEW");
+
+        // An absent batch — that depth never issued the query — groups to an empty map.
+        assert!(group_opt(None, group_tables).unwrap().is_empty());
     }
 }
