@@ -12,10 +12,10 @@ use adbc_core::error::{Result, Status};
 use adbc_core::options::InfoCode;
 use adbc_core::schemas::GET_INFO_SCHEMA;
 use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray, UInt32Array};
-use arrow_schema::{ArrowError, DataType};
+use arrow_schema::DataType;
 
 use crate::error::err;
-use crate::nested::dense_union;
+use crate::nested::{arrow_err, dense_union};
 use crate::{DRIVER_NAME, DRIVER_VERSION, VENDOR_NAME};
 
 /// Type ids of the `info_value` union branches this driver populates (see [`GET_INFO_SCHEMA`]:
@@ -54,7 +54,9 @@ const REPORTED: &[InfoCode] = &[
 
 /// A single info value, tagged by which union branch it belongs to.
 enum InfoValue {
-    Str(String),
+    /// Every string this driver reports is a compile-time constant (a `const` or an `env!`), so the
+    /// variant borrows rather than allocates.
+    Str(&'static str),
     Bool(bool),
     Int(i64),
     /// A code we recognise but have no stable value for (e.g. a Spanner product version): emitted as
@@ -65,13 +67,13 @@ enum InfoValue {
 /// The value this driver reports for `code`.
 fn value_for(code: InfoCode) -> InfoValue {
     match code {
-        InfoCode::VendorName => InfoValue::Str(VENDOR_NAME.to_string()),
+        InfoCode::VendorName => InfoValue::Str(VENDOR_NAME),
         // Spanner speaks SQL (GoogleSQL / PostgreSQL) but not Substrait.
         InfoCode::VendorSql => InfoValue::Bool(true),
         InfoCode::VendorSubstrait => InfoValue::Bool(false),
-        InfoCode::DriverName => InfoValue::Str(DRIVER_NAME.to_string()),
-        InfoCode::DriverVersion => InfoValue::Str(DRIVER_VERSION.to_string()),
-        InfoCode::DriverArrowVersion => InfoValue::Str(ARROW_VERSION.to_string()),
+        InfoCode::DriverName => InfoValue::Str(DRIVER_NAME),
+        InfoCode::DriverVersion => InfoValue::Str(DRIVER_VERSION),
+        InfoCode::DriverArrowVersion => InfoValue::Str(ARROW_VERSION),
         InfoCode::DriverAdbcVersion => InfoValue::Int(ADBC_VERSION_1_1_0),
         // Recognised codes without a stable value, emitted as null rather than a fabricated string.
         // In particular `VendorVersion` (the Spanner *server* product version) is deliberately null:
@@ -103,7 +105,7 @@ pub(crate) fn build(codes: Option<HashSet<InfoCode>>) -> Result<RecordBatch> {
     let mut names: Vec<u32> = Vec::with_capacity(codes.len());
     let mut type_ids: Vec<i8> = Vec::with_capacity(codes.len());
     let mut offsets: Vec<i32> = Vec::with_capacity(codes.len());
-    let mut strings: Vec<Option<String>> = Vec::new();
+    let mut strings: Vec<Option<&'static str>> = Vec::new();
     let mut bools: Vec<Option<bool>> = Vec::new();
     let mut ints: Vec<Option<i64>> = Vec::new();
 
@@ -164,13 +166,6 @@ pub(crate) fn build(codes: Option<HashSet<InfoCode>>) -> Result<RecordBatch> {
         vec![Arc::new(UInt32Array::from(names)), Arc::new(info_value)],
     )
     .map_err(arrow_err)
-}
-
-fn arrow_err(e: ArrowError) -> adbc_core::error::Error {
-    err(
-        format!("failed to build get_info batch: {e}"),
-        Status::Internal,
-    )
 }
 
 #[cfg(test)]
