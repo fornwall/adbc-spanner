@@ -141,7 +141,13 @@ Key design points:
   and a truly unknown level string is still rejected with `InvalidArguments`. The standard `adbc.connection.readonly`
   option (default `false`) makes a connection reject all writes — DML/DDL/ingest fail with
   `InvalidState`, queries still run; the flag is a shared `Arc<AtomicBool>` that statements read at
-  execution time, so toggling it on the connection immediately affects existing statements too.
+  execution time, so toggling it on the connection immediately affects existing statements too. The
+  **commit paths honour it too** (COR-10): `check_commit_writable` in `apply_manual_txn` — the one
+  choke point `commit` and the `enter_autocommit` toggle share — rejects applying a manual
+  transaction's buffered DML/mutations with `InvalidState` while the flag is set, gated on
+  `ManualTxn::has_pending_work` so a query (or empty) transaction still commits and `rollback`
+  (which never applies anything) is never gated; the rejection changes no state, so the buffer
+  stays replayable like after any other failed commit.
 - **Stale reads.** Read-only queries default to a strong bound. A single `spanner.read.staleness`
   option requests a non-strong `TimestampBound`; its value is one of four distinct prefixes —
   `exact:<duration>` / `max:<duration>` (relative) and `read:<rfc3339>` / `min:<rfc3339>` (absolute;

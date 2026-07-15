@@ -129,7 +129,9 @@ Early, tested end-to-end against the Spanner emulator.
   `spanner.data_boost` bakes [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview)
   into the descriptors; `spanner.partition.max_count` hints the partition count.
 - Read-only connections — `adbc.connection.readonly=true` is supported, making the connection reject all writes while still
-  allowing queries.
+  allowing queries. The commit paths are covered too: committing a manual transaction's buffered DML/ingest work (via
+  `commit()`, or by re-enabling `adbc.connection.autocommit`) is rejected while the flag is set, leaving the transaction
+  open and replayable; `rollback()` and committing a query transaction still work — neither writes.
 - execute_schema() (ADBC 1.1.0) — returns a query's result schema without executing it, via Spanner's QueryMode::Plan.
 - Cancellation (ADBC 1.1.0) — both Connection::cancel() and Statement::cancel() interrupt an in-flight operation.
 
