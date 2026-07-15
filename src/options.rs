@@ -1,8 +1,8 @@
 //! Shared coercions from an ADBC [`OptionValue`] into concrete Rust types.
 //!
 //! The driver, connection and statement all accept the same handful of option shapes — booleans
-//! (as bool-ish strings), plain strings, and positive integers (as an integer or a
-//! numeric string). These used to be copy-pasted (with slightly divergent error text) into
+//! (as exactly the string `true`/`false`), plain strings, and positive integers (as an integer or
+//! a numeric string). These used to be copy-pasted (with slightly divergent error text) into
 //! `driver.rs`, `connection.rs` and `statement.rs`; they live here so every level parses an option
 //! identically and returns the same `InvalidArguments` status on bad input.
 //!
@@ -14,23 +14,25 @@ use adbc_core::options::OptionValue;
 
 use crate::error::invalid_argument;
 
-/// Parse a boolean option, accepted as a bool-ish string (`true`/`false`/`1`/`0`/`yes`/`no`,
-/// case-insensitive). Anything else — including an int-typed value — is rejected with
-/// `InvalidArguments`.
+/// Parse a boolean option, accepted as exactly the string `true` or `false` (lowercase — the
+/// ADBC canonical spellings, matching `adbc_core`'s own `TryFrom<OptionValue> for bool` and the
+/// reference C++ drivers; no case folding, no alternative spellings — COR-7). Anything else —
+/// including an int-typed value — is rejected with `InvalidArguments`.
 ///
 /// Int-typed sets are deliberately rejected rather than coerced: no surveyed ADBC driver accepts
 /// `SetOptionInt` for a boolean option (the C++ driver framework's `Option::AsBool` and Go's
 /// driverbase likewise reject/never route ints to booleans, and Rust `adbc_core`'s own
 /// `TryFrom<OptionValue> for bool` rejects `Int`). Accepting the int set would also break the
 /// spec's set/get type symmetry, since the getters serve the canonical `"true"`/`"false"` string
-/// (COR-4).
+/// (COR-4). The same survey drives the exact-string requirement: every surveyed driver
+/// exact-matches option values, none case-folds (COR-7).
 pub(crate) fn bool_option(value: OptionValue, what: &str) -> Result<bool> {
     match value {
-        OptionValue::String(s) => match s.to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" => Ok(true),
-            "false" | "0" | "no" => Ok(false),
+        OptionValue::String(s) => match s.as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
             other => Err(invalid_argument(format!(
-                "{what} expects a boolean, got {other:?}"
+                "{what} expects \"true\" or \"false\", got {other:?}"
             ))),
         },
         _ => Err(invalid_argument(format!(
@@ -225,21 +227,23 @@ mod tests {
     }
 
     #[test]
-    fn bool_option_accepts_boolish_strings_and_rejects_int_typed_values() {
-        // The string forms stay lenient (case-insensitive true/false/1/0/yes/no)...
-        for (s, expected) in [
-            ("true", true),
-            ("TRUE", true),
-            ("1", true),
-            ("yes", true),
-            ("false", false),
-            ("0", false),
-            ("No", false),
-        ] {
-            let parsed = bool_option(OptionValue::String(s.into()), "option o").unwrap();
-            assert_eq!(parsed, expected, "string {s:?}");
+    fn bool_option_accepts_exact_true_false_and_rejects_int_typed_values() {
+        // The string forms are exactly "true"/"false" (COR-7): the formerly-accepted lenient
+        // spellings (case variants, 1/0, yes/no) are rejected with an error naming the option
+        // and the expected spellings.
+        assert!(bool_option(OptionValue::String("true".into()), "option o").unwrap());
+        assert!(!bool_option(OptionValue::String("false".into()), "option o").unwrap());
+        for s in ["TRUE", "1", "yes", "0", "No", "maybe"] {
+            let error = bool_option(OptionValue::String(s.into()), "option o").unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "string {s:?}");
+            assert!(error.message.contains("option o"), "{}", error.message);
+            assert!(
+                error.message.contains("\"true\" or \"false\""),
+                "{}",
+                error.message
+            );
         }
-        // ...but an int-typed set is rejected (COR-4): the getters serve the canonical
+        // An int-typed set is rejected too (COR-4): the getters serve the canonical
         // "true"/"false" string, so accepting SetOptionInt(k, 1) would break the spec's set/get
         // type symmetry — and no surveyed ADBC driver accepts an int set for a boolean option.
         for i in [0, 1, -1] {

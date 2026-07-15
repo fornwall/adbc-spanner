@@ -579,8 +579,8 @@ pub const OPTION_INGEST_BATCH_WRITE: &str = "spanner.ingest.batch_write";
 pub const OPTION_READ_STALENESS: &str = "spanner.read.staleness";
 
 /// Driver-specific connection **and** statement option: the **request priority** Spanner's
-/// scheduler uses to arbitrate CPU between workloads — `low`, `medium` or `high`
-/// (case-insensitive). Applied to every query and DML statement the driver builds, and as the
+/// scheduler uses to arbitrate CPU between workloads — exactly `low`, `medium` or `high`
+/// (lowercase). Applied to every query and DML statement the driver builds, and as the
 /// **commit priority** of every read/write transaction runner (autocommit DML, the manual-mode
 /// commit, ingest commits). Unset (the default) leaves the service default (high); set an empty
 /// string to unset. Set on a connection it becomes the default for statements it creates; a
@@ -600,10 +600,10 @@ pub const OPTION_REQUEST_PRIORITY: &str = "spanner.request.priority";
 /// ```
 ///
 /// - `<mode>` is `include` (an ordered preference list Spanner tries in turn) or `exclude`
-///   (replicas Spanner routes around), case-insensitive.
+///   (replicas Spanner routes around), exact lowercase.
 /// - Each `<selection>` is `<location>`, `<location>:<type>` or `:<type>` (at least one of the two),
 ///   where `<location>` is a region such as `us-east1` and `<type>` is `read_write`, `read_only` or
-///   `any` (case-insensitive; `any`/omitted matches every replica type).
+///   `any` (exact lowercase; `any`/omitted matches every replica type).
 /// - The optional `;auto_failover_disabled` suffix (valid only with `include`) stops Spanner from
 ///   falling back to a replica outside the list when the listed replicas are unavailable.
 ///
@@ -785,7 +785,7 @@ pub const OPTION_MAX_COMMIT_DELAY: &str = "spanner.commit.max_delay";
 /// Driver-specific connection **and** statement option: whether to request Spanner return **commit
 /// statistics** for the read/write commits the driver builds (see Spanner's
 /// [commit statistics](https://docs.cloud.google.com/spanner/docs/commit-statistics)). A boolean,
-/// `false` by default; accepted as a bool-ish string (`true`/`false`/`1`/`0`/`yes`/`no`), and an
+/// `false` by default; accepted as exactly the string `true`/`false`, and an
 /// empty string unsets it (back to `false`). Round-trips through `get_option` (the
 /// effective boolean is always reported).
 ///

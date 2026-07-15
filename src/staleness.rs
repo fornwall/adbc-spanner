@@ -22,7 +22,8 @@
 //! default), `ms`, `us`/`µs`, `ns`, `m` (minutes) or `h` (hours). Examples: `exact:10`, `exact:2.5s`,
 //! `max:500ms`, `max:1m`, `read:2026-07-07T00:00:00Z`, `min:2026-07-07T00:00:00+02:00`.
 //!
-//! The four prefixes are distinct, so a single value is unambiguous. Malformed values are rejected
+//! The four prefixes are distinct, so a single value is unambiguous; like every option value in
+//! this driver they are lowercase and matched exactly. Malformed values are rejected
 //! with `InvalidArgument`. Set the option to an empty string to unset it (which is also how a
 //! statement clears a bound inherited from its connection).
 
@@ -168,21 +169,21 @@ const GRAMMAR_MSG: &str = "spanner.read.staleness must be one of \"exact:<durati
 /// Parse a `spanner.read.staleness` value into a [`ReadBound`]. Accepts the four prefixed forms —
 /// the *relative* `exact:<duration>` / `max:<duration>` and the *absolute* `read:<rfc3339>` /
 /// `min:<rfc3339>` — plus a bare `<rfc3339>` (equivalent to `read:`). The four prefixes are
-/// distinct, so the value is unambiguous.
+/// distinct, so the value is unambiguous. They are matched exactly (lowercase): ADBC option values
+/// are exact-match canonical strings across the driver ecosystem, so an uppercase prefix is
+/// rejected with the grammar error rather than case-folded.
 pub(crate) fn parse_read_bound(value: &str) -> Result<ReadBound> {
-    // RFC 3339 timestamps themselves contain colons, so the `read:`/`min:` prefixes are matched
-    // literally (not via `split_once(':')`) before the duration kinds.
-    if let Some(rest) = value.strip_prefix("read:") {
-        return Ok(ReadBound::ReadTimestamp(parse_rfc3339(rest.trim())?));
-    }
-    if let Some(rest) = value.strip_prefix("min:") {
-        return Ok(ReadBound::MinReadTimestamp(parse_rfc3339(rest.trim())?));
-    }
+    // RFC 3339 timestamps themselves contain colons, but only *after* the date part, so splitting
+    // at the first colon cleanly separates a kind prefix from its argument: `read:<rfc3339>` keeps
+    // the timestamp's own colons in `arg`, while a bare timestamp's pseudo-kind (`2026-07-07T00`)
+    // matches no arm and falls through.
     if let Some((kind, arg)) = value.split_once(':') {
-        match kind.trim().to_ascii_lowercase().as_str() {
+        match kind.trim() {
             "exact" => return Ok(ReadBound::ExactStaleness(parse_duration(arg.trim())?)),
             "max" => return Ok(ReadBound::MaxStaleness(parse_duration(arg.trim())?)),
-            // Not a duration kind — fall through and try a bare RFC 3339 timestamp (which also
+            "read" => return Ok(ReadBound::ReadTimestamp(parse_rfc3339(arg.trim())?)),
+            "min" => return Ok(ReadBound::MinReadTimestamp(parse_rfc3339(arg.trim())?)),
+            // Not a known kind — fall through and try a bare RFC 3339 timestamp (which also
             // contains colons), else report the grammar error.
             _ => {}
         }
@@ -266,7 +267,7 @@ mod tests {
             ReadBound::MaxStaleness(Duration::from_millis(500))
         );
         assert_eq!(
-            parse_read_bound("MAX:1m").unwrap(),
+            parse_read_bound("max:1m").unwrap(),
             ReadBound::MaxStaleness(Duration::from_secs(60))
         );
         assert_eq!(
@@ -290,6 +291,31 @@ mod tests {
             parse_read_bound("min:2026-07-07T00:00:00+02:00").unwrap(),
             ReadBound::MinReadTimestamp(dt("2026-07-07T00:00:00+02:00"))
         );
+        // The absolute prefixes tolerate whitespace around the prefix, like ` exact : 1h ` — all
+        // four kinds share one grammar (COR-7).
+        assert_eq!(
+            parse_read_bound("read : 2026-07-07T00:00:00Z").unwrap(),
+            ReadBound::ReadTimestamp(dt("2026-07-07T00:00:00Z"))
+        );
+    }
+
+    /// Prefixes are exact lowercase, like every other option value in the driver (and the ADBC
+    /// ecosystem, which exact-matches option values): any case variant is rejected with the
+    /// grammar error, uniformly across all four kinds (COR-7).
+    #[test]
+    fn rejects_uppercase_and_mixed_case_prefixes() {
+        for bad in [
+            "EXACT:10s",
+            "Exact:10s",
+            "MAX:1m",
+            "READ:2026-07-07T00:00:00Z",
+            "Read:2026-07-07T00:00:00Z",
+            "MIN:2026-07-07T00:00:00+02:00",
+            "Min:2026-07-07T00:00:00+02:00",
+        ] {
+            let error = parse_read_bound(bad).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "{bad}");
+        }
     }
 
     /// All four prefixes plus the bare form dispatch to the right kind through the one entry point.

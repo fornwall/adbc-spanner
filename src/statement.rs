@@ -2203,7 +2203,7 @@ fn check_exec_incremental(value: OptionValue) -> Result<()> {
 
 /// Parse the `spanner.ingest.batch_write` statement option. Like the driver's other unset-able
 /// booleans (`spanner.commit_stats`), an empty/whitespace string unsets it (back to `false`, the
-/// write-only-transaction path); otherwise it is a bool-ish string.
+/// write-only-transaction path); otherwise it is a boolean string (exactly `true`/`false`).
 fn ingest_batch_write_option(value: OptionValue) -> Result<bool> {
     match &value {
         OptionValue::String(s) if s.trim().is_empty() => Ok(false),
@@ -2495,18 +2495,18 @@ mod tests {
 
     #[test]
     fn ingest_temporary_accepts_false_and_rejects_true() {
-        // The spec default (`false`, in any accepted boolean spelling) is a no-op.
-        for falsy in ["false", "FALSE", "0", "no"] {
-            check_ingest_temporary(OptionValue::String(falsy.into())).unwrap();
+        // The spec default (`false`, as the exact string) is a no-op.
+        check_ingest_temporary(OptionValue::String("false".into())).unwrap();
+        // Spanner has no temporary tables: a truthy value is rejected as unimplemented.
+        let error = check_ingest_temporary(OptionValue::String("true".into())).unwrap_err();
+        assert_eq!(error.status, Status::NotImplemented);
+        // Malformed values fail boolean coercion, not the temporary-table check — the
+        // formerly-accepted lenient spellings (COR-7) and int-typed sets (COR-4) alike.
+        for bad in ["maybe", "FALSE", "0", "no", "TRUE", "1", "yes"] {
+            let error = check_ingest_temporary(OptionValue::String(bad.into())).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "{bad}");
         }
-        // Spanner has no temporary tables: any truthy value is rejected as unimplemented.
-        for truthy in ["true", "TRUE", "1", "yes"] {
-            let error = check_ingest_temporary(OptionValue::String(truthy.into())).unwrap_err();
-            assert_eq!(error.status, Status::NotImplemented);
-        }
-        // Malformed values fail boolean coercion, not the temporary-table check — and so do
-        // int-typed sets (boolean options take strings only; COR-4).
-        for bad in [OptionValue::String("maybe".into()), OptionValue::Int(0)] {
+        for bad in [OptionValue::Int(0), OptionValue::Int(1)] {
             let error = check_ingest_temporary(bad).unwrap_err();
             assert_eq!(error.status, Status::InvalidArguments);
         }
@@ -2514,18 +2514,18 @@ mod tests {
 
     #[test]
     fn exec_incremental_accepts_false_and_rejects_true() {
-        // The spec default (`false`, in any accepted boolean spelling) is a no-op.
-        for falsy in ["false", "FALSE", "0", "no"] {
-            check_exec_incremental(OptionValue::String(falsy.into())).unwrap();
+        // The spec default (`false`, as the exact string) is a no-op.
+        check_exec_incremental(OptionValue::String("false".into())).unwrap();
+        // Incremental execution is not implemented: a truthy value is rejected as such.
+        let error = check_exec_incremental(OptionValue::String("true".into())).unwrap_err();
+        assert_eq!(error.status, Status::NotImplemented);
+        // Malformed values fail boolean coercion, not the incremental check — the
+        // formerly-accepted lenient spellings (COR-7) and int-typed sets (COR-4) alike.
+        for bad in ["maybe", "FALSE", "0", "no", "TRUE", "1", "yes"] {
+            let error = check_exec_incremental(OptionValue::String(bad.into())).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "{bad}");
         }
-        // Incremental execution is not implemented: any truthy value is rejected as such.
-        for truthy in ["true", "TRUE", "1", "yes"] {
-            let error = check_exec_incremental(OptionValue::String(truthy.into())).unwrap_err();
-            assert_eq!(error.status, Status::NotImplemented);
-        }
-        // Malformed values fail boolean coercion, not the incremental check — and so do int-typed
-        // sets (boolean options take strings only; COR-4).
-        for bad in [OptionValue::String("maybe".into()), OptionValue::Int(0)] {
+        for bad in [OptionValue::Int(0), OptionValue::Int(1)] {
             let error = check_exec_incremental(bad).unwrap_err();
             assert_eq!(error.status, Status::InvalidArguments);
         }
@@ -2533,23 +2533,21 @@ mod tests {
 
     #[test]
     fn ingest_batch_write_option_coerces_and_unsets_on_empty() {
-        // Every accepted truthy / falsy string spelling coerces.
-        for truthy in ["true", "TRUE", "1", "yes"] {
-            assert!(ingest_batch_write_option(OptionValue::String(truthy.into())).unwrap());
-        }
-        for falsy in ["false", "FALSE", "0", "no"] {
-            assert!(!ingest_batch_write_option(OptionValue::String(falsy.into())).unwrap());
-        }
+        // The accepted boolean spellings coerce: exactly the strings "true"/"false".
+        assert!(ingest_batch_write_option(OptionValue::String("true".into())).unwrap());
+        assert!(!ingest_batch_write_option(OptionValue::String("false".into())).unwrap());
         // Empty / whitespace unsets it, back to the default (false) — never an error.
         for empty in ["", "   "] {
             assert!(!ingest_batch_write_option(OptionValue::String(empty.into())).unwrap());
         }
-        // A non-bool string — or an int-typed set (COR-4) — is rejected with InvalidArguments
-        // (the shared boolean coercion).
-        for bad in [OptionValue::String("maybe".into()), OptionValue::Int(1)] {
-            let error = ingest_batch_write_option(bad).unwrap_err();
-            assert_eq!(error.status, Status::InvalidArguments);
+        // A non-bool string — including the formerly-accepted lenient spellings (COR-7) — and an
+        // int-typed set (COR-4) are rejected with InvalidArguments (the shared boolean coercion).
+        for bad in ["maybe", "TRUE", "1", "yes", "FALSE", "0", "no"] {
+            let error = ingest_batch_write_option(OptionValue::String(bad.into())).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "{bad}");
         }
+        let error = ingest_batch_write_option(OptionValue::Int(1)).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
     }
 
     #[test]
@@ -2678,20 +2676,21 @@ mod tests {
     }
 
     #[test]
-    fn bool_option_parses_bool_ish_strings() {
-        // Accepted truthy / falsy spellings, case-insensitive.
-        for truthy in ["true", "TRUE", "True", "1", "yes", "YES"] {
-            assert!(bool_option(OptionValue::String(truthy.into()), "option o").unwrap());
-        }
-        for falsy in ["false", "FALSE", "False", "0", "no", "NO"] {
-            assert!(!bool_option(OptionValue::String(falsy.into()), "option o").unwrap());
-        }
+    fn bool_option_parses_exact_true_false() {
+        // Only the exact lowercase ADBC canonical spellings are accepted (matching adbc_core's
+        // own `TryFrom<OptionValue> for bool` and the reference C++ drivers).
+        assert!(bool_option(OptionValue::String("true".into()), "option o").unwrap());
+        assert!(!bool_option(OptionValue::String("false".into()), "option o").unwrap());
     }
 
     #[test]
     fn bool_option_rejects_non_bool_values() {
-        // A string that is not a recognised boolean spelling.
-        for bad in ["maybe", "", "2", "t", "on"] {
+        // A string that is not exactly "true"/"false" — including the formerly-accepted lenient
+        // spellings (case variants, 1/0, yes/no), dropped for ADBC-ecosystem parity (COR-7).
+        for bad in [
+            "maybe", "", "2", "t", "on", "TRUE", "True", "FALSE", "False", "1", "0", "yes", "no",
+            "YES", "NO",
+        ] {
             let error = bool_option(OptionValue::String(bad.into()), "option o").unwrap_err();
             assert_eq!(error.status, Status::InvalidArguments);
         }

@@ -9,7 +9,7 @@
 //! them and applies the stored values onto the client's builders:
 //!
 //! - [`OPTION_REQUEST_PRIORITY`](crate::OPTION_REQUEST_PRIORITY) (`spanner.request.priority`) —
-//!   `low` / `medium` / `high` (case-insensitive). Applied to every query/DML statement the driver
+//!   `low` / `medium` / `high` (exact lowercase). Applied to every query/DML statement the driver
 //!   builds and, as the commit priority, to every read/write transaction runner. Connection and
 //!   statement level.
 //! - [`OPTION_REQUEST_TAG`](crate::OPTION_REQUEST_TAG) (`spanner.request.tag`) — a free-form
@@ -85,9 +85,10 @@ impl RequestPriority {
     }
 }
 
-/// Parse a `spanner.request.priority` value: `low` / `medium` / `high`, case-insensitive.
+/// Parse a `spanner.request.priority` value: exactly `low` / `medium` / `high` (lowercase, like
+/// every option value in this driver — ADBC option values are exact-match canonical strings).
 pub(crate) fn parse_priority(value: &str) -> Result<RequestPriority> {
-    match value.to_ascii_lowercase().as_str() {
+    match value {
         "low" => Ok(RequestPriority::Low),
         "medium" => Ok(RequestPriority::Medium),
         "high" => Ok(RequestPriority::High),
@@ -159,7 +160,7 @@ impl RequestConfig {
     }
 
     /// Handle a `set_option` for `spanner.commit_stats`. An empty string unsets it (back to the
-    /// default of not requesting stats); otherwise a bool-ish string (`true`/`false`/`1`/`0`/…).
+    /// default of not requesting stats); otherwise a boolean string (exactly `true`/`false`).
     pub(crate) fn set_commit_stats(&mut self, value: OptionValue) -> Result<()> {
         if let OptionValue::String(s) = &value
             && s.trim().is_empty()
@@ -346,14 +347,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_priorities_case_insensitively() {
+    fn parses_exact_lowercase_priorities() {
         for (input, expected) in [
             ("low", RequestPriority::Low),
-            ("LOW", RequestPriority::Low),
             ("medium", RequestPriority::Medium),
-            ("Medium", RequestPriority::Medium),
             ("high", RequestPriority::High),
-            ("HIGH", RequestPriority::High),
         ] {
             assert_eq!(parse_priority(input).unwrap(), expected, "{input}");
         }
@@ -361,7 +359,18 @@ mod tests {
 
     #[test]
     fn rejects_unknown_priorities() {
-        for bad in ["urgent", "0", "priority_high", "hi gh", "médium"] {
+        // Case variants of valid priorities are rejected too: values are exact lowercase (COR-7).
+        for bad in [
+            "urgent",
+            "0",
+            "priority_high",
+            "hi gh",
+            "médium",
+            "HIGH",
+            "High",
+            "Medium",
+            "LOW",
+        ] {
             let error = parse_priority(bad).unwrap_err();
             assert_eq!(error.status, Status::InvalidArguments, "{bad}");
         }
@@ -372,8 +381,8 @@ mod tests {
         let mut config = RequestConfig::default();
         assert_eq!(config.priority_string(), None);
 
-        // Set (case-insensitive, surrounding whitespace tolerated), reported canonically.
-        config.set_priority(s(" HIGH ")).unwrap();
+        // Set (exact lowercase, surrounding whitespace tolerated), reported canonically.
+        config.set_priority(s(" high ")).unwrap();
         assert_eq!(config.priority_string(), Some("high"));
         config.set_priority(s("medium")).unwrap();
         assert_eq!(config.priority_string(), Some("medium"));
@@ -488,18 +497,19 @@ mod tests {
         // Default is off, always reported as an effective boolean.
         assert_eq!(config.commit_stats_string(), "false");
 
-        // Accepts the shared bool-ish string spellings.
-        for truthy in ["true", "1", "yes", "TRUE"] {
-            config.set_commit_stats(s(truthy)).unwrap();
-            assert_eq!(config.commit_stats_string(), "true", "{truthy}");
-        }
+        // Accepts exactly the strings "true"/"false"; the formerly-accepted lenient spellings
+        // ("1", "yes", "TRUE", …) are rejected (COR-7).
+        config.set_commit_stats(s("true")).unwrap();
+        assert_eq!(config.commit_stats_string(), "true");
         // An int-typed set is rejected (COR-4) and leaves the stored value untouched.
         let error = config.set_commit_stats(OptionValue::Int(1)).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
         assert_eq!(config.commit_stats_string(), "true");
-        for falsy in ["false", "0", "no"] {
-            config.set_commit_stats(s(falsy)).unwrap();
-            assert_eq!(config.commit_stats_string(), "false", "{falsy}");
+        config.set_commit_stats(s("false")).unwrap();
+        assert_eq!(config.commit_stats_string(), "false");
+        for lenient in ["1", "yes", "TRUE", "0", "no", "False"] {
+            let error = config.set_commit_stats(s(lenient)).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "{lenient}");
         }
 
         // An empty string unsets (back to the default of not requesting stats).
