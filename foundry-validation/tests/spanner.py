@@ -16,7 +16,7 @@ class SpannerQuirks(model.DriverQuirks):
     # These must match what the driver reports via get_info (see src/lib.rs, src/info.rs).
     driver_name = "adbc-spanner"
     vendor_name = "Google Cloud Spanner"
-    vendor_version = ""  # the driver reports no Spanner server version
+    vendor_version = None  # the driver reports VendorVersion as a null value (no Spanner server version)
     short_version = "emulator"
 
     features = model.DriverFeatures(

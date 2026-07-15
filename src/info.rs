@@ -32,13 +32,20 @@ const ADBC_VERSION_1_1_0: i64 = 1_001_000;
 /// by `build.rs`), reported for `DriverArrowVersion` with the conventional leading `v`.
 const ARROW_VERSION: &str = concat!("v", env!("ADBC_SPANNER_ARROW_VERSION"));
 
-/// The codes reported when the caller requests *all* info (`get_info(None)`): the ones with a
-/// stable, meaningful value. Requesting a specific code outside this set still yields a row (with a
-/// null value) — see [`value_for`].
+/// Every info code this driver recognises, in code order — the exact result set of
+/// `get_info(None)` ("fetch all"). Includes the codes whose value is null (see [`value_for`]):
+/// per `adbc.h`, null *is* the defined value for the Substrait version bounds when Substrait is
+/// unsupported, and omission is reserved for *unrecognized* codes. Explicit requests are filtered
+/// to this set, so a code answered on explicit request is always present in the all-codes result
+/// and vice versa.
 const REPORTED: &[InfoCode] = &[
     InfoCode::VendorName,
+    InfoCode::VendorVersion,
+    InfoCode::VendorArrowVersion,
     InfoCode::VendorSql,
     InfoCode::VendorSubstrait,
+    InfoCode::VendorSubstraitMinVersion,
+    InfoCode::VendorSubstraitMaxVersion,
     InfoCode::DriverName,
     InfoCode::DriverVersion,
     InfoCode::DriverArrowVersion,
@@ -70,8 +77,10 @@ fn value_for(code: InfoCode) -> InfoValue {
         // In particular `VendorVersion` (the Spanner *server* product version) is deliberately null:
         // Spanner exposes no user-visible server version, so reporting anything here — least of all
         // this driver's own version — would be misleading. Likewise `VendorArrowVersion` (the server
-        // runs no Arrow library) and the Substrait version bounds. Also covers any future
-        // `#[non_exhaustive]` variant.
+        // runs no Arrow library) and the Substrait version bounds (null is `adbc.h`'s defined value
+        // when Substrait is unsupported). A future `#[non_exhaustive]` variant also lands here, but
+        // never reaches this function: it is absent from [`REPORTED`], so [`build`] omits it as
+        // unrecognized first.
         _ => InfoValue::Null,
     }
 }
@@ -79,11 +88,12 @@ fn value_for(code: InfoCode) -> InfoValue {
 /// Build the `get_info` record batch for the requested `codes` (or the full [`REPORTED`] set when
 /// `None`).
 pub(crate) fn build(codes: Option<HashSet<InfoCode>>) -> Result<RecordBatch> {
-    // One row per code. For an explicit request, honour exactly the codes asked for (a row each,
-    // even for ones we answer with null), in a deterministic order.
+    // One row per recognised code, in code order. An explicit request yields a row for each
+    // requested code in [`REPORTED`] (even the null-valued ones) and — per the `adbc.h` contract —
+    // silently omits unrecognized codes, keeping explicit requests and `get_info(None)` symmetric.
     let codes: Vec<InfoCode> = match codes {
         Some(set) => {
-            let mut v: Vec<InfoCode> = set.into_iter().collect();
+            let mut v: Vec<InfoCode> = set.into_iter().filter(|c| REPORTED.contains(c)).collect();
             v.sort_by_key(|c| u32::from(c));
             v
         }
@@ -182,6 +192,37 @@ mod tests {
         let got: Vec<u32> = (0..names.len()).map(|i| names.value(i)).collect();
         let want: Vec<u32> = REPORTED.iter().map(u32::from).collect();
         assert_eq!(got, want);
+        assert!(
+            want.windows(2).all(|w| w[0] < w[1]),
+            "REPORTED must be in strict code order (it is the get_info(None) row order)"
+        );
+    }
+
+    #[test]
+    fn all_codes_result_covers_every_explicitly_answered_code() {
+        // The SPEC-5 invariant (mirrors the C++ validation `MetadataGetInfoAllCodes` test): any
+        // code answered for an explicit request must also appear in the `get_info(None)` result.
+        let all = build(None).unwrap();
+        let all_names = all
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let all_codes: HashSet<u32> = (0..all_names.len()).map(|i| all_names.value(i)).collect();
+
+        for code in REPORTED {
+            let batch = build(Some([*code].into_iter().collect())).unwrap();
+            assert_eq!(batch.num_rows(), 1, "explicit request for {code:?}");
+            let names = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+            assert!(
+                all_codes.contains(&names.value(0)),
+                "{code:?} answered explicitly but missing from the all-codes result"
+            );
+        }
     }
 
     #[test]
@@ -247,10 +288,10 @@ mod tests {
     #[test]
     fn vendor_version_is_null_not_the_driver_version() {
         // The Spanner *server* has no user-visible product version, so `VendorVersion` must never be
-        // populated — least of all with this driver's own version. It is absent from the default set
-        // and, when requested explicitly, yields a row with a null string value.
-        assert!(!REPORTED.contains(&InfoCode::VendorVersion));
-        assert!(!REPORTED.contains(&InfoCode::VendorArrowVersion));
+        // populated — least of all with this driver's own version. It is a recognised code, present
+        // in the default set and answered on explicit request, always with a null string value.
+        assert!(REPORTED.contains(&InfoCode::VendorVersion));
+        assert!(REPORTED.contains(&InfoCode::VendorArrowVersion));
 
         let batch = build(Some(
             [InfoCode::VendorVersion, InfoCode::DriverVersion]
