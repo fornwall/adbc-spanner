@@ -49,7 +49,8 @@ def connect(
         (see src/lib.rs / docs/options.md). The ``uri`` option requires the
         ``spanner://`` scheme; a bare database path is rejected. Credentials, the
         emulator, endpoint overrides, and every other setting are passed here as
-        their raw keys.
+        their raw keys — and the secret-holding ``KEYFILE_JSON`` / ``ACCESS_TOKEN``
+        options must be, since a ``uri`` may not carry them as query parameters.
     conn_kwargs:
         Connection-level options, keyed with the :class:`ConnectionOptions`
         constants (``adbc.connection.*`` / ``spanner.*``).

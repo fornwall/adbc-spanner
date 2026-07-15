@@ -12,6 +12,13 @@ Releases are cut with [`cargo-release`](https://github.com/crate-ci/cargo-releas
 
 ### Changed
 
+- **Breaking:** a `spanner://` connection URI no longer accepts the two secret-holding database
+  options — `spanner.auth.keyfile_json` and `spanner.auth.access_token` — as query parameters; a URI
+  carrying either is rejected with `InvalidArguments` naming the key. A URI is the most-logged
+  configuration artifact there is (shell history, process listings, tracing spans), so a secret in
+  one leaks far beyond the driver. Set them as database options instead, or use
+  `spanner.auth.keyfile` (a path, not a secret), which a URI may still carry. This matches the
+  write-only `get_option` treatment of the same two keys (REVIEW.md SEC-2).
 - MSRV raised to 1.97.
 - `get_parameter_schema` now reports real Spanner-inferred parameter types instead of typing every
   parameter `Null`: a `QueryMode: PLAN` probe returns the statement's undeclared parameters typed

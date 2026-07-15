@@ -108,8 +108,9 @@ impl Driver for SpannerDriver {
 /// token) never render in cleartext: each is shown as `Some("<redacted>")` / `None`, exposing only
 /// presence, never the secret. This mirrors `StaticTokenCredentials`, whose token lives in a
 /// sensitive `HeaderValue` for the same reason. `get_option` matches: the two secret-*holding*
-/// options (`keyfile_json`, `access_token`) are write-only and always report `NotFound`, while
-/// `keyfile` — a path, not a secret — reads back normally.
+/// options (`keyfile_json`, `access_token`) are write-only and always report `NotFound`, and a
+/// connection URI may not carry them as query parameters (`URI_SECRET_OPTIONS`), while `keyfile` —
+/// a path, not a secret — both reads back normally and stays a legal query parameter.
 pub struct SpannerDatabase {
     runtime: SharedRuntime,
     database: Option<String>,
@@ -202,7 +203,8 @@ impl SpannerDatabase {
     ///
     /// The value must be a **`spanner://` connection URI**: its path is the Spanner database path,
     /// an optional `//host:port` authority becomes the endpoint, and query parameters are
-    /// database-level options. A bare database path is **rejected** — the `spanner://` scheme is
+    /// database-level options — except the secret-holding ones ([`URI_SECRET_OPTIONS`]), which a
+    /// URI may not carry at all. A bare database path is **rejected** — the `spanner://` scheme is
     /// required, matching the ADBC BigQuery driver, whose `uri` likewise requires the `bigquery://`
     /// scheme. The URI is parsed by [`parse_connection_uri`] and *expanded immediately* into the
     /// underlying option fields, as if each part had been passed as an individual database option.
@@ -681,21 +683,34 @@ pub(crate) fn ensure_scheme(host: &str) -> String {
 
 /// The database-level option names a connection URI may carry as query parameters.
 ///
-/// Exactly the options that configure a [`SpannerDatabase`] besides the database path itself; the
-/// path key (`uri`) is deliberately absent — the URI's path component is the one way to name the
-/// database. Unknown keys are rejected with `InvalidArguments`.
-const URI_QUERY_OPTIONS: [&str; 10] = [
+/// The options that configure a [`SpannerDatabase`] besides the database path itself, minus the
+/// secret-holding ones ([`URI_SECRET_OPTIONS`]). The path key (`uri`) is deliberately absent — the
+/// URI's path component is the one way to name the database. Unknown keys are rejected with
+/// `InvalidArguments`.
+const URI_QUERY_OPTIONS: [&str; 8] = [
     OPTION_ENDPOINT,
     OPTION_EMULATOR,
     OPTION_KEYFILE,
-    OPTION_KEYFILE_JSON,
     OPTION_IMPERSONATE_TARGET_PRINCIPAL,
     OPTION_IMPERSONATE_DELEGATES,
     OPTION_IMPERSONATE_SCOPES,
     OPTION_IMPERSONATE_LIFETIME,
-    OPTION_ACCESS_TOKEN,
     OPTION_QUOTA_PROJECT,
 ];
+
+/// The database options whose *value is a live secret*, and which a connection URI therefore may
+/// **not** carry as a query parameter: [`OPTION_KEYFILE_JSON`] (a full service-account private key)
+/// and [`OPTION_ACCESS_TOKEN`] (a live OAuth bearer token).
+///
+/// A URI is the most-logged configuration artifact there is — it lands in shell history, process
+/// listings (`ps`), connection strings pasted into tickets, and tracing spans — so embedding a
+/// secret in one leaks it far beyond the driver. These two keys are rejected with a message naming
+/// the key and pointing at the option itself, which is the one supported way to supply them. The
+/// same two keys are write-only for `get_option` and redacted in [`SpannerDatabase`]'s [`Debug`],
+/// for the same reason; this closes the remaining path by which they could travel in cleartext.
+///
+/// [`OPTION_KEYFILE`] — a *path*, not a secret — stays accepted, as it does for `get_option`.
+const URI_SECRET_OPTIONS: [&str; 2] = [OPTION_KEYFILE_JSON, OPTION_ACCESS_TOKEN];
 
 /// If `value` starts with the `spanner:` scheme (ASCII case-insensitive, per RFC 3986) — return the
 /// remainder after the scheme. Any other value (a bare database path, or a different scheme) returns
@@ -729,7 +744,8 @@ struct ParsedConnectionUri {
 /// - An optional `//host[:port]` **authority** names the gRPC endpoint; it is taken verbatim as
 ///   the [`OPTION_ENDPOINT`] value.
 /// - **Query parameters** are full driver option names from [`URI_QUERY_OPTIONS`]; unknown keys are
-///   rejected. Keys and values are percent-decoded ([`percent_decode`]; `+` is *not* a space).
+///   rejected, as are the secret-holding keys of [`URI_SECRET_OPTIONS`] (which name a dedicated
+///   error). Keys and values are percent-decoded ([`percent_decode`]; `+` is *not* a space).
 /// - A `#fragment` is meaningless here and rejected rather than silently dropped.
 fn parse_connection_uri(remainder: &str) -> Result<ParsedConnectionUri> {
     let (remainder, fragment) = match remainder.split_once('#') {
@@ -785,6 +801,15 @@ fn parse_connection_uri(remainder: &str) -> Result<ParsedConnectionUri> {
     for pair in query.unwrap_or("").split('&').filter(|s| !s.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         let key = percent_decode(key)?;
+        // Refuse the secret-holding keys before the unknown-key check, so they get the specific
+        // "why" rather than a misleading "unknown parameter".
+        if URI_SECRET_OPTIONS.contains(&key.as_str()) {
+            return Err(invalid_argument(format!(
+                "connection URI query parameter {key:?} is not supported because its value is a \
+                 secret, and a connection URI is routinely logged (shell history, process \
+                 listings, tracing spans); set the `{key}` database option directly instead"
+            )));
+        }
         if !URI_QUERY_OPTIONS.contains(&key.as_str()) {
             return Err(invalid_argument(format!(
                 "unknown connection URI query parameter {key:?}; supported parameters: {}",
@@ -803,9 +828,9 @@ fn parse_connection_uri(remainder: &str) -> Result<ParsedConnectionUri> {
 
 /// Percent-decode a connection-URI component (RFC 3986): each `%XX` hex escape becomes one byte,
 /// everything else passes through unchanged. Notably `+` is **not** decoded to a space (that is the
-/// `application/x-www-form-urlencoded` convention, not RFC 3986) — an inline keyfile JSON or an
-/// RFC 3339 timestamp may legitimately contain a literal `+`. Malformed escapes and non-UTF-8
-/// results are rejected with `InvalidArguments`.
+/// `application/x-www-form-urlencoded` convention, not RFC 3986) — a keyfile path or an endpoint
+/// may legitimately contain a literal `+`. Malformed escapes and non-UTF-8 results are rejected
+/// with `InvalidArguments`.
 fn percent_decode(s: &str) -> Result<String> {
     if !s.contains('%') {
         return Ok(s.to_owned());
@@ -2068,28 +2093,26 @@ mod tests {
     }
 
     #[test]
-    fn every_database_level_option_is_accepted_as_a_query_parameter() {
+    fn every_non_secret_database_level_option_is_accepted_as_a_query_parameter() {
         let mut db = new_database();
         set_uri(
             &mut db,
             &format!(
                 "spanner:///{DB_PATH}\
                  ?spanner.auth.keyfile=/path/key.json\
-                 &spanner.auth.keyfile_json=%7B%22type%22%3A%22service_account%22%7D\
                  &spanner.auth.impersonate.target_principal=target%40p.iam.gserviceaccount.com\
                  &spanner.auth.impersonate.delegates=a%40p.iam.gserviceaccount.com,b%40p.iam.gserviceaccount.com\
                  &spanner.auth.impersonate.scopes=https://www.googleapis.com/auth/cloud-platform\
                  &spanner.auth.impersonate.lifetime=900\
-                 &spanner.auth.access_token=ya29.uri-token"
+                 &spanner.auth.quota_project=billing-project"
             ),
         )
         .unwrap();
+        // `spanner.auth.keyfile` is a path, not a secret, so — as with `get_option` — it stays a
+        // legal query parameter; the two secret-holding keys are covered by
+        // `secret_bearing_query_parameters_are_rejected`.
         assert_eq!(db.keyfile.as_deref(), Some("/path/key.json"));
-        assert_eq!(db.access_token.as_deref(), Some("ya29.uri-token"));
-        assert_eq!(
-            db.keyfile_json.as_deref(),
-            Some("{\"type\":\"service_account\"}")
-        );
+        assert_eq!(db.quota_project.as_deref(), Some("billing-project"));
         assert_eq!(
             db.impersonate_target_principal.as_deref(),
             Some("target@p.iam.gserviceaccount.com")
@@ -2186,6 +2209,44 @@ mod tests {
     }
 
     #[test]
+    fn secret_bearing_query_parameters_are_rejected() {
+        // SEC-2: a URI is the most-logged config artifact there is (shell history, `ps`, tracing
+        // spans), so the two options whose value is a live secret cannot travel in one. They are
+        // rejected by name — not silently accepted, and not lumped in with unknown keys — and the
+        // error points at the option itself, which is the supported way to supply them.
+        for (key, value) in [
+            (
+                OPTION_KEYFILE_JSON,
+                "%7B%22type%22%3A%22service_account%22%7D",
+            ),
+            (OPTION_ACCESS_TOKEN, "ya29.uri-token"),
+        ] {
+            let mut db = new_database();
+            let error =
+                set_uri(&mut db, &format!("spanner:///{DB_PATH}?{key}={value}")).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "key: {key}");
+            assert!(error.message.contains(key), "{}", error.message);
+            assert!(error.message.contains("secret"), "{}", error.message);
+            // Rejected, so nothing was stored — the URI never reaches the option fields.
+            assert_eq!(db.keyfile_json, None, "key: {key}");
+            assert_eq!(db.access_token, None, "key: {key}");
+
+            // The option itself still works: only the URI route is closed.
+            let decoded = percent_decode(value).unwrap();
+            db.set_option(
+                OptionDatabase::Other(key.into()),
+                OptionValue::String(decoded.clone()),
+            )
+            .unwrap();
+            let stored = match key {
+                OPTION_KEYFILE_JSON => db.keyfile_json.as_deref(),
+                _ => db.access_token.as_deref(),
+            };
+            assert_eq!(stored, Some(decoded.as_str()), "key: {key}");
+        }
+    }
+
+    #[test]
     fn a_rejected_uri_leaves_the_configuration_untouched() {
         let mut db = new_database();
         set_uri(&mut db, &format!("spanner:///{DB_PATH}")).unwrap();
@@ -2201,6 +2262,11 @@ mod tests {
             "spanner:///projects/p2/instances/i2/databases/d2?spanner.emulator=maybe".to_string(),
             "spanner://host:9010/projects/p2/instances/i2/databases/d2?spanner.auth.keyfile=%G1"
                 .to_string(),
+            // A refused secret-holding key (SEC-2) is no different: the whole URI is rejected
+            // before any field is mutated, authority included.
+            format!(
+                "spanner://host:9010/projects/p2/instances/i2/databases/d2?{OPTION_ACCESS_TOKEN}=ya29.x"
+            ),
         ] {
             let error = set_uri(&mut db, &bad).unwrap_err();
             assert_eq!(error.status, Status::InvalidArguments, "uri: {bad}");
@@ -2222,7 +2288,7 @@ mod tests {
             assert!(error.message.contains("percent-encoding"), "input: {bad}");
         }
         // Percent-decoding is RFC 3986: `+` stays a literal plus (form-encoding would corrupt e.g.
-        // base64 in an inline keyfile JSON).
+        // a keyfile path or an endpoint containing one).
         assert_eq!(percent_decode("a+b%20c%3D1").unwrap(), "a+b c=1");
         // A decoded byte sequence that is not UTF-8 is rejected, not lossily replaced.
         let error = percent_decode("%FF%FE").unwrap_err();
