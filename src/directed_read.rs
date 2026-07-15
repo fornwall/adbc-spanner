@@ -41,6 +41,11 @@
 //! An empty string unsets the option. Malformed input is rejected with `InvalidArguments`. Like the
 //! read-staleness and request options, a connection's value becomes the default for statements it
 //! creates (which may override it) and the option round-trips through `get_option`.
+//!
+//! The read-only query sites are `SpannerStatement::read_sql_builder` (the plain `execute` query,
+//! the bound-query path, `execute_partitions` and the `execute_schema` PLAN probe) plus the
+//! `get_statistics` aggregate scans (SPAN-3), which read user tables and so honour the connection's
+//! selection like a user query — see [`ScanConfig`](crate::statistics::ScanConfig).
 
 use adbc_core::error::Result;
 use adbc_core::options::OptionValue;

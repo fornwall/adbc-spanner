@@ -82,8 +82,9 @@
 //! [`with_attempt_limit`](google_cloud_gax::retry_policy::RetryPolicyExt::with_attempt_limit) /
 //! [`with_time_limit`](google_cloud_gax::retry_policy::RetryPolicyExt::with_time_limit) wrappers on
 //! top. The policy is applied to every user statement/DML builder, the read/write transaction
-//! runner's begin+commit RPCs, the bulk-ingest write-only transaction, and the `ExecuteBatchDml`
-//! batch — the same builder sites the request priority/tag options cover.
+//! runner's begin+commit RPCs, the bulk-ingest write-only transaction, the `ExecuteBatchDml` batch,
+//! and the `get_statistics` aggregate scans (SPAN-3) — the same builder sites the request
+//! priority/tag options cover.
 //!
 //! Both options exist at connection **and** statement level; a connection's values become the
 //! default for statements it creates (which may override them), an empty string unsets, and every

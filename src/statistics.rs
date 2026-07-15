@@ -12,6 +12,13 @@
 //! and every row reports `statistic_is_approximate = false`. (The
 //! `MIN_VALUE`/`MAX_VALUE` statistics are not reported: the value union only has int64/uint64/
 //! float64/binary members, so they cannot represent Spanner's STRING/DATE/TIMESTAMP/NUMERIC types.)
+//!
+//! Those per-table aggregates are the heaviest queries the driver ever issues on its own — a full
+//! scan of every matching user table — so they are deliberately **not** treated as ordinary
+//! driver-internal metadata reads: they run under the connection's read options, exactly like a
+//! user query would (see [`ScanConfig`]). The `INFORMATION_SCHEMA` discovery queries that feed them
+//! stay plain metadata reads, left unconfigured like every other one (`get_objects`,
+//! `get_table_schema`, …) — they are cheap, and they read a system catalog rather than user data.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,12 +32,15 @@ use arrow_array::{
 use arrow_schema::{DataType, Fields, SchemaRef};
 use futures_util::stream::{self, StreamExt};
 use google_cloud_spanner::client::DatabaseClient;
-use google_cloud_spanner::statement::Statement as SpannerSql;
+use google_cloud_spanner::statement::{Statement as SpannerSql, StatementBuilder};
 
 use crate::connection::{LikeMatcher, query_batch, str_col};
 use crate::conversion::result_set_to_batch;
+use crate::directed_read::DirectedRead;
 use crate::error::{err, from_spanner};
 use crate::nested::{arrow_err, dense_union, field, list_item, list_of, struct_fields};
+use crate::request::RequestConfig;
+use crate::retry::RetryConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
 use crate::sql::{qualified_table, quote_ident};
 use crate::staleness::ReadStaleness;
@@ -80,14 +90,52 @@ pub(crate) struct SchemaStatistics {
     pub statistics: Vec<Statistic>,
 }
 
+/// The connection's read configuration for the per-table aggregate scans.
+///
+/// The scans read *user tables* (unlike the `INFORMATION_SCHEMA` discovery queries around them),
+/// and are by far the heaviest queries the driver issues on its own, so they honour the same
+/// connection-level options a user's own read-only query would: the read staleness, the request
+/// priority / request tag (so the scans are attributable and schedulable — a `get_statistics` on a
+/// busy instance should be able to yield to serving traffic), the directed-read replica selection,
+/// and the retry / backoff bounds. Bundled into one struct because they always travel together and
+/// [`collect_statistics`] already takes plenty of arguments.
+///
+/// There is no statement level here: `get_statistics` is a `Connection` method, so only the
+/// connection's values apply.
+pub(crate) struct ScanConfig<'a> {
+    pub read_staleness: &'a ReadStaleness,
+    pub request: &'a RequestConfig,
+    pub directed_read: &'a DirectedRead,
+    pub retry: &'a RetryConfig,
+}
+
+impl ScanConfig<'_> {
+    /// A statement builder for one aggregate scan, composed in the same order as
+    /// `SpannerStatement::read_sql_builder` does for a user read-only query: the request options,
+    /// then the retry / backoff policies, then the directed-read replica selection.
+    ///
+    /// The query-optimizer options (`spanner.query.optimizer_*`) are deliberately *not* applied:
+    /// they shape the plan of the caller's own SQL, and these aggregates are driver-generated.
+    #[must_use]
+    fn read_sql_builder(&self, sql: String) -> StatementBuilder {
+        self.directed_read.apply_to_statement(
+            self.retry
+                .apply_to_statement(self.request.apply_to_statement(SpannerSql::builder(sql))),
+        )
+    }
+}
+
 /// Compute exact statistics for the base tables matching the `LIKE` filters: `ROW_COUNT` per
 /// table, and `NULL_COUNT` (+ `DISTINCT_COUNT` for groupable types) per column.
+///
+/// `config` carries the connection's read options; they apply to the per-table aggregate scans (not
+/// to the `INFORMATION_SCHEMA` discovery reads) — see [`ScanConfig`].
 pub(crate) fn collect_statistics(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
     cancel: &CancelSignal,
     timeout: Option<Duration>,
-    read_staleness: &ReadStaleness,
+    config: &ScanConfig<'_>,
     db_schema: Option<&str>,
     table_name: Option<&str>,
 ) -> Result<Vec<SchemaStatistics>> {
@@ -144,7 +192,7 @@ pub(crate) fn collect_statistics(
     // non-deterministic — we keep this prepared list as the canonical order and reassemble against
     // it, so the output (tables, schemas and their statistics) is identical to the old sequential
     // loop regardless of completion order.
-    let bound = read_staleness.timestamp_bound()?;
+    let bound = config.read_staleness.timestamp_bound()?;
     // The `LIKE` patterns are loop-invariant, so compile each once and reuse it across every row.
     let db_schema_matcher = db_schema.map(LikeMatcher::new);
     let table_name_matcher = table_name.map(LikeMatcher::new);
@@ -191,12 +239,14 @@ pub(crate) fn collect_statistics(
             let mut scans = stream::iter(prepared.iter().enumerate().map(|(idx, p)| {
                 let client = client.clone();
                 let sql = p.sql.clone();
-                // The aggregate scans the user table, so honour the connection's read staleness.
+                // The aggregate scans the user table, so honour the connection's read options: the
+                // staleness bound on the transaction, and the request/directed-read/retry config on
+                // the statement itself (SPAN-3).
                 let bound = bound.clone();
                 async move {
                     let transaction = crate::staleness::single_use(&client, bound);
                     let result_set = transaction
-                        .execute_query(SpannerSql::builder(sql).build())
+                        .execute_query(config.read_sql_builder(sql).build())
                         .await
                         .map_err(from_spanner)?;
                     // The aggregate scan returns only INT64 counts, never a TIMESTAMP column, so the

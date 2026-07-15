@@ -96,9 +96,9 @@ path, not the original URI.
 | `adbc.connection.transaction.isolation_level` | one of `adbc.connection.transaction.isolation.default`, `…isolation.serializable`, `…isolation.repeatable_read`, `…isolation.snapshot` | `adbc.connection.transaction.isolation.default` (Spanner's default, `SERIALIZABLE`) | yes, always (the canonical spec string) | **Standard ADBC.** Isolation level for the **read/write transactions the driver builds for DML** — autocommit DML, the `ExecuteBatchDml` batch, and the manual-mode commit of buffered DML. It has **no effect on queries**: read-only transactions take a [timestamp bound](#stale-reads) instead of an isolation level (Spanner rejects `REPEATABLE_READ` on read-only and partitioned-DML transactions), and a mutations-only ingest commit uses the write-only path, which has no isolation setting. Setting it on a connection that only runs queries is accepted and inert. `serializable`, `repeatable_read` and `snapshot` map natively onto Spanner's levels (`snapshot` → `REPEATABLE_READ` — Spanner implements repeatable read *as* snapshot isolation); `default` sends no level, which Spanner reads as `SERIALIZABLE`. The remaining spec levels are **promoted upward** to the weakest supported level that satisfies them (`read_uncommitted`/`read_committed` → `repeatable_read`; `linearizable` → `serializable`) rather than rejected — spec-permitted and safe (a stronger level satisfies a weaker one); `get_option` reports the effective level. Unknown strings are rejected with `InvalidArguments`. Under `repeatable_read`, Spanner detects **write-write conflicts only**: a DML statement that reads rows it does not write (a subquery guard, a join, `INSERT … SELECT`) can commit on a stale snapshot and produce [write skew](https://cloud.google.com/spanner/docs/isolation-levels) — this applies to a single autocommit statement, not just to multi-statement transactions. |
 | `spanner.read.staleness` | `exact:<duration>`, `max:<duration>`, `read:<rfc3339>` or `min:<rfc3339>` (see [Stale reads](#stale-reads)); `""` unsets | unset (strong read) | yes, when set (the raw, trimmed value) | Read bound for read-only queries. Becomes the default for statements this connection creates (statements may override). One value at a time; setting a new value replaces the old. |
 | `spanner.max_timestamp_precision` | `nanoseconds_error_on_overflow` or `microseconds` (see [Timestamp precision](#timestamp-precision)); `""` resets to the default | `nanoseconds_error_on_overflow` | yes, always (the effective mode) | How `TIMESTAMP` columns map to Arrow: `Timestamp(Nanosecond, "UTC")` with a loud error on instants outside ~1677–2262 (the default), or `Timestamp(Microsecond, "UTC")` covering Spanner's full 0001–9999 range (sub-microsecond digits truncate toward negative infinity). Becomes the default for statements this connection creates (statements may override); also governs `get_table_schema` and `read_partition`, which have no statement. |
-| `spanner.request.priority` | exactly `low`, `medium` or `high` (lowercase); `""` unsets | unset (service default, high) | yes, when set (the canonical lowercase form) | [Request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions) applied to every query/DML statement the driver builds, and the commit priority of every read/write transaction. Becomes the default for statements this connection creates (statements may override). |
-| `spanner.request.tag` | free-form string; `""` unsets | unset | yes, when set | [Request tag](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags) attached to every query/DML request the driver builds (surfaced in query/transaction statistics). Becomes the default for statements this connection creates (statements may override). Driver-internal metadata queries stay untagged. |
-| `spanner.directed_read` | `include`/`exclude` replica selection (see [Directed reads](#directed-reads)); `""` unsets | unset (Spanner's own routing) | yes, when set (the raw, trimmed value) | [Directed read](https://docs.cloud.google.com/spanner/docs/directed-reads) replica selection applied to **read-only queries** (Spanner rejects it on writes). Becomes the default for statements this connection creates (statements may override). |
+| `spanner.request.priority` | exactly `low`, `medium` or `high` (lowercase); `""` unsets | unset (service default, high) | yes, when set (the canonical lowercase form) | [Request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions) applied to every query/DML statement the driver builds, and the commit priority of every read/write transaction. Also applied to the `get_statistics` aggregate scans (see [Metadata calls](#metadata-calls)). Becomes the default for statements this connection creates (statements may override). |
+| `spanner.request.tag` | free-form string; `""` unsets | unset | yes, when set | [Request tag](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags) attached to every query/DML request the driver builds (surfaced in query/transaction statistics). Becomes the default for statements this connection creates (statements may override). Driver-internal metadata queries stay untagged, except the `get_statistics` aggregate scans (see [Metadata calls](#metadata-calls)). |
+| `spanner.directed_read` | `include`/`exclude` replica selection (see [Directed reads](#directed-reads)); `""` unsets | unset (Spanner's own routing) | yes, when set (the raw, trimmed value) | [Directed read](https://docs.cloud.google.com/spanner/docs/directed-reads) replica selection applied to **read-only queries** (Spanner rejects it on writes), including the `get_statistics` aggregate scans (see [Metadata calls](#metadata-calls)). Becomes the default for statements this connection creates (statements may override). |
 | `spanner.query.optimizer_version` | opaque version string, e.g. `"6"` or `"latest"`; `""` unsets | unset (database/service default) | yes, when set (the raw value) | [Query optimizer version](https://docs.cloud.google.com/spanner/docs/query-optimizer/manage-query-optimizer) applied as a `QueryOptions` on every query statement the driver builds. Becomes the default for statements this connection creates (statements may override). |
 | `spanner.query.optimizer_statistics_package` | opaque statistics-package name; `""` unsets | unset (database default) | yes, when set (the raw value) | [Optimizer statistics package](https://docs.cloud.google.com/spanner/docs/query-optimizer/statistics-packages) applied as a `QueryOptions` on every query statement the driver builds. Same inheritance as `spanner.query.optimizer_version`. |
 | `spanner.transaction.tag` | free-form string; `""` unsets | unset | yes, when set | Transaction tag attached to every read/write transaction the driver builds (autocommit DML, the manual-mode commit, ingest commits). Connection level only. |
@@ -212,11 +212,37 @@ Examples:
 - `include::read_only` — prefer any read-only replica, in any location.
 
 Directed reads apply to **read-only queries only**: the driver attaches them to its query paths
-(autocommit and manual mode, including parameterized/bound queries and `execute_partitions`) and
-never to DML/DDL, which Spanner would reject. Values are trimmed before parsing; malformed values
-fail with `InvalidArguments`. Unset (the default) leaves Spanner's own routing; set `""` to unset. A
-statement inherits the connection's value at creation and may override it (including clearing it with
-`""`).
+(autocommit and manual mode, including parameterized/bound queries and `execute_partitions`) — plus
+the `get_statistics` aggregate scans (see [Metadata calls](#metadata-calls)) — and never to DML/DDL,
+which Spanner would reject. Values are trimmed before parsing; malformed values fail with
+`InvalidArguments`. Unset (the default) leaves Spanner's own routing; set `""` to unset. A statement
+inherits the connection's value at creation and may override it (including clearing it with `""`).
+
+## Metadata calls
+
+The driver issues some queries of its own, to answer the ADBC metadata calls (`get_objects`,
+`get_table_schema`, `get_statistics`, …). These read `INFORMATION_SCHEMA`, are cheap, and are
+deliberately left **unconfigured**: the request priority / tag, directed-read and retry options above
+describe *your* statements, not the driver's bookkeeping. (The [RPC timeouts](#rpc-timeouts) are the
+exception — they bound every network path, metadata reads included.)
+
+`get_statistics` is the one call that reads **user data**: it computes exact `ROW_COUNT` /
+`NULL_COUNT` / `DISTINCT_COUNT` with one full-table `COUNT(*)` / `COUNTIF` / `COUNT(DISTINCT)`
+aggregate scan per matching table — by far the heaviest queries the driver produces on its own. Those
+scans therefore run under the connection's read options, exactly as one of your own read-only queries
+would:
+
+- `spanner.read.staleness` — the scans read at the configured bound.
+- `spanner.request.priority` and `spanner.request.tag` — so a statistics sweep is attributable in
+  query statistics and can be told to yield to serving traffic (`low`).
+- `spanner.directed_read` — so the scans honour the same replica selection.
+- `spanner.retry.max_attempts` / `…max_elapsed_seconds` / `…backoff.*` — so they are bounded the same
+  way.
+
+Only the connection's values apply (`get_statistics` is a `Connection` method, so there is no
+statement to inherit from or override). The `INFORMATION_SCHEMA` discovery queries that decide *which*
+tables to scan stay plain metadata reads, per the paragraph above; the query-optimizer options are
+not applied either, since the aggregates are driver-generated SQL rather than yours.
 
 ## Timestamp precision
 
@@ -345,7 +371,8 @@ by default changes nothing. When either is set, the driver applies a bounded pol
 retries transport / IO errors on idempotent requests exactly like the client's default — the
 attempt / elapsed limits are layered on top rather than replacing that behaviour — to every user
 query/DML statement, the read/write transaction runner's begin+commit RPCs, the bulk-ingest
-write-only transaction, and the `ExecuteBatchDml` batch. This tunes the *per-attempt* retry loop;
+write-only transaction, the `ExecuteBatchDml` batch, and the `get_statistics` aggregate scans (see
+[Metadata calls](#metadata-calls)). This tunes the *per-attempt* retry loop;
 the [RPC timeout](#rpc-timeouts) family bounds the *overall* per-operation wall time — the two are
 complementary. The transaction-level abort retry (Spanner's optimistic-concurrency re-run on
 `ABORTED`) is a separate policy and stays at the client default.

@@ -478,7 +478,9 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   `spanner.transaction.tag` connection-only; parsed/applied via `RequestConfig` in `src/request.rs`
   — every user statement builder goes through `SpannerStatement::sql_builder`, `run_batch_dml`
   tags the `ExecuteBatchDml` batch and the runner [commit priority + transaction tag; the client
-  has no batch-level priority setter], driver-internal metadata queries stay untagged), directed
+  has no batch-level priority setter], driver-internal metadata queries stay untagged **except the
+  `get_statistics` aggregate scans**, which take the connection's config — see the `get_statistics`
+  bullet below), directed
   reads (`spanner.directed_read` at connection + statement level [statement inherits, then overrides;
   `""` unsets — the staleness pattern; round-trip via `get_option`] — a replica selection for
   read-only queries parsed by `DirectedRead`/`parse` in `src/directed_read.rs` [unit-tested offline]
@@ -487,7 +489,8 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   built into the client `DirectedReadOptions` and applied via `StatementBuilder::set_directed_read_options`
   only on the read-only query paths — `SpannerStatement::read_sql_builder` [= `sql_builder` + directed
   reads] feeds the main `execute` query, the bound-query path, `execute_partitions`, and the
-  `execute_schema` PLAN probe; DML/DDL keep the plain `sql_builder` since Spanner rejects directed
+  `execute_schema` PLAN probe, and the `get_statistics` scans compose the same way; DML/DDL keep the
+  plain `sql_builder` since Spanner rejects directed
   reads on a read/write transaction), commit
   batching (`spanner.commit.max_delay` at connection + statement level [statement inherits, then
   overrides; `""` unsets — the staleness pattern; a duration in `0..=500ms` parsed with the shared
@@ -536,7 +539,8 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   copy of this type until googleapis/google-cloud-rust#6048 made it public — UP-3), applied via the builders'
   `with_retry_policy` / `with_begin_retry_policy` / `with_commit_retry_policy` at the same sites the
   request tags cover [`sql_builder`, `run_batch_txn`'s runner + `ExecuteBatchDml` batch, the ingest
-  write-only txn]; unset = the client's own unbounded policy, so it is purely opt-in. Bounds the
+  write-only txn, the `get_statistics` scans]; unset = the client's own unbounded policy, so it is
+  purely opt-in. Bounds the
   *per-attempt* retry loop, complementary to the *overall* RPC-timeout deadlines. Custom **backoff**
   is also supported via three orthogonal knobs
   `spanner.retry.backoff.{initial_seconds,max_seconds,multiplier}` [same connection+statement /
@@ -566,7 +570,20 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   per table — see `src/statistics.rs`; `approximate=true` serves the same exact stats (exact values
   always satisfy an approximate request; Spanner has no cheaper source), with
   `statistic_is_approximate=false` on every row. `get_statistic_names` returns an empty,
-  correctly-typed result set.)
+  correctly-typed result set. Those per-table aggregates are the **one driver-internal query that
+  reads user data** — a full `COUNT(*)`/`COUNTIF`/`COUNT(DISTINCT)` scan per table, the heaviest SQL
+  the driver issues on its own — so unlike every other metadata query they run under the
+  **connection's** read config, not bare (SPAN-3): `ScanConfig` in `src/statistics.rs` bundles
+  `read_staleness` + `RequestConfig` + `DirectedRead` + `RetryConfig`, and its `read_sql_builder`
+  composes them in the same order `SpannerStatement::read_sql_builder` does [request → retry →
+  directed read]. Connection-level only — `get_statistics` is a `Connection` method, so nothing
+  inherits/overrides. Deliberately **out of scope**: the two `INFORMATION_SCHEMA` discovery queries
+  that pick the tables stay plain metadata reads [cheap, catalog not user data — and SPAN-4/SPAN-5
+  own the `get_objects` staleness / cross-phase-snapshot questions], and the query-optimizer options
+  are not applied [the aggregates are driver-generated SQL, not the caller's]. Wire-asserted by
+  `statistics_scans_carry_the_connections_request_options_and_directed_read` [positives + the
+  discovery-stays-unconfigured negative] and `statistics_scans_honour_the_connections_retry_bound`
+  [an attempt count, since a retry policy is client-side] in `tests/mock_spanner.rs`.)
 - Partitioned execution (`execute_partitions`/`read_partition`): `execute_partitions` opens a batch
   read-only transaction (`DatabaseClient::batch_read_only_transaction`), calls `partition_query`, and
   serialises each `google_cloud_spanner::batch::Partition` (which carries its session + transaction

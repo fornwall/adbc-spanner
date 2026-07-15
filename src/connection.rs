@@ -1613,7 +1613,14 @@ impl Connection for SpannerConnection {
             &self.client,
             &self.cancel.current(),
             self.timeouts.query_timeout(),
-            &self.read_staleness,
+            // The aggregate scans read user tables, so they run under this connection's read
+            // options rather than as bare metadata queries (SPAN-3).
+            &crate::statistics::ScanConfig {
+                read_staleness: &self.read_staleness,
+                request: &self.request,
+                directed_read: &self.directed_read,
+                retry: &self.retry,
+            },
             db_schema,
             table_name,
         )?;
