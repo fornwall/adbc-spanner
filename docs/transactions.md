@@ -19,13 +19,61 @@ Spanner is externally consistent: every read and write is stamped with a **TrueT
 timestamp, and the ordering of those timestamps matches real time. That single property is what the
 transaction modes below are built on.
 
-**Locking read-write.** The only mode that can write. Pessimistic locking, `SERIALIZABLE` by default
-(`REPEATABLE_READ` is also selectable — Spanner implements it as snapshot isolation). It must be
-committed, and it may be **aborted** by the server at any time — contention, deadlock avoidance,
-schema change. An aborted transaction is not a failure the application must surface; the contract is
-that the client **replays the whole transaction body** on `ABORTED`. That is why the client library
-takes a *closure* rather than handing out a begin/commit handle: the closure is what it re-runs. The
-`ABORTED` error carries a `RetryInfo` with a `retryDelay` the runner consumes for its backoff.
+**Locking read-write.** The only mode that can write. `SERIALIZABLE` by default (`REPEATABLE_READ` is
+also selectable — Spanner implements it as snapshot isolation). It must be committed, and it may be
+**aborted** by the server at any time — contention, deadlock avoidance, schema change. An aborted
+transaction is not a failure the application must surface; the contract is that the client **replays
+the whole transaction body** on `ABORTED`. That is why the client library takes a *closure* rather
+than handing out a begin/commit handle: the closure is what it re-runs. The `ABORTED` error carries a
+`RetryInfo` with a `retryDelay` the runner consumes for its backoff.
+
+**Lock mode, and the isolation level that silently picks one.** A read-write transaction also carries
+a `read_lock_mode` (`TransactionOptions.ReadWrite.read_lock_mode`), which decides *when* a conflict is
+resolved:
+
+- `PESSIMISTIC` — under `SERIALIZABLE`, *"reads and writes acquire necessary locks during transaction
+  statement execution"*. A conflict blocks at the conflicting statement.
+- `OPTIMISTIC` — at either isolation level, *"reads and writes do not acquire locks during transaction
+  statement execution"*. Nothing blocks; instead the commit is validated and `ABORTED` if anything the
+  transaction read has changed since.
+
+Pessimistic pays in lock contention and blocking; optimistic pays in wasted work, since a long
+transaction can do everything and only then abort at commit.
+
+The part worth knowing is that the **default is derived from the isolation level** rather than being a
+fixed value (`<client>/src/generated/gapic_dataplane/model.rs:9644`):
+
+> * If isolation level is `SERIALIZABLE`, locking semantics default to `PESSIMISTIC`.
+> * If isolation level is `REPEATABLE_READ`, locking semantics default to `OPTIMISTIC`.
+
+This driver never sets `read_lock_mode` — it appears nowhere in `src/` — so every read-write
+transaction gets the isolation-derived default. Composed with the
+`adbc.connection.transaction.isolation_level` mapping (`apply_isolation`, `src/connection.rs:805`),
+the effective lock mode is:
+
+| Option value | Level sent to Spanner | Effective lock mode |
+| --- | --- | --- |
+| `default` | none (Spanner reads this as `SERIALIZABLE`) | pessimistic |
+| `serializable` | `SERIALIZABLE` | pessimistic |
+| `linearizable` (promoted) | `SERIALIZABLE` | pessimistic |
+| `repeatable_read` | `REPEATABLE_READ` | **optimistic** |
+| `snapshot` (SPEC-7) | `REPEATABLE_READ` | **optimistic** |
+| `read_committed` (promoted) | `REPEATABLE_READ` | **optimistic** |
+| `read_uncommitted` (promoted) | `REPEATABLE_READ` | **optimistic** |
+
+So choosing a *weaker* isolation level here does not merely relax the isolation guarantee — it also
+flips the concurrency-control strategy, trading execution-time blocking for commit-time aborts. Under
+write contention that can mean *more* aborts, which is the opposite of what someone reaching for a
+weaker level usually expects. The client does expose `TransactionRunnerBuilder::set_read_lock_mode`
+(`<client>/src/transaction_runner.rs:276`) beside the `set_isolation_level` the driver already calls
+(`<client>/src/transaction_runner.rs:253`), so decoupling the two is possible; the driver currently
+does not.
+
+Note also that this only bites where statements execute *inside* the transaction — autocommit DML and
+the batch-DML runner. In the driver's manual DML mode, statements are buffered client-side
+(`TxnState::buffer_dml`, `src/connection.rs:282`) and replayed at commit (`apply_manual_txn`,
+`src/connection.rs:719`), so a "transaction" holds no locks at all while the user believes it is
+open; locks exist only for the replay window inside `commit`.
 
 **Read-only / snapshot.** Reads at a **timestamp bound** with no locks, and therefore never blocks
 writers, is never aborted, and needs no commit. The bound is either *strong* (read at now — the
@@ -34,6 +82,17 @@ are cheaper and can be served by any sufficiently-caught-up replica. Bounded-sta
 (`max_staleness` / `min_read_timestamp`) are **single-use only** — Spanner rejects them on a
 multi-use read-only transaction, because a multi-use transaction must pin one repeatable timestamp
 and a bounded kind lets the server pick one per read.
+
+**Isolation level does not apply to read-only transactions**, and neither does `read_lock_mode`. A
+read-only transaction takes no locks and can never conflict, so there is nothing to isolate it
+against: what it observes is fixed entirely by its **timestamp bound**, which is the read-only
+analogue of an isolation knob. The proto states the exclusion outright — `REPEATABLE_READ` *"does not
+support read-only and partitioned DML transactions"*
+(`<client>/src/generated/gapic_dataplane/model.rs:10165`) — and an unspecified level means
+`SERIALIZABLE` (`:10146`), so on this path the field is a no-op at best and an error at worst.
+Accordingly `adbc.connection.transaction.isolation_level` is inert on queries in this driver (it
+reaches only the three `read_write_transaction()` sites listed under [`Commit`](#commit)), and
+`spanner.read.staleness` is the option that actually controls what a query sees.
 
 **Single-use vs multi-use.** A *single-use* transaction has no id and no lifetime: its options ride
 inline on one request, and it dies with that request. A *multi-use* transaction has an id returned
