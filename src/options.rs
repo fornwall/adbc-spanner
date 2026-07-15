@@ -50,6 +50,13 @@ pub(crate) fn string_option(value: OptionValue, what: &str) -> Result<String> {
     }
 }
 
+/// Parse a plain string option that spells "unset" as the empty string: `None` for `""`, `Some`
+/// otherwise (as [`string_option`] for any non-string value kind). The value is stored verbatim —
+/// callers whose grammar tolerates surrounding whitespace trim it themselves.
+pub(crate) fn non_empty_string_option(value: OptionValue, what: &str) -> Result<Option<String>> {
+    Ok(Some(string_option(value, what)?).filter(|s| !s.is_empty()))
+}
+
 /// Parse a strictly-positive `i64` option, accepted as an integer or a numeric string. Zero,
 /// negatives, non-numeric strings and other value kinds are rejected with `InvalidArguments`.
 pub(crate) fn positive_i64(value: OptionValue, what: &str) -> Result<i64> {

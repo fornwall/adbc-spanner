@@ -49,6 +49,7 @@ use google_cloud_spanner::statement::StatementBuilder;
 use google_cloud_wkt::Duration as WktDuration;
 
 use crate::error::invalid_argument;
+use crate::options::{non_empty_string_option, string_option};
 use crate::staleness::parse_duration;
 
 /// Spanner caps `max_commit_delay` at 500 milliseconds (values above are rejected server-side); we
@@ -123,7 +124,7 @@ pub(crate) struct RequestConfig {
 impl RequestConfig {
     /// Handle a `set_option` for `spanner.request.priority`. An empty value unsets it.
     pub(crate) fn set_priority(&mut self, value: OptionValue) -> Result<()> {
-        let raw = as_string(value)?;
+        let raw = string_option(value, crate::OPTION_REQUEST_PRIORITY)?;
         let trimmed = raw.trim();
         self.priority = if trimmed.is_empty() {
             None
@@ -135,20 +136,20 @@ impl RequestConfig {
 
     /// Handle a `set_option` for `spanner.request.tag`. An empty value unsets it.
     pub(crate) fn set_request_tag(&mut self, value: OptionValue) -> Result<()> {
-        self.request_tag = non_empty(as_string(value)?);
+        self.request_tag = non_empty_string_option(value, crate::OPTION_REQUEST_TAG)?;
         Ok(())
     }
 
     /// Handle a `set_option` for `spanner.transaction.tag`. An empty value unsets it.
     pub(crate) fn set_transaction_tag(&mut self, value: OptionValue) -> Result<()> {
-        self.transaction_tag = non_empty(as_string(value)?);
+        self.transaction_tag = non_empty_string_option(value, crate::OPTION_TRANSACTION_TAG)?;
         Ok(())
     }
 
     /// Handle a `set_option` for `spanner.commit.max_delay`. An empty value unsets it; a malformed
     /// value or one outside `0..=500ms` is rejected with `InvalidArguments`.
     pub(crate) fn set_max_commit_delay(&mut self, value: OptionValue) -> Result<()> {
-        let raw = as_string(value)?;
+        let raw = string_option(value, crate::OPTION_MAX_COMMIT_DELAY)?;
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             self.max_commit_delay = None;
@@ -319,22 +320,6 @@ pub(crate) fn parse_max_commit_delay(value: &str) -> Result<Duration> {
         )));
     }
     Ok(duration)
-}
-
-/// Extract a string from an option value, erroring on any other value kind.
-fn as_string(value: OptionValue) -> Result<String> {
-    match value {
-        OptionValue::String(s) => Ok(s),
-        _ => Err(invalid_argument(
-            "request priority/tag options require a string value",
-        )),
-    }
-}
-
-/// `None` for an empty string (the "unset" spelling), `Some` otherwise. Tags are free-form, so a
-/// non-empty value is stored verbatim (no trimming).
-fn non_empty(s: String) -> Option<String> {
-    if s.is_empty() { None } else { Some(s) }
 }
 
 #[cfg(test)]

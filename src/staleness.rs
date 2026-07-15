@@ -36,6 +36,7 @@ use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::transaction::{SingleUseReadOnlyTransaction, TimestampBound};
 
 use crate::error::invalid_argument;
+use crate::options::string_option;
 
 /// Build a single-use read-only transaction, applying an optional non-strong timestamp bound.
 /// `None` leaves the client default (a strong read).
@@ -114,7 +115,7 @@ impl ReadStaleness {
     /// Handle a `set_option` for `spanner.read.staleness`. An empty value unsets it (a strong
     /// read); any non-empty value replaces the current bound.
     pub(crate) fn set_staleness(&mut self, value: OptionValue) -> Result<()> {
-        let raw = as_string(value)?;
+        let raw = string_option(value, crate::OPTION_READ_STALENESS)?;
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             self.staleness = None;
@@ -148,16 +149,6 @@ impl ReadStaleness {
             .as_ref()
             .map(|b| b.pinned_for_multi_use().to_timestamp_bound())
             .transpose()
-    }
-}
-
-/// Extract a string from an option value, erroring on any other value kind.
-fn as_string(value: OptionValue) -> Result<String> {
-    match value {
-        OptionValue::String(s) => Ok(s),
-        _ => Err(invalid_argument(
-            "spanner.read.staleness requires a string value",
-        )),
     }
 }
 

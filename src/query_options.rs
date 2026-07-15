@@ -23,7 +23,7 @@ use adbc_core::options::OptionValue;
 use google_cloud_spanner::model::execute_sql_request::QueryOptions;
 use google_cloud_spanner::statement::StatementBuilder;
 
-use crate::error::invalid_argument;
+use crate::options::non_empty_string_option;
 
 /// The query optimizer options held by a connection or statement.
 ///
@@ -41,14 +41,16 @@ pub(crate) struct QueryOptionsConfig {
 impl QueryOptionsConfig {
     /// Handle a `set_option` for `spanner.query.optimizer_version`. An empty value unsets it.
     pub(crate) fn set_optimizer_version(&mut self, value: OptionValue) -> Result<()> {
-        self.optimizer_version = non_empty(as_string(value)?);
+        self.optimizer_version =
+            non_empty_string_option(value, crate::OPTION_QUERY_OPTIMIZER_VERSION)?;
         Ok(())
     }
 
     /// Handle a `set_option` for `spanner.query.optimizer_statistics_package`. An empty value unsets
     /// it.
     pub(crate) fn set_optimizer_statistics_package(&mut self, value: OptionValue) -> Result<()> {
-        self.optimizer_statistics_package = non_empty(as_string(value)?);
+        self.optimizer_statistics_package =
+            non_empty_string_option(value, crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE)?;
         Ok(())
     }
 
@@ -78,22 +80,6 @@ impl QueryOptionsConfig {
         }
         builder.set_query_options(options)
     }
-}
-
-/// Extract a string from an option value, erroring on any other value kind.
-fn as_string(value: OptionValue) -> Result<String> {
-    match value {
-        OptionValue::String(s) => Ok(s),
-        _ => Err(invalid_argument(
-            "query optimizer options require a string value",
-        )),
-    }
-}
-
-/// `None` for an empty string (the "unset" spelling), `Some` otherwise. The values are opaque
-/// pass-through strings, so a non-empty value is stored verbatim (no trimming).
-fn non_empty(s: String) -> Option<String> {
-    if s.is_empty() { None } else { Some(s) }
 }
 
 #[cfg(test)]
