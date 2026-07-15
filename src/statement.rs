@@ -1277,23 +1277,121 @@ impl SpannerStatement {
             .ok_or_else(|| invalid_state("no SQL query set on statement; call set_sql_query first"))
     }
 
-    /// Build a Spanner query statement for `sql`, binding the first bound row (if any) as named
-    /// parameters. With `plan = true` the statement is set to `QueryMode::Plan` so it returns column
-    /// metadata without scanning data. Used by `execute_partitions` for both the schema probe and the
-    /// partitioned query itself. Only the first bound row is used — partitioned execution has no
-    /// per-row fan-out, so extra bound rows are ignored.
+    /// Build a Spanner query statement for `sql`, binding the single bound parameter row (if any)
+    /// as named parameters. With `plan = true` the statement is set to `QueryMode::Plan` so it
+    /// returns column metadata without scanning data. Used by `execute_partitions` for both the
+    /// schema probe and the partitioned query itself; its caller has already rejected more than one
+    /// bound row ([`check_single_bound_row`](Self::check_single_bound_row) — partitioned execution
+    /// has no per-row fan-out), so the row bound here is *the* bound row, wherever it sits in the
+    /// bound batches.
     fn build_query_statement(&self, sql: &str, plan: bool) -> Result<SpannerSql> {
         let mut builder = self.read_sql_builder(sql);
         if plan {
             builder = builder.set_query_mode(QueryMode::Plan);
         }
-        if let Some(batch) = self.bound.first()
-            && batch.num_rows() > 0
-        {
+        if let Some(batch) = self.bound.iter().find(|batch| batch.num_rows() > 0) {
             let names = bind::resolve_parameter_names(sql, batch, self.bind_by_name)?;
             builder = bind::bind_params(builder, &names, batch, 0)?;
         }
         Ok(builder.build())
+    }
+
+    /// Guard for `execute_partitions`: at most **one** bound parameter row. Partitioned execution
+    /// has no per-row fan-out (each bound row would need its own partitioned query, and ADBC's
+    /// partition surface has no way to attribute descriptors back to rows), so silently truncating
+    /// several bound rows to the first — the old behaviour — misreported the result. Reject the
+    /// ambiguous case up front, before any RPC.
+    fn check_single_bound_row(&self) -> Result<()> {
+        let rows: usize = self.bound.iter().map(RecordBatch::num_rows).sum();
+        if rows > 1 {
+            return Err(invalid_argument(format!(
+                "execute_partitions supports at most one bound parameter row, but {rows} rows \
+                 are bound: partitioned execution has no per-row fan-out; bind a single row per \
+                 execute_partitions call"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The body of [`execute_partitions`](Statement::execute_partitions) from the bound-data
+    /// guard onward, split out so its caller clears the bound data however the attempt ends (the
+    /// [`run_ingest`](Self::run_ingest) / DML-path convention).
+    fn run_partition_query(&self, sql: &str) -> Result<PartitionedResult> {
+        // Several bound rows cannot be partitioned (no per-row fan-out) — reject before any RPC.
+        self.check_single_bound_row()?;
+        // Probe the schema and create the partitions. The partition query runs inside a batch
+        // read-only transaction; each returned partition carries its session, transaction id and
+        // partition token and is independently serializable, so it maps directly onto ADBC's opaque
+        // partition descriptor. The (Arc-shared, multiplexed) session lives as long as the
+        // connection's `DatabaseClient`, so the descriptors stay valid after this statement is gone,
+        // to be executed later by `Connection::read_partition`.
+        let plan_stmt = self.build_query_statement(sql, true)?;
+        let query_stmt = self.build_query_statement(sql, false)?;
+        let client = self.client.clone();
+        let data_boost = self.data_boost;
+        let max_partitions = self.max_partitions;
+        // The advertised schema carries this statement's timestamp precision. Note the partitions
+        // themselves are decoded by `Connection::read_partition` under the **reading** connection's
+        // `spanner.max_timestamp_precision`, so set the two to the same mode.
+        let precision = self.timestamp_precision;
+        // The partitioned read honours the statement's read staleness: it is baked into the batch
+        // read-only transaction, so every partition executes at that bound wherever it is read back.
+        let bound = self.read_staleness.timestamp_bound()?;
+
+        // Partitioning is a query-side operation: the query timeout bounds the schema probe plus
+        // the PartitionQuery call.
+        let partition_op = async move {
+            // Schema via a PLAN of the query: column metadata without scanning any data.
+            let plan_rs = crate::staleness::single_use(&client, bound.clone())
+                .execute_query(plan_stmt)
+                .await
+                .map_err(from_spanner)?;
+            let (schema, _batch) = result_set_to_batch(plan_rs, precision).await?;
+
+            // Partition the query across a batch read-only transaction.
+            let mut txn_builder = client.batch_read_only_transaction();
+            if let Some(b) = bound {
+                txn_builder = txn_builder.set_timestamp_bound(b);
+            }
+            let transaction = txn_builder.build().await.map_err(from_spanner)?;
+            let mut options = PartitionOptions::default();
+            if let Some(n) = max_partitions {
+                options = options.set_max_partitions(n);
+            }
+            let partitions = transaction
+                .partition_query(query_stmt, options)
+                .await
+                .map_err(from_spanner)?;
+
+            // Serialize each partition into an opaque ADBC descriptor, baking in the Data Boost
+            // choice so it travels with the token (honoured wherever the partition is executed).
+            let mut tokens: Vec<Vec<u8>> = Vec::with_capacity(partitions.len());
+            for partition in partitions {
+                let partition = if data_boost {
+                    partition.set_data_boost(true)
+                } else {
+                    partition
+                };
+                tokens.push(crate::connection::encode_partition(&partition)?);
+            }
+            Ok::<_, Error>((schema, tokens))
+        };
+        let (schema, partitions) = block_on_cancellable(
+            &self.runtime,
+            &self.cancel.current(),
+            with_timeout(
+                self.timeouts.query_timeout(),
+                crate::OPTION_RPC_TIMEOUT_QUERY,
+                partition_op,
+            ),
+        )?;
+
+        Ok(PartitionedResult {
+            partitions,
+            schema: (*schema).clone(),
+            // A read query has no affected-row count; ADBC uses -1 for "unknown".
+            rows_affected: -1,
+        })
     }
 
     /// Ask Spanner to type this statement's `@name` parameters: a `QueryMode::Plan` probe of the
@@ -1820,6 +1918,14 @@ impl Statement for SpannerStatement {
     /// Partition this query and return one opaque descriptor per partition, to be executed later by
     /// `Connection::read_partition`.
     ///
+    /// # Bound parameter rows
+    ///
+    /// At most **one** bound parameter row is supported: partitioned execution has no per-row
+    /// fan-out, so several bound rows are rejected with `InvalidArguments` up front (before any
+    /// RPC) rather than silently truncated to the first. The bound data is consumed by the call
+    /// either way — success or failure — matching the DML paths, so a reused statement handle
+    /// never silently re-applies stale rows.
+    ///
     /// # Security
     ///
     /// Each returned descriptor is **opaque but executable**: a versioned JSON envelope
@@ -1847,79 +1953,12 @@ impl Statement for SpannerStatement {
         // snapshot). Note a partitioned read never joins a query transaction's shared snapshot —
         // it always runs in its own batch read-only transaction below.
         self.ensure_query_allowed()?;
-        // Probe the schema and create the partitions. The partition query runs inside a batch
-        // read-only transaction; each returned partition carries its session, transaction id and
-        // partition token and is independently serializable, so it maps directly onto ADBC's opaque
-        // partition descriptor. The (Arc-shared, multiplexed) session lives as long as the
-        // connection's `DatabaseClient`, so the descriptors stay valid after this statement is gone,
-        // to be executed later by `Connection::read_partition`.
-        let plan_stmt = self.build_query_statement(&sql, true)?;
-        let query_stmt = self.build_query_statement(&sql, false)?;
-        let client = self.client.clone();
-        let data_boost = self.data_boost;
-        let max_partitions = self.max_partitions;
-        // The advertised schema carries this statement's timestamp precision. Note the partitions
-        // themselves are decoded by `Connection::read_partition` under the **reading** connection's
-        // `spanner.max_timestamp_precision`, so set the two to the same mode.
-        let precision = self.timestamp_precision;
-        // The partitioned read honours the statement's read staleness: it is baked into the batch
-        // read-only transaction, so every partition executes at that bound wherever it is read back.
-        let bound = self.read_staleness.timestamp_bound()?;
-
-        // Partitioning is a query-side operation: the query timeout bounds the schema probe plus
-        // the PartitionQuery call.
-        let partition_op = async move {
-            // Schema via a PLAN of the query: column metadata without scanning any data.
-            let plan_rs = crate::staleness::single_use(&client, bound.clone())
-                .execute_query(plan_stmt)
-                .await
-                .map_err(from_spanner)?;
-            let (schema, _batch) = result_set_to_batch(plan_rs, precision).await?;
-
-            // Partition the query across a batch read-only transaction.
-            let mut txn_builder = client.batch_read_only_transaction();
-            if let Some(b) = bound {
-                txn_builder = txn_builder.set_timestamp_bound(b);
-            }
-            let transaction = txn_builder.build().await.map_err(from_spanner)?;
-            let mut options = PartitionOptions::default();
-            if let Some(n) = max_partitions {
-                options = options.set_max_partitions(n);
-            }
-            let partitions = transaction
-                .partition_query(query_stmt, options)
-                .await
-                .map_err(from_spanner)?;
-
-            // Serialize each partition into an opaque ADBC descriptor, baking in the Data Boost
-            // choice so it travels with the token (honoured wherever the partition is executed).
-            let mut tokens: Vec<Vec<u8>> = Vec::with_capacity(partitions.len());
-            for partition in partitions {
-                let partition = if data_boost {
-                    partition.set_data_boost(true)
-                } else {
-                    partition
-                };
-                tokens.push(crate::connection::encode_partition(&partition)?);
-            }
-            Ok::<_, Error>((schema, tokens))
-        };
-        let (schema, partitions) = block_on_cancellable(
-            &self.runtime,
-            &self.cancel.current(),
-            with_timeout(
-                self.timeouts.query_timeout(),
-                crate::OPTION_RPC_TIMEOUT_QUERY,
-                partition_op,
-            ),
-        )?;
-
-        Ok(PartitionedResult {
-            partitions,
-            schema: (*schema).clone(),
-            // A read query has no affected-row count; ADBC uses -1 for "unknown".
-            rows_affected: -1,
-        })
+        let result = self.run_partition_query(&sql);
+        // The bound parameter row is consumed by the partitioning attempt either way — including a
+        // failed one — matching the DML paths: a reused statement handle must not silently re-apply
+        // stale bound rows to a later, unrelated execution.
+        self.bound.clear();
+        result
     }
 
     fn get_parameter_schema(&self) -> Result<Schema> {

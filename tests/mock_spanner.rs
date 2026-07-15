@@ -723,6 +723,54 @@ fn execute_update_routes_a_query_to_the_read_only_path() {
     );
 }
 
+/// SPEC-3 regression: `execute_partitions` must reject more than one bound parameter row with
+/// `InvalidArguments` **before any RPC** — partitioned execution has no per-row fan-out, and the
+/// old behaviour silently truncated the bound data to row 0 — and it must consume the bound rows
+/// however the call ends (the DML-path convention), so a reused statement handle never silently
+/// re-applies stale rows to a later, unrelated execution.
+#[test]
+fn execute_partitions_rejects_multiple_bound_rows_and_consumes_them() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "execute_partitions_rejects_multiple_bound_rows_and_consumes_them",
+    );
+
+    // Nothing is scripted: any RPC would hit the UNIMPLEMENTED catch-alls and fail with a
+    // different status/message, so the InvalidArguments asserted below proves the rejection
+    // happens driver-side, before anything reaches the server.
+    let server = MockServer::start(|_| {});
+    let mut connection = server.connect();
+
+    let mut statement = connection.new_statement().expect("new statement");
+    statement.set_sql_query("SELECT 1").unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Utf8, false)]));
+    let two_rows = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["a", "b"]))])
+        .expect("build bound batch");
+    statement.bind(two_rows).expect("bind two parameter rows");
+
+    let Err(error) = statement.execute_partitions() else {
+        panic!("execute_partitions with two bound rows must be rejected, not truncated to row 0");
+    };
+    assert_eq!(error.status, AdbcStatus::InvalidArguments);
+    assert!(
+        error
+            .message
+            .contains("at most one bound parameter row, but 2 rows"),
+        "the error must name the limitation and the row count: {}",
+        error.message
+    );
+
+    // The failed attempt consumed the bound rows (the DML-path convention). With no bound data,
+    // `get_parameter_schema` falls back to the SQL's `@name` references — none in `SELECT 1`, so
+    // an empty schema (and no RPC) — instead of reflecting the stale bound batch's schema.
+    let params = statement.get_parameter_schema().expect("parameter schema");
+    assert_eq!(
+        params.fields().len(),
+        0,
+        "bound rows must not survive execute_partitions on a reused statement handle"
+    );
+}
+
 /// COR-3 regression, manual-mode half: in a manual transaction `execute_update` on a SELECT must
 /// run it immediately as a read-only query (on the transaction's shared multi-use read-only
 /// transaction, which it begins) and buffer **nothing** to commit — the old mis-routing buffered
