@@ -54,7 +54,7 @@ pub(crate) fn single_use(
 /// A parsed read bound, before it is turned into a client [`TimestampBound`]. Kept as a small,
 /// pure value so the option parsing can be unit-tested offline.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ReadBound {
+enum ReadBound {
     /// Read exactly this far in the past (`exact:<duration>`).
     ExactStaleness(Duration),
     /// Read at any timestamp within this window of now (`max:<duration>`).
@@ -74,7 +74,7 @@ impl ReadBound {
     /// stale* timestamp their window allows, which is always a legal choice under the original
     /// bound: `max:<d>` becomes exact staleness `<d>`, and `min:<t>` becomes read timestamp `<t>`.
     /// The already-exact kinds pass through unchanged.
-    pub(crate) fn pinned_for_multi_use(&self) -> ReadBound {
+    fn pinned_for_multi_use(&self) -> ReadBound {
         match self {
             ReadBound::MaxStaleness(d) => ReadBound::ExactStaleness(*d),
             ReadBound::MinReadTimestamp(t) => ReadBound::ReadTimestamp(*t),
@@ -83,7 +83,7 @@ impl ReadBound {
     }
 
     /// Build the client [`TimestampBound`] for this read bound.
-    pub(crate) fn to_timestamp_bound(&self) -> Result<TimestampBound> {
+    fn to_timestamp_bound(&self) -> Result<TimestampBound> {
         match self {
             ReadBound::ExactStaleness(d) => TimestampBound::try_exact_staleness(*d)
                 .map_err(|e| invalid_argument(format!("read staleness out of range: {e}"))),
@@ -163,7 +163,7 @@ const GRAMMAR_MSG: &str = "spanner.read.staleness must be one of \"exact:<durati
 /// distinct, so the value is unambiguous. They are matched exactly (lowercase): ADBC option values
 /// are exact-match canonical strings across the driver ecosystem, so an uppercase prefix is
 /// rejected with the grammar error rather than case-folded.
-pub(crate) fn parse_read_bound(value: &str) -> Result<ReadBound> {
+fn parse_read_bound(value: &str) -> Result<ReadBound> {
     // RFC 3339 timestamps themselves contain colons, but only *after* the date part, so splitting
     // at the first colon cleanly separates a kind prefix from its argument: `read:<rfc3339>` keeps
     // the timestamp's own colons in `arg`, while a bare timestamp's pseudo-kind (`2026-07-07T00`)
