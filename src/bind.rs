@@ -57,8 +57,8 @@
 use adbc_core::error::Result;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    Date32Type, Date64Type, Decimal128Type, Float32Type, Float64Type, Int8Type, Int16Type,
-    Int32Type, Int64Type, TimestampMicrosecondType, TimestampMillisecondType,
+    ArrowPrimitiveType, Date32Type, Date64Type, Decimal128Type, Float32Type, Float64Type, Int8Type,
+    Int16Type, Int32Type, Int64Type, TimestampMicrosecondType, TimestampMillisecondType,
     TimestampNanosecondType, TimestampSecondType,
 };
 use arrow_array::{Array, ArrayRef, RecordBatch, downcast_dictionary_array};
@@ -283,38 +283,15 @@ type ScalarBinder = fn(&str, &DataType, &dyn Array, usize) -> Result<Value>;
 /// (A new *container* kind — beyond `List`/`LargeList` — is instead added to [`cell_value`].)
 fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
     let bind: ScalarBinder = match data_type {
-        DataType::Int64 => |_, _, a, i| {
-            Ok(scalar_value(a.is_null(i), || {
-                a.as_primitive::<Int64Type>().value(i)
-            }))
-        },
-        // Spanner's only integer type is INT64, so narrower Arrow ints widen to it.
-        DataType::Int32 => |_, _, a, i| {
-            Ok(scalar_value(a.is_null(i), || {
-                i64::from(a.as_primitive::<Int32Type>().value(i))
-            }))
-        },
-        DataType::Int16 => |_, _, a, i| {
-            Ok(scalar_value(a.is_null(i), || {
-                i64::from(a.as_primitive::<Int16Type>().value(i))
-            }))
-        },
-        DataType::Int8 => |_, _, a, i| {
-            Ok(scalar_value(a.is_null(i), || {
-                i64::from(a.as_primitive::<Int8Type>().value(i))
-            }))
-        },
-        DataType::Float64 => |_, _, a, i| {
-            Ok(scalar_value(a.is_null(i), || {
-                a.as_primitive::<Float64Type>().value(i)
-            }))
-        },
-        // f32 widens losslessly to Spanner FLOAT64.
-        DataType::Float32 => |_, _, a, i| {
-            Ok(scalar_value(a.is_null(i), || {
-                f64::from(a.as_primitive::<Float32Type>().value(i))
-            }))
-        },
+        // Spanner's only integer type is INT64, so every Arrow int width widens to it; both Arrow
+        // floats map to FLOAT64 (f32 widens losslessly). Each arm names its Arrow type and the
+        // Spanner-native type it widens into — the shared body lives in [`primitive_binder`].
+        DataType::Int64 => primitive_binder::<Int64Type, i64>(),
+        DataType::Int32 => primitive_binder::<Int32Type, i64>(),
+        DataType::Int16 => primitive_binder::<Int16Type, i64>(),
+        DataType::Int8 => primitive_binder::<Int8Type, i64>(),
+        DataType::Float64 => primitive_binder::<Float64Type, f64>(),
+        DataType::Float32 => primitive_binder::<Float32Type, f64>(),
         DataType::Boolean => {
             |_, _, a, i| Ok(scalar_value(a.is_null(i), || a.as_boolean().value(i)))
         }
@@ -396,6 +373,26 @@ fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
         _ => return None,
     };
     Some(bind)
+}
+
+/// The [`ScalarBinder`] for an Arrow primitive type `T` whose values bind as the Spanner-native
+/// `V` they convert into — `i64` for every Arrow integer width, `f64` for both float widths. The
+/// conversion is [`From`], so it is always lossless (and the identity for `Int64`/`Float64`), and
+/// nulls are preserved by [`scalar_value`] as for every other scalar.
+///
+/// The returned closure captures nothing — `T`/`V` are generic parameters, not captures — so it
+/// coerces to the plain `fn` pointer a [`ScalarBinder`] is, keeping [`scalar_binder`]'s dispatch
+/// table allocation-free.
+fn primitive_binder<T, V>() -> ScalarBinder
+where
+    T: ArrowPrimitiveType,
+    V: From<T::Native> + ToValue,
+{
+    |_, _, a, i| {
+        Ok(scalar_value(a.is_null(i), || {
+            V::from(a.as_primitive::<T>().value(i))
+        }))
+    }
 }
 
 /// The NULL bind for a null dictionary-encoded cell. The dictionary's *value* type is still
