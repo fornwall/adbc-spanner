@@ -146,8 +146,8 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 - [x] **PERF-7 (Low)** — `is_raw_prefix` allocates per word lexeme — `src/sql.rs:90`
   `to_ascii_lowercase()` per `Word` in every lexed SQL string; `eq_ignore_ascii_case` is allocation-free. *Resolved:* replaced the `to_ascii_lowercase()` + `matches!` with three `eq_ignore_ascii_case` comparisons (allocation-free); case-variant coverage added as `raw_prefix_detection` in `src/sql.rs`.
 
-- [ ] **PERF-8 (Low)** — `InfoValue::Str(String)` for static-only strings; duplicated `arrow_err` helper — `src/info.rs:49-77,159`
-  All `Str` values are `&'static str`; switch the variant and drop four allocations. Reuse `nested.rs:19`'s `arrow_err`.
+- [x] **PERF-8 (Low)** — `InfoValue::Str(String)` for static-only strings; duplicated `arrow_err` helper — `src/info.rs:49-77,159`
+  All `Str` values are `&'static str`; switch the variant and drop four allocations. Reuse `nested.rs:19`'s `arrow_err`. *Resolved:* `InfoValue::Str` now holds `&'static str` — all four values are compile-time constants (`VENDOR_NAME`, `DRIVER_NAME`, `DRIVER_VERSION` = `env!("CARGO_PKG_VERSION")`, `ARROW_VERSION` = a `concat!` of `build.rs`'s `env!`), so the four `to_string()`s and the `Vec<Option<String>>` accumulator are gone; the null-valued codes (`VendorVersion` et al.) carry no string at all. The local `arrow_err` is deleted in favour of `nested::arrow_err`, already `pub(crate)` for `objects.rs`/`statistics.rs` (no visibility widened); its message becomes the shared "failed to build metadata result batch", reachable only if `GET_INFO_SCHEMA` itself is malformed. `get_info` output is unchanged — the existing `src/info.rs` tests pin it.
 
 ## 6. Utilizing Spanner well
 

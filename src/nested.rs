@@ -1,6 +1,7 @@
-//! Shared helpers for assembling the nested list/struct result batches of the metadata methods
-//! ([`get_objects`](adbc_core::Connection::get_objects),
-//! [`get_statistics`](adbc_core::Connection::get_statistics)).
+//! Shared helpers for assembling the nested list/struct/union result batches of the metadata
+//! methods ([`get_objects`](adbc_core::Connection::get_objects),
+//! [`get_statistics`](adbc_core::Connection::get_statistics),
+//! [`get_info`](adbc_core::Connection::get_info)).
 //!
 //! The result schemas are `adbc_core` constants, so the shape lookups here cannot fail in
 //! practice — but this crate is loaded as a cdylib, so a mismatch must surface as a
