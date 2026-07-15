@@ -80,7 +80,14 @@ SpannerDriver ──▶ SpannerDatabase ──▶ SpannerConnection ──▶ Sp
   *annotation* wrappers downstream on that path — `remap_ingest_append_error`'s `AlreadyExists`
   branch and `note_rows_already_committed` in `src/statement.rs` — preserve `vendor_code` **and**
   `details` through their rebuilt messages; the probe-based branches that *reinterpret* the error
-  (deriving a status from `table_exists`) deliberately preserve neither. `from_builder` stays
+  (deriving a status from `table_exists`) deliberately preserve neither. All three probe-remap sites
+  (`SpannerConnection::get_table_schema` plus `SpannerStatement::remap_ingest_{append,create}_error`,
+  which share one `ingest_table_exists` probe helper) match the same
+  `Ok(true)`/`Ok(false)`/`Err(_) => original` shape: when the **probe itself** fails, the caller's
+  original error is returned unchanged rather than the probe's (IDIO-9 — the probe only refines an
+  error that already happened; on a real outage the original already reports it, and the probe needs
+  an `INFORMATION_SCHEMA` read permission a write-only principal may lack). The policy is documented
+  once, on `table_exists`. `from_builder` stays
   generic over `Display` for the status-less client-builder errors.
 
 Key design points:
