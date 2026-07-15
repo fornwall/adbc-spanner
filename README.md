@@ -92,12 +92,14 @@ Early, tested end-to-end against the Spanner emulator.
       undo it; and DDL issued after buffered DML executes *before* it (the DML/DDL reorder
       caveat). A `;`-separated DDL batch still applies as one `UpdateDatabaseDdl` call.
 - Transaction isolation level — the adbc.connection.transaction.isolation_level option is honored for serializable,
-  repeatable_read, and default. The four levels Spanner does not natively expose are promoted upward to the weakest
-  supported level that still satisfies them (read_uncommitted/read_committed → repeatable_read; snapshot/linearizable →
-  serializable), which is spec-permitted and safe; get_option reports the effective promoted level, and an unknown
-  level string is still rejected. It applies to the driver's read/write transactions (autocommit DML and the
-  manual-mode DML commit); query-kind manual transactions are Spanner read-only snapshot reads, which take no
-  isolation level.
+  repeatable_read, snapshot, and default. serializable, repeatable_read and snapshot map natively onto Spanner's two
+  levels — snapshot included, since Spanner implements repeatable read as snapshot isolation — while default sends no
+  level, which Spanner reads as serializable. The three levels Spanner does not natively expose are promoted upward to
+  the weakest supported level that still satisfies them (read_uncommitted/read_committed → repeatable_read;
+  linearizable → serializable), which is spec-permitted and safe; get_option reports the effective level, and an
+  unknown level string is still rejected. It applies only to the driver's read/write transactions (autocommit DML and
+  the manual-mode DML commit); query-kind manual transactions are Spanner read-only snapshot reads, which take no
+  isolation level, so the option is inert on them.
 - Parameter binding: `bind`/`bind_stream` an Arrow batch whose columns become Spanner named
   parameters; each bound row runs the statement once. How columns pair with the query's `@name`
   parameters is set by the `adbc.statement.bind_by_name` statement option (the [SQLite reference

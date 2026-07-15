@@ -130,15 +130,24 @@ Key design points:
   with a CI-executed example asserting the guard `ProgrammingError`, `SpannerConnection` rustdoc
   + connection.rs module doc + lib.rs crate docs). Genuine read-your-writes inside a DML
   transaction still waits on the client exposing begin/commit handles. The standard
-  `adbc.connection.transaction.isolation_level` option is honoured for read/write transactions:
-  `serializable` and `repeatable_read` map to the client's `IsolationLevel` (applied via
-  `TransactionRunnerBuilder::set_isolation_level`), `default` leaves the database default, and the
-  four spec levels Spanner does not natively expose are **promoted upward** to the weakest supported
-  level that still satisfies their guarantees rather than rejected (`read_uncommitted`/`read_committed`
-  → `repeatable_read`; `snapshot`/`linearizable` → `serializable`) — spec-permitted (the spec says a
-  driver *should*, not *must*, error; JDBC sanctions substituting a higher level) and safe (a stronger
-  level always satisfies a weaker one's guarantees); `get_option` reports the effective promoted level,
-  and a truly unknown level string is still rejected with `InvalidArguments`. The standard `adbc.connection.readonly`
+  `adbc.connection.transaction.isolation_level` option is honoured for read/write transactions
+  **only** — it reaches exactly the three `client.read_write_transaction()` sites (`run_batch_txn`,
+  `execute_returning_dml`, `plan_dml_parameter_types`) via `apply_isolation`, and is inert on
+  queries (Spanner's proto states `REPEATABLE_READ` "does not support read-only and partitioned DML
+  transactions"; read-only transactions take a timestamp bound instead) and on the mutations-only
+  ingest commit (the write-only builder has no isolation setter). `serializable`, `repeatable_read`
+  **and `snapshot`** map natively to the client's `IsolationLevel` (applied via
+  `TransactionRunnerBuilder::set_isolation_level`) — `snapshot` → `REPEATABLE_READ`, because Spanner
+  implements `REPEATABLE_READ` *as* snapshot isolation and the two definitions are near-verbatim
+  identical (SPEC-7; an earlier version wrongly promoted `snapshot` → `serializable`, reasoning from
+  the ANSI level's name). `default` sends **no** level, which Spanner reads as `SERIALIZABLE` —
+  there is no database- or client-level isolation default to inherit. The three remaining spec
+  levels are **promoted upward** to the weakest supported level that still satisfies their
+  guarantees rather than rejected (`read_uncommitted`/`read_committed` → `repeatable_read`;
+  `linearizable` → `serializable`) — spec-permitted (the spec says a driver *should*, not *must*,
+  error; JDBC sanctions substituting a higher level) and safe (a stronger level always satisfies a
+  weaker one's guarantees); `get_option` reports the effective level, and a truly unknown level
+  string is still rejected with `InvalidArguments`. The standard `adbc.connection.readonly`
   option (default `false`) makes a connection reject all writes — DML/DDL/ingest fail with
   `InvalidState`, queries still run; the flag is a shared `Arc<AtomicBool>` that statements read at
   execution time, so toggling it on the connection immediately affects existing statements too. The

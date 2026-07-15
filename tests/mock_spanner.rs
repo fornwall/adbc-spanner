@@ -1861,12 +1861,13 @@ fn max_commit_delay_reaches_the_wire_on_runner_commits() {
 /// 1. **Unset** (the negative that makes the rest meaningful): with no isolation level set, the
 ///    begin must carry `ISOLATION_LEVEL_UNSPECIFIED` — the database default stands. Without it, an
 ///    assertion that a level is populated could never fail.
-/// 2. **Natively supported**: `serializable` and `repeatable_read` map 1:1 onto Spanner's own two
-///    levels.
-/// 3. **Promoted** (SPEC-4, the deliberate deviation worth pinning): each of the four spec levels
+/// 2. **Natively supported**: `serializable`, `repeatable_read` and `snapshot` map 1:1 onto
+///    Spanner's own two levels — `snapshot` included, because Spanner implements `REPEATABLE_READ`
+///    *as* snapshot isolation (SPEC-7), so it is an exact match rather than a promotion.
+/// 3. **Promoted** (SPEC-4, the deliberate deviation worth pinning): each of the three spec levels
 ///    Spanner does not expose arrives as the weakest supported level that satisfies it —
-///    `read_uncommitted`/`read_committed` → `REPEATABLE_READ`, `snapshot`/`linearizable` →
-///    `SERIALIZABLE`. Nothing on the wire is ever an unsupported level, and nothing is dropped.
+///    `read_uncommitted`/`read_committed` → `REPEATABLE_READ`, `linearizable` → `SERIALIZABLE`.
+///    Nothing on the wire is ever an unsupported level, and nothing is dropped.
 /// 4. **Back to `default`**: it resets the connection, so the begin is unspecified again.
 ///
 /// Every case asserts the exact wire enum value, not mere presence.
@@ -1945,7 +1946,7 @@ fn isolation_level_reaches_transaction_options_on_the_begin() {
         ),
         (
             Some(ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT),
-            IsolationLevel::Serializable,
+            IsolationLevel::RepeatableRead,
         ),
         (
             Some(ADBC_OPTION_ISOLATION_LEVEL_LINEARIZABLE),

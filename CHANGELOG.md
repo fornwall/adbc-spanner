@@ -12,6 +12,18 @@ Releases are cut with [`cargo-release`](https://github.com/crate-ci/cargo-releas
 
 ### Changed
 
+- **Breaking:** `adbc.connection.transaction.isolation_level` = `snapshot` now maps to Spanner's
+  `REPEATABLE_READ` instead of `SERIALIZABLE`, and `get_option` reports it back as
+  `repeatable_read` rather than `serializable`. Spanner implements `REPEATABLE_READ` *as* snapshot
+  isolation — its proto definition matches ADBC's `snapshot` almost verbatim — so this is an exact
+  native mapping, not the promotion the driver previously treated it as. Transactions that ask for
+  `snapshot` keep the isolation they requested while shedding serializable's pessimistic read locks
+  and higher abort rate; note that `REPEATABLE_READ` detects write-write conflicts only, so DML
+  that reads rows it does not write (a subquery guard, a join, `INSERT … SELECT`) can now be
+  exposed to write skew where serializable would have aborted it. Callers who want the old
+  behaviour should set `serializable` explicitly. `serializable`, `repeatable_read`, `default`, and
+  the `read_uncommitted`/`read_committed`/`linearizable` promotions are unchanged (REVIEW.md
+  SPEC-7).
 - **Breaking:** a `spanner://` connection URI no longer accepts the two secret-holding database
   options — `spanner.auth.keyfile_json` and `spanner.auth.access_token` — as query parameters; a URI
   carrying either is rejected with `InvalidArguments` naming the key. A URI is the most-logged

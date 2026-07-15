@@ -10,7 +10,7 @@ being listed.
 Each finding is a checkbox — tick it when fixed (or explicitly decided against, noting
 why next to the item). IDs are stable for cross-referencing.
 
-**Severity counts:** High 4 · Medium 17 · Low ~55 · Upstream 12.
+**Severity counts:** High 4 · Medium 18 · Low ~55 · Upstream 12.
 
 **Overall shape:** the codebase is in unusually good health — centralized identifier
 quoting with hostile-name tests, bound-parameter metadata filters, exact ADBC result
@@ -99,6 +99,9 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 
 - [ ] **SPEC-6 (Low)** — Status-code consistency nits — `src/connection.rs:809-814,1249-1260`, `src/statement.rs:1731-1742`
   `current_catalog`/`current_db_schema` set to non-empty → `InvalidArguments` (C++ PostgreSQL driver uses `NotImplemented` for the same class); `execute_schema` guard returns `InvalidState` for DDL but `InvalidArguments` for DML on the same "not a query" class. Cosmetic alignment only.
+
+- [x] **SPEC-7 (Medium)** — `snapshot` isolation mapped to `SERIALIZABLE`, not the exact `REPEATABLE_READ` match — `src/connection.rs:843`
+  Distinct from **SPEC-4** (which records promotion-instead-of-error as a knowing deviation and stands): one row of that promotion table was simply wrong. `snapshot` was classified as an unsupported level needing promotion "because snapshot/RR are incomparable" — true of *ANSI* repeatable read, but Spanner implements `REPEATABLE_READ` **as snapshot isolation**, and the two definitions are near-verbatim identical (ADBC `Snapshot`, `rust/core/src/options.rs`: "all reads in the transaction will see a consistent snapshot of the database and the transaction should only successfully commit if no updates conflict with any concurrent updates made since that snapshot"; Spanner `REPEATABLE_READ`, pinned client proto `model.rs`: "All reads performed during the transaction observe a consistent snapshot of the database, and the transaction is only successfully committed in the absence of conflicts between its updates and any concurrent updates that have occurred since that snapshot"). The mapping was derived from the level's *name* rather than Spanner's semantics, and contradicted the driver's own stated rule ("the weakest supported level that still satisfies their guarantees"). Not a correctness bug — serializable is strictly stronger — but callers asking for `snapshot` silently paid serializable's pessimistic read-lock footprint and higher abort rate, and `get_option` misreported the effective level. *Resolved:* `parse_isolation_level` maps `snapshot` → `IsolationLevel::RepeatableRead` and the rustdoc reclassifies it as a native mapping (the promotion table now covers `read_uncommitted`/`read_committed`/`linearizable` only). Wire-asserted by the `snapshot` case of `isolation_level_reaches_transaction_options_on_the_begin` (`tests/mock_spanner.rs`, from TEST-3), plus the `parse`/`get_option` unit tests in `src/connection.rs`. Same pass corrected two neighbouring doc bugs: the false "leaves the database default" phrasing (Spanner has **no** database- or client-level isolation default — the proto says an unspecified level *is* `SERIALIZABLE`, and the pinned client exposes `set_isolation_level` only per-transaction) at `src/connection.rs:630,793,809` and `docs/options.md:96`, and the undocumented DML-only scope (the option is inert on queries — the proto states `REPEATABLE_READ` "does not support read-only and partitioned DML transactions" — and on the mutations-only ingest commit, whose write-only builder has no isolation setter).
 
 ## 4. Type conversion (correctness)
 
