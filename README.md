@@ -128,6 +128,10 @@ Early, tested end-to-end against the Spanner emulator.
   descriptor, and `Connection::read_partition()` streams one partition's rows back as Arrow.
   `spanner.data_boost` bakes [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview)
   into the descriptors; `spanner.partition.max_count` hints the partition count.
+  **A descriptor is opaque but *executable*** — it carries the SQL text plus the session and
+  transaction identity, and `read_partition()` runs whatever it contains with the connection's
+  credentials — and it is **not** authenticated, so transport descriptors only over trusted channels
+  and never execute one from an untrusted source.
 - Read-only connections — `adbc.connection.readonly=true` is supported, making the connection reject all writes while still
   allowing queries. The commit paths are covered too: committing a manual transaction's buffered DML/ingest work (via
   `commit()`, or by re-enabling `adbc.connection.autocommit`) is rejected while the flag is set, leaving the transaction

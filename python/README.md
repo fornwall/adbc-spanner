@@ -404,6 +404,11 @@ with spanner.connect(
 
 Only single-table scans are partitionable — queries with an `ORDER BY` or aggregation are not.
 
+A descriptor is opaque but *executable*: it carries the SQL text plus the session and transaction
+identity, so `adbc_read_partition` runs whatever it contains with the connection's credentials, and
+it is not authenticated. Ship descriptors only over trusted channels, and never read one from an
+untrusted source.
+
 [Data Boost]: https://cloud.google.com/spanner/docs/databoost/databoost-overview
 
 ## Supported platforms
