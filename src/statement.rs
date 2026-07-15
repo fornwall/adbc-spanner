@@ -402,7 +402,13 @@ impl SpannerStatement {
                 ),
                 Status::AlreadyExists,
             );
+            // Pure annotation: this branch only names the table, so everything structured about the
+            // underlying failure — the numeric gRPC code and the forwarded `google.rpc.Status`
+            // details — carries through untouched. (The probe branches below *reinterpret* the
+            // error, deriving a new status from the table's existence, so they deliberately keep
+            // neither.)
             named.vendor_code = error.vendor_code;
+            named.details = error.details;
             return Err(named);
         }
         // Probe the target table in its schema (`adbc.ingest.target_db_schema`, empty = Spanner's
@@ -787,8 +793,9 @@ impl SpannerStatement {
     /// multi-chunk write-only path already carries, but now within a chunk too — which is what makes
     /// it the cheaper firehose transport for large loads. Each streamed [`BatchWriteResponse`]
     /// reports, per group index, whether it applied: an `OK`/absent status counts those rows as
-    /// applied, and the first non-`OK` group status becomes the returned error via
-    /// [`from_status_parts`] (so a duplicate primary key still surfaces as `AlreadyExists` and the
+    /// applied, and the first non-`OK` group status — code, message *and* its `google.rpc.Status`
+    /// details — becomes the returned error via [`from_status_parts`] (so a duplicate primary key
+    /// still surfaces as `AlreadyExists`, its structured details reach `Error::details`, and the
     /// append/create remaps fire, exactly as on the write-only path). Because a non-atomic batch may
     /// have applied some groups before the failing one, an error here is combined with the
     /// already-committed-rows annotation by the caller ([`run_ingest_mutations`](Self::run_ingest_mutations)).
@@ -830,7 +837,11 @@ impl SpannerStatement {
                         match response.status.as_ref().filter(|s| s.code != 0) {
                             None => applied += response.indexes.len() as i64,
                             Some(status) if first_error.is_none() => {
-                                first_error = Some(from_status_parts(status.code, &status.message));
+                                first_error = Some(from_status_parts(
+                                    status.code,
+                                    &status.message,
+                                    &status.details,
+                                ));
                             }
                             Some(_) => {}
                         }
@@ -2243,7 +2254,11 @@ fn note_rows_already_committed(error: Error, committed: i64) -> Error {
         ),
         error.status,
     );
+    // Pure annotation, like the append remap's `AlreadyExists` branch: the underlying failure's
+    // structured halves — numeric gRPC code and forwarded `google.rpc.Status` details — survive the
+    // rebuilt message.
     annotated.vendor_code = error.vendor_code;
+    annotated.details = error.details;
     annotated
 }
 
@@ -2388,14 +2403,19 @@ mod tests {
         let source = || {
             let mut e = err("Spanner error: row already exists", Status::AlreadyExists);
             e.vendor_code = 6; // gRPC ALREADY_EXISTS
+            e.details = Some(vec![(
+                "google.rpc.errorinfo".to_string(),
+                br#"{"reason":"DUPLICATE_KEY"}"#.to_vec(),
+            )]);
             e
         };
         // First-chunk failure: nothing was committed, the error passes through untouched.
         let untouched = note_rows_already_committed(source(), 0);
         assert_eq!(untouched.message, "Spanner error: row already exists");
         assert_eq!(untouched.status, Status::AlreadyExists);
-        // Later-chunk failure: the exact committed row count is reported, and the status and
-        // vendor_code survive so callers still branch on the underlying failure.
+        // Later-chunk failure: the exact committed row count is reported, and the status,
+        // vendor_code and forwarded details survive so callers still branch on — and diagnose —
+        // the underlying failure.
         let annotated = note_rows_already_committed(source(), 4_000);
         assert!(
             annotated
@@ -2411,6 +2431,7 @@ mod tests {
         );
         assert_eq!(annotated.status, Status::AlreadyExists);
         assert_eq!(annotated.vendor_code, 6);
+        assert_eq!(annotated.details, source().details);
     }
 
     #[test]
