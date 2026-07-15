@@ -187,8 +187,9 @@ jobs:
   # cargo-deny — security advisories (RUSTSEC), license compliance, banned/duplicate
   #   crates and allowed sources (see deny.toml).
   # cargo-machete — unused dependencies.
+  # fuzz lock — the `fuzz/` workspace's Cargo.lock is current (see the step's comment).
   supply-chain:
-    name: cargo-deny + machete
+    name: cargo-deny + machete + fuzz lock
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -203,3 +204,15 @@ jobs:
 
       - name: Unused dependencies
         run: cargo machete
+
+      # `fuzz/` is a SEPARATE cargo workspace (fuzz/Cargo.toml ends with a bare `[workspace]`),
+      # so it carries its own Cargo.lock that no root-level cargo command ever resolves. Nothing
+      # else in CI passes `--locked` for it — fuzz.yml just runs `cargo fuzz run`, which silently
+      # rewrites the lock and moves on — so drift there is invisible. It has drifted twice over:
+      # commit c9ac506 moved the google-cloud-* pins off the (defunct) fornwall fork and updated
+      # the root lock but not this one, and every `cargo release` bump re-stales the
+      # `adbc-spanner` version it records. `--locked` turns both into a hard failure instead.
+      # Cheap here: cargo-deny above already resolved the same git-pinned dependency graph, so
+      # the checkout is warm.
+      - name: fuzz/Cargo.lock is current
+        run: cargo fetch --locked --manifest-path fuzz/Cargo.toml

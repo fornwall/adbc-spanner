@@ -37,7 +37,24 @@ pre-release-commit-message = "Release {{version}}"
 # self-skip offline, so this hook covers the unit tests + doctests locally; the ci-gate job in
 # libraries.yml additionally blocks publishing until the full CI run (emulator included) is
 # green on the tagged commit.
-pre-release-hook = ["sh", "-c", "cargo fmt --all --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test"]
+#
+# The trailing `cargo fetch` re-resolves the SEPARATE `fuzz/` workspace's own lock file.
+# cargo-release refreshes only the root Cargo.lock (it runs `cargo metadata` against the
+# workspace being released, and `fuzz/` is not a member of it), so without this every version
+# bump would leave `fuzz/Cargo.lock` pinning the *previous* `adbc-spanner` version — which the
+# `fuzz/Cargo.lock is current` CI gate (ci.yml) would then flag red on the release commit,
+# and ci-gate would refuse to publish the tag. Ordering is what makes this work: cargo-release
+# runs the hook AFTER writing the new version to Cargo.toml and immediately before
+# `git commit -am`, so the refreshed lock records the NEW version and is swept into the same
+# "Release X.Y.Z" commit. `cargo fetch` (not `cargo update`) keeps it a minimal re-resolve:
+# only the `adbc-spanner` version line moves, every other package stays pinned. The $DRY_RUN
+# guard matters because cargo-release runs hooks on dry runs too (where Cargo.toml still holds
+# the OLD version) — without it, a preview run would rewrite the lock and dirty the tree.
+pre-release-hook = [
+    "sh",
+    "-c",
+    'cargo fmt --all --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test && { [ "$DRY_RUN" = "true" ] || cargo fetch --manifest-path fuzz/Cargo.toml; }',
+]
 # Keep the Python package's checked-in dev-fallback version in step with the crate. Release
 # wheels do not depend on it (CI overwrites the file from the pushed tag), this just stops the
 # committed copy from drifting.

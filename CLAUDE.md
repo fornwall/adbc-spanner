@@ -348,6 +348,16 @@ cargo release patch            # dry run (default) — preview only
 cargo release patch --execute  # bump + commit "Release X.Y.Z" + tag vX.Y.Z + push
 ```
 
+**`fuzz/` is a separate cargo workspace** (`fuzz/Cargo.toml` ends with a bare `[workspace]`; the
+root has no workspace section), so it has its own checked-in `fuzz/Cargo.lock` that no root-level
+cargo command — including cargo-release's own root-lock refresh — ever resolves. Two things keep it
+from rotting, and they are complementary: the `pre-release-hook` re-resolves it after the version
+bump (else every release would leave it pinning the old `adbc-spanner` version), and ci.yml's
+`fuzz/Cargo.lock is current` step (`cargo fetch --locked --manifest-path fuzz/Cargo.toml`) fails
+loudly on any *other* drift — notably a git-pin move, which no release hook would catch. The gate is
+why the hook is not optional: a stale lock reddens ci.yml on the release commit, and `ci-gate`
+(libraries.yml) then refuses to publish the tag. If you ever drop the hook, drop the gate too.
+
 **crates.io publishing is off**, via `publish = false` in the release config (the git-pinned deps —
 both the `google-cloud-*` family and `adbc_core`/`adbc_ffi` — can't be published; see the two-pin
 dependency note above). So `cargo release --execute`
