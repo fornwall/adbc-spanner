@@ -228,8 +228,8 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 
 ## 9. Idiomatic code & clarity
 
-- [ ] **IDIO-1 (Medium)** — Broken quickstart URI example the driver rejects — `src/ffi.rs:19`, `docs/adbc.md:135`
-  Both show `uri="projects/p/…"`; `driver.rs:193` rejects bare paths. **Fix:** `spanner:///projects/p/instances/i/databases/d`.
+- [x] **IDIO-1 (Medium)** — Broken quickstart URI example the driver rejects — `src/ffi.rs:19`, `docs/adbc.md:135`
+  Both show `uri="projects/p/…"`; `driver.rs:193` rejects bare paths. **Fix:** `spanner:///projects/p/instances/i/databases/d`. *Resolved:* both examples now read `uri="spanner:///projects/p/instances/i/databases/d"` (the three-slash no-endpoint form `set_uri_option` accepts; the `python/adbc_driver_spanner/dbapi.py` example already used it, and repo-wide grep found no other bare-path `uri=` example). The exact documented string is pinned by `the_documented_quickstart_uri_example_parses` in `src/driver.rs`, so the quickstart can't silently rot into a rejected spelling again.
 
 - [ ] **IDIO-2 (Medium)** — Commit/read-config plumbing threads 9–14 positional args — `src/connection.rs:451,498`, `src/statement.rs:211`
   The same bundle the `impl_shared_option_dispatch!` macro already treats as one unit travels as loose params (two `#[allow(too_many_arguments)]`s; transposition risk; every new knob touches every call site). **Fix:** a `SharedConfig` struct owned by connection and statement, passed as one argument.

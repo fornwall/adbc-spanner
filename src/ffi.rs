@@ -16,7 +16,7 @@
 //! db = adbc_driver_manager.AdbcDatabase(
 //!     driver="/path/to/libadbc_spanner.so",
 //!     entrypoint="AdbcSpannerInit",
-//!     uri="projects/p/instances/i/databases/d",
+//!     uri="spanner:///projects/p/instances/i/databases/d",
 //! )
 //! ```
 
