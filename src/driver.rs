@@ -2266,7 +2266,7 @@ mod tests {
         set_uri(
             &mut db,
             &format!(
-                "spanner:///{DB_PATH}?spanner.endpoint=http://localhost:9010&spanner.emulator=yes"
+                "spanner:///{DB_PATH}?spanner.endpoint=http://localhost:9010&spanner.emulator=true"
             ),
         )
         .unwrap();

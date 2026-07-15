@@ -7358,11 +7358,12 @@ fn request_priority_and_tags() {
         assert_eq!(error.status, Status::NotFound, "{key}");
     }
 
-    // Set all three at connection level; the priority is case-insensitive and reported canonically.
+    // Set all three at connection level; the priority is exact lowercase (like every option value)
+    // and reported canonically.
     connection
         .set_option(
             conn_key(OPTION_REQUEST_PRIORITY),
-            OptionValue::String("MEDIUM".into()),
+            OptionValue::String("medium".into()),
         )
         .expect("set connection priority");
     connection

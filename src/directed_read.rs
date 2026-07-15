@@ -16,10 +16,10 @@
 //!
 //! ```text
 //! <value>      ::= <mode> [ ":" <selections> ] [ ";auto_failover_disabled" ]
-//! <mode>       ::= "include" | "exclude"            (case-insensitive)
+//! <mode>       ::= "include" | "exclude"            (exact lowercase)
 //! <selections> ::= <selection> ("," <selection>)*
 //! <selection>  ::= <location> [ ":" <type> ]        (at least one of location / type)
-//! <type>       ::= "read_write" | "read_only" | "any"   (case-insensitive)
+//! <type>       ::= "read_write" | "read_only" | "any"   (exact lowercase)
 //! ```
 //!
 //! - `<mode>` picks an include list (an ordered preference) or an exclude list.
@@ -176,7 +176,7 @@ pub(crate) fn parse(value: &str) -> Result<DirectedReadSpec> {
     let (main, auto_failover_disabled) = match value.split_once(';') {
         Some((main, flag)) => {
             let flag = flag.trim();
-            if !flag.eq_ignore_ascii_case("auto_failover_disabled") {
+            if flag != "auto_failover_disabled" {
                 return Err(invalid_argument(format!(
                     "unknown spanner.directed_read flag {flag:?}; the only supported flag is \
                      \";auto_failover_disabled\""
@@ -192,7 +192,7 @@ pub(crate) fn parse(value: &str) -> Result<DirectedReadSpec> {
         Some((mode, rest)) => (mode.trim(), Some(rest.trim())),
         None => (main, None),
     };
-    let mode = match mode_str.to_ascii_lowercase().as_str() {
+    let mode = match mode_str {
         "include" => Mode::Include,
         "exclude" => Mode::Exclude,
         other => {
@@ -251,9 +251,10 @@ pub(crate) fn parse(value: &str) -> Result<DirectedReadSpec> {
     })
 }
 
-/// Parse a replica type: `read_write` / `read_only` / `any` (case-insensitive).
+/// Parse a replica type: exactly `read_write` / `read_only` / `any` (lowercase, like every option
+/// value in this driver).
 fn parse_type(value: &str) -> Result<ReplicaType> {
-    match value.to_ascii_lowercase().as_str() {
+    match value {
         "read_write" => Ok(ReplicaType::ReadWrite),
         "read_only" => Ok(ReplicaType::ReadOnly),
         "any" => Ok(ReplicaType::Any),
@@ -311,9 +312,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_case_insensitively_and_trims() {
+    fn trims_whitespace_around_tokens() {
         assert_eq!(
-            parse("  INCLUDE : us-east1 : READ_ONLY , us-east4 : Any  ").unwrap(),
+            parse("  include : us-east1 : read_only , us-east4 : any  ").unwrap(),
             DirectedReadSpec {
                 mode: Mode::Include,
                 selections: vec![
@@ -323,6 +324,30 @@ mod tests {
                 auto_failover_disabled: false,
             }
         );
+    }
+
+    /// The mode, replica type and flag keywords are exact lowercase, like every option value in
+    /// the driver (ADBC option values are exact-match canonical strings): case variants are
+    /// rejected with `InvalidArguments` (COR-7).
+    #[test]
+    fn rejects_case_variants_of_keywords() {
+        for bad in [
+            "INCLUDE:us-east1",
+            "Include:us-east1",
+            "EXCLUDE:us-central1",
+            "include:us-east1:READ_ONLY",
+            "include:us-east1:Read_Write",
+            "include::ANY",
+            "include:us-east1;AUTO_FAILOVER_DISABLED",
+            "include:us-east1;Auto_Failover_Disabled",
+        ] {
+            let err = parse(bad).unwrap_err();
+            assert_eq!(
+                err.status,
+                Status::InvalidArguments,
+                "expected error for {bad:?}"
+            );
+        }
     }
 
     #[test]

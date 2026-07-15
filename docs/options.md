@@ -16,11 +16,18 @@ Options are set through the standard ADBC surfaces: `set_option` on the object,
 
 All levels parse option values with the same shared rules (`src/options.rs`):
 
-- **boolean** — the strings `true` / `false` / `1` / `0` / `yes` / `no` (case-insensitive), or an
-  integer value (`0` = false, any non-zero = true). Anything else fails with `InvalidArguments`.
+- **boolean** — exactly the string `true` or `false` (lowercase — the ADBC canonical spellings,
+  matching the reference drivers; no other spellings, no case folding). Anything else — including
+  an int-typed value (`SetOptionInt`) — fails with `InvalidArguments`.
 - **positive integer** — an integer value or a numeric string; must be `> 0`.
 - **non-negative seconds** — an integer value or a numeric string; must be `>= 0`.
 - **string** — must be a string value; other value kinds fail with `InvalidArguments`.
+
+Enumerated string values (modes, priorities, staleness prefixes, replica types, …) are matched
+**exactly** in their canonical lowercase form — ADBC option values are exact-match constants across
+the driver ecosystem, so e.g. `HIGH` or `MAX:1m` is rejected with `InvalidArguments` rather than
+case-folded. (Free-form values such as tags are stored verbatim; surrounding whitespace of a value
+is trimmed.)
 
 The *Round-trips* column below says what `get_option` (the string form; `AdbcDatabaseGetOption`
 etc.) returns for the option. Reading an option that is unset — and has no default to report —
@@ -79,14 +86,14 @@ path, not the original URI.
 | `adbc.connection.transaction.isolation_level` | one of `adbc.connection.transaction.isolation.default`, `…isolation.serializable`, `…isolation.repeatable_read` | `adbc.connection.transaction.isolation.default` (the database default) | yes, always (the canonical spec string) | **Standard ADBC.** Isolation level for read/write (DML) transactions. `serializable` and `repeatable_read` map to Spanner's isolation levels; `default` leaves the database default. The four levels Spanner does not natively expose are **promoted upward** to the weakest supported level that satisfies them (`read_uncommitted`/`read_committed` → `repeatable_read`; `snapshot`/`linearizable` → `serializable`) rather than rejected — spec-permitted and safe (a stronger level satisfies a weaker one); `get_option` reports the effective promoted level. Unknown strings are rejected with `InvalidArguments`. |
 | `spanner.read.staleness` | `exact:<duration>`, `max:<duration>`, `read:<rfc3339>` or `min:<rfc3339>` (see [Stale reads](#stale-reads)); `""` unsets | unset (strong read) | yes, when set (the raw, trimmed value) | Read bound for read-only queries. Becomes the default for statements this connection creates (statements may override). One value at a time; setting a new value replaces the old. |
 | `spanner.max_timestamp_precision` | `nanoseconds_error_on_overflow` or `microseconds` (see [Timestamp precision](#timestamp-precision)); `""` resets to the default | `nanoseconds_error_on_overflow` | yes, always (the effective mode) | How `TIMESTAMP` columns map to Arrow: `Timestamp(Nanosecond, "UTC")` with a loud error on instants outside ~1677–2262 (the default), or `Timestamp(Microsecond, "UTC")` covering Spanner's full 0001–9999 range (sub-microsecond digits truncate toward negative infinity). Becomes the default for statements this connection creates (statements may override); also governs `get_table_schema` and `read_partition`, which have no statement. |
-| `spanner.request.priority` | `low`, `medium` or `high` (case-insensitive); `""` unsets | unset (service default, high) | yes, when set (the canonical lowercase form) | [Request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions) applied to every query/DML statement the driver builds, and the commit priority of every read/write transaction. Becomes the default for statements this connection creates (statements may override). |
+| `spanner.request.priority` | exactly `low`, `medium` or `high` (lowercase); `""` unsets | unset (service default, high) | yes, when set (the canonical lowercase form) | [Request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions) applied to every query/DML statement the driver builds, and the commit priority of every read/write transaction. Becomes the default for statements this connection creates (statements may override). |
 | `spanner.request.tag` | free-form string; `""` unsets | unset | yes, when set | [Request tag](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags) attached to every query/DML request the driver builds (surfaced in query/transaction statistics). Becomes the default for statements this connection creates (statements may override). Driver-internal metadata queries stay untagged. |
 | `spanner.directed_read` | `include`/`exclude` replica selection (see [Directed reads](#directed-reads)); `""` unsets | unset (Spanner's own routing) | yes, when set (the raw, trimmed value) | [Directed read](https://docs.cloud.google.com/spanner/docs/directed-reads) replica selection applied to **read-only queries** (Spanner rejects it on writes). Becomes the default for statements this connection creates (statements may override). |
 | `spanner.query.optimizer_version` | opaque version string, e.g. `"6"` or `"latest"`; `""` unsets | unset (database/service default) | yes, when set (the raw value) | [Query optimizer version](https://docs.cloud.google.com/spanner/docs/query-optimizer/manage-query-optimizer) applied as a `QueryOptions` on every query statement the driver builds. Becomes the default for statements this connection creates (statements may override). |
 | `spanner.query.optimizer_statistics_package` | opaque statistics-package name; `""` unsets | unset (database default) | yes, when set (the raw value) | [Optimizer statistics package](https://docs.cloud.google.com/spanner/docs/query-optimizer/statistics-packages) applied as a `QueryOptions` on every query statement the driver builds. Same inheritance as `spanner.query.optimizer_version`. |
 | `spanner.transaction.tag` | free-form string; `""` unsets | unset | yes, when set | Transaction tag attached to every read/write transaction the driver builds (autocommit DML, the manual-mode commit, ingest commits). Connection level only. |
 | `spanner.commit.max_delay` | duration in `0..=500ms` (staleness grammar — default unit seconds, plus `s`/`ms`/`us`/`ns`/`m`/`h`; e.g. `100ms`, `0.2s`); `""` unsets | unset (no delay) | yes, when set (the raw, trimmed value) | [Maximum commit delay](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions) Spanner may add to a read/write commit so it can batch it with others (throughput-for-latency). Applied at every read/write commit the driver builds: autocommit DML, the `ExecuteBatchDml` batch runner, the manual-mode commit, and the bulk-ingest write-only transaction. Values above 500ms (and malformed ones) are rejected with `InvalidArguments`. Becomes the default for statements this connection creates (statements may override). |
-| `spanner.commit_stats` | boolean (`true`/`false`/`1`/`0`/`yes`/`no`, or an integer); `""` unsets | `false` | yes, always (`true`/`false`) | Request [commit statistics](https://docs.cloud.google.com/spanner/docs/commit-statistics) on the read/write commits the driver builds (the same four sites as `spanner.commit.max_delay`). When enabled, the returned **mutation count** of the most recent commit is captured and read back via `spanner.commit_stats.mutation_count`. On a connection the count captured here is the **manual-mode commit's** (autocommit DML / bulk ingest report on the statement). Becomes the default for statements this connection creates (statements may override). |
+| `spanner.commit_stats` | boolean (`true`/`false`); `""` unsets | `false` | yes, always (`true`/`false`) | Request [commit statistics](https://docs.cloud.google.com/spanner/docs/commit-statistics) on the read/write commits the driver builds (the same four sites as `spanner.commit.max_delay`). When enabled, the returned **mutation count** of the most recent commit is captured and read back via `spanner.commit_stats.mutation_count`. On a connection the count captured here is the **manual-mode commit's** (autocommit DML / bulk ingest report on the statement). Becomes the default for statements this connection creates (statements may override). |
 | `spanner.commit_stats.mutation_count` | read-only (setting it is rejected with `NotImplemented`) | `NotFound` until a commit with stats has run | via `get_option` / `get_option_int` | The mutation count from the connection's most recent commit run with `spanner.commit_stats` enabled (the manual-mode commit). `NotFound` until such a commit has run. |
 | `spanner.rpc.timeout_seconds.query` | finite, non-negative seconds (fractions allowed); `0` disables; `""` unsets (see [RPC timeouts](#rpc-timeouts)) | unset (no deadline) | yes, when set (also via `get_option_double`) | Overall deadline on a query's **initial execution**: the `ExecuteStreamingSql` call plus the first chunk of the streamed result, the `execute_schema` / `execute_partitions` probes, and `read_partition`'s initial fetch. Also bounds the driver-internal metadata **reads** (`get_objects`, `get_statistics`, `get_table_schema`, the ingest table-exists probe). Expiry fails with `Timeout`. Becomes the default for statements this connection creates (statements may override). |
 | `spanner.rpc.timeout_seconds.update` | as `…query` | unset (no deadline) | yes, when set (also via `get_option_double`) | Overall deadline on each **write** operation: an autocommit DML / batch-DML transaction, the manual-mode commit, each bulk-ingest commit chunk, and a DDL change (the admin `UpdateDatabaseDdl` call **and** its long-running-operation poll loop) — covering any retries the client performs within it. A commit whose confirmation the driver stopped waiting for may still have landed server-side — the usual ambiguity of any timed-out commit (a timed-out DDL likewise may already have applied). Same inheritance as `…query`. |
@@ -154,7 +161,8 @@ duration) and two *absolute* (an RFC 3339 timestamp):
 `ms`, `us`/`µs`, `ns`, `m` (minutes) or `h` (hours). Examples: `exact:10`, `exact:2.5s`,
 `max:500ms`, `max:1m`, `read:2026-07-07T00:00:00Z`, `min:2026-07-07T00:00:00+02:00`.
 
-The four prefixes are distinct, so a value is unambiguous. The option holds one bound at a time;
+The four prefixes are distinct, so a value is unambiguous; they are lowercase and matched exactly
+(`MAX:1m` is rejected). The option holds one bound at a time;
 setting a new value replaces the old, and `""` unsets it. Values are trimmed before parsing;
 malformed values fail with `InvalidArguments`. A statement inherits the connection's bound at
 creation and may override it (including clearing it with `""`). Because Spanner accepts the
@@ -174,12 +182,12 @@ small grammar:
 <mode> [ ":" <selection> ("," <selection>)* ] [ ";auto_failover_disabled" ]
 ```
 
-- `<mode>` is `include` or `exclude` (case-insensitive):
+- `<mode>` is exactly `include` or `exclude` (lowercase):
   - `include` — an **ordered preference** list; Spanner tries the selections in turn.
   - `exclude` — replicas Spanner routes **around**.
 - Each `<selection>` is `<location>`, `<location>:<type>`, or `:<type>` (at least one of the two):
   - `<location>` is a region such as `us-east1`.
-  - `<type>` is `read_write`, `read_only` or `any` (case-insensitive). Omitted or `any` matches every
+  - `<type>` is exactly `read_write`, `read_only` or `any` (lowercase). Omitted or `any` matches every
     replica type.
 - The optional `;auto_failover_disabled` suffix — valid only with `include` — stops Spanner from
   falling back to a replica outside the list when the listed replicas are unavailable.
