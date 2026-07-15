@@ -212,7 +212,8 @@ jobs:
       # commit c9ac506 moved the google-cloud-* pins off the (defunct) fornwall fork and updated
       # the root lock but not this one, and every `cargo release` bump re-stales the
       # `adbc-spanner` version it records. `--locked` turns both into a hard failure instead.
-      # Cheap here: cargo-deny above already resolved the same git-pinned dependency graph, so
-      # the checkout is warm.
+      # Costs ~2min (it clones the git-pinned google-cloud-rust to resolve; cargo-deny above is a
+      # Docker action, so its own checkout is not shared). That is off the critical path — this
+      # job runs in parallel with the much longer emulator `test` job — and it compiles nothing.
       - name: fuzz/Cargo.lock is current
         run: cargo fetch --locked --manifest-path fuzz/Cargo.toml
