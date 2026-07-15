@@ -307,6 +307,17 @@ struct RetryInfo {
     retry_delay: Option<prost_types::Duration>,
 }
 
+/// `google.rpc.ErrorInfo` — like [`RetryInfo`], not in the mock crate's generated protos, so
+/// declared locally against the (stable) wire format. `metadata` (field 3) is unused here and
+/// omitted.
+#[derive(Clone, PartialEq, prost::Message)]
+struct ErrorInfo {
+    #[prost(string, tag = "1")]
+    reason: String,
+    #[prost(string, tag = "2")]
+    domain: String,
+}
+
 /// An `ABORTED` status carrying a `google.rpc.RetryInfo` detail in `grpc-status-details-bin`,
 /// exactly as Cloud Spanner sends on transaction aborts.
 fn aborted_with_retry_info(message: &str) -> tonic::Status {
@@ -357,6 +368,28 @@ fn too_many_mutations_status() -> tonic::Status {
 /// A default successful `Commit` response (no commit stats requested).
 fn commit_ok() -> tonic::Result<tonic::Response<v1::CommitResponse>> {
     Ok(tonic::Response::new(v1::CommitResponse::default()))
+}
+
+/// One streamed `BatchWriteResponse` reporting that mutation group `0` failed with `ALREADY_EXISTS`
+/// and a `google.rpc.ErrorInfo` detail — the in-band, per-group failure shape BatchWrite uses (the
+/// RPC itself succeeds; the status rides *inside* the response, not the gRPC trailer).
+fn batch_write_group_already_exists() -> v1::BatchWriteResponse {
+    let error_info = ErrorInfo {
+        reason: "DUPLICATE_KEY".to_string(),
+        domain: "spanner.googleapis.com".to_string(),
+    };
+    v1::BatchWriteResponse {
+        indexes: vec![0],
+        status: Some(spanner_grpc_mock::google::rpc::Status {
+            code: tonic::Code::AlreadyExists as i32,
+            message: "Row [v0] in table MockTable already exists".to_string(),
+            details: vec![prost_types::Any {
+                type_url: "type.googleapis.com/google.rpc.ErrorInfo".to_string(),
+                value: error_info.encode_to_vec(),
+            }],
+        }),
+        commit_timestamp: None,
+    }
 }
 
 /// Serve `BeginTransaction` (the write-only ingest path begins a read/write transaction before each
@@ -1431,6 +1464,124 @@ fn ingest_does_not_bisect_a_non_mutation_limit_error() {
         commits.load(Ordering::SeqCst),
         1,
         "a non-mutation-limit error must not trigger the bisect retry"
+    );
+}
+
+/// (d‴) **BatchWrite per-group failure.** The `spanner.ingest.batch_write` transport reports a
+/// failed mutation group *in band* — a `google.rpc.Status` embedded in a streamed
+/// `BatchWriteResponse`, not a gRPC trailer — so it never passes through `from_spanner`. This is the
+/// only wire coverage of that second error path (`error::from_status_parts`), and it must be
+/// indistinguishable from the write-only commit path's:
+///
+/// - the numeric code maps the same way (`ALREADY_EXISTS` → `AlreadyExists`, 6 in `vendor_code`);
+/// - the ingest `append` remap still fires, naming the target table;
+/// - and the status' **structured details** reach [`adbc_core::error::Error::details`] under the
+///   contract `from_spanner` documents — key = lowercased proto type name, value = ProtoJSON.
+///
+/// The details assertion is what pins COR-8: before the fix only `code` + `message` were forwarded
+/// on this path, so an `ErrorInfo` a caller needs to distinguish *why* a group failed was silently
+/// dropped. Driving it through the wire also exercises the client's own
+/// `prost Any → wkt::Any` decode of the embedded status, which the `src/error.rs` unit tests
+/// (which build the details directly) cannot.
+#[test]
+fn batch_write_group_failure_forwards_status_details() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "batch_write_group_failure_forwards_status_details",
+    );
+
+    let batch_writes = Arc::new(AtomicUsize::new(0));
+    let writes_in_mock = batch_writes.clone();
+    let server = MockServer::start(move |mock| {
+        // BatchWrite needs no BeginTransaction/Commit: the RPC owns its own writes.
+        mock.expect_batch_write().returning(move |_| {
+            writes_in_mock.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(Ok(batch_write_group_already_exists()))
+                .expect("scripted stream channel sized to fit");
+            Ok(tonic::Response::new(rx))
+        });
+    });
+
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("MockTable".into()),
+        )
+        .expect("set target table");
+    // `append` into a pre-existing table: no DDL, so no admin client is built (the mock serves only
+    // data-plane RPCs). The AlreadyExists remap keeps the status and just names the table.
+    statement
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .expect("set ingest mode append");
+    statement
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_INGEST_BATCH_WRITE.into()),
+            OptionValue::String("true".into()),
+        )
+        .expect("route the ingest through BatchWrite");
+    // One row ⇒ one MutationGroup ⇒ the single failing group the mock scripts.
+    statement.bind(ingest_batch(1)).expect("bind ingest data");
+
+    let error = statement
+        .execute_update()
+        .expect_err("a failed mutation group must fail the ingest");
+
+    assert_eq!(
+        batch_writes.load(Ordering::SeqCst),
+        1,
+        "the ingest must have gone through the BatchWrite RPC, not a write-only Commit"
+    );
+    // The in-band group status maps exactly as the commit path's gRPC status would.
+    assert_eq!(
+        error.status,
+        AdbcStatus::AlreadyExists,
+        "got error: {error}"
+    );
+    assert_eq!(
+        error.vendor_code, 6,
+        "vendor_code must carry ALREADY_EXISTS = 6; got error: {error}"
+    );
+    assert!(
+        error.message.contains("MockTable"),
+        "the append remap should name the target table; got: {}",
+        error.message
+    );
+
+    // COR-8: the group status' details survive the whole stack — the client's decode of the
+    // embedded `google.rpc.Status`, `from_status_parts`, and the ingest append remap.
+    let details = error.details.as_ref().unwrap_or_else(|| {
+        panic!(
+            "the failing group carried a google.rpc.ErrorInfo detail; Error.details must be Some"
+        )
+    });
+    let (_, value) = details
+        .iter()
+        .find(|(key, _)| key == "google.rpc.errorinfo")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a `google.rpc.errorinfo` detail, got keys: {:?}",
+                details.iter().map(|(k, _)| k).collect::<Vec<_>>()
+            )
+        });
+    let json: serde_json::Value =
+        serde_json::from_slice(value).expect("the detail value is UTF-8 ProtoJSON");
+    assert_eq!(
+        json["@type"], "type.googleapis.com/google.rpc.ErrorInfo",
+        "the detail must self-describe as an ErrorInfo, got: {json}"
+    );
+    assert_eq!(
+        json["reason"], "DUPLICATE_KEY",
+        "the ErrorInfo's reason must round-trip what the mock sent, got: {json}"
+    );
+    assert_eq!(
+        json["domain"], "spanner.googleapis.com",
+        "the ErrorInfo's domain must round-trip what the mock sent, got: {json}"
     );
 }
 

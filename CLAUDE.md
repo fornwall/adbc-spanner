@@ -71,8 +71,17 @@ SpannerDriver ──▶ SpannerDatabase ──▶ SpannerConnection ──▶ Sp
   augments — message text, status, `vendor_code` and forwarded details are all preserved (IAM isn't
   enforced on the emulator, so it's covered by unit tests plus a `tests/mock_spanner.rs`
   PERMISSION_DENIED mock; `from_status_parts` adds the same guidance on the BatchWrite path).
-  `from_builder` stays generic over
-  `Display` for the status-less client-builder errors.
+  `from_status_parts` is the **second** error path — the BatchWrite RPC reports a failed mutation
+  group *in band*, as a `google.rpc.Status` embedded in a `BatchWriteResponse`, so it never passes
+  through `from_spanner` — and it is kept output-identical: same code→status table, same
+  `vendor_code`, same IAM guidance, and (COR-8) the status' details forwarded through the same
+  `details_for_adbc`. Its details arrive as the wire `wkt::Any`s rather than decoded
+  `StatusDetails`, so it converts them with the client's own `StatusDetails::from(&Any)`. The two
+  *annotation* wrappers downstream on that path — `remap_ingest_append_error`'s `AlreadyExists`
+  branch and `note_rows_already_committed` in `src/statement.rs` — preserve `vendor_code` **and**
+  `details` through their rebuilt messages; the probe-based branches that *reinterpret* the error
+  (deriving a status from `table_exists`) deliberately preserve neither. `from_builder` stays
+  generic over `Display` for the status-less client-builder errors.
 
 Key design points:
 
@@ -423,7 +432,8 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   each row shipped as its own `MutationGroup`, non-atomic per-group — for firehose loads
   [`SpannerStatement::{commit_ingest_chunk,batch_write_chunk}`]; it preserves chunking, insert
   semantics, the row count and the append `NotFound`/`AlreadyExists` remap [a non-OK group status →
-  `error::from_status_parts`, mapping the numeric gRPC code like `from_spanner`], is **ignored** in
+  `error::from_status_parts`, mapping the numeric gRPC code *and forwarding the status' details*
+  like `from_spanner` — COR-8], is **ignored** in
   manual mode [which buffers + commits atomically], and — since BatchWrite takes no per-request commit
   options — bypasses the request priority/tag, `max_commit_delay` and `commit_stats` settings on that
   path), `get_info` (static

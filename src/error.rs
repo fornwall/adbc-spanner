@@ -2,6 +2,7 @@
 
 use adbc_core::error::{Error, Status};
 use google_cloud_gax::error::rpc::{Code, StatusDetails};
+use google_cloud_wkt::Any;
 
 /// Build an ADBC error with the given message and status.
 pub(crate) fn err(message: impl Into<String>, status: Status) -> Error {
@@ -158,27 +159,38 @@ fn map_detail(detail: &StatusDetails) -> Option<(String, Vec<u8>)> {
     Some((key, serde_json::to_vec(&value).ok()?))
 }
 
-/// Build an ADBC error from a `google.rpc.Status`-style numeric code and message.
+/// Build an ADBC error from the parts of a `google.rpc.Status`: its numeric code, message and
+/// details.
 ///
 /// The BatchWrite (`spanner.ingest.batch_write`) path surfaces a failed mutation group as a
-/// `google.rpc.Status` embedded in a streamed `BatchWriteResponse` — a numeric gRPC `code` plus a
-/// `message` — rather than as a `google_cloud_spanner::Error`. This maps that numeric code onto the
-/// closest ADBC [`Status`] through the very same [`status_for_grpc_code`] table [`from_spanner`]
-/// uses (turning the number into a [`Code`] via [`Code::from`]) and keeps the numeric code in
-/// `vendor_code`. A duplicate primary key therefore surfaces as [`Status::AlreadyExists`] exactly as
-/// it does on the write-only commit path, so the bulk-ingest append/create error remaps still fire
-/// identically for both ingest transports.
-pub(crate) fn from_status_parts(code: i32, message: &str) -> Error {
+/// `google.rpc.Status` embedded in a streamed `BatchWriteResponse` — rather than as a
+/// `google_cloud_spanner::Error` — so it reaches the driver as loose parts instead of through
+/// [`from_spanner`]. This keeps the two paths' output identical: the numeric code maps onto the
+/// closest ADBC [`Status`] through the very same [`status_for_grpc_code`] table (turning the number
+/// into a [`Code`] via [`Code::from`]) and survives in `vendor_code`, a `PERMISSION_DENIED` gains
+/// the same [`PERMISSION_DENIED_GUIDANCE`], and the `details` are forwarded through the same
+/// [`details_for_adbc`] mapping — same lowercased-type-name keys, same ProtoJSON values (see
+/// [`from_spanner`] for the full contract). A duplicate primary key therefore surfaces as
+/// [`Status::AlreadyExists`] exactly as it does on the write-only commit path, so the bulk-ingest
+/// append/create error remaps still fire identically for both ingest transports.
+///
+/// The `details` arrive as the wire [`Any`]s of the embedded status (the response message models
+/// them as such) rather than as decoded [`StatusDetails`]; they are decoded here with the very
+/// conversion the client itself applies when it turns a `google.rpc.Status` into the gax error
+/// status [`from_spanner`] reads, so a given detail maps to byte-identical output on either path.
+pub(crate) fn from_status_parts(code: i32, message: &str, details: &[Any]) -> Error {
     let status = status_for_grpc_code(Code::from(code));
     let mut full = format!("Spanner batch-write error: {message}");
     // A per-group `PERMISSION_DENIED` on the BatchWrite path gets the same fixed IAM guidance the
-    // `from_spanner` commit path adds (see [`PERMISSION_DENIED_GUIDANCE`]); the original message and
-    // `vendor_code` are preserved.
+    // `from_spanner` commit path adds (see [`PERMISSION_DENIED_GUIDANCE`]); the original message,
+    // `vendor_code` and forwarded details are preserved.
     if Code::from(code) == Code::PermissionDenied {
         full.push_str(PERMISSION_DENIED_GUIDANCE);
     }
+    let decoded: Vec<StatusDetails> = details.iter().map(StatusDetails::from).collect();
     let mut adbc = err(full, status);
     adbc.vendor_code = code;
+    adbc.details = details_for_adbc(&decoded);
     adbc
 }
 
@@ -288,22 +300,25 @@ mod tests {
         // A duplicate primary key on the BatchWrite path arrives as a numeric ALREADY_EXISTS (6)
         // and must surface as the same ADBC status the write-only path produces, so the ingest
         // append/create remaps fire identically.
-        let adbc = from_status_parts(Code::AlreadyExists as i32, "Row already exists");
+        let adbc = from_status_parts(Code::AlreadyExists as i32, "Row already exists", &[]);
         assert_eq!(adbc.status, Status::AlreadyExists);
         assert_eq!(adbc.vendor_code, 6);
         assert!(adbc.message.contains("Row already exists"));
+        // A status without details keeps details = None, not Some(vec![]) — as on the
+        // `from_spanner` path.
+        assert_eq!(adbc.details, None);
         // NOT_FOUND (5) → NotFound, INVALID_ARGUMENT (3) → InvalidArguments, and the numeric code
         // is preserved in vendor_code throughout.
         assert_eq!(
-            from_status_parts(Code::NotFound as i32, "no table").status,
+            from_status_parts(Code::NotFound as i32, "no table", &[]).status,
             Status::NotFound
         );
         assert_eq!(
-            from_status_parts(Code::InvalidArgument as i32, "bad").status,
+            from_status_parts(Code::InvalidArgument as i32, "bad", &[]).status,
             Status::InvalidArguments
         );
         // An unmapped/unknown numeric code falls back to Internal but still keeps the code.
-        let internal = from_status_parts(13, "boom");
+        let internal = from_status_parts(13, "boom", &[]);
         assert_eq!(internal.status, Status::Internal);
         assert_eq!(internal.vendor_code, 13);
     }
@@ -558,6 +573,7 @@ mod tests {
         let adbc = from_status_parts(
             Code::PermissionDenied as i32,
             "Caller is missing IAM permission spanner.databases.write on resource d.",
+            &[],
         );
         assert_eq!(adbc.status, Status::Unauthorized);
         assert_eq!(adbc.vendor_code, 7);
@@ -569,12 +585,75 @@ mod tests {
         );
         assert!(!adbc.message.contains("roles/spanner."));
         // A non-permission numeric code stays guidance-free.
-        let already = from_status_parts(Code::AlreadyExists as i32, "Row already exists");
+        let already = from_status_parts(Code::AlreadyExists as i32, "Row already exists", &[]);
         assert!(
             !already
                 .message
                 .contains("cloud.google.com/spanner/docs/iam")
         );
+    }
+
+    /// Build a `wkt::Any` from its ProtoJSON form — the shape a `google.rpc.Status`'s details take
+    /// on the BatchWrite response, and the input [`from_status_parts`] decodes.
+    fn any_from_json(value: serde_json::Value) -> Any {
+        serde_json::from_value(value).expect("valid Any ProtoJSON")
+    }
+
+    #[test]
+    fn from_status_parts_forwards_status_details_like_from_spanner() {
+        // A `BatchWriteResponse`'s embedded `google.rpc.Status` carries the same structured details
+        // a commit-path error does. They must reach `Error::details` under exactly the contract
+        // `from_spanner` documents — lowercased proto type-name keys, ProtoJSON values, in order —
+        // so a consumer cannot tell the two ingest transports apart.
+        let adbc = from_status_parts(
+            Code::AlreadyExists as i32,
+            "Row [v0] in table MockTable already exists",
+            &[
+                any_from_json(serde_json::json!({
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "reason": "DUPLICATE_KEY",
+                    "domain": "spanner.googleapis.com",
+                })),
+                any_from_json(serde_json::json!({
+                    "@type": "type.googleapis.com/google.rpc.BadRequest",
+                    "fieldViolations": [{"field": "Id", "description": "duplicate"}],
+                })),
+            ],
+        );
+        assert_eq!(adbc.status, Status::AlreadyExists);
+        assert_eq!(adbc.vendor_code, 6);
+
+        let details = adbc
+            .details
+            .expect("the group status' details must be forwarded");
+        let keys: Vec<&str> = details.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(keys, ["google.rpc.errorinfo", "google.rpc.badrequest"]);
+        // Values are the details' self-describing ProtoJSON, exactly as on the `from_spanner` path.
+        let error_info: serde_json::Value = serde_json::from_slice(&details[0].1).unwrap();
+        assert_eq!(
+            error_info["@type"],
+            "type.googleapis.com/google.rpc.ErrorInfo"
+        );
+        assert_eq!(error_info["reason"], "DUPLICATE_KEY");
+        assert_eq!(error_info["domain"], "spanner.googleapis.com");
+        let bad_request: serde_json::Value = serde_json::from_slice(&details[1].1).unwrap();
+        assert_eq!(bad_request["fieldViolations"][0]["field"], "Id");
+    }
+
+    #[test]
+    fn from_status_parts_keys_an_unrecognised_detail_off_its_type_url() {
+        // A detail type outside the well-known `google.rpc` set decodes to `StatusDetails::Other`
+        // and is still forwarded, keyed off its Any type URL — the same fallback `from_spanner` has.
+        let custom = serde_json::json!({
+            "@type": "type.googleapis.com/mycompany.CustomDetail",
+            "foo": "bar",
+        });
+        let adbc = from_status_parts(13, "boom", &[any_from_json(custom.clone())]);
+        let details = adbc.details.expect("custom detail forwarded");
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].0, "mycompany.customdetail");
+        let parsed: serde_json::Value = serde_json::from_slice(&details[0].1).unwrap();
+        assert_eq!(parsed, custom);
     }
 
     #[test]
