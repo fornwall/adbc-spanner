@@ -60,7 +60,7 @@ const MAX_COMMIT_DELAY_CAP: Duration = Duration::from_millis(500);
 /// non-exhaustive [`Priority`]) so the canonical option string can be recovered exactly for
 /// `get_option` and the parsing is unit-testable offline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RequestPriority {
+enum RequestPriority {
     Low,
     Medium,
     High,
@@ -68,7 +68,7 @@ pub(crate) enum RequestPriority {
 
 impl RequestPriority {
     /// The canonical option string, for `get_option` round-trip.
-    pub(crate) fn as_str(self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             RequestPriority::Low => "low",
             RequestPriority::Medium => "medium",
@@ -88,7 +88,7 @@ impl RequestPriority {
 
 /// Parse a `spanner.request.priority` value: exactly `low` / `medium` / `high` (lowercase, like
 /// every option value in this driver — ADBC option values are exact-match canonical strings).
-pub(crate) fn parse_priority(value: &str) -> Result<RequestPriority> {
+fn parse_priority(value: &str) -> Result<RequestPriority> {
     match value {
         "low" => Ok(RequestPriority::Low),
         "medium" => Ok(RequestPriority::Medium),
@@ -309,7 +309,7 @@ impl CommitStats {
 
 /// Parse a `spanner.commit.max_delay` value: a duration (the staleness duration grammar — `s`
 /// default, `ms`, `us`/`µs`, `ns`, `m`, `h`) that must fall within Spanner's `0..=500ms` range.
-pub(crate) fn parse_max_commit_delay(value: &str) -> Result<Duration> {
+fn parse_max_commit_delay(value: &str) -> Result<Duration> {
     let duration = parse_duration(value)?;
     if duration > MAX_COMMIT_DELAY_CAP {
         return Err(invalid_argument(format!(

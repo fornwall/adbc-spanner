@@ -227,7 +227,7 @@ impl RetryConfig {
     /// The gax retry policy for this configuration, or `None` when neither knob is set (leaving the
     /// client's default [`SpannerRetryPolicy`] in place). When either is set that same policy is
     /// re-applied explicitly, bounded by the configured attempt / elapsed-time limits.
-    pub(crate) fn retry_policy_arg(&self) -> Option<RetryPolicyArg> {
+    fn retry_policy_arg(&self) -> Option<RetryPolicyArg> {
         match (self.max_attempts, self.max_elapsed_duration()) {
             (None, None) => None,
             (Some(attempts), None) => Some(

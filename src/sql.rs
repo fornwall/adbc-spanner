@@ -86,7 +86,7 @@ pub(crate) fn is_dml_returning(sql: &str) -> bool {
 /// literal prefix marking a **raw** literal (`r`, `rb` or `br`, any case), in which backslash is
 /// an ordinary character rather than an escape. A plain bytes prefix (`b`) keeps backslash
 /// escapes, so it needs no special handling.
-pub(crate) fn is_raw_prefix(word: &str) -> bool {
+fn is_raw_prefix(word: &str) -> bool {
     // `eq_ignore_ascii_case` keeps this allocation-free — this runs once per word lexeme of every
     // lexed SQL string, so a `to_ascii_lowercase()` here would allocate per word.
     word.eq_ignore_ascii_case("r")
@@ -103,7 +103,7 @@ pub(crate) fn is_raw_prefix(word: &str) -> bool {
 /// - **raw** literals (`raw` = true, from an `r`/`rb`/`br` prefix — see [`is_raw_prefix`]), in
 ///   which `\` does not escape anything;
 /// - backslash escapes everywhere else, including quoted identifiers (`` ` ``, never triple/raw).
-pub(crate) fn consume_quoted(
+fn consume_quoted(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     quote: char,
     raw: bool,
@@ -149,7 +149,7 @@ pub(crate) fn consume_quoted(
 /// ignore the lexeme kinds they do not care about — all of them sharing this one lexer instead of
 /// a hand-rolled comment/quote walker each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Lexeme<'a> {
+enum Lexeme<'a> {
     /// A maximal run of identifier characters (`[A-Za-z0-9_]`): a keyword, identifier or number.
     Word(&'a str),
     /// A string/bytes literal or quoted identifier, delimiters included — triple-quoted, raw
@@ -168,7 +168,7 @@ pub(crate) enum Lexeme<'a> {
 /// `@name` extraction). The lexer
 /// tracks the trailing identifier run itself so it can recognise raw-literal prefixes (`r'…'`) —
 /// callers never need to; see [`consume_quoted`].
-pub(crate) fn lex(sql: &str) -> Lexer<'_> {
+fn lex(sql: &str) -> Lexer<'_> {
     Lexer {
         input: sql,
         chars: sql.chars().peekable(),
@@ -178,7 +178,7 @@ pub(crate) fn lex(sql: &str) -> Lexer<'_> {
 }
 
 /// The iterator behind [`lex`]. See [`Lexeme`] for the guarantees each item carries.
-pub(crate) struct Lexer<'a> {
+struct Lexer<'a> {
     input: &'a str,
     chars: std::iter::Peekable<std::str::Chars<'a>>,
     /// Byte offset of the next character `chars` will yield — used to slice `input`.
