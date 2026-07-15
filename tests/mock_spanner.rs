@@ -1575,6 +1575,12 @@ fn manual_ingest_conversion_failure_leaves_txn_buffer_untouched() {
 /// `table_exists` probe only fires to remap an *error*). The scripted `CommitResponse` carries a
 /// distinctive `mutation_count` the driver could not derive from the two ingested rows, proving it
 /// reads the server's value verbatim rather than counting rows.
+///
+/// TEST-5 rides along here: `spanner.commit.max_delay` is the other option
+/// `RequestConfig::apply_to_write_only` puts on this very `CommitRequest`, so the same scripted
+/// ingest asserts it arrives as the duration it was set to. The runner commit sites — and the
+/// negative (unset ⇒ no delay on the wire) — are covered by
+/// [`max_commit_delay_reaches_the_wire_on_runner_commits`].
 #[test]
 fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
     let _watchdog = Watchdog::arm(
@@ -1585,10 +1591,10 @@ fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
     // A value the driver cannot infer from the two ingested rows — it must come from the server.
     const SCRIPTED_MUTATION_COUNT: i64 = 4242;
 
-    // Whether the driver actually asked Spanner to return commit stats (it must, given
-    // `spanner.commit_stats=true`), captured off the CommitRequest the mock receives.
-    let saw_return_commit_stats = Arc::new(AtomicBool::new(false));
-    let flag = saw_return_commit_stats.clone();
+    // Every CommitRequest the mock receives, for the two commit-option wire assertions below
+    // (`return_commit_stats` and `max_commit_delay`).
+    let commits: Arc<Mutex<Vec<v1::CommitRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let record_commits = commits.clone();
     let server = MockServer::start(move |mock| {
         // The write-only ingest transaction begins a read/write transaction...
         mock.expect_begin_transaction().returning(|_| {
@@ -1597,11 +1603,11 @@ fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
                 ..Default::default()
             }))
         });
-        // ...then commits the insert mutations. Record whether commit stats were requested, and
-        // return a CommitResponse carrying the scripted mutation count. No precommit token is set,
-        // so the client's write-only path commits exactly once (no precommit-token retry).
+        // ...then commits the insert mutations. Record the request (the commit options ride it),
+        // and return a CommitResponse carrying the scripted mutation count. No precommit token is
+        // set, so the client's write-only path commits exactly once (no precommit-token retry).
         mock.expect_commit().returning(move |request| {
-            flag.store(request.into_inner().return_commit_stats, Ordering::SeqCst);
+            record_commits.lock().unwrap().push(request.into_inner());
             Ok(tonic::Response::new(v1::CommitResponse {
                 commit_stats: Some(v1::commit_response::CommitStats {
                     mutation_count: SCRIPTED_MUTATION_COUNT,
@@ -1635,6 +1641,14 @@ fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
             OptionValue::String("true".into()),
         )
         .expect("enable commit stats");
+    // TEST-5: the other commit option applied at this same write-only site — it must reach the
+    // CommitRequest as a 100ms `max_commit_delay` (asserted below).
+    statement
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_MAX_COMMIT_DELAY.into()),
+            OptionValue::String("100ms".into()),
+        )
+        .expect("set the commit delay");
 
     let rows = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, false)])),
@@ -1651,10 +1665,24 @@ fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
         "the ingest reports the number of rows it applied"
     );
 
-    assert!(
-        saw_return_commit_stats.load(Ordering::SeqCst),
-        "spanner.commit_stats=true must make the driver set return_commit_stats on the CommitRequest"
-    );
+    {
+        let commits = commits.lock().unwrap();
+        assert_eq!(commits.len(), 1, "the ingest chunk commits exactly once");
+        assert!(
+            commits[0].return_commit_stats,
+            "spanner.commit_stats=true must make the driver set return_commit_stats on the \
+             CommitRequest"
+        );
+        // TEST-5: the delay must arrive as the duration it was set to, not merely be present.
+        assert_eq!(
+            commits[0].max_commit_delay,
+            Some(prost_types::Duration {
+                seconds: 0,
+                nanos: 100_000_000,
+            }),
+            "spanner.commit.max_delay=100ms must reach the write-only ingest CommitRequest verbatim"
+        );
+    }
     // The count read back must be exactly what the server put in the CommitResponse.
     assert_eq!(
         statement
@@ -1664,6 +1692,162 @@ fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
             .expect("mutation count must be readable after a stats-bearing commit"),
         SCRIPTED_MUTATION_COUNT,
         "the driver must read back the server's mutation_count verbatim"
+    );
+}
+
+/// TEST-5 (wire): `spanner.commit.max_delay` is parse/round-trip tested offline (`src/request.rs`),
+/// but nothing proved the parsed duration leaves the driver. `RequestConfig::apply_to_runner` puts
+/// it on the read/write **runner** commits — autocommit DML and the manual-mode commit — which
+/// `commit_stats_mutation_count_is_captured_from_the_commit_response` (the write-only ingest site)
+/// does not touch.
+///
+/// Four commits on one connection, in order, all captured off the wire:
+/// 1. **Unset** (the negative that makes the rest meaningful): an autocommit DML before any
+///    `spanner.commit.max_delay` is set must carry **no** `max_commit_delay` — otherwise an
+///    assertion that the field is populated could never fail.
+/// 2. **Inherited**: with the connection-level option at `100ms`, a statement created afterwards
+///    inherits it and its autocommit DML commit carries exactly 100ms.
+/// 3. **Overridden**: a statement-level `250ms` wins over the connection's 100ms.
+/// 4. **Manual commit**: `Connection::commit` replays the buffered DML through the runner with the
+///    *connection's* 100ms (the statement's override does not leak into it).
+#[test]
+fn max_commit_delay_reaches_the_wire_on_runner_commits() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "max_commit_delay_reaches_the_wire_on_runner_commits",
+    );
+
+    const DML_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
+
+    /// The wire form of a `spanner.commit.max_delay` of `millis` milliseconds.
+    fn delay_millis(millis: i32) -> Option<prost_types::Duration> {
+        Some(prost_types::Duration {
+            seconds: 0,
+            nanos: millis * 1_000_000,
+        })
+    }
+
+    // Every CommitRequest the server saw, in order.
+    let commits: Arc<Mutex<Vec<v1::CommitRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let record = commits.clone();
+    let server = MockServer::start(move |mock| {
+        // In case the client begins the read/write transaction explicitly rather than inline.
+        serve_begin_transaction(mock);
+        // Autocommit DML and the manual commit both replay through ExecuteBatchDml; echo a
+        // transaction id back when the batch begins the transaction inline.
+        mock.expect_execute_batch_dml().returning(move |request| {
+            let request = request.into_inner();
+            let inline_begin = matches!(
+                request
+                    .transaction
+                    .as_ref()
+                    .and_then(|t| t.selector.as_ref()),
+                Some(v1::transaction_selector::Selector::Begin(_))
+            );
+            Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
+                result_sets: vec![v1::ResultSet {
+                    metadata: Some(v1::ResultSetMetadata {
+                        transaction: inline_begin.then(|| v1::Transaction {
+                            id: b"dml-txn".to_vec(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    stats: Some(v1::ResultSetStats {
+                        row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                status: Some(spanner_grpc_mock::google::rpc::Status {
+                    code: 0,
+                    message: "OK".into(),
+                    details: vec![],
+                }),
+                ..Default::default()
+            }))
+        });
+        mock.expect_commit().returning(move |request| {
+            record.lock().unwrap().push(request.into_inner());
+            commit_ok()
+        });
+    });
+
+    let mut connection = server.connect();
+
+    let run_autocommit_dml = |connection: &mut SpannerConnection, delay: Option<&str>| {
+        let mut statement = connection.new_statement().expect("new statement");
+        if let Some(value) = delay {
+            statement
+                .set_option(
+                    OptionStatement::Other(adbc_spanner::OPTION_MAX_COMMIT_DELAY.into()),
+                    OptionValue::String(value.into()),
+                )
+                .expect("set statement-level commit delay");
+        }
+        statement.set_sql_query(DML_SQL).unwrap();
+        assert_eq!(
+            statement.execute_update().expect("autocommit DML"),
+            Some(1),
+            "the scripted DML affects one row"
+        );
+    };
+
+    // 1. The negative: no commit delay configured anywhere yet.
+    run_autocommit_dml(&mut connection, None);
+
+    // 2. Statements created after this inherit the connection-level delay.
+    connection
+        .set_option(
+            OptionConnection::Other(adbc_spanner::OPTION_MAX_COMMIT_DELAY.into()),
+            OptionValue::String("100ms".into()),
+        )
+        .expect("set connection-level commit delay");
+    run_autocommit_dml(&mut connection, None);
+
+    // 3. ...and may override it.
+    run_autocommit_dml(&mut connection, Some("250ms"));
+
+    // 4. The manual-mode commit uses the connection's own config.
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("enter manual transaction mode");
+    let mut buffered = connection.new_statement().expect("new statement");
+    buffered.set_sql_query(DML_SQL).unwrap();
+    assert_eq!(
+        buffered.execute_update().expect("manual-mode DML buffers"),
+        None,
+        "manual-mode DML buffers (returns None), not commits"
+    );
+    connection.commit().expect("commit the buffered DML");
+
+    let commits = commits.lock().unwrap();
+    assert_eq!(
+        commits.len(),
+        4,
+        "one commit per transaction: three autocommit DMLs, then the manual commit"
+    );
+    assert_eq!(
+        commits[0].max_commit_delay, None,
+        "with spanner.commit.max_delay unset, the driver must send no max_commit_delay at all"
+    );
+    assert_eq!(
+        commits[1].max_commit_delay,
+        delay_millis(100),
+        "an autocommit DML must commit with the connection's inherited 100ms delay"
+    );
+    assert_eq!(
+        commits[2].max_commit_delay,
+        delay_millis(250),
+        "the statement-level 250ms must override the connection's 100ms"
+    );
+    assert_eq!(
+        commits[3].max_commit_delay,
+        delay_millis(100),
+        "the manual-mode commit must carry the connection's 100ms delay"
     );
 }
 
