@@ -312,10 +312,11 @@ pub(crate) fn collect_objects(
             {
                 continue;
             }
-            let ttype = table.table_type.to_string();
+            // Filter on the borrowed type name; only a kept row pays for the `String`.
+            let ttype = table.table_type;
             if table_type
                 .as_ref()
-                .is_some_and(|types| !types.iter().any(|t| *t == ttype))
+                .is_some_and(|types| !types.contains(&ttype))
             {
                 continue;
             }
@@ -336,7 +337,7 @@ pub(crate) fn collect_objects(
             );
             tables.push(Table {
                 name: name.to_string(),
-                table_type: ttype,
+                table_type: ttype.to_string(),
                 columns,
                 constraints,
             });
@@ -712,8 +713,8 @@ pub(crate) fn build(depth: ObjectDepth, schemas: Vec<DbSchema>) -> Result<Record
         new_null_array(db_schemas_field.data_type(), 1)
     } else {
         // Build the db_schema struct across all schemas.
-        let schema_names: ArrayRef = Arc::new(StringArray::from_iter(
-            schemas.iter().map(|s| Some(s.name.clone())),
+        let schema_names: ArrayRef = Arc::new(StringArray::from_iter_values(
+            schemas.iter().map(|s| s.name.as_str()),
         ));
 
         let tables_field = field(&db_schema_fields, "db_schema_tables")?;
@@ -725,11 +726,11 @@ pub(crate) fn build(depth: ObjectDepth, schemas: Vec<DbSchema>) -> Result<Record
             let table_item = list_item(&tables_field)?;
             let table_fields = struct_fields(&table_item)?;
 
-            let table_name: ArrayRef = Arc::new(StringArray::from_iter(
-                tables.iter().map(|t| Some(t.name.clone())),
+            let table_name: ArrayRef = Arc::new(StringArray::from_iter_values(
+                tables.iter().map(|t| t.name.as_str()),
             ));
-            let table_type: ArrayRef = Arc::new(StringArray::from_iter(
-                tables.iter().map(|t| Some(t.table_type.clone())),
+            let table_type: ArrayRef = Arc::new(StringArray::from_iter_values(
+                tables.iter().map(|t| t.table_type.as_str()),
             ));
 
             let cols_field = field(&table_fields, "table_columns")?;
@@ -792,19 +793,19 @@ fn build_column_struct(column_fields: &Fields, columns: &[&Column]) -> Result<Ar
     let arrays: Vec<ArrayRef> = column_fields
         .iter()
         .map(|f| match f.name().as_str() {
-            "column_name" => Arc::new(StringArray::from_iter(
-                columns.iter().map(|c| Some(c.name.clone())),
+            "column_name" => Arc::new(StringArray::from_iter_values(
+                columns.iter().map(|c| c.name.as_str()),
             )) as ArrayRef,
-            "ordinal_position" => Arc::new(Int32Array::from_iter(
-                columns.iter().map(|c| Some(c.ordinal)),
+            "ordinal_position" => Arc::new(Int32Array::from_iter_values(
+                columns.iter().map(|c| c.ordinal),
             )) as ArrayRef,
-            "xdbc_type_name" => Arc::new(StringArray::from_iter(
-                columns.iter().map(|c| Some(c.type_name.clone())),
+            "xdbc_type_name" => Arc::new(StringArray::from_iter_values(
+                columns.iter().map(|c| c.type_name.as_str()),
             )) as ArrayRef,
-            "xdbc_is_nullable" => Arc::new(StringArray::from_iter(
+            "xdbc_is_nullable" => Arc::new(StringArray::from_iter_values(
                 columns
                     .iter()
-                    .map(|c| Some(if c.nullable { "YES" } else { "NO" })),
+                    .map(|c| if c.nullable { "YES" } else { "NO" }),
             )) as ArrayRef,
             _ => new_null_array(f.data_type(), n),
         })
@@ -859,11 +860,12 @@ fn build_constraint_struct(
     let arrays: Vec<ArrayRef> = constraint_fields
         .iter()
         .map(|f| match f.name().as_str() {
+            // `constraint_name` is the one nullable column here, so it keeps `from_iter`.
             "constraint_name" => Arc::new(StringArray::from_iter(
-                constraints.iter().map(|c| c.name.clone()),
+                constraints.iter().map(|c| c.name.as_deref()),
             )) as ArrayRef,
-            "constraint_type" => Arc::new(StringArray::from_iter(
-                constraints.iter().map(|c| Some(c.constraint_type.clone())),
+            "constraint_type" => Arc::new(StringArray::from_iter_values(
+                constraints.iter().map(|c| c.constraint_type.as_str()),
             )) as ArrayRef,
             "constraint_column_names" => constraint_column_names.clone(),
             "constraint_column_usage" => constraint_column_usage.clone(),
@@ -884,16 +886,16 @@ fn build_usage_struct(usage_fields: &Fields, usages: &[&Usage]) -> Result<ArrayR
         .iter()
         .map(|f| match f.name().as_str() {
             "fk_catalog" => {
-                Arc::new(StringArray::from_iter(usages.iter().map(|_| Some("")))) as ArrayRef
+                Arc::new(StringArray::from_iter_values(usages.iter().map(|_| ""))) as ArrayRef
             }
-            "fk_db_schema" => Arc::new(StringArray::from_iter(
-                usages.iter().map(|u| Some(u.db_schema.clone())),
+            "fk_db_schema" => Arc::new(StringArray::from_iter_values(
+                usages.iter().map(|u| u.db_schema.as_str()),
             )) as ArrayRef,
-            "fk_table" => Arc::new(StringArray::from_iter(
-                usages.iter().map(|u| Some(u.table.clone())),
+            "fk_table" => Arc::new(StringArray::from_iter_values(
+                usages.iter().map(|u| u.table.as_str()),
             )) as ArrayRef,
-            "fk_column_name" => Arc::new(StringArray::from_iter(
-                usages.iter().map(|u| Some(u.column.clone())),
+            "fk_column_name" => Arc::new(StringArray::from_iter_values(
+                usages.iter().map(|u| u.column.as_str()),
             )) as ArrayRef,
             _ => new_null_array(f.data_type(), n),
         })

@@ -187,7 +187,7 @@ pub(crate) fn collect_statistics(
         runtime,
         cancel,
         with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async {
-            let mut slots: Vec<Option<RecordBatch>> = (0..prepared.len()).map(|_| None).collect();
+            let mut slots: Vec<Option<RecordBatch>> = vec![None; prepared.len()];
             let mut scans = stream::iter(prepared.iter().enumerate().map(|(idx, p)| {
                 let client = client.clone();
                 let sql = p.sql.clone();
@@ -354,8 +354,8 @@ pub(crate) fn build(schemas: Vec<SchemaStatistics>, out_schema: SchemaRef) -> Re
     let lengths: Vec<usize> = schemas.iter().map(|s| s.statistics.len()).collect();
     let db_schema_statistics = list_of(stat_item, &lengths, stat_struct)?;
 
-    let schema_names: ArrayRef = Arc::new(StringArray::from_iter(
-        schemas.iter().map(|s| Some(s.db_schema.clone())),
+    let schema_names: ArrayRef = Arc::new(StringArray::from_iter_values(
+        schemas.iter().map(|s| s.db_schema.as_str()),
     ));
     let db_schema_struct: ArrayRef = Arc::new(
         StructArray::try_new(
@@ -388,7 +388,7 @@ fn build_statistic_struct(stat_fields: &Fields, stats: &[&Statistic]) -> Result<
         }
     };
     let int64_values: ArrayRef =
-        Arc::new(Int64Array::from_iter(stats.iter().map(|s| Some(s.value))));
+        Arc::new(Int64Array::from_iter_values(stats.iter().map(|s| s.value)));
     // Every statistic value lives in the `int64` branch; `dense_union` fills the other branches with
     // empty children so the union type still matches the schema.
     let type_ids = vec![INT64_BRANCH; n];
@@ -403,19 +403,18 @@ fn build_statistic_struct(stat_fields: &Fields, stats: &[&Statistic]) -> Result<
     let arrays: Vec<ArrayRef> = stat_fields
         .iter()
         .map(|f| match f.name().as_str() {
-            "table_name" => Arc::new(StringArray::from_iter(
-                stats.iter().map(|s| Some(s.table.clone())),
+            "table_name" => Arc::new(StringArray::from_iter_values(
+                stats.iter().map(|s| s.table.as_str()),
             )) as ArrayRef,
+            // `column_name` is NULL for the table-level ROW_COUNT rows, so it keeps `from_iter`.
             "column_name" => Arc::new(StringArray::from_iter(
-                stats.iter().map(|s| s.column.clone()),
+                stats.iter().map(|s| s.column.as_deref()),
             )) as ArrayRef,
             "statistic_key" => {
-                Arc::new(Int16Array::from_iter(stats.iter().map(|s| Some(s.key)))) as ArrayRef
+                Arc::new(Int16Array::from_iter_values(stats.iter().map(|s| s.key))) as ArrayRef
             }
             "statistic_value" => statistic_value.clone(),
-            "statistic_is_approximate" => {
-                Arc::new(BooleanArray::from_iter(stats.iter().map(|_| Some(false)))) as ArrayRef
-            }
+            "statistic_is_approximate" => Arc::new(BooleanArray::from(vec![false; n])) as ArrayRef,
             _ => new_null_array(f.data_type(), n),
         })
         .collect();
