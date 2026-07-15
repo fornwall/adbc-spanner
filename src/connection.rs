@@ -72,7 +72,7 @@
 //!   ambiguous transport failures.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -92,18 +92,13 @@ use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::{MultiUseReadOnlyTransaction, ReadWriteTransaction};
 
 use crate::conversion::{TimestampPrecision, result_set_to_batch, stream_query};
-use crate::directed_read::DirectedRead;
 use crate::driver::{Connected, SharedDatabaseAdmin};
 use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
-use crate::options::{impl_shared_option_dispatch, impl_typed_option_getters};
-use crate::query_options::QueryOptionsConfig;
-use crate::request::{CommitStats, RequestConfig};
-use crate::retry::RetryConfig;
+use crate::options::{SharedConfig, impl_shared_option_dispatch, impl_typed_option_getters};
 use crate::runtime::{CancelSignal, CancelSlot, SharedRuntime, block_on_cancellable};
 use crate::sql::qualified_table;
-use crate::staleness::ReadStaleness;
 use crate::statement::{DEFAULT_ROWS_PER_BATCH, SpannerStatement};
-use crate::timeout::{RpcTimeouts, with_timeout};
+use crate::timeout::with_timeout;
 
 /// What a manual transaction has become — fixed by its **first** statement, after which work of
 /// the other kind is rejected with [`Status::InvalidState`] until `commit` or `rollback` (see
@@ -621,52 +616,11 @@ pub struct SpannerConnection {
     /// on the same database — so the first DDL statement builds it and later ones clone it (see
     /// [`SharedDatabaseAdmin`]).
     admin: SharedDatabaseAdmin,
-    /// The standard `adbc.connection.readonly` flag. Shared (`Arc`) with every statement the
-    /// connection creates, and read by statements at *execution* time, so toggling the option
-    /// immediately affects existing statements in both directions.
-    read_only: Arc<AtomicBool>,
-    /// Isolation level applied to read/write transactions (autocommit DML and manual-mode commit),
-    /// set via the standard ADBC `adbc.connection.transaction.isolation_level` option. It reaches
-    /// only the DML paths — queries take a timestamp bound instead (see [`apply_isolation`]).
-    /// [`IsolationLevel::Unspecified`] (the default) sends no level, which Spanner reads as
-    /// `SERIALIZABLE`.
-    isolation: IsolationLevel,
-    /// Read bound for read-only queries (`spanner.read.staleness`). The default is a strong read;
-    /// this becomes the default for statements created on the connection, which may override it.
-    read_staleness: ReadStaleness,
-    /// Request priority and request/transaction tags (`spanner.request.priority` /
-    /// `spanner.request.tag` / `spanner.transaction.tag`). Unset by default; becomes the default
-    /// for statements created on the connection, which may override the priority and request tag
-    /// (the transaction tag is connection-level only).
-    request: RequestConfig,
-    /// Directed-read replica selection for read-only queries (`spanner.directed_read`). Unset by
-    /// default (Spanner's own routing); becomes the default for statements created on the
-    /// connection, which may override it.
-    directed_read: DirectedRead,
-    /// Query optimizer options (`spanner.query.optimizer_version` /
-    /// `spanner.query.optimizer_statistics_package`). Unset by default; becomes the default for
-    /// statements created on the connection, which may override either field.
-    query_options: QueryOptionsConfig,
-    /// How `TIMESTAMP` columns map to Arrow (`spanner.max_timestamp_precision`): nanoseconds that
-    /// error on out-of-range instants (the default) or microseconds covering Spanner's full range.
-    /// Becomes the default for statements created on the connection, which may override it; also
-    /// applied to `get_table_schema` and `read_partition` (which have no statement).
-    timestamp_precision: TimestampPrecision,
-    /// RPC timeouts (`spanner.rpc.timeout_seconds.{query,update,fetch}`). Unset by default (no
-    /// deadline); becomes the default for statements created on the connection, which may override
-    /// each value. The connection itself applies the update timeout to its commit paths and the
-    /// query/fetch timeouts to `read_partition`.
-    timeouts: RpcTimeouts,
-    /// Retry-policy tuning (`spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds`).
-    /// Unset by default (the client's own policy); becomes the default for statements created on the
-    /// connection, which may override each knob. The connection itself applies it to its commit
-    /// paths (autocommit DML, the manual-mode commit, ingest commits).
-    retry: RetryConfig,
-    /// Mutation count captured from the connection's most recent manual-mode commit that requested
-    /// commit statistics (`spanner.commit_stats`), read back via
-    /// `spanner.commit_stats.mutation_count`. Connection-owned (not shared with statements): the
-    /// manual-mode commit runs on the connection, so its stats belong here.
-    commit_stats: CommitStats,
+    /// Every option-settable value on this connection — the readonly flag, the isolation level, the
+    /// read staleness, request/retry/timeout/optimizer config and this connection's commit-stats
+    /// cell. Each statement the connection creates starts from a [`SharedConfig::inherit`]ed copy
+    /// and may override the fields it exposes; see [`SharedConfig`] for the per-field detail.
+    config: SharedConfig,
     txn: SharedTxn,
     /// Per-operation cancellation for this connection's metadata/commit operations (see
     /// [`Connection::cancel`]): each entry point mints a fresh [`CancelSignal`] here, and
@@ -688,25 +642,10 @@ impl SpannerConnection {
             spanner: connected.spanner,
             database: connected.database,
             admin: connected.admin,
-            read_only: Arc::new(AtomicBool::new(false)),
-            isolation: IsolationLevel::Unspecified,
-            read_staleness: ReadStaleness::default(),
-            request: RequestConfig::default(),
-            directed_read: DirectedRead::default(),
-            query_options: QueryOptionsConfig::default(),
-            timestamp_precision: TimestampPrecision::default(),
-            timeouts: RpcTimeouts::default(),
-            retry: RetryConfig::default(),
-            commit_stats: CommitStats::default(),
+            config: SharedConfig::default(),
             txn: Arc::new(Mutex::new(TxnState::new())),
             cancel: CancelSlot::new(),
         }
-    }
-
-    /// The *live* value of this connection's `adbc.connection.readonly` flag — the same shared
-    /// flag the statement write paths load at execution time.
-    fn is_read_only(&self) -> bool {
-        self.read_only.load(Ordering::Acquire)
     }
 
     /// Apply the buffered work of a manual transaction: DML statements and ingest mutations
@@ -717,7 +656,7 @@ impl SpannerConnection {
     /// buffered work to apply (see [`check_commit_writable`]); the caller keeps the buffer, so
     /// the transaction stays replayable exactly as after any other failed commit.
     fn apply_manual_txn(&self, work: &ManualTxn) -> Result<()> {
-        check_commit_writable(self.is_read_only(), work)?;
+        check_commit_writable(self.config.is_read_only(), work)?;
         match work {
             ManualTxn::Unset | ManualTxn::Read(_) => Ok(()),
             ManualTxn::Dml {
@@ -749,10 +688,7 @@ impl SpannerConnection {
                 &self.runtime,
                 &self.client,
                 &self.cancel.current(),
-                self.request.clone(),
-                self.retry,
-                self.timeouts.update_timeout(),
-                &self.commit_stats,
+                &self.config,
                 mutations,
             );
         }
@@ -760,11 +696,7 @@ impl SpannerConnection {
             &self.runtime,
             &self.client,
             &self.cancel.current(),
-            self.isolation.clone(),
-            self.request.clone(),
-            self.retry,
-            self.timeouts.update_timeout(),
-            &self.commit_stats,
+            &self.config,
             statements,
             mutations,
             // Manual commit buffers mutations that Spanner applies at commit, so this batch is not
@@ -783,7 +715,7 @@ impl SpannerConnection {
             &self.runtime,
             &self.client,
             &self.cancel.current(),
-            self.timeouts.query_timeout(),
+            self.config.timeouts.query_timeout(),
             db_schema,
             table_name,
         )
@@ -902,16 +834,11 @@ fn isolation_to_adbc_string(isolation: &IsolationLevel) -> &'static str {
 /// single-DML case and dbt-style `DELETE …; INSERT …` batches alike. Mutation-carrying /
 /// manual-commit batches instead go through [`run_batch_txn`] with the flag off (their commit
 /// still applies buffered mutations, so the batch is *not* the transaction's last request).
-#[allow(clippy::too_many_arguments)] // threads one connection/statement config item per argument
 pub(crate) fn run_batch_dml(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
     cancel: &CancelSignal,
-    isolation: IsolationLevel,
-    request: RequestConfig,
-    retry: RetryConfig,
-    timeout: Option<Duration>,
-    commit_stats: &CommitStats,
+    config: &SharedConfig,
     statements: Vec<SpannerSql>,
 ) -> Result<i64> {
     // Every autocommit batch is the whole transaction — nothing follows it before the commit —
@@ -921,11 +848,7 @@ pub(crate) fn run_batch_dml(
         runtime,
         client,
         cancel,
-        isolation,
-        request,
-        retry,
-        timeout,
-        commit_stats,
+        config,
         statements,
         Vec::new(),
         last_statements,
@@ -941,8 +864,8 @@ pub(crate) fn run_batch_dml(
 /// are replayed on each attempt. This is the manual-transaction commit path; the DML-only wrapper
 /// is [`run_batch_dml`].
 ///
-/// `timeout` — the caller's `spanner.rpc.timeout_seconds.update` value — is an overall deadline on
-/// the whole transaction (including the runner's abort retries); expiry fails with
+/// The caller's `spanner.rpc.timeout_seconds.update` value (`config.timeouts`) is an overall
+/// deadline on the whole transaction (including the runner's abort retries); expiry fails with
 /// [`Status::Timeout`]. Note a commit whose confirmation the driver stopped waiting for may still
 /// have landed server-side, the usual ambiguity of any timed-out commit.
 ///
@@ -950,16 +873,11 @@ pub(crate) fn run_batch_dml(
 /// [`run_batch_dml`] doc for the `last_statement` optimization). Callers must pass `false` unless
 /// the batch is genuinely the whole transaction: the manual-commit path buffers `mutations` that
 /// Spanner applies *at* commit, so the batch is never the last request there.
-#[allow(clippy::too_many_arguments)] // threads one connection/statement config item per argument
 pub(crate) fn run_batch_txn(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
     cancel: &CancelSignal,
-    isolation: IsolationLevel,
-    request: RequestConfig,
-    retry: RetryConfig,
-    timeout: Option<Duration>,
-    commit_stats: &CommitStats,
+    config: &SharedConfig,
     statements: Vec<SpannerSql>,
     mutations: Vec<Mutation>,
     last_statements: bool,
@@ -967,6 +885,11 @@ pub(crate) fn run_batch_txn(
     if statements.is_empty() && mutations.is_empty() {
         return Ok(0);
     }
+    // Owned copies for the `async move` below (the runner replays its closure on abort).
+    let isolation = config.isolation.clone();
+    let request = config.request.clone();
+    let retry = config.retry;
+    let timeout = config.timeouts.update_timeout();
     let client = client.clone();
     let transaction = async move {
         // The commit priority and transaction tag ride on the runner; the request tag rides on the
@@ -1015,7 +938,7 @@ pub(crate) fn run_batch_txn(
         cancel,
         with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_UPDATE, transaction),
     )?;
-    commit_stats.record(mutation_count);
+    config.commit_stats.record(mutation_count);
     Ok(count)
 }
 
@@ -1027,26 +950,26 @@ pub(crate) fn run_batch_txn(
 /// can apply the batch twice — `write` is replay-protected: it begins the transaction with a
 /// mutation key and retries internally on `ABORTED`, so on success the mutations were applied
 /// **exactly once** whatever the underlying network did. The same commit configuration as the
-/// runner path is applied via [`RequestConfig::apply_to_write_only`] /
-/// [`RetryConfig::apply_to_write_only`]: commit priority, transaction tag,
+/// runner path is applied via [`RequestConfig::apply_to_write_only`](crate::request::RequestConfig::apply_to_write_only) /
+/// [`RetryConfig::apply_to_write_only`](crate::retry::RetryConfig::apply_to_write_only): commit priority, transaction tag,
 /// `spanner.commit.max_delay`, `spanner.commit_stats` (the returned mutation count is recorded
-/// into `commit_stats`), and the retry/backoff tuning on the Begin/Commit RPCs. The isolation
-/// level does not apply here — the write-only builder exposes no isolation setter, and a
-/// transaction that performs no reads has no reads for a level to constrain.
-#[allow(clippy::too_many_arguments)] // threads one connection/statement config item per argument
+/// into `config.commit_stats`), and the retry/backoff tuning on the Begin/Commit RPCs.
+/// `config.isolation` is deliberately ignored here — the write-only builder exposes no isolation
+/// setter, and a transaction that performs no reads has no reads for a level to constrain.
 pub(crate) fn write_mutations_txn(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
     cancel: &CancelSignal,
-    request: RequestConfig,
-    retry: RetryConfig,
-    timeout: Option<Duration>,
-    commit_stats: &CommitStats,
+    config: &SharedConfig,
     mutations: Vec<Mutation>,
 ) -> Result<()> {
     if mutations.is_empty() {
         return Ok(());
     }
+    // Owned copies for the `async move` below.
+    let request = config.request.clone();
+    let retry = config.retry;
+    let timeout = config.timeouts.update_timeout();
     let client = client.clone();
     let transaction = async move {
         let response = retry
@@ -1069,7 +992,7 @@ pub(crate) fn write_mutations_txn(
         cancel,
         with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_UPDATE, transaction),
     )?;
-    commit_stats.record(mutation_count);
+    config.commit_stats.record(mutation_count);
     Ok(())
 }
 
@@ -1323,15 +1246,17 @@ impl Optionable for SpannerConnection {
                     return Err(e);
                 }
             }
-            OptionConnection::ReadOnly => self.read_only.store(
+            OptionConnection::ReadOnly => self.config.read_only.store(
                 crate::options::bool_option(value, "option adbc.connection.readonly")?,
                 Ordering::Release,
             ),
-            OptionConnection::IsolationLevel => self.isolation = parse_isolation_level(value)?,
+            OptionConnection::IsolationLevel => {
+                self.config.isolation = parse_isolation_level(value)?
+            }
             // Connection-only: the transaction tag applies to the whole read/write transaction, so
             // it is not a per-statement option (not in the shared dispatch below).
             OptionConnection::Other(k) if k == crate::OPTION_TRANSACTION_TAG => {
-                self.request.set_transaction_tag(value)?;
+                self.config.request.set_transaction_tag(value)?;
             }
             // Every other `spanner.*` option the connection and statement dispatch identically —
             // request priority/tag, directed read, staleness, max_commit_delay, commit_stats, query
@@ -1371,12 +1296,13 @@ impl Optionable for SpannerConnection {
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
         match &key {
             OptionConnection::AutoCommit => Ok(self.txn.lock().unwrap().autocommit.to_string()),
-            OptionConnection::ReadOnly => Ok(self.read_only.load(Ordering::Acquire).to_string()),
+            OptionConnection::ReadOnly => Ok(self.config.is_read_only().to_string()),
             OptionConnection::IsolationLevel => {
-                Ok(isolation_to_adbc_string(&self.isolation).to_string())
+                Ok(isolation_to_adbc_string(&self.config.isolation).to_string())
             }
             // Connection-only (see the setter): reports the transaction tag, or NotFound when unset.
             OptionConnection::Other(k) if k == crate::OPTION_TRANSACTION_TAG => self
+                .config
                 .request
                 .transaction_tag_string()
                 .map(str::to_string)
@@ -1414,15 +1340,7 @@ impl Connection for SpannerConnection {
             self.spanner.clone(),
             self.database.clone(),
             self.admin.clone(),
-            self.read_only.clone(),
-            self.isolation.clone(),
-            self.read_staleness.clone(),
-            self.request.clone(),
-            self.directed_read.clone(),
-            self.query_options.clone(),
-            self.timestamp_precision,
-            self.timeouts,
-            self.retry,
+            self.config.inherit(),
             self.txn.clone(),
         ))
     }
@@ -1478,7 +1396,7 @@ impl Connection for SpannerConnection {
             &self.runtime,
             &self.client,
             &self.cancel.current(),
-            self.timeouts.query_timeout(),
+            self.config.timeouts.query_timeout(),
             depth,
             &crate::objects::ObjectFilters {
                 db_schema,
@@ -1514,16 +1432,16 @@ impl Connection for SpannerConnection {
         let table = qualified_table(db_schema, table_name);
         let sql = format!("SELECT * FROM {table} LIMIT 0");
         let client = self.client.clone();
-        let bound = self.read_staleness.timestamp_bound()?;
+        let bound = self.config.read_staleness.timestamp_bound()?;
         // The reported schema honours the connection's timestamp precision, so it matches what a
         // query on this connection would actually stream.
-        let precision = self.timestamp_precision;
+        let precision = self.config.timestamp_precision;
         // A metadata read, so the connection's query timeout bounds it.
         let result = block_on_cancellable(
             &self.runtime,
             &self.cancel.current(),
             with_timeout(
-                self.timeouts.query_timeout(),
+                self.config.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
                 async move {
                     let transaction = crate::staleness::single_use(&client, bound);
@@ -1612,8 +1530,8 @@ impl Connection for SpannerConnection {
             &self.runtime,
             &self.client,
             &self.cancel.current(),
-            self.timeouts.query_timeout(),
-            &self.read_staleness,
+            self.config.timeouts.query_timeout(),
+            &self.config.read_staleness,
             db_schema,
             table_name,
         )?;
@@ -1699,13 +1617,13 @@ impl Connection for SpannerConnection {
         // same mode as the producing statement so the descriptor's advertised schema matches). The
         // connection's query timeout bounds the initial execute + first chunk; its fetch timeout
         // bounds each later chunk inside the prefetch task.
-        let precision = self.timestamp_precision;
-        let fetch_timeout = self.timeouts.fetch_timeout();
+        let precision = self.config.timestamp_precision;
+        let fetch_timeout = self.config.timeouts.fetch_timeout();
         let reader = block_on_cancellable(
             &self.runtime,
             &self.cancel.current(),
             with_timeout(
-                self.timeouts.query_timeout(),
+                self.config.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
                 async move {
                     let result_set = partition.execute(&client).await.map_err(from_spanner)?;
