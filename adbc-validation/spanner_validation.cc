@@ -207,22 +207,25 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
         // then binds the Arrow int64/string columns to matching param types).
         {"StatementTest::TestSqlPrepareSelectParams::select-params",
          {"SELECT @p0, @p1", "SELECT CAST(@p0 AS INT64), CAST(@p1 AS STRING)"}},
-        // Still excluded (the readback asserts insertion order, unrecoverable
-        // in Spanner's unordered tables — see EXCLUDED in
-        // scripts/run-adbc-validation.sh), but the inserts themselves are
-        // rewritten to valid GoogleSQL so the cases fail only on that final
-        // ordering assertion: INSERT requires a column list, and omitting
-        // `adbc_ingest_key` lets its DEFAULT (GENERATE_UUID()) fill the key.
+        // Now passing (apache/arrow-adbc#4534 gave the readback a deterministic
+        // `ORDER BY <col> ASC NULLS FIRST` and sorted the expected vectors — see
+        // ARROW_ADBC_TAG in CMakeLists.txt). INSERT needs a column list, and
+        // omitting `adbc_ingest_key` lets its DEFAULT (GENERATE_UUID()) fill the
+        // synthetic key; the readback drops NULLS FIRST (implicit for GoogleSQL
+        // ASC) and projects past that key, so it returns the ingested column in
+        // the NULL-first ascending order the suite now expects.
         {"StatementTest::TestSqlPrepareUpdate::insert-bulk-ingest",
          {"INSERT INTO `bulk_ingest` VALUES (@p0)",
           "INSERT INTO `bulk_ingest` (`int64s`) VALUES (@p0)"}},
         {"StatementTest::TestSqlPrepareUpdate::select-bulk-ingest",
-         {"SELECT * FROM `bulk_ingest`", "SELECT `int64s` FROM `bulk_ingest`"}},
+         {"SELECT * FROM `bulk_ingest` ORDER BY `int64s` ASC NULLS FIRST",
+          "SELECT `int64s` FROM `bulk_ingest` ORDER BY `int64s` ASC"}},
         {"StatementTest::TestSqlPrepareUpdateStream::insert-bulk-ingest",
          {"INSERT INTO `bulk_ingest` VALUES (@p0)",
           "INSERT INTO `bulk_ingest` (`ints`) VALUES (@p0)"}},
         {"StatementTest::TestSqlPrepareUpdateStream::select-bulk-ingest",
-         {"SELECT * FROM `bulk_ingest`", "SELECT `ints` FROM `bulk_ingest`"}},
+         {"SELECT * FROM `bulk_ingest` ORDER BY `ints` ASC NULLS FIRST",
+          "SELECT `ints` FROM `bulk_ingest` ORDER BY `ints` ASC"}},
         // Suite-internal DDL/DML in Spanner-valid form.
         {"StatementTest::TestSqlBind::create-table-bindtest",
          {"CREATE TABLE bindtest (col1 INTEGER, col2 TEXT)",

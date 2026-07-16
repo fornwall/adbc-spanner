@@ -121,15 +121,17 @@ done
 # never appear here.
 # ---------------------------------------------------------------------------
 EXCLUDED=(
-  # --- Bucket 1: readbacks that assert insertion order -------------------------
-  # Both cases create `bulk_ingest` via create-mode ingest, INSERT more rows via
-  # bound params, and then assert the `SELECT *` readback returns ALL rows in
-  # insertion order. The SpannerQuirks::RewriteSql overrides
-  # (apache/arrow-adbc#4514 routes the SQL; see spanner_validation.cc) fix the SQL itself —
-  # the INSERT gets its required column list, the readback dodges the synthetic
-  # adbc_ingest_key column — but no SQL can recover insertion order from a
-  # Spanner table: rows come back in primary-key order and the synthetic key is
-  # a random UUID. The final CompareArray on row order is what still fails.
+  # --- Formerly Bucket 1: readbacks that asserted insertion order --------------
+  # SqlPrepareUpdate / SqlPrepareUpdateStream used to live here: both create
+  # `bulk_ingest` via create-mode ingest, INSERT more rows via bound params, and
+  # read the rows back. They are NOT excluded anymore — apache/arrow-adbc#4534
+  # gave the readback a deterministic `ORDER BY <col> ASC NULLS FIRST` and sorted
+  # the expected vectors, so the SpannerQuirks::RewriteSql overrides (see
+  # spanner_validation.cc) now make them pass: the INSERT gets its required
+  # column list, and the readback drops NULLS FIRST (implicit for GoogleSQL ASC)
+  # and projects past the synthetic adbc_ingest_key column, returning the
+  # ingested column in the NULL-first ascending order the suite expects.
+  # Gate-enforced.
   #
   # The rest of the former non-Spanner-DDL bucket is NOT here anymore: SqlBind,
   # SqlQueryEmpty, SqlQueryInsertRollback, SqlQueryRowsAffectedDelete{,Stream}
@@ -142,8 +144,7 @@ EXCLUDED=(
   # Spanner-incompatible bit was the bare `CAST(1.5 AS FLOAT)` query, rewritten
   # to GoogleSQL `FLOAT64` (apache/arrow-adbc#4496), so both pass and are
   # gate-enforced.
-  'SpannerStatementTest.SqlPrepareUpdate'
-  'SpannerStatementTest.SqlPrepareUpdateStream'
+  #
   # Transactions is NOT excluded: it expects read-your-writes of an uncommitted
   # ingest, which the driver's buffer-and-commit manual transactions (one kind of
   # work per transaction — queries or DML) reject with InvalidState, so the case
