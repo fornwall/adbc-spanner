@@ -26,8 +26,9 @@ use arrow_schema::{DataType, Fields, SchemaRef};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::Statement as SpannerSql;
+use google_cloud_spanner::transaction::MultiUseReadOnlyTransaction;
 
-use crate::connection::{LikeMatcher, query_batch, str_col};
+use crate::connection::{LikeMatcher, str_col};
 use crate::conversion::result_set_to_batch;
 use crate::error::{err, from_spanner};
 use crate::nested::{arrow_err, dense_union, field, list_item, list_of, struct_fields};
@@ -91,23 +92,44 @@ pub(crate) fn collect_statistics(
     db_schema: Option<&str>,
     table_name: Option<&str>,
 ) -> Result<Vec<SchemaStatistics>> {
+    // Build ONE multi-use read-only transaction so the INFORMATION_SCHEMA discovery *and* every
+    // per-table aggregate scan observe a single, consistent snapshot (SPAN-5): a table created
+    // between discovery and its scan can no longer fail the call, and all counts are taken at one
+    // timestamp. This mirrors `collect_objects`, which runs its metadata queries on one shared
+    // read-only transaction; the bound-query path likewise shares an
+    // `Arc<MultiUseReadOnlyTransaction>` across statements. Honour the configured
+    // `spanner.read.staleness` (pinned to its multi-use-legal equivalent) on it, as `collect_objects`
+    // does, so a stale read still reads from one pinned timestamp. Building it issues no RPC — the
+    // begin is inline on the first query below.
+    let bound = read_staleness.multi_use_timestamp_bound()?;
+    let txn = {
+        let client = client.clone();
+        Arc::new(block_on_cancellable(runtime, cancel, async move {
+            let mut builder = client.read_only_transaction();
+            if let Some(b) = bound {
+                builder = builder.set_timestamp_bound(b);
+            }
+            builder.build().await.map_err(from_spanner)
+        })?)
+    };
+
     // A metadata read, so the connection's query timeout bounds each network phase — the
     // INFORMATION_SCHEMA discovery fetch here, and the aggregate scans below — with `Status::Timeout`
     // on expiry; unset (the default) leaves them unbounded.
     let (table_batch, column_batch) = {
-        let client = client.clone();
+        let txn = txn.clone();
         block_on_cancellable(
             runtime,
             cancel,
             with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async move {
-                let tables = query_batch(
-                    &client,
+                let tables = query_txn(
+                    &txn,
                     "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
                      WHERE TABLE_TYPE = 'BASE TABLE'",
                 )
                 .await?;
-                let columns = query_batch(
-                    &client,
+                let columns = query_txn(
+                    &txn,
                     "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, SPANNER_TYPE \
                      FROM INFORMATION_SCHEMA.COLUMNS \
                      ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION",
@@ -143,7 +165,6 @@ pub(crate) fn collect_statistics(
     // order. The scans run concurrently below but their results are yielded back in this same
     // order, so the output (tables, schemas and their statistics) is identical to a sequential
     // loop regardless of completion order.
-    let bound = read_staleness.timestamp_bound()?;
     // The `LIKE` patterns are loop-invariant, so compile each once and reuse it across every row.
     let db_schema_matcher = db_schema.map(LikeMatcher::new);
     let table_name_matcher = table_name.map(LikeMatcher::new);
@@ -175,37 +196,22 @@ pub(crate) fn collect_statistics(
         });
     }
 
-    // Run the per-table aggregate scans with bounded concurrency on the one shared runtime.
-    // `buffered` polls up to `STATISTICS_SCAN_CONCURRENCY` of them at once yet yields their results
-    // in input order, so the deterministic `prepared` order is preserved without reassembly. The
-    // whole stream is driven inside a single `block_on_cancellable`, so a `cancel` still interrupts
-    // an in-flight batch of scans, and any scan error ends the collect as an overall `Err`.
-    // The whole concurrent scan phase is one query-side operation, bounded by the same query
-    // timeout (so a stalled aggregate scan cannot hang the collector unboundedly).
+    // Run the per-table aggregate scans with bounded concurrency on the one shared runtime, all on
+    // the shared read-only transaction built above so every count is taken at the same snapshot as
+    // the discovery reads. `buffered` polls up to `STATISTICS_SCAN_CONCURRENCY` of them at once yet
+    // yields their results in input order, so the deterministic `prepared` order is preserved
+    // without reassembly. The whole stream is driven inside a single `block_on_cancellable`, so a
+    // `cancel` still interrupts an in-flight batch of scans, and any scan error ends the collect as
+    // an overall `Err`. The whole concurrent scan phase is one query-side operation, bounded by the
+    // same query timeout (so a stalled aggregate scan cannot hang the collector unboundedly).
     let batches: Vec<RecordBatch> = block_on_cancellable(
         runtime,
         cancel,
         with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async {
             stream::iter(prepared.iter().map(|p| {
-                let client = client.clone();
+                let txn = txn.clone();
                 let sql = p.sql.clone();
-                // The aggregate scans the user table, so honour the connection's read staleness.
-                let bound = bound.clone();
-                async move {
-                    let transaction = crate::staleness::single_use(&client, bound);
-                    let result_set = transaction
-                        .execute_query(SpannerSql::builder(sql).build())
-                        .await
-                        .map_err(from_spanner)?;
-                    // The aggregate scan returns only INT64 counts, never a TIMESTAMP column, so the
-                    // default timestamp precision is fine here.
-                    let (_schema, batch) = result_set_to_batch(
-                        result_set,
-                        crate::conversion::TimestampPrecision::default(),
-                    )
-                    .await?;
-                    Ok::<_, Error>(batch)
-                }
+                async move { query_txn(&txn, &sql).await }
             }))
             .buffered(STATISTICS_SCAN_CONCURRENCY)
             .try_collect()
@@ -232,6 +238,21 @@ pub(crate) fn collect_statistics(
         }
     }
     Ok(schemas)
+}
+
+/// Run one metadata/aggregate query on the shared multi-use read-only transaction and materialise
+/// its result batch. Every read in [`collect_statistics`] — the `INFORMATION_SCHEMA` discovery and
+/// each per-table aggregate scan — goes through this one transaction, so they all observe a single
+/// consistent snapshot. The results are only INT64 counts or string metadata, never a TIMESTAMP
+/// column, so the default timestamp precision is fine.
+async fn query_txn(txn: &MultiUseReadOnlyTransaction, sql: &str) -> Result<RecordBatch> {
+    let result_set = txn
+        .execute_query(SpannerSql::builder(sql).build())
+        .await
+        .map_err(from_spanner)?;
+    let (_schema, batch) =
+        result_set_to_batch(result_set, crate::conversion::TimestampPrecision::default()).await?;
+    Ok(batch)
 }
 
 /// A per-table aggregate statistics query, prepared but not yet run.

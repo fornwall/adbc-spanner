@@ -1066,21 +1066,6 @@ pub(crate) fn table_exists(
     )
 }
 
-/// Run a query and return its single materialised record batch. Shared with the `INFORMATION_SCHEMA`
-/// collector in [`crate::statistics`] ([`crate::objects`] runs its queries concurrently on one
-/// multi-use read-only transaction instead).
-pub(crate) async fn query_batch(client: &DatabaseClient, sql: &str) -> Result<RecordBatch> {
-    let transaction = client.single_use().build();
-    let result_set = transaction
-        .execute_query(SpannerSql::builder(sql).build())
-        .await
-        .map_err(from_spanner)?;
-    // The INFORMATION_SCHEMA collectors read only string/int columns, never TIMESTAMPs, so the
-    // default timestamp precision is fine here.
-    let (_schema, batch) = result_set_to_batch(result_set, TimestampPrecision::default()).await?;
-    Ok(batch)
-}
-
 /// Extract column `index` of an `INFORMATION_SCHEMA` batch as a [`StringArray`]. Shared with the
 /// collectors in [`crate::objects`] and [`crate::statistics`].
 pub(crate) fn str_col(batch: &RecordBatch, index: usize) -> Result<&StringArray> {
