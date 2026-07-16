@@ -7,7 +7,7 @@
 //! identically and returns the same `InvalidArguments` status on bad input.
 //!
 //! Each helper takes a `what` label describing the option (e.g. `"option spanner.emulator"` or
-//! `"max_partitions"`) so the shared error message names the offending option.
+//! `"rows_per_batch"`) so the shared error message names the offending option.
 
 use adbc_core::error::Result;
 use adbc_core::options::OptionValue;

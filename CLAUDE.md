@@ -580,7 +580,13 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   `stream_query` path as `execute`. This works because the client's session is **multiplexed** and
   `Arc`-shared across the connection's cloned `DatabaseClient`s, so a descriptor stays valid after
   the producing statement is gone. `spanner.data_boost` (statement option) bakes Data
-  Boost into each descriptor; `spanner.partition.max_count` hints the partition count. The emulator
+  Boost into each descriptor; the `PartitionQuery` call passes a default `PartitionOptions` and
+  Spanner chooses the partition count. (There is deliberately no `max_partitions` knob: the Spanner
+  proto documents the field as "currently ignored by `PartitionQuery` and `PartitionRead` requests"
+  — and those are its only two consumers in the v1 API — and says the returned count "can be smaller
+  or larger" than the request, so it is not a cap even in principle. A `spanner.partition.max_count`
+  statement option existed until it was removed as inert; the key now returns `NotImplemented` like
+  any unknown statement option.) The emulator
   supports the Partition RPCs (it ignores Data Boost) — covered by `execute_partitions_round_trip` in
   `tests/integration.rs`. **Security caveat:** a descriptor is opaque but *executable* — its serde
   JSON carries the SQL text plus session/transaction identity, so `read_partition` runs whatever it

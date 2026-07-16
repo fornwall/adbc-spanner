@@ -389,7 +389,6 @@ with spanner.connect(
         # Optional statement options, set on the underlying ADBC statement:
         cur.adbc_statement.set_options(**{
             StatementOptions.DATA_BOOST.value: "true",  # run on Data Boost
-            StatementOptions.MAX_PARTITIONS.value: "8",     # cap the partition count
         })
         partitions, schema = cur.adbc_execute_partitions("SELECT SingerId FROM Singers")
 

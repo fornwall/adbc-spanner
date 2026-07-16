@@ -6607,27 +6607,17 @@ fn execute_partitions_round_trip() {
     );
 
     let mut statement = connection.new_statement().expect("new statement");
-    // The Data Boost and max-partitions options round-trip through get_option. Data Boost is baked
-    // into each descriptor at partition-creation time (below), so it travels with the token.
+    // The Data Boost option round-trips through get_option. Data Boost is baked into each
+    // descriptor at partition-creation time (below), so it travels with the token.
     let data_boost_key = || OptionStatement::Other(adbc_spanner::OPTION_DATA_BOOST.into());
-    let max_partitions_key = || OptionStatement::Other(adbc_spanner::OPTION_MAX_PARTITIONS.into());
     statement
         .set_option(data_boost_key(), OptionValue::String("true".into()))
         .expect("set data_boost");
-    statement
-        .set_option(max_partitions_key(), OptionValue::Int(4))
-        .expect("set max_partitions");
     assert_eq!(
         statement
             .get_option_string(data_boost_key())
             .expect("get data_boost"),
         "true"
-    );
-    assert_eq!(
-        statement
-            .get_option_int(max_partitions_key())
-            .expect("get max_partitions"),
-        4
     );
 
     // A simple single-table scan is root-partitionable. No ORDER BY: ordering is not partitionable,

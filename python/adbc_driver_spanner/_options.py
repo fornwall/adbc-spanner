@@ -114,8 +114,6 @@ class StatementOptions(enum.Enum):
     ROWS_PER_BATCH = "spanner.rows_per_batch"
     #: ``"true"`` runs ``execute_partitions`` partitions on Data Boost.
     DATA_BOOST = "spanner.data_boost"
-    #: Hint for the maximum number of partitions from ``execute_partitions``.
-    MAX_PARTITIONS = "spanner.partition.max_count"
     #: Per-statement override of :attr:`ConnectionOptions.READ_STALENESS`.
     READ_STALENESS = "spanner.read.staleness"
     #: Per-statement override of :attr:`ConnectionOptions.MAX_TIMESTAMP_PRECISION`.

@@ -33,7 +33,7 @@ The *Round-trips* column below says what `get_option` (the string form; `AdbcDat
 etc.) returns for the option. Reading an option that is unset — and has no default to report —
 fails with `NotFound`. The typed getters (`get_option_int` / `get_option_double`) reinterpret the
 same stored string, so they serve any set option whose value parses as that type — e.g.
-`spanner.rows_per_batch` and `spanner.partition.max_count` through `get_option_int`, and the
+`spanner.rows_per_batch` and `spanner.retry.max_attempts` through `get_option_int`, and the
 `spanner.rpc.timeout_seconds.*` options through `get_option_double` (integer-valued options are
 served as doubles too) — and fail with `InvalidArguments` for options whose value does not.
 
@@ -126,7 +126,6 @@ one.
 | ------ | --------------------- | ------- | ----------- | ----------- |
 | `spanner.rows_per_batch` | positive integer | `8192` | yes, always (also via `get_option_int`) | Number of rows converted into each Arrow `RecordBatch` streamed by `execute`. Larger batches trade memory for fewer per-batch conversions; smaller batches lower first-batch latency and peak memory. |
 | `spanner.data_boost` | boolean | `false` | yes, always (`true`/`false`) | Run `execute_partitions` partitions on [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview) (Spanner's serverless, workload-isolated compute). Baked into every partition descriptor, so `read_partition` honours it on any connection. |
-| `spanner.partition.max_count` | positive integer | unset (Spanner chooses) | yes, when set (also via `get_option_int`) | Hint for the maximum number of partitions returned by `execute_partitions`; Spanner may return fewer. |
 | `spanner.read.staleness` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement read-bound override. Set `""` to clear a bound inherited from the connection (i.e. force a strong read). |
 | `spanner.max_timestamp_precision` | as the connection option; `""` resets to the **driver** default | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement timestamp-precision override (see [Timestamp precision](#timestamp-precision)). Note `""` resets to the driver default (`nanoseconds_error_on_overflow`), not to the connection's value. |
 | `spanner.request.priority` | as the connection option; `""` unsets | inherited from the connection at statement creation | yes — reports the effective value, whether inherited or set on the statement | Per-statement request-priority override. |
