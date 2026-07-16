@@ -293,6 +293,34 @@ pub mod fuzzing {
         crate::driver::ensure_scheme(host)
     }
 
+    /// Parse a `spanner.read.staleness` option value, exercising the read-bound grammar
+    /// (`parse_read_bound` → `parse_duration` / RFC 3339) and the client `TimestampBound` mapping.
+    /// This is the parser whose missing coverage let COR-1's panic through; pure/offline, so it
+    /// must never panic — malformed input is a clean error, not a crash.
+    pub fn parse_read_staleness(value: &str) {
+        use adbc_core::options::OptionValue;
+        let mut staleness = crate::staleness::ReadStaleness::default();
+        if staleness
+            .set_staleness(OptionValue::String(value.to_string()))
+            .is_ok()
+        {
+            let _ = staleness.timestamp_bound();
+            let _ = staleness.multi_use_timestamp_bound();
+        }
+    }
+
+    /// Parse a duration option value with the shared grammar (`spanner.read.staleness` durations,
+    /// also used by `spanner.commit.max_delay`). Pure/offline; must never panic.
+    pub fn parse_duration(value: &str) {
+        let _ = crate::staleness::parse_duration(value);
+    }
+
+    /// Parse a `spanner.directed_read` option value with the module's hand-written grammar parser
+    /// (the most complex hand parser in the driver). Pure/offline; must never panic.
+    pub fn parse_directed_read(value: &str) {
+        let _ = crate::directed_read::parse(value);
+    }
+
     /// An arbitrary ADBC option value, mirroring the variants of
     /// [`OptionValue`](adbc_core::options::OptionValue) the driver accepts.
     #[derive(arbitrary::Arbitrary, Debug)]
@@ -340,6 +368,37 @@ pub mod fuzzing {
             let _ = database.set_option(OptionDatabase::Other(key.clone()), value);
             let _ = database.get_option_string(OptionDatabase::Other(key));
         }
+    }
+
+    /// Expand a `spanner:` connection URI through the database option boundary
+    /// (`OptionDatabase::Uri`): scheme detection, `parse_connection_uri`, percent-decoding, and the
+    /// eager expansion of query parameters into option fields. This is the surface a driver manager
+    /// reaches by setting the standard `uri` option — unreachable from `exercise_database_options`,
+    /// which only forwards `Other(key)`. No network I/O: this stops well before `connect()` and
+    /// must never panic. The shared driver/runtime is built once (as in
+    /// [`exercise_database_options`]) so throughput is not dominated by construction.
+    pub fn expand_connection_uri(uri: &str) {
+        use adbc_core::options::{OptionDatabase, OptionValue};
+        use adbc_core::{Driver, Optionable};
+        use std::sync::{Mutex, OnceLock};
+
+        static DRIVER: OnceLock<Mutex<crate::SpannerDriver>> = OnceLock::new();
+        let driver = DRIVER.get_or_init(|| {
+            Mutex::new(crate::SpannerDriver::try_new().expect("driver construction is infallible"))
+        });
+
+        let mut database = {
+            let mut guard = driver.lock().unwrap();
+            match guard.new_database() {
+                Ok(db) => db,
+                Err(_) => return,
+            }
+        };
+
+        // Both a well-formed `spanner://…` URI and arbitrary garbage go through the same option;
+        // a bad scheme, path, query parameter, or value is an error, not a panic.
+        let _ = database.set_option(OptionDatabase::Uri, OptionValue::String(uri.to_string()));
+        let _ = database.get_option_string(OptionDatabase::Uri);
     }
 
     #[cfg(test)]

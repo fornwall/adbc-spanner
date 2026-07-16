@@ -74,3 +74,24 @@ path = "fuzz_targets/partition.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "staleness"
+path = "fuzz_targets/staleness.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "directed_read"
+path = "fuzz_targets/directed_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uri"
+path = "fuzz_targets/uri.rs"
+test = false
+doc = false
+bench = false
