@@ -392,6 +392,10 @@ carrying `arrow.json` binds as a Spanner `JSON`-typed parameter (a list of tagge
 Bulk-ingest create modes likewise create a `JSON` column for a tagged field. So JSON values
 round-trip: what `execute` reads from a `JSON` column can be bound straight back into one.
 
+On the bind / bulk-ingest side, unsigned Arrow integers that fit `i64` losslessly —
+`UInt8`/`UInt16`/`UInt32` — widen to `INT64` like the signed widths; `UInt64` is unsupported
+(`u64::MAX` exceeds `i64::MAX`). `FixedSizeBinary` binds as `BYTES` like the other binary layouts.
+
 `TIMESTAMP` is read at full nanosecond precision by default (matching the bind/write path). Arrow
 stores `Timestamp(Nanosecond)` as an `i64` count of nanoseconds since the Unix epoch, which spans
 only ~1677-09-21 to 2262-04-11 — a narrower window than Spanner's year 1–9999 range. A Spanner

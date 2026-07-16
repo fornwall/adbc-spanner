@@ -11,9 +11,12 @@
 //! [`insert_mutation`]), whose cells use the exact same Arrow→Spanner value mapping
 //! ([`cell_value`]) as parameter binding.
 //!
-//! Supported Arrow parameter types are `Int8`/`Int16`/`Int32`/`Int64` (all → Spanner `INT64`),
+//! Supported Arrow parameter types are `Int8`/`Int16`/`Int32`/`Int64` and the unsigned widths that
+//! fit `i64` losslessly, `UInt8`/`UInt16`/`UInt32` (all → Spanner `INT64`; `UInt64` is unsupported
+//! — `u64::MAX` exceeds `i64::MAX`),
 //! `Float64`, `Float32`, `Boolean`, `Utf8`/`LargeUtf8`/`Utf8View`,
-//! `Binary`/`LargeBinary`/`BinaryView`, `Date32`/`Date64` (→ `DATE`), `Timestamp` at any `TimeUnit`
+//! `Binary`/`LargeBinary`/`BinaryView`/`FixedSizeBinary` (all → Spanner `BYTES`),
+//! `Date32`/`Date64` (→ `DATE`), `Timestamp` at any `TimeUnit`
 //! (Second/Millisecond/Microsecond/Nanosecond, → `TIMESTAMP`), `Decimal128` (→ `NUMERIC`), and
 //! their nulls. `List`/`LargeList` of any of those scalar element types binds to a Spanner
 //! `ARRAY<...>` (`ARRAY<INT64|FLOAT64|BOOL|STRING|BYTES|DATE|TIMESTAMP|NUMERIC>`), preserving
@@ -59,7 +62,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{
     ArrowPrimitiveType, Date32Type, Date64Type, Decimal128Type, Float32Type, Float64Type, Int8Type,
     Int16Type, Int32Type, Int64Type, TimestampMicrosecondType, TimestampMillisecondType,
-    TimestampNanosecondType, TimestampSecondType,
+    TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type, UInt32Type,
 };
 use arrow_array::{Array, ArrayRef, RecordBatch, downcast_dictionary_array};
 use arrow_schema::{DataType, Field, TimeUnit};
@@ -290,6 +293,13 @@ fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
         DataType::Int32 => primitive_binder::<Int32Type, i64>(),
         DataType::Int16 => primitive_binder::<Int16Type, i64>(),
         DataType::Int8 => primitive_binder::<Int8Type, i64>(),
+        // The unsigned integer widths that fit `i64` losslessly (`u8`/`u16`/`u32`, whose max
+        // 4_294_967_295 < `i64::MAX`) widen to Spanner INT64 via `i64::from`, exactly like the
+        // signed widths. `UInt64` is deliberately absent: `u64::MAX` (1.8e19) exceeds `i64::MAX`
+        // (9.2e18), so there is no lossless `From<u64>` for `i64` and no INT64 mapping for it.
+        DataType::UInt32 => primitive_binder::<UInt32Type, i64>(),
+        DataType::UInt16 => primitive_binder::<UInt16Type, i64>(),
+        DataType::UInt8 => primitive_binder::<UInt8Type, i64>(),
         DataType::Float64 => primitive_binder::<Float64Type, f64>(),
         DataType::Float32 => primitive_binder::<Float32Type, f64>(),
         DataType::Boolean => {
@@ -322,6 +332,14 @@ fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
         DataType::BinaryView => |_, _, a, i| {
             Ok(scalar_value(a.is_null(i), || {
                 a.as_binary_view().value(i).to_vec()
+            }))
+        },
+        // `FixedSizeBinary(n)` is a byte string of a fixed width; it maps to Spanner BYTES exactly
+        // like the variable-width binary kinds (the width is a layout detail Spanner does not carry
+        // — a BYTES column has no fixed length — so the read path returns plain `Binary`).
+        DataType::FixedSizeBinary(_) => |_, _, a, i| {
+            Ok(scalar_value(a.is_null(i), || {
+                a.as_fixed_size_binary().value(i).to_vec()
             }))
         },
         DataType::Date32 => |name, _, a, i| {
@@ -593,11 +611,17 @@ pub(crate) const INGEST_KEY_COLUMN: &str = "adbc_ingest_key";
 pub(crate) fn spanner_column_type(data_type: &DataType) -> Result<String> {
     Ok(match data_type {
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => "INT64".to_string(),
+        // The unsigned widths that fit `i64` losslessly widen to INT64 too (see `scalar_binder`);
+        // `UInt64` has no INT64 mapping and is rejected below.
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => "INT64".to_string(),
         DataType::Float32 => "FLOAT32".to_string(),
         DataType::Float64 => "FLOAT64".to_string(),
         DataType::Boolean => "BOOL".to_string(),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "STRING(MAX)".to_string(),
-        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "BYTES(MAX)".to_string(),
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_) => "BYTES(MAX)".to_string(),
         DataType::Date32 | DataType::Date64 => "DATE".to_string(),
         DataType::Timestamp(_, _) => "TIMESTAMP".to_string(),
         DataType::Decimal128(_, _) => "NUMERIC".to_string(),
@@ -729,6 +753,61 @@ mod tests {
         );
         assert!(bind_row(Statement::builder("SELECT @a, @b"), &b, 0).is_ok());
         assert!(bind_row(Statement::builder("SELECT @a, @b"), &b, 1).is_ok());
+    }
+
+    #[test]
+    fn binds_unsigned_integers_as_int64() {
+        // UInt8 / UInt16 / UInt32 widen losslessly to Spanner INT64; the boundary values (each
+        // width's max) must bind as their exact decimal encoding, not overflow or wrap.
+        let b = batch(
+            vec![
+                Field::new("a", DataType::UInt8, true),
+                Field::new("b", DataType::UInt16, true),
+                Field::new("c", DataType::UInt32, true),
+            ],
+            vec![
+                Arc::new(arrow_array::UInt8Array::from(vec![Some(u8::MAX), None])),
+                Arc::new(arrow_array::UInt16Array::from(vec![Some(u16::MAX), None])),
+                Arc::new(arrow_array::UInt32Array::from(vec![Some(u32::MAX), None])),
+            ],
+        );
+        let stmt = bind_row(Statement::builder("SELECT @p0, @p1, @p2"), &b, 0)
+            .unwrap()
+            .build();
+        let dbg = format!("{stmt:?}");
+        // u32::MAX = 4_294_967_295 round-trips as its exact decimal string (INT64 holds it).
+        assert!(
+            dbg.contains(r#"StringValue("4294967295")"#),
+            "u32::MAX must widen to INT64 4294967295: {dbg}"
+        );
+        assert!(dbg.contains(r#"StringValue("255")"#), "u8::MAX: {dbg}");
+        assert!(dbg.contains(r#"StringValue("65535")"#), "u16::MAX: {dbg}");
+        // The null row still binds (typed null).
+        assert!(bind_row(Statement::builder("SELECT @p0, @p1, @p2"), &b, 1).is_ok());
+    }
+
+    #[test]
+    fn binds_fixed_size_binary_as_bytes() {
+        // FixedSizeBinary(n) binds as Spanner BYTES, exactly like variable-width Binary.
+        let values: Vec<Option<&[u8]>> = vec![Some(b"abcd"), None];
+        let arr = arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            values.into_iter(),
+            4,
+        )
+        .unwrap();
+        let b = batch(
+            vec![Field::new("v", DataType::FixedSizeBinary(4), true)],
+            vec![Arc::new(arr)],
+        );
+        // Ingested as an insert mutation, a 4-byte fixed cell lands as its raw BYTES value.
+        let dbg = format!("{:?}", insert_mutation("t", &b, 0).unwrap());
+        assert!(
+            dbg.contains("StringValue") && dbg.contains("YWJjZA=="),
+            "FixedSizeBinary cell must ship as base64 BYTES (\"abcd\" = YWJjZA==): {dbg}"
+        );
+        // A null fixed cell stays NULL.
+        let dbg = format!("{:?}", insert_mutation("t", &b, 1).unwrap());
+        assert!(dbg.contains("NullValue"), "null fixed cell: {dbg}");
     }
 
     /// A nullable string-family field tagged with the canonical `arrow.json` extension, as the
@@ -863,8 +942,17 @@ mod tests {
         );
         let list = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
         assert_eq!(spanner_column_type(&list).unwrap(), "ARRAY<INT64>");
-        // No Spanner column type for unsigned integers.
-        assert!(spanner_column_type(&DataType::UInt32).is_err());
+        // The unsigned widths that fit i64 losslessly widen to INT64.
+        assert_eq!(spanner_column_type(&DataType::UInt8).unwrap(), "INT64");
+        assert_eq!(spanner_column_type(&DataType::UInt16).unwrap(), "INT64");
+        assert_eq!(spanner_column_type(&DataType::UInt32).unwrap(), "INT64");
+        // FixedSizeBinary maps to BYTES like the variable-width binary kinds.
+        assert_eq!(
+            spanner_column_type(&DataType::FixedSizeBinary(4)).unwrap(),
+            "BYTES(MAX)"
+        );
+        // UInt64 has no lossless INT64 mapping (u64::MAX > i64::MAX), so it is rejected.
+        assert!(spanner_column_type(&DataType::UInt64).is_err());
     }
 
     #[test]
