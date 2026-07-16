@@ -47,30 +47,36 @@ if(SPANNER_VALIDATION_SANITIZE)
   add_link_options(-fsanitize=${SPANNER_VALIDATION_SANITIZE})
 endif()
 
-# Pin to an apache/arrow-adbc `main` revision. This is the same *family* as the
-# adbc_core / adbc_ffi git pin the driver builds on (see Cargo.toml), but the two
-# revisions are bumped independently and may differ — this one only selects the
-# C++ validation-suite sources. Tracking `main` (rather than the 0.23 release
-# tag) picks up three C++ validation fixes:
+# Pin to an apache/arrow-adbc `main` revision.
+#
+# This is the same *family* as the adbc_core / adbc_ffi git pin the driver
+# builds on (see Cargo.toml), but the two revisions are bumped independently
+# and may differ — this one only selects the C++ validation-suite sources.
+# Its apache/arrow-adbc base (rather than the 0.23 release tag) carries four
+# C++ validation fixes this suite relies on:
 # apache/arrow-adbc#4493 — TestSqlPartitionedInts now allows >1 partition, so
 # SpannerStatementTest.SqlPartitionedInts is gate-enforced instead of excluded;
-# apache/arrow-adbc#4496, which adds the general
-# `DriverQuirks::RewriteSql(query_id, default_sql)` hook. The Spanner quirks
-# override it (spanner_validation.cc) to rewrite the `CAST(1.5 AS FLOAT)` in
-# TestSqlQueryFloats / TestSqlSchemaFloats to GoogleSQL `FLOAT64`, so both cases
-# are gate-enforced instead of excluded; and apache/arrow-adbc#4504, which adds
-# the `DriverQuirks::QuoteIdentifier(name)` hook (the Spanner quirks override it
-# to GoogleSQL backticks, so the ingest/prepare readback queries are no longer
-# blocked on ANSI double-quoting — see the EXCLUDED buckets in
-# scripts/run-adbc-validation.sh for what still keeps them excluded). Bump the
-# SHA to advance the suite.
+# apache/arrow-adbc#4496 — the `DriverQuirks::RewriteSql(query_id, default_sql)`
+# hook itself (first used to rewrite the `CAST(1.5 AS FLOAT)` in
+# TestSqlQueryFloats / TestSqlSchemaFloats to GoogleSQL `FLOAT64`);
+# apache/arrow-adbc#4504, which adds the `DriverQuirks::QuoteIdentifier(name)`
+# hook (the Spanner quirks override it to GoogleSQL backticks, so the
+# ingest/prepare readback queries are no longer blocked on ANSI
+# double-quoting); and apache/arrow-adbc#4514, which routes the statement
+# tests' remaining hardcoded dialect-sensitive SQL (non-Spanner CREATE TABLEs,
+# INSERTs without a column list, `SELECT *` ingest readbacks, NULLS
+# FIRST/LAST) through RewriteSql under stable query ids. The Spanner quirks
+# override RewriteSql (spanner_validation.cc) to substitute GoogleSQL per query
+# id, which unlocks most of the former ingest-readback and non-Spanner-DDL
+# exclusions (see EXCLUDED in scripts/run-adbc-validation.sh for the
+# survivors). Bump the SHA to advance the suite.
 #
 # FORCE so this pin always wins over a value cached in a restored/incremental
 # build tree: a plain `set(... CACHE STRING)` is a no-op when the entry already
 # exists, so a stale `CMakeCache.txt` (e.g. one restored from a run on the old
 # rev) would silently keep the previous tag and rebuild against the wrong
 # arrow-adbc source. FORCE makes a rev bump here authoritative.
-set(ARROW_ADBC_TAG "9be02985954c29b19ca14be9564f3ad92e63b5d9"
+set(ARROW_ADBC_TAG "1ba7fe665fd8224939ae824e7739df550bbea086"
     CACHE STRING "arrow-adbc main revision" FORCE)
 
 include(FetchContent)

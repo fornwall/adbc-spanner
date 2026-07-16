@@ -13,7 +13,11 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
 
 #include <arrow-adbc/adbc.h>
 #include <gtest/gtest.h>
@@ -92,10 +96,17 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
     return "CREATE TABLE `" + std::string(name) + "` (id INT64) PRIMARY KEY (id)";
   }
 
+  // Deliberately unsupported: the SqlIngestPrimaryKey case append-ingests rows
+  // *omitting* the primary-key column and expects the database to auto-assign
+  // ascending key values ("databases start numbering at 0 or 1"). Spanner has
+  // no ordered auto-increment: a keyless insert mutation writes NULL (a second
+  // NULL key row is a duplicate-PK error), and Spanner SEQUENCEs are
+  // bit-reversed, so even a DEFAULT sequence key cannot satisfy the case's
+  // `ORDER BY id` readback that expects insertion order. Returning nullopt is
+  // the quirk's sanctioned way to say so; the case self-skips.
   std::optional<std::string> PrimaryKeyIngestTableDdl(
-      std::string_view name) const override {
-    return "CREATE TABLE `" + std::string(name) +
-           "` (id INT64, value INT64) PRIMARY KEY (id)";
+      std::string_view) const override {
+    return std::nullopt;
   }
 
   std::optional<std::string> CompositePrimaryKeyTableDdl(
@@ -135,24 +146,157 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
     return "`" + std::string(name) + "`";
   }
 
-  // GoogleSQL has no bare `FLOAT` type. The suite's float cases default to
-  // `SELECT CAST(1.5 AS FLOAT)`, which Spanner rejects; rewrite them to the
-  // GoogleSQL 64-bit floating-point type `FLOAT64` (the generic per-query
-  // override hook from apache/arrow-adbc#4496) so both cases run and pass.
+  // Substitute GoogleSQL for the suite's dialect-sensitive default SQL (the
+  // generic per-query override hook from apache/arrow-adbc#4496; the routing of
+  // all the statement-test SQL below it is apache/arrow-adbc#4514 — see
+  // ARROW_ADBC_TAG in CMakeLists.txt). Three Spanner-isms drive the rewrites:
+  //   - DDL: Spanner requires a PRIMARY KEY and has INT64/STRING(MAX), not
+  //     INT/INTEGER/TEXT; DML INSERT requires an explicit column list.
+  //   - `NULLS FIRST`/`NULLS LAST` are rejected (by the emulator's GoogleSQL);
+  //     dropping them is semantics-preserving — GoogleSQL's defaults are
+  //     exactly NULLS FIRST for ASC and NULLS LAST for DESC.
+  //   - Create-mode ingest adds the synthetic `adbc_ingest_key` UUID primary
+  //     key, so a `SELECT *` readback has one column too many (and no ORDER BY
+  //     readback has a deterministic order — the UUID key order is random):
+  //     select the ingested column(s) explicitly and order by them.
+  // Every entry pins the upstream default so a future ARROW_ADBC_TAG bump that
+  // changes a query out from under us fails the test loudly, rather than
+  // silently rewriting a query the substitution no longer matches.
   std::string RewriteSql(std::string_view query_id,
                          std::string default_sql) const override {
-    if (query_id == "StatementTest::TestSqlQueryFloats::cast-1.5-as-float" ||
-        query_id == "StatementTest::TestSqlSchemaFloats::cast-1.5-as-float") {
-      // Pin the upstream default so a future ARROW_ADBC_TAG bump that changes the
-      // query out from under us fails the test loudly, rather than silently
-      // rewriting a query that may no longer be the `CAST(1.5 AS FLOAT)` this
-      // FLOAT64 substitution assumes.
-      EXPECT_EQ(default_sql, "SELECT CAST(1.5 AS FLOAT)")
-          << "upstream default SQL for " << query_id
-          << " changed; revisit the FLOAT64 rewrite";
-      return "SELECT CAST(1.5 AS FLOAT64)";
+    struct Rewrite {
+      std::string_view expected_default;
+      std::string_view sql;
+    };
+    static const std::unordered_map<std::string_view, Rewrite> kRewrites = {
+        // GoogleSQL has no bare `FLOAT` type; its 64-bit float is `FLOAT64`.
+        {"StatementTest::TestSqlQueryFloats::cast-1.5-as-float",
+         {"SELECT CAST(1.5 AS FLOAT)", "SELECT CAST(1.5 AS FLOAT64)"}},
+        {"StatementTest::TestSqlSchemaFloats::cast-1.5-as-float",
+         {"SELECT CAST(1.5 AS FLOAT)", "SELECT CAST(1.5 AS FLOAT64)"}},
+        // Ingest readbacks: dodge the synthetic key column; the expected row
+        // order NULL-first ascending is GoogleSQL's ASC default.
+        {"StatementTest::TestSqlIngestTemporalType::select-bulk-ingest",
+         {"SELECT * FROM `bulk_ingest` ORDER BY `col` ASC NULLS FIRST",
+          "SELECT `col` FROM `bulk_ingest` ORDER BY `col` ASC"}},
+        {"StatementTest::TestSqlIngestInterval::select-bulk-ingest",
+         {"SELECT * FROM `bulk_ingest` ORDER BY `col` ASC NULLS FIRST",
+          "SELECT `col` FROM `bulk_ingest` ORDER BY `col` ASC"}},
+        {"StatementTest::TestSqlIngestStreamZeroArrays::select-bulk-ingest",
+         {"SELECT * FROM `bulk_ingest`", "SELECT `col` FROM `bulk_ingest`"}},
+        // Append expects {42, -42, NULL} — its insertion order, which `ORDER BY
+        // int64s DESC` happens to reproduce exactly (GoogleSQL DESC puts NULLs
+        // last by default).
+        {"StatementTest::TestSqlIngestAppend::select-bulk-ingest",
+         {"SELECT * FROM `bulk_ingest`",
+          "SELECT `int64s` FROM `bulk_ingest` ORDER BY `int64s` DESC"}},
+        {"StatementTest::TestSqlIngestReplace::select-bulk-ingest",
+         {"SELECT * FROM `bulk_ingest`", "SELECT `int64s` FROM `bulk_ingest`"}},
+        {"StatementTest::TestSqlIngestCreateAppend::select-bulk-ingest",
+         {"SELECT * FROM `bulk_ingest`", "SELECT `int64s` FROM `bulk_ingest`"}},
+        {"StatementTest::TestSqlIngestMultipleConnections::select-bulk-ingest",
+         {"SELECT * FROM `bulk_ingest` ORDER BY `int64s` DESC NULLS LAST",
+          "SELECT `int64s` FROM `bulk_ingest` ORDER BY `int64s` DESC"}},
+        // The sample table is CreateSampleTable's own DDL (no synthetic key),
+        // so only the NULLS FIRST needs to go.
+        {"StatementTest::TestSqlIngestSample::select-bulk-ingest",
+         {"SELECT * FROM `bulk_ingest` ORDER BY int64s ASC NULLS FIRST",
+          "SELECT `int64s`, `strings` FROM `bulk_ingest` ORDER BY `int64s` ASC"}},
+        // Spanner cannot infer the types of undeclared parameters selected
+        // bare; the CASTs give the inference the context it needs (the driver
+        // then binds the Arrow int64/string columns to matching param types).
+        {"StatementTest::TestSqlPrepareSelectParams::select-params",
+         {"SELECT @p0, @p1", "SELECT CAST(@p0 AS INT64), CAST(@p1 AS STRING)"}},
+        // Still excluded (the readback asserts insertion order, unrecoverable
+        // in Spanner's unordered tables — see EXCLUDED in
+        // scripts/run-adbc-validation.sh), but the inserts themselves are
+        // rewritten to valid GoogleSQL so the cases fail only on that final
+        // ordering assertion: INSERT requires a column list, and omitting
+        // `adbc_ingest_key` lets its DEFAULT (GENERATE_UUID()) fill the key.
+        {"StatementTest::TestSqlPrepareUpdate::insert-bulk-ingest",
+         {"INSERT INTO `bulk_ingest` VALUES (@p0)",
+          "INSERT INTO `bulk_ingest` (`int64s`) VALUES (@p0)"}},
+        {"StatementTest::TestSqlPrepareUpdate::select-bulk-ingest",
+         {"SELECT * FROM `bulk_ingest`", "SELECT `int64s` FROM `bulk_ingest`"}},
+        {"StatementTest::TestSqlPrepareUpdateStream::insert-bulk-ingest",
+         {"INSERT INTO `bulk_ingest` VALUES (@p0)",
+          "INSERT INTO `bulk_ingest` (`ints`) VALUES (@p0)"}},
+        {"StatementTest::TestSqlPrepareUpdateStream::select-bulk-ingest",
+         {"SELECT * FROM `bulk_ingest`", "SELECT `ints` FROM `bulk_ingest`"}},
+        // Suite-internal DDL/DML in Spanner-valid form.
+        {"StatementTest::TestSqlBind::create-table-bindtest",
+         {"CREATE TABLE bindtest (col1 INTEGER, col2 TEXT)",
+          "CREATE TABLE bindtest (col1 INT64, col2 STRING(MAX)) PRIMARY KEY (col1)"}},
+        {"StatementTest::TestSqlBind::insert-bindtest",
+         {"INSERT INTO bindtest VALUES (@p0, @p1)",
+          "INSERT INTO bindtest (col1, col2) VALUES (@p0, @p1)"}},
+        {"StatementTest::TestSqlBind::select-bindtest",
+         {"SELECT * FROM bindtest ORDER BY col1 ASC NULLS FIRST",
+          "SELECT * FROM bindtest ORDER BY col1 ASC"}},
+        {"StatementTest::TestSqlQueryEmpty::create-table-queryempty",
+         {"CREATE TABLE queryempty (FOO INT)",
+          "CREATE TABLE queryempty (FOO INT64) PRIMARY KEY (FOO)"}},
+        {"StatementTest::TestSqlQueryInsertRollback::create-table-rollbacktest",
+         {"CREATE TABLE `rollbacktest` (a INT)",
+          "CREATE TABLE `rollbacktest` (a INT64) PRIMARY KEY (a)"}},
+        {"StatementTest::TestSqlQueryRowsAffectedDelete::create-table-delete-test",
+         {"CREATE TABLE `delete_test` (foo INT)",
+          "CREATE TABLE `delete_test` (foo INT64) PRIMARY KEY (foo)"}},
+        {"StatementTest::TestSqlQueryRowsAffectedDeleteStream::create-table-delete-test",
+         {"CREATE TABLE `delete_test` (foo INT)",
+          "CREATE TABLE `delete_test` (foo INT64) PRIMARY KEY (foo)"}},
+    };
+
+    // The whole TestSqlIngestType family shares one call site whose query id is
+    // suffixed with the ingested Arrow type. All scalar types take the plain
+    // rewrite; a list column cannot be ORDER BY'd in GoogleSQL, so order by its
+    // first element instead (NULL rows order first, matching the expected
+    // NULL-then-ascending data of both list cases).
+    constexpr std::string_view kIngestTypePrefix =
+        "StatementTest::TestSqlIngestType::select-bulk-ingest::";
+    if (query_id.substr(0, kIngestTypePrefix.size()) == kIngestTypePrefix) {
+      EXPECT_EQ(default_sql, "SELECT * FROM `bulk_ingest` ORDER BY `col` ASC NULLS FIRST")
+          << "upstream default SQL for " << query_id << " changed; revisit the rewrite";
+      if (query_id.substr(kIngestTypePrefix.size()) == "list") {
+        return "SELECT `col` FROM `bulk_ingest` ORDER BY `col`[SAFE_OFFSET(0)] ASC";
+      }
+      return "SELECT `col` FROM `bulk_ingest` ORDER BY `col` ASC";
     }
-    return default_sql;
+
+    auto it = kRewrites.find(query_id);
+    if (it == kRewrites.end()) return default_sql;
+    EXPECT_EQ(default_sql, it->second.expected_default)
+        << "upstream default SQL for " << query_id << " changed; revisit the rewrite";
+    return std::string(it->second.sql);
+  }
+
+  // What the driver hands back when a column of ingested Arrow data is
+  // selected: Spanner's integer type is INT64, its float types are
+  // FLOAT32/FLOAT64, strings are STRING(MAX) and binary is BYTES(MAX), so the
+  // narrower/alternate Arrow layouts widen to the canonical Arrow type of the
+  // Spanner column (`bind::spanner_column_type` on the ingest side,
+  // `src/conversion.rs` on the readback side). Nested types recurse through the
+  // base class's SchemaField overload, mapping e.g. List<Int32> to List<Int64>.
+  ArrowType IngestSelectRoundTripType(ArrowType ingest_type) const override {
+    switch (ingest_type) {
+      case NANOARROW_TYPE_INT8:
+      case NANOARROW_TYPE_INT16:
+      case NANOARROW_TYPE_INT32:
+      case NANOARROW_TYPE_UINT8:
+      case NANOARROW_TYPE_UINT16:
+      case NANOARROW_TYPE_UINT32:
+      case NANOARROW_TYPE_UINT64:
+        return NANOARROW_TYPE_INT64;
+      case NANOARROW_TYPE_LARGE_STRING:
+      case NANOARROW_TYPE_STRING_VIEW:
+        return NANOARROW_TYPE_STRING;
+      case NANOARROW_TYPE_LARGE_BINARY:
+      case NANOARROW_TYPE_BINARY_VIEW:
+      case NANOARROW_TYPE_FIXED_SIZE_BINARY:
+        return NANOARROW_TYPE_BINARY;
+      default:
+        return ingest_type;
+    }
   }
 
   // The driver supports all four ingest modes; for the create modes it builds
@@ -264,6 +408,39 @@ class SpannerStatementTest : public ::testing::Test,
   void TearDown() override { ASSERT_NO_FATAL_FAILURE(TearDownTest()); }
 
  protected:
+  // Value check for the temporal ingest cases (the base class deliberately
+  // FAILs). Only TIMESTAMP ingest reaches this: Duration ingest is unsupported
+  // (its case is excluded), so no other temporal type gets to the readback.
+  // The driver stores Arrow timestamps of any unit as Spanner TIMESTAMP and
+  // reads them back as Timestamp(Nanosecond, "UTC"), so the suite's raw
+  // {NULL, -42, 0, 42} inputs come back scaled from the source unit to
+  // nanoseconds (the timezone changes nothing — Arrow timestamps are
+  // epoch-anchored and the tz is metadata).
+  void ValidateIngestedTemporalData(struct ArrowArrayView* values, ArrowType type,
+                                    enum ArrowTimeUnit unit,
+                                    const char* /*timezone*/) override {
+    ASSERT_EQ(NANOARROW_TYPE_TIMESTAMP, type)
+        << "unexpected temporal ingest type reached the readback";
+    int64_t factor = 1;
+    switch (unit) {
+      case NANOARROW_TIME_UNIT_SECOND:
+        factor = 1000000000;
+        break;
+      case NANOARROW_TIME_UNIT_MILLI:
+        factor = 1000000;
+        break;
+      case NANOARROW_TIME_UNIT_MICRO:
+        factor = 1000;
+        break;
+      case NANOARROW_TIME_UNIT_NANO:
+        factor = 1;
+        break;
+    }
+    const std::vector<std::optional<int64_t>> expected{std::nullopt, -42 * factor, 0,
+                                                       42 * factor};
+    ASSERT_NO_FATAL_FAILURE(adbc_validation::CompareArray<int64_t>(values, expected));
+  }
+
   SpannerQuirks quirks_;
 };
 ADBCV_TEST_STATEMENT(SpannerStatementTest)

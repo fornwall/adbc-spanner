@@ -121,30 +121,29 @@ done
 # never appear here.
 # ---------------------------------------------------------------------------
 EXCLUDED=(
-  # --- Bucket 1: suite-internal non-Spanner DDL -------------------------------
-  # These cases issue hardcoded CREATE TABLE with no primary key and INT/TEXT
-  # types — not valid Spanner DDL (which needs INT64/TEXT-less types and a
-  # PRIMARY KEY) and there is no quirks hook for the DDL text. (Identifier
-  # *quoting* is no longer a blocker: DriverQuirks::QuoteIdentifier —
-  # apache/arrow-adbc#4504, overridden to backticks in spanner_validation.cc —
-  # covers the statements that used it, but the type/PK problems remain.)
-  # SqlPrepareUpdate/SqlPrepareUpdateStream create their table via create-mode
-  # ingest instead, so their table carries the synthetic adbc_ingest_key column;
-  # their `INSERT INTO bulk_ingest VALUES (@p0)` then has the wrong arity and
-  # their `SELECT *` readback surfaces the extra column.
+  # --- Bucket 1: readbacks that assert insertion order -------------------------
+  # Both cases create `bulk_ingest` via create-mode ingest, INSERT more rows via
+  # bound params, and then assert the `SELECT *` readback returns ALL rows in
+  # insertion order. The SpannerQuirks::RewriteSql overrides
+  # (apache/arrow-adbc#4514 routes the SQL; see spanner_validation.cc) fix the SQL itself —
+  # the INSERT gets its required column list, the readback dodges the synthetic
+  # adbc_ingest_key column — but no SQL can recover insertion order from a
+  # Spanner table: rows come back in primary-key order and the synthetic key is
+  # a random UUID. The final CompareArray on row order is what still fails.
   #
-  # SqlQueryFloats / SqlSchemaFloats are NOT here: their only Spanner-incompatible
-  # bit was the bare `CAST(1.5 AS FLOAT)` query, and the SpannerQuirks::RewriteSql
-  # override (apache/arrow-adbc#4496) rewrites it to GoogleSQL `FLOAT64`, so both
-  # now pass and are gate-enforced.
-  'SpannerStatementTest.SqlBind'
-  'SpannerStatementTest.SqlPrepareSelectParams'
+  # The rest of the former non-Spanner-DDL bucket is NOT here anymore: SqlBind,
+  # SqlQueryEmpty, SqlQueryInsertRollback, SqlQueryRowsAffectedDelete{,Stream}
+  # (hardcoded CREATE TABLE with INT/INTEGER/TEXT and no PRIMARY KEY) and
+  # SqlPrepareSelectParams (a bare `SELECT @p0, @p1` whose parameter types
+  # Spanner cannot infer) are rewritten to valid GoogleSQL via RewriteSql and
+  # now pass, gate-enforced.
+  #
+  # SqlQueryFloats / SqlSchemaFloats are NOT here either: their only
+  # Spanner-incompatible bit was the bare `CAST(1.5 AS FLOAT)` query, rewritten
+  # to GoogleSQL `FLOAT64` (apache/arrow-adbc#4496), so both pass and are
+  # gate-enforced.
   'SpannerStatementTest.SqlPrepareUpdate'
   'SpannerStatementTest.SqlPrepareUpdateStream'
-  'SpannerStatementTest.SqlQueryEmpty'
-  'SpannerStatementTest.SqlQueryInsertRollback'
-  'SpannerStatementTest.SqlQueryRowsAffectedDelete'
-  'SpannerStatementTest.SqlQueryRowsAffectedDeleteStream'
   # Transactions is NOT excluded: it expects read-your-writes of an uncommitted
   # ingest, which the driver's buffer-and-commit manual transactions (one kind of
   # work per transaction — queries or DML) reject with InvalidState, so the case
@@ -152,20 +151,29 @@ EXCLUDED=(
   # (see the comment on the quirk in adbc-validation/spanner_validation.cc), which
   # the gate tolerates — no expected-failure bookkeeping needed.
 
-  # --- Bucket 2: ingest readback ----------------------------------------------
-  # Create-mode ingest is supported (synthetic adbc_ingest_key UUID PK), so these
-  # now *run* instead of skipping. Their readback SQL is valid GoogleSQL since
-  # DriverQuirks::QuoteIdentifier (apache/arrow-adbc#4504, overridden to
-  # backticks), but the `SELECT *` readback surfaces the synthetic key column,
-  # breaking the single-column assertions.
-  # This includes the view-type variants SqlIngest{BinaryView,StringView}:
-  # the driver supports those inputs (the quirks declare it), so they run and fail
-  # on the same readback as the rest — an expected failure that flips to passing
-  # once the readback is fixed, guarded here.
+  # --- Bucket 2: Arrow types the driver cannot map to a Spanner column ---------
+  # These fail at ingest time with "cannot create a Spanner column for Arrow
+  # type ...": the driver maps no unsigned integer type (UInt64 cannot fit
+  # INT64; UInt8/16/32 *could* widen losslessly to INT64 but that mapping does
+  # not exist yet), and Duration / Interval(MonthDayNano) / FixedSizeBinary have
+  # no bind/create mapping either (Spanner INTERVAL is not wired up). Expected
+  # failures until the driver grows those mappings.
+  #
+  # The rest of the former ingest-readback bucket is NOT here anymore: the
+  # readback SQL is routed through RewriteSql (apache/arrow-adbc#4514), and the
+  # Spanner rewrites select the ingested column(s) explicitly (dodging the
+  # synthetic adbc_ingest_key column) and drop the NULLS FIRST/LAST the emulator
+  # rejects, so the whole SqlIngest type family plus Append/Replace/CreateAppend/
+  # MultipleConnections/Sample now pass and are gate-enforced (with
+  # IngestSelectRoundTripType declaring the INT64/STRING/BYTES widenings and
+  # ValidateIngestedTemporalData checking the Timestamp readback values).
   #
   # NOT here (self-skip via a quirk, and the gate tolerates skips, so no bookkeeping):
-  # SqlIngestFloat16 (Spanner has no float16 type) and SqlIngestTemporary{,Append,
-  # Replace,Exclusive} (Spanner has no temporary tables).
+  # SqlIngestFloat16 (Spanner has no float16 type), SqlIngestTemporary{,Append,
+  # Replace,Exclusive} (Spanner has no temporary tables), and SqlIngestPrimaryKey
+  # (PrimaryKeyIngestTableDdl returns nullopt: the case append-ingests rows
+  # omitting the primary key and expects auto-assigned ascending keys, which
+  # Spanner cannot do — no ordered auto-increment, and sequences are bit-reversed).
   # (SqlIngest{TargetCatalog,TargetSchema,TargetCatalogSchema} are NOT here: their
   # quirks are declared true, but the cases only ingest and never read back, so with
   # the create default they pass cleanly and are gate-enforced.)
@@ -174,41 +182,22 @@ EXCLUDED=(
   # identifier-escaping is additionally covered natively in tests/integration.rs.)
   # (SqlIngestErrors is NOT here: it exercises only the ingest error paths, with no
   # readback and no non-Spanner DDL, so it passes cleanly and is enforced by the gate.)
-  'SpannerStatementTest.SqlIngestAppend'
-  'SpannerStatementTest.SqlIngestBinary'
-  'SpannerStatementTest.SqlIngestBinaryView'
-  'SpannerStatementTest.SqlIngestBool'
-  'SpannerStatementTest.SqlIngestCreateAppend'
-  'SpannerStatementTest.SqlIngestDate32'
   'SpannerStatementTest.SqlIngestDuration'
   'SpannerStatementTest.SqlIngestFixedSizeBinary'
-  'SpannerStatementTest.SqlIngestFloat32'
-  'SpannerStatementTest.SqlIngestFloat64'
-  'SpannerStatementTest.SqlIngestInt16'
-  'SpannerStatementTest.SqlIngestInt32'
-  'SpannerStatementTest.SqlIngestInt64'
-  'SpannerStatementTest.SqlIngestInt8'
   'SpannerStatementTest.SqlIngestInterval'
-  'SpannerStatementTest.SqlIngestLargeBinary'
-  'SpannerStatementTest.SqlIngestLargeString'
-  'SpannerStatementTest.SqlIngestListOfInt32'
-  'SpannerStatementTest.SqlIngestListOfString'
-  'SpannerStatementTest.SqlIngestMultipleConnections'
-  'SpannerStatementTest.SqlIngestPrimaryKey'
-  'SpannerStatementTest.SqlIngestReplace'
-  'SpannerStatementTest.SqlIngestSample'
-  'SpannerStatementTest.SqlIngestString'
-  'SpannerStatementTest.SqlIngestStringDictionary'
-  'SpannerStatementTest.SqlIngestStringView'
-  'SpannerStatementTest.SqlIngestTimestamp'
-  'SpannerStatementTest.SqlIngestTimestampTz'
   'SpannerStatementTest.SqlIngestUInt16'
   'SpannerStatementTest.SqlIngestUInt32'
   'SpannerStatementTest.SqlIngestUInt64'
   'SpannerStatementTest.SqlIngestUInt8'
+
+  # --- Bucket 3: empty-stream ingest -------------------------------------------
+  # Ingesting a stream with zero batches fails with InvalidState "cannot ingest:
+  # no data has been bound" — the driver requires bound data before an ingest
+  # executes, upstream expects a zero-row ingest to succeed and create the
+  # table. A driver-side gap (no SQL involved), guarded here until fixed.
   'SpannerStatementTest.TestSqlIngestStreamZeroArrays'
 
-  # --- Bucket 3: ECANCELED through the C stream -------------------------------
+  # --- Bucket 4: ECANCELED through the C stream -------------------------------
   # SqlQueryCancel requires the result stream's get_next to return exactly
   # ECANCELED (125) after a cancel, but arrow-rs's FFI_ArrowArrayStream exporter
   # (used by adbc_ffi) can only map errors to ENOSYS/ENOMEM/EIO/EINVAL, so no Rust
