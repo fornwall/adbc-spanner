@@ -392,6 +392,14 @@ carrying `arrow.json` binds as a Spanner `JSON`-typed parameter (a list of tagge
 Bulk-ingest create modes likewise create a `JSON` column for a tagged field. So JSON values
 round-trip: what `execute` reads from a `JSON` column can be bound straight back into one.
 
+`ENUM`, `PROTO`, `INTERVAL` and `UUID` have **no** such bind-side tag, so they do not round-trip
+through DML parameters automatically: a value read back binds as its Arrow storage type, and Spanner
+infers the parameter as `INT64` (`ENUM`), `BYTES` (`PROTO`) or `STRING` (`INTERVAL`/`UUID`) and will
+not coerce it into the column's type. To insert or filter one of these via a bound parameter, wrap
+it in an explicit `CAST(@p AS ENUM<…> | PROTO<…> | INTERVAL | UUID)` in the SQL. (Bulk ingest is
+unaffected — it ships native mutations, not DML parameters — though its create modes still make
+`INT64`/`BYTES`/`STRING` columns for these, not `ENUM`/`PROTO`/`INTERVAL`/`UUID`.)
+
 On the bind / bulk-ingest side, unsigned Arrow integers that fit `i64` losslessly —
 `UInt8`/`UInt16`/`UInt32` — widen to `INT64` like the signed widths; `UInt64` is unsupported
 (`u64::MAX` exceeds `i64::MAX`). `FixedSizeBinary` binds as `BYTES` like the other binary layouts.
