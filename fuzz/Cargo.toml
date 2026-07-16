@@ -7,6 +7,12 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
+# This crate is a member of the root workspace (there is no `[workspace]` here on purpose — see
+# the note in ../Cargo.toml). Keep cargo-release from ever versioning or tagging it: releases
+# only cut the `adbc-spanner` crate.
+[package.metadata.release]
+release = false
+
 [dependencies]
 libfuzzer-sys = "0.4"
 # Differential/round-trip oracles for the fuzz targets: `regex` gives an independent
@@ -68,5 +74,3 @@ path = "fuzz_targets/partition.rs"
 test = false
 doc = false
 bench = false
-
-[workspace]

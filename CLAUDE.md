@@ -312,6 +312,27 @@ is cross-compiled, off the universal Apple toolchain) and installs NASM only on 
   ports stay `9010`/`9020` so the remap works. `SPANNER_EMULATOR_REST_PORT` (read by the Python
   `conftest.py`, not the driver) can still move the REST admin port.
 
+## Fuzzing
+
+`fuzz/` holds the `cargo-fuzz` targets (`sql`, `values`, `like`, `options`, `keyword`, `params`,
+`partition`), each a `libfuzzer-sys` harness over a `#[cfg(feature = "fuzzing")] pub mod fuzzing`
+wrapper in `src/lib.rs`. Run one with `cargo +nightly fuzz run <target>`; CI runs them nightly via
+`.github/workflows/fuzz.yml` (see the TEST-9 gaps in REVIEW.md for targets still worth adding).
+
+`fuzz/` is a **member of the root workspace** (its manifest has no `[workspace]` of its own — the
+`[workspace]` lives in the root `Cargo.toml`), so the whole repo resolves to **one** `Cargo.lock`.
+This is deliberate (TEST-13): cargo-fuzz's default layout makes `fuzz/` its *own* workspace with a
+second, checked-in `fuzz/Cargo.lock` that no root-level cargo command ever touches — it drifted
+silently on both git-pin moves and every `cargo-release` version bump, dirtying the tree and (via
+`ci-gate`) threatening to block releases. As a member it shares the root's exact dependency graph —
+same git pins, same `adbc-spanner` version — so that drift is now impossible by construction rather
+than policed by a CI check. `default-members = ["."]` keeps the default build scope to the
+`adbc-spanner` crate, so plain `cargo build`/`test`/`clippy` never build the fuzz member or need
+nightly/`libfuzzer-sys`; `cargo fuzz` (or `-p adbc-spanner-fuzz`) builds it, into the shared root
+`target/` (its instrumented artifacts get a distinct fingerprint from normal host builds, so they
+coexist). `fuzz/Cargo.toml` carries `[package.metadata.release] release = false` so cargo-release
+never versions or tags it.
+
 ## Shared library (loadable driver)
 
 The `cdylib` exports `AdbcSpannerInit` (+ an `AdbcDriverInit` fallback) so ADBC driver managers can

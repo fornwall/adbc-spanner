@@ -41,7 +41,10 @@ fuzz_target!(|input: (String, Vec<String>, bool)| {
     let all_named = column_names.iter().all(|c| params.contains(c));
     match resolve_parameter_names(&sql, &column_names, bind_by_name) {
         Some(resolved) if bind_by_name => {
-            assert!(all_named, "by-name accepted an unmatched column: {column_names:?}");
+            assert!(
+                all_named,
+                "by-name accepted an unmatched column: {column_names:?}"
+            );
             assert_eq!(resolved, column_names);
         }
         Some(resolved) => assert_eq!(resolved, params),

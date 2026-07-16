@@ -45,7 +45,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          workspaces: "fuzz -> target"
+          # `fuzz/` is a member of the root workspace, so `cargo fuzz` builds into the root
+          # `target/` (keyed off the single root Cargo.lock), not `fuzz/target`.
+          workspaces: ". -> target"
 
       # Persist the generated corpus across runs so coverage accumulates. Cache keys are
       # immutable, so key on the run id: each run saves a fresh cache and restore-keys picks
