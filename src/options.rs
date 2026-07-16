@@ -7,8 +7,12 @@
 //! every level parses an option identically and returns the same `InvalidArguments` status on bad
 //! input.
 //!
-//! `"rows_per_batch"`) so the shared error message names the offending option. [`f64_option`] is
-//! the exception: it takes the bare option key and prefixes `option ` itself.
+//! Each helper takes a `what` label naming the offending option, so the shared error message can
+//! point at it. That label is always the option's **full key** (e.g. `"option spanner.emulator"`,
+//! not a short name like `"max_partitions"`): a caller reading the error needs the exact string
+//! they must fix, and a key spelled anywhere else can drift from the one actually dispatched on
+//! (IDIO-7). Callers whose key is an enum derive it — `format!("option {}", key.as_ref())`.
+//! [`f64_option`] is the exception: it takes the bare option key and prefixes `option ` itself.
 
 use std::time::Duration;
 

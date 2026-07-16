@@ -1295,7 +1295,8 @@ impl Optionable for SpannerConnection {
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
         match &key {
             OptionConnection::AutoCommit => {
-                let enable = parse_bool(value, "option adbc.connection.autocommit")?;
+                let enable =
+                    crate::options::bool_option(value, "option adbc.connection.autocommit")?;
                 // Enabling autocommit commits any active manual transaction. The mode flip and the
                 // state take happen in ONE lock acquisition (`enter_autocommit`): once the mode is
                 // autocommit, the buffer paths — which check-and-buffer under this same mutex —
@@ -1323,7 +1324,7 @@ impl Optionable for SpannerConnection {
                 }
             }
             OptionConnection::ReadOnly => self.read_only.store(
-                parse_bool(value, "option adbc.connection.readonly")?,
+                crate::options::bool_option(value, "option adbc.connection.readonly")?,
                 Ordering::Release,
             ),
             OptionConnection::IsolationLevel => self.isolation = parse_isolation_level(value)?,
@@ -1776,10 +1777,6 @@ pub(crate) fn decode_partition(descriptor: &[u8]) -> Result<Partition> {
         invalid_argument("invalid partition descriptor: missing \"partition\" field")
     })?;
     serde_json::from_value(payload).map_err(invalid)
-}
-
-fn parse_bool(value: OptionValue, what: &str) -> Result<bool> {
-    crate::options::bool_option(value, what)
 }
 
 /// Validate a `current_catalog` / `current_schema` set request. Spanner has a single, unnamed (`""`)
