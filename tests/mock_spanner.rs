@@ -3149,6 +3149,106 @@ fn read_staleness_reaches_the_wire_on_single_use_queries() {
     );
 }
 
+/// TEST-1 (wire, SPAN-4): the `execute_schema` PLAN probe must carry `spanner.read.staleness` on
+/// its single-use read-only transaction, just as `execute` does. Without the fix the probe ran a
+/// strong read (no timestamp bound), which `single_use_read_only_bound` rejects — so this is
+/// non-vacuous.
+#[test]
+fn read_staleness_reaches_the_wire_on_execute_schema() {
+    use v1::transaction_options::read_only::TimestampBound as WireBound;
+
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "read_staleness_reaches_the_wire_on_execute_schema",
+    );
+
+    let selectors: Arc<Mutex<Vec<Option<v1::TransactionSelector>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let server = MockServer::start({
+        let record = selectors.clone();
+        move |mock| serve_streaming_sql_begin_aware(mock, &["v1"], Some(record.clone()))
+    });
+
+    let mut connection = server.connect();
+    connection
+        .set_option(
+            OptionConnection::Other(adbc_spanner::OPTION_READ_STALENESS.into()),
+            OptionValue::String("exact:10s".into()),
+        )
+        .expect("set connection-level staleness");
+
+    let mut statement = connection.new_statement().expect("new statement");
+    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+    statement.execute_schema().expect("execute_schema probe");
+
+    let selectors = selectors.lock().unwrap();
+    assert_eq!(selectors.len(), 1, "one PLAN probe request");
+    assert_eq!(
+        single_use_read_only_bound(selectors[0].as_ref()),
+        WireBound::ExactStaleness(prost_types::Duration {
+            seconds: 10,
+            nanos: 0,
+        }),
+        "the execute_schema PLAN probe must carry the connection's exact:10s staleness"
+    );
+}
+
+/// TEST-1 (wire, SPAN-4): the `get_objects` metadata snapshot must carry `spanner.read.staleness`
+/// on its shared multi-use read-only transaction (pinned via `multi_use_timestamp_bound`), which
+/// the client begins inline — so the first request's `transaction.begin` selector carries the
+/// bound. Without the fix it began a strong read (no timestamp bound), which `read_only_bound`
+/// rejects — so this is non-vacuous.
+#[test]
+fn read_staleness_reaches_the_wire_on_get_objects() {
+    use adbc_core::options::ObjectDepth;
+    use v1::transaction_options::read_only::TimestampBound as WireBound;
+
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "read_staleness_reaches_the_wire_on_get_objects",
+    );
+
+    let selectors: Arc<Mutex<Vec<Option<v1::TransactionSelector>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let server = MockServer::start({
+        let record = selectors.clone();
+        move |mock| serve_streaming_sql_begin_aware(mock, &["default"], Some(record.clone()))
+    });
+
+    let mut connection = server.connect();
+    connection
+        .set_option(
+            OptionConnection::Other(adbc_spanner::OPTION_READ_STALENESS.into()),
+            OptionValue::String("exact:10s".into()),
+        )
+        .expect("set connection-level staleness");
+
+    // Schemas depth fires exactly the SCHEMATA query, which begins the shared read-only transaction.
+    let reader = connection
+        .get_objects(ObjectDepth::Schemas, None, None, None, None, None)
+        .expect("get_objects");
+    reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("drain get_objects");
+
+    let selectors = selectors.lock().unwrap();
+    let begin = selectors
+        .iter()
+        .find_map(|s| match s.as_ref().and_then(|s| s.selector.as_ref()) {
+            Some(v1::transaction_selector::Selector::Begin(options)) => Some(options),
+            _ => None,
+        })
+        .expect("get_objects must begin its read-only transaction inline");
+    assert_eq!(
+        read_only_bound(begin),
+        WireBound::ExactStaleness(prost_types::Duration {
+            seconds: 10,
+            nanos: 0,
+        }),
+        "the get_objects snapshot must carry the connection's exact:10s staleness"
+    );
+}
+
 /// Run one two-row bound (parameterized) query with the given `spanner.read.staleness` against its
 /// own mock server, returning the transaction selector of every `ExecuteSqlRequest` the server
 /// saw. Two bound rows force the multi-use read-only transaction path; the client begins it

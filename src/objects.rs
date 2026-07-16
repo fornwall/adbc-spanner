@@ -30,6 +30,7 @@ use crate::conversion::result_set_to_batch;
 use crate::error::{err, from_spanner};
 use crate::nested::{arrow_err, field, list_item, list_of, list_of_nullable, struct_fields};
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
+use crate::staleness::ReadStaleness;
 use crate::timeout::with_timeout;
 
 /// A column of a table, as returned by `get_objects`.
@@ -156,6 +157,7 @@ pub(crate) fn collect_objects(
     client: &DatabaseClient,
     cancel: &CancelSignal,
     timeout: Option<Duration>,
+    read_staleness: &ReadStaleness,
     depth: ObjectDepth,
     filters: &ObjectFilters<'_>,
 ) -> Result<Vec<DbSchema>> {
@@ -248,6 +250,10 @@ pub(crate) fn collect_objects(
         .build()
     });
 
+    // The whole metadata fetch shares one multi-use read-only transaction, so honour the
+    // connection's read staleness (pinned to a legal multi-use equivalent) as `get_table_schema`
+    // and the statistics scans do.
+    let bound = read_staleness.multi_use_timestamp_bound()?;
     let batches = block_on_cancellable(
         runtime,
         cancel,
@@ -261,11 +267,11 @@ pub(crate) fn collect_objects(
             // supports concurrent statements on one transaction: `execute_query` takes `&self`,
             // and the inline-begin state machine serialises the implicit `BeginTransaction`
             // among concurrent first statements (later ones wait for the begun transaction id).
-            let txn = client
-                .read_only_transaction()
-                .build()
-                .await
-                .map_err(from_spanner)?;
+            let mut txn_builder = client.read_only_transaction();
+            if let Some(b) = bound {
+                txn_builder = txn_builder.set_timestamp_bound(b);
+            }
+            let txn = txn_builder.build().await.map_err(from_spanner)?;
             let (schemata, tables, columns, constraints, key_columns, referential) = try_join!(
                 query_txn(&txn, schemata_stmt),
                 query_txn_opt(&txn, tables_stmt),

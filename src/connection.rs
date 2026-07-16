@@ -1421,6 +1421,7 @@ impl Connection for SpannerConnection {
             &self.client,
             &self.cancel.current(),
             self.config.timeouts.query_timeout(),
+            &self.config.read_staleness,
             depth,
             &crate::objects::ObjectFilters {
                 db_schema,
