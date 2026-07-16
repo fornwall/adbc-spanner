@@ -1022,7 +1022,9 @@ fn build_struct(fields: &Fields, values: &[Option<&Value>]) -> Result<ArrayRef> 
     for &value in values {
         match present(value) {
             None => {
-                children.iter_mut().for_each(|child| child.push(None));
+                for child in children.iter_mut() {
+                    child.push(None);
+                }
                 validity.push(false);
             }
             Some(v) if v.kind() == Kind::List => {
