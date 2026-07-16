@@ -363,10 +363,16 @@ impl Iterator for SpannerBatchReader {
     type Item = std::result::Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Emit the prefetched first chunk (which settled the schema) before pulling any more. This
-        // also yields the single (possibly empty) batch of a small or empty result, matching the
-        // one-batch shape callers previously saw.
-        if let Some(rows) = self.first.take() {
+        // Emit the prefetched first chunk (which settled the schema) before pulling any more. An
+        // *empty* first chunk means an empty result set — `pull_chunk` returns no rows only once the
+        // stream is already exhausted — so skip it and fall through to end the stream: an empty
+        // result yields zero batches (its schema is still exposed via `schema()`), the Arrow-standard
+        // end-of-stream shape the ADBC contract expects (adbc_validation's empty-readback case reads
+        // a released/NULL array, not a spurious 0-row batch). A non-empty first chunk is emitted as
+        // the result's first batch.
+        if let Some(rows) = self.first.take()
+            && !rows.is_empty()
+        {
             return Some(build_batch(self.schema.clone(), &rows).map_err(to_arrow_error));
         }
         let rx = self.chunks.as_mut()?;

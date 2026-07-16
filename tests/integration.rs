@@ -3129,6 +3129,76 @@ fn bulk_ingest_edge_cases() {
         .execute_update()
         .expect("drop AdbcEdgeCreate");
 
+    // --- A stream that yields ZERO batches (not merely zero-row batches): the empty-array-stream
+    // shape `AdbcStatementBindStream` receives from a source with no data. The stream still declares
+    // a schema, so `bind_stream` preserves it as a zero-row batch (mirroring single-batch `bind`) —
+    // the empty ingest must succeed, not be rejected as "no data has been bound". This is exactly the
+    // C++ adbc_validation `TestSqlIngestStreamZeroArrays` scenario.
+    let empty_stream = || {
+        RecordBatchIterator::new(
+            Vec::<std::result::Result<RecordBatch, arrow_schema::ArrowError>>::new(),
+            schema.clone(),
+        )
+    };
+    // Create mode: the table is built from the stream's declared schema alone, with zero rows.
+    let mut create_empty = connection.new_statement().expect("new statement");
+    create_empty
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcEdgeZero".into()),
+        )
+        .unwrap();
+    create_empty
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("create".into()),
+        )
+        .unwrap();
+    create_empty
+        .bind_stream(Box::new(empty_stream()))
+        .expect("bind a zero-batch stream");
+    assert_eq!(
+        create_empty
+            .execute_update()
+            .expect("create-mode ingest of a zero-batch stream must succeed"),
+        Some(0),
+        "a zero-batch ingest commits zero rows"
+    );
+    assert_eq!(
+        count_rows(&mut connection, "AdbcEdgeZero"),
+        0,
+        "the table must be created (from the stream's schema) with zero rows"
+    );
+    // Append mode into the now-existing table: a zero-batch stream is a clean no-op.
+    let mut append_empty = connection.new_statement().expect("new statement");
+    append_empty
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcEdgeZero".into()),
+        )
+        .unwrap();
+    append_empty
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .unwrap();
+    append_empty
+        .bind_stream(Box::new(empty_stream()))
+        .expect("bind a zero-batch stream for append");
+    assert_eq!(
+        append_empty
+            .execute_update()
+            .expect("append of a zero-batch stream must succeed"),
+        Some(0)
+    );
+    assert_eq!(count_rows(&mut connection, "AdbcEdgeZero"), 0);
+    let mut drop_edge_zero = connection.new_statement().expect("new statement");
+    drop_edge_zero
+        .set_sql_query("DROP TABLE AdbcEdgeZero")
+        .unwrap();
+    drop_edge_zero.execute_update().expect("drop AdbcEdgeZero");
+
     // --- Bind BEFORE the ingest options: the bound data and the ingest options may arrive in
     // either order.
     let mut before = connection.new_statement().expect("new statement");

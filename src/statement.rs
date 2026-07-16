@@ -1642,6 +1642,13 @@ impl Statement for SpannerStatement {
     }
 
     fn bind_stream(&mut self, reader: Box<dyn RecordBatchReader + Send>) -> Result<()> {
+        // Capture the stream's schema up front: a stream may yield *zero* batches yet still declare a
+        // schema (an empty bulk ingest — `AdbcStatementBindStream` of an empty array stream). The
+        // single-batch `bind` path already represents empty input as one zero-row batch, so preserve
+        // the schema the same way here (`RecordBatch::new_empty`). Without it a zero-array ingest
+        // would lose the schema entirely and be rejected as "no data has been bound", when it should
+        // create the table from the schema and commit zero rows.
+        let schema = reader.schema();
         let mut batches = Vec::new();
         for batch in reader {
             batches.push(batch.map_err(|e| {
@@ -1650,6 +1657,9 @@ impl Statement for SpannerStatement {
                     Status::InvalidData,
                 )
             })?);
+        }
+        if batches.is_empty() {
+            batches.push(RecordBatch::new_empty(schema));
         }
         self.bound = batches;
         Ok(())

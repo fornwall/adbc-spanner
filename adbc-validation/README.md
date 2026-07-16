@@ -265,10 +265,6 @@ none of them fixable by rewriting SQL:
   unsigned mapping yet; Duration/Interval(MonthDayNano)/FixedSizeBinary have no
   bind/create mapping (Spanner INTERVAL is not wired up). Expected failures that
   flip to gate-enforced passes as the driver grows each mapping.
-- **Empty-stream ingest** — `TestSqlIngestStreamZeroArrays` binds a stream with
-  zero batches and expects the ingest to succeed (creating an empty table); the
-  driver requires bound data and fails with `INVALID_STATE` "cannot ingest: no
-  data has been bound". A driver-side gap, no SQL involved.
 - **`ECANCELED` through the C stream** — `SqlQueryCancel` requires the result
   stream's `get_next` to return exactly `ECANCELED` (125) after a cancel, but
   arrow-rs's `FFI_ArrowArrayStream` exporter (which `adbc_ffi` uses to export

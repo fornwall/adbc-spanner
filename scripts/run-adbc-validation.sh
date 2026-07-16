@@ -209,12 +209,11 @@ EXCLUDED=(
   'SpannerStatementTest.SqlIngestInterval'
   'SpannerStatementTest.SqlIngestUInt64'
 
-  # --- Bucket 3: empty-stream ingest -------------------------------------------
-  # Ingesting a stream with zero batches fails with InvalidState "cannot ingest:
-  # no data has been bound" — the driver requires bound data before an ingest
-  # executes, upstream expects a zero-row ingest to succeed and create the
-  # table. A driver-side gap (no SQL involved), guarded here until fixed.
-  'SpannerStatementTest.TestSqlIngestStreamZeroArrays'
+  # (TestSqlIngestStreamZeroArrays is NOT here: an empty-array ingest stream now
+  # preserves its declared schema as a zero-row batch — mirroring the single-batch
+  # `bind` path — so create-mode builds the table from the schema and commits zero
+  # rows, and the case passes cleanly and is gate-enforced. The `SELECT *` readback
+  # is routed through RewriteSql to dodge the synthetic adbc_ingest_key column.)
 
   # --- Bucket 4: ECANCELED through the C stream -------------------------------
   # SqlQueryCancel requires the result stream's get_next to return exactly
