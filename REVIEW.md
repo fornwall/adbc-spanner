@@ -230,7 +230,7 @@ parse-tested but never verified to reach the wire (TEST-1..5).
 
 - [ ] **TEST-9 (Medium)** — Fuzzing misses `staleness::parse_read_bound`/`parse_duration` (COR-1 would have been found by this), `directed_read::parse` (the most complex hand parser), and the `spanner:` URI expansion (unreachable from the `options` target, which feeds only `Other(key)`); lower-value: an `arbitrary`-driven hostile proto-value target for `rows_to_arrow` (pairs with SEC-5). Each ~10 lines on the existing wrapper pattern.
 
-- [ ] **TEST-10 (Low)** — `python/tests/test_options.py` asserts only enum *names* — one pytest driving a vendor option through `db_kwargs` end-to-end.
+- [x] **TEST-10 (Low)** — `python/tests/test_options.py` asserts only enum *names* — one pytest driving a vendor option through `db_kwargs` end-to-end. *Resolved:* `test_connection_option_round_trips_through_kwargs` in `python/tests/test_options.py` passes `spanner.request.tag` via `conn_kwargs`, asserts it round-trips back through `conn.adbc_connection.get_option`, and runs a `SELECT 1` under it — reusing the `emulator_database` conftest fixture so it self-skips cleanly when `SPANNER_EMULATOR_HOST` is unset.
 
 - [ ] **TEST-11 (Low)** — Benchmarks (`benches/`) have no CI consumer — no perf-regression gate; acceptable now, worth a nightly smoke eventually.
 
