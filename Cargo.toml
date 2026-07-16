@@ -9,6 +9,12 @@
 [workspace]
 members = ["fuzz"]
 default-members = ["."]
+# Keep cargo out of `.claude/` — the harness stores agent git worktrees under
+# `.claude/worktrees/`, each a nested checkout of this crate. Without this, a `cargo` run inside
+# such a worktree (or one based on a pre-workspace commit) walks up, finds THIS `[workspace]`, and
+# errors that the nested package is neither a member nor excluded. Excluding the dir makes any
+# nested checkout resolve as its own standalone package.
+exclude = [".claude"]
 
 [package]
 name = "adbc-spanner"
