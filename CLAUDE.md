@@ -404,7 +404,10 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   no special driver support; covered by `gql_graph_query_round_trip` in `tests/integration.rs`),
   manual transactions
   (buffer-and-commit), native Arrow types for DATE/TIMESTAMP/NUMERIC and native `List`/`Struct` for
-  ARRAY/STRUCT, parameter binding (positional by default — the *i*-th bound column binds the *i*-th
+  ARRAY/STRUCT (struct fields are decoded **positionally**, the only encoding Spanner sends for a
+  STRUCT value — a `ListValue` in field order — so Spanner's legal duplicate/empty field names keep
+  their own values; a keyed `google.protobuf.Struct` wire value is a strict `decode_error`, since a
+  map cannot represent duplicate fields at all — CONV-6), parameter binding (positional by default — the *i*-th bound column binds the *i*-th
   distinct `@param` in query order, column names ignored; the `adbc.statement.bind_by_name`
   statement option [SQLite reference-driver convention, a boolean defaulting to `false`] set to
   `true` forces strict by-name binding [order-independent; an unmatched column → `InvalidArguments`];

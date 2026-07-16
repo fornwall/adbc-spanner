@@ -363,7 +363,9 @@ present (non-`NULL`) wire value that cannot be decoded as its column's type surf
 `InvalidData` error naming the type and the offending value — it is never silently mapped to a
 null slot the caller could mistake for a genuine SQL `NULL`. `ARRAY` and `STRUCT` map to
 native Arrow `List`/`Struct` recursively, so nested shapes like `ARRAY<STRUCT<..>>` round-trip with
-full type fidelity.
+full type fidelity. Struct fields are matched **positionally**, not by name, so a `STRUCT` with
+duplicate or empty field names — both legal in Spanner, e.g. `STRUCT(1 AS x, 2 AS x)` or an unnamed
+`SELECT`ed expression — keeps every field's own value.
 
 `ENUM` and `PROTO` columns map to lossless primitives: `ENUM` → `Int64` (the enum's integer
 ordinal, delivered as a decimal string like `INT64`) and `PROTO` → `Binary` (the message's raw

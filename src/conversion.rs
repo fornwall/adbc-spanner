@@ -27,7 +27,10 @@
 //!
 //! `ARRAY` and `STRUCT` map to native Arrow `List`/`Struct` recursively, so nested shapes like
 //! `ARRAY<STRUCT<..>>` round-trip with full type fidelity. (Struct field metadata comes from
-//! [`Type::struct_type`](google_cloud_spanner::value::Type::struct_type).)
+//! [`Type::struct_type`](google_cloud_spanner::value::Type::struct_type).) Both Spanner and Arrow
+//! address struct fields **positionally**, so a Spanner `STRUCT`'s duplicate or empty field names —
+//! both legal, e.g. `STRUCT(1 AS x, 2 AS x)` or an unnamed `SELECT`ed expression — are carried over
+//! verbatim, each field keeping its own value (CONV-6).
 //!
 //! `JSON` columns keep `Utf8` storage (the value bytes are the JSON text) but carry the canonical
 //! `arrow.json` extension type as field metadata (`ARROW:extension:name` = `arrow.json`), so Arrow
@@ -991,13 +994,17 @@ fn build_list(field: &FieldRef, values: &[Option<&Value>]) -> Result<ArrayRef> {
     Ok(Arc::new(list))
 }
 
-/// Build an Arrow `Struct` array. Spanner encodes struct values positionally (a `ListValue` whose
-/// elements match the struct's field order); a value delivered as a keyed struct is handled too.
+/// Build an Arrow `Struct` array. Spanner encodes struct values **positionally** — a `ListValue`
+/// whose elements match the struct type's field order — and fields are addressed by index only.
+/// That is the sole encoding accepted here, and it is what makes Spanner's duplicate and empty
+/// field names decode correctly: a name-keyed lookup would collapse two same-named fields onto one
+/// value (CONV-6), and a keyed `google.protobuf.Struct` wire value could not carry them apart in
+/// the first place, being a map.
 ///
 /// The strict-decode policy of the scalar arms applies here too: a SQL NULL (or absent value)
-/// becomes a null slot, but a *present* value that is neither a wire list nor a keyed struct is an
-/// error (see [`decode_error`]), never a silent null. Field values recurse through
-/// [`build_array`], so an undecodable field — at any nesting depth — errors as well.
+/// becomes a null slot, but a *present* value that is not a wire list is an error (see
+/// [`decode_error`]), never a silent null. Field values recurse through [`build_array`], so an
+/// undecodable field — at any nesting depth — errors as well.
 fn build_struct(fields: &Fields, values: &[Option<&Value>]) -> Result<ArrayRef> {
     let mut children: Vec<Vec<Option<&Value>>> =
         vec![Vec::with_capacity(values.len()); fields.len()];
@@ -1012,13 +1019,6 @@ fn build_struct(fields: &Fields, values: &[Option<&Value>]) -> Result<ArrayRef> 
                 let list = v.as_list();
                 for (i, child) in children.iter_mut().enumerate() {
                     child.push(list.get(i));
-                }
-                validity.push(true);
-            }
-            Some(v) if v.kind() == Kind::Struct => {
-                let s = v.as_struct();
-                for (field, child) in fields.iter().zip(children.iter_mut()) {
-                    child.push(s.get(field.name()));
                 }
                 validity.push(true);
             }
@@ -1679,9 +1679,9 @@ mod tests {
     }
 
     /// The strict-decode policy applies inside `STRUCT` columns too: a present column value that is
-    /// neither a wire list (positional encoding) nor a keyed struct, and a present *field* value
-    /// that cannot be decoded as the field's type, are both loud errors — never silent nulls. This
-    /// also covers recursion: an undecodable struct nested inside a list errors as well.
+    /// not a wire list (the positional encoding), and a present *field* value that cannot be
+    /// decoded as the field's type, are both loud errors — never silent nulls. This also covers
+    /// recursion: an undecodable struct nested inside a list errors as well.
     #[test]
     fn struct_with_undecodable_field_errors() {
         use google_cloud_spanner::value::ToValue;
@@ -1701,8 +1701,7 @@ mod tests {
             err.message
         );
 
-        // A present column value that is neither a list nor a keyed struct errors as a STRUCT
-        // decode failure.
+        // A present column value that is not a wire list errors as a STRUCT decode failure.
         let not_a_struct = "scalar".to_value();
         let err = build_array(&struct_type, &[Some(&not_a_struct)]).unwrap_err();
         assert_eq!(err.status, Status::InvalidData);
@@ -1724,6 +1723,62 @@ mod tests {
             "{}",
             err.message
         );
+    }
+
+    /// A keyed (`google.protobuf.Struct`) wire value cannot represent a Spanner `STRUCT`, so it is
+    /// a loud decode error rather than a name-keyed lookup that silently drops fields.
+    #[test]
+    fn keyed_struct_wire_value_errors() {
+        // STRUCT<x INT64, x INT64> — Spanner permits duplicate (and empty) field names, so a
+        // name-keyed decode cannot address these two fields apart. A keyed map cannot even hold
+        // them: `google.protobuf.Struct` is a map, so one "x" key must lose the other's value.
+        let dup = DataType::Struct(Fields::from(vec![
+            Field::new("x", DataType::Int64, true),
+            Field::new("x", DataType::Int64, true),
+        ]));
+        let keyed = prost_types::Value {
+            kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
+                fields: [(
+                    "x".to_string(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::StringValue("1".to_string())),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            })),
+        }
+        .to_value();
+        let err = build_array(&dup, &[Some(&keyed)]).unwrap_err();
+        assert_eq!(err.status, Status::InvalidData);
+        assert!(err.message.contains("STRUCT"), "{}", err.message);
+    }
+
+    /// Spanner's positional wire encoding addresses fields by index, so duplicate and empty field
+    /// names — both legal in a Spanner `STRUCT` — keep their own distinct values.
+    #[test]
+    fn positional_struct_keeps_duplicate_and_anonymous_fields() {
+        use arrow_array::{Array, Int64Array};
+
+        // STRUCT<x INT64, x INT64, `` INT64>: two same-named fields plus an anonymous one.
+        let fields = Fields::from(vec![
+            Field::new("x", DataType::Int64, true),
+            Field::new("x", DataType::Int64, true),
+            Field::new("", DataType::Int64, true),
+        ]);
+        let value = vec!["1".to_value(), "2".to_value(), "3".to_value()].to_value();
+        let array = build_array(&DataType::Struct(fields), &[Some(&value)]).unwrap();
+        let s = array.as_any().downcast_ref::<StructArray>().unwrap();
+
+        // Each field keeps its own value; nothing collapses onto the first "x".
+        let col = |i: usize| {
+            s.column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!((col(0), col(1), col(2)), (1, 2, 3));
     }
 
     /// Genuine wire NULLs still round-trip as nulls under strict list/struct decoding: SQL NULL
