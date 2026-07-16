@@ -291,7 +291,7 @@ behalf. Each is covered below.
   Reached via the client's `execute_query` at: `src/statement.rs:1089`/`:1091` (bound query),
   `src/statement.rs:934` (DML `THEN RETURN`), `src/conversion.rs:437`/`:508` (bound-query streaming),
   `src/connection.rs:1120` (ingest `table_exists` probe), `:1137` (`INFORMATION_SCHEMA` helper),
-  `:1530` (`get_table_schema`), and `src/objects.rs:411` (`get_objects`).
+  `:1530` (`get_table_schema`), and `src/objects.rs:435` (`get_objects`).
   - **Single-use** selectors come from `client.single_use()` — `src/statement.rs:1207` (plain
     `execute`), `:1090` (bound query, ≤1 row), `:1356` (partition PLAN probe), `:1907`
     (`execute_schema` PLAN probe), `:1450` (`plan_parameter_types`), `src/connection.rs:1118`,
@@ -299,7 +299,7 @@ behalf. Each is covered below.
     `staleness::single_use` (`src/staleness.rs:42`), which is where a timestamp bound is applied.
   - **Multi-use** read-only transactions — `src/statement.rs:1568` (the manual-mode shared
     snapshot), `src/statement.rs:1126` (bound query over >1 row, so all rows share a snapshot), and
-    `src/objects.rs:247` (`get_objects` runs six `INFORMATION_SCHEMA` queries on one snapshot).
+    `src/objects.rs:266` (`get_objects` runs six `INFORMATION_SCHEMA` queries on one snapshot).
 - **Retry caveat.** This RPC is dispatched **outside** gax's `retry_loop` — `send()` calls the
   transport directly (`<client>/src/server_streaming/builder.rs:62-75`) — and hand-rolls resumption
   in `ResultSet::check_retry` (`<client>/src/result_set.rs:674-685`), which seeds a fresh
@@ -363,20 +363,45 @@ behalf. Each is covered below.
   currently ignored** (`<client>/src/generated/gapic_dataplane/model.rs:7659-7675`):
   - `max_partitions`: *"**Note:** This hint is currently ignored by `PartitionQuery` and
     `PartitionRead` requests. The desired maximum number of partitions to return… The default for
-    this option is currently 10,000. The maximum value is currently 200,000. This is only a hint."*
+    this option is currently 10,000. The maximum value is currently 200,000. This is only a hint.
+    The actual number of partitions returned **can be smaller or larger** than this maximum count
+    request."*
   - `partition_size_bytes`: same "currently ignored" note; default 1 GiB.
 
-  **Caveat:** this means `spanner.partition.max_count` — which the driver plumbs into
-  `max_partitions` — may have **no server-side effect** at present. The option is accepted and
-  round-trips, but Spanner is documented as ignoring it. The quotas page's *"Maximum number of
-  partitions per instance | 20"* is **geo-partitioning**, a different feature, and does not bound
-  query partitions.
+  **The driver therefore exposes no knob for either**, and passes a default `PartitionOptions`. Two
+  independent reasons, both from the proto above. First, that "currently ignored" note is
+  *exhaustive*, not a carve-out: `PartitionOptions` has exactly two consumers in the whole v1 API —
+  `PartitionQueryRequest` and `PartitionReadRequest` — so the two RPCs it names are the only two that
+  can accept it. There is no third call where it might be honoured. Second, even granting a world
+  where the hint works, `max_partitions` is not an upper bound — the count "can be smaller **or
+  larger**" than requested — so it cannot be used to bound anything. Google's own Spark connector
+  never sets these, and Beam's `SpannerIO` javadoc calls them "unused options". A
+  `spanner.partition.max_count` statement option existed here until it was removed as inert; the key
+  now returns `NotImplemented` like any other unknown statement option.
+
+  **What actually determines the partition count is undocumented.** No Google source states the
+  algorithm. The only public characterisation is from a Spanner engineer on
+  [beam#14811](https://github.com/apache/beam/pull/14811#issuecomment-890849612): in practice "many"
+  is *"only a few 10s of elements, not millions"*, and elsewhere that it *"depends on how much data
+  is in your tables, the query, and some Spanner internals"*. Treat `>= 1` as the only safe
+  assumption — which is exactly what Google's own conformance tests assert.
+
+  **Empty partitions are normal.** A returned partition may yield zero rows, and consumers must
+  tolerate that rather than treat it as end-of-data. This is not an edge case: the Spanner emulator
+  generates empty partitions *deliberately* (`kNumEmptyPartitions = 5`) to simulate production, and
+  the hazard is real — it has caused a bug in one of Google's own client libraries, where a loader
+  stopped at the first empty partition instead of continuing. `execute_partitions_round_trip` covers
+  this implicitly: it runs against the emulator, iterates every partition, and asserts only that at
+  least one comes back.
+
+  The quotas page's *"Maximum number of partitions per instance | 20"* is **geo-partitioning**, a
+  different feature, and does not bound query partitions.
 - **Where we use it.** `PartitionQuery` only, in `run_partition_query`: batch read-only transaction
   built at `src/statement.rs:1363` (its `build()` at `:1367` *does* issue an RPC), `partition_query`
   at `src/statement.rs:1373`, schema from a separate `QueryMode::Plan` probe at `:1356`. Each
   `Partition` is serialised into the versioned descriptor envelope by `encode_partition`
-  (`src/connection.rs:1740`, called at `src/statement.rs:1386`) and later executed by
-  `read_partition` via `Partition::execute` (`src/connection.rs:1711`).
+  (`src/connection.rs:1730`, called at `src/statement.rs:1386`) and later executed by
+  `read_partition` via `Partition::execute` (`src/connection.rs:1701`).
   **`PartitionRead` is never used** — it is the key-based twin of `PartitionQuery`, and the driver
   has no key-based path.
 - **Security.** A descriptor is opaque but *executable* — it carries the SQL text plus
@@ -494,7 +519,7 @@ From the proto comments in the pinned client (not the quotas page):
 | Max commit delay | 0–500 ms | `model.rs:8851-8855` |
 | Unary `ExecuteSql` / `Read` result set | 10 MiB, else `FAILED_PRECONDITION` | `client.rs:119-122`, `:161-165` |
 | `request_tag` / `transaction_tag` length | 50 characters, *"Values that exceed this limit are truncated"* | `model.rs:6030-6031`, `:6044-6045` |
-| `max_partitions` | default 10,000, max 200,000 — **hint, currently ignored** | `model.rs:7666-7675` |
+| `max_partitions` | default 10,000, max 200,000 — **hint, currently ignored; not a cap** (count "can be smaller or larger") | `model.rs:7666-7675` |
 | `partition_size_bytes` | default 1 GiB — **hint, currently ignored** | `model.rs:7659-7665` |
 
 **Not published / unknown** — stated as such rather than guessed:
