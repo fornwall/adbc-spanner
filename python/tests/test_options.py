@@ -1,9 +1,16 @@
-"""Offline tests for credential kwargs and the typed option-key enums."""
+"""Tests for credential kwargs and the typed option-key enums.
+
+Most of these are offline (they only inspect the enums / connect signatures); the
+last one drives a ``spanner.*`` vendor option through ``conn_kwargs`` end-to-end
+against the emulator and self-skips (via the ``emulator_database`` fixture) when no
+``SPANNER_EMULATOR_HOST`` is configured.
+"""
 
 import inspect
 
 import adbc_driver_spanner
 import adbc_driver_spanner.dbapi
+import adbc_driver_spanner.dbapi as spanner
 from adbc_driver_spanner import (
     ConnectionOptions,
     DatabaseOptions,
@@ -37,3 +44,28 @@ def test_option_enum_values_are_usable_as_kwargs_keys():
     assert DatabaseOptions.ACCESS_TOKEN.value == "spanner.auth.access_token"
     assert ConnectionOptions.READ_STALENESS.value == "spanner.read.staleness"
     assert StatementOptions.ROWS_PER_BATCH.value == "spanner.rows_per_batch"
+
+
+def test_connection_option_round_trips_through_kwargs(emulator_database):
+    """A ``spanner.*`` vendor option passed via ``conn_kwargs`` takes effect
+    end-to-end: it round-trips through ``get_option`` and a query runs under it."""
+    conn = spanner.connect(
+        db_kwargs={
+            DatabaseOptions.URI.value: f"spanner:///{emulator_database}",
+            DatabaseOptions.EMULATOR.value: "true",
+        },
+        conn_kwargs={ConnectionOptions.REQUEST_TAG.value: "adbc-py-e2e"},
+        autocommit=True,
+    )
+    try:
+        # The value the driver received round-trips back through get_option.
+        assert (
+            conn.adbc_connection.get_option(ConnectionOptions.REQUEST_TAG.value)
+            == "adbc-py-e2e"
+        )
+        # And a query still runs with the option in effect.
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 AS one")
+            assert cur.fetchone()[0] == 1
+    finally:
+        conn.close()
