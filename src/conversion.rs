@@ -721,6 +721,12 @@ fn arrow_type(ty: &Type, precision: TimestampPrecision) -> Result<DataType> {
         // `CAST(col AS STRING)` in SQL (enum member name / proto text format) instead.
         TypeCode::Enum => DataType::Int64,
         TypeCode::Proto => DataType::Binary,
+        // Unlike JSON (whose `arrow.json` tag also drives the bind path), ENUM/PROTO/INTERVAL/UUID
+        // carry no such marker, so a value read back binds as its storage type — Spanner infers the
+        // param as INT64/BYTES/STRING and won't coerce it into the column. Wrap the parameter in
+        // `CAST(@p AS ENUM<…>|PROTO<…>|INTERVAL|UUID)` to round-trip one through DML (bulk-ingest
+        // mutations are unaffected). Documented in the README type-mapping section.
+        //
         // STRING, JSON, UUID, INTERVAL and any future/unknown code are UTF-8 text.
         _ => DataType::Utf8,
     })
