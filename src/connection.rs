@@ -825,10 +825,15 @@ pub(crate) fn apply_isolation(
 /// *stronger* than the ANSI level of the same name, so it satisfies a `repeatable_read` request too.
 ///
 /// The remaining two levels are **promoted upward** to the weakest supported level that still
-/// satisfies their guarantees, rather than being rejected. A stronger isolation level always
-/// satisfies a weaker one's guarantees, so promotion is semantically safe, and it is
-/// spec-permitted: the ADBC spec says a driver *should* (not *must*) error on an unsupported
-/// level, and JDBC explicitly sanctions substituting a higher/more-restrictive level.
+/// satisfies their guarantees, rather than being rejected. Isolation levels are
+/// minimum-guarantee contracts — each names the *maximum* anomalies it permits (ANSI SQL defines
+/// them by permitted phenomena) — so a stronger level always satisfies a weaker one's request.
+/// Promoting upward therefore delivers *at least* what was asked, which is itself a valid way to
+/// **support** the level, not a deviation: the ADBC spec's "if the desired isolation level is not
+/// supported … return an appropriate error" is aimed at the opposite case, a driver that can only
+/// offer something *weaker* than requested — this driver never downgrades. The SQL standard and
+/// JDBC's `setTransactionIsolation` likewise sanction substituting a higher/more-restrictive
+/// level. (The one genuinely unsupported input, an unknown level string, is rejected below.)
 ///
 /// | requested          | mapped to         | rationale                                                  |
 /// |--------------------|-------------------|------------------------------------------------------------|
