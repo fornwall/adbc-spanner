@@ -380,5 +380,6 @@ gets a portable ADBC status *and* the Spanner-specific specifics if they want th
 
 That is the whole driver. From here, the natural next reads are the
 [README](../README.md) for the feature list and type mapping, [docs/options.md](options.md) for the
-configuration reference, and the module-level rustdoc in [`src/`](../src) for any internal you want
-to go deeper on.
+configuration reference, [docs/transactions.md](transactions.md) for Spanner's transaction model and
+the gRPC calls the driver makes underneath all of the above, and the module-level rustdoc in
+[`src/`](../src) for any internal you want to go deeper on.

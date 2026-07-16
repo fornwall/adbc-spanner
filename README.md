@@ -171,6 +171,11 @@ TODO: Go over these and merge with above:
 
 ## Supported Spanner functionality
 
+- [Transactions](https://cloud.google.com/spanner/docs/transactions): locking read-write, read-only
+  snapshot, and write-only/mutation commits.
+  **[docs/transactions.md](docs/transactions.md)** documents Spanner's transaction model, every gRPC
+  call the driver makes to read or write data — with its transaction semantics, batching limits and
+  the driver's call sites — and what the driver deliberately does not use.
 - Connecting to production Spanner or a [Spanner emulator](https://docs.cloud.google.com/spanner/docs/emulator).
 - [Timestamp bounds](https://cloud.google.com/spanner/docs/timestamp-bounds): Queries read at a
   [strong](https://docs.cloud.google.com/spanner/docs/timestamp-bounds#strong) bound by default.
