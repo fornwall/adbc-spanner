@@ -1627,6 +1627,91 @@ fn ingest_does_not_bisect_a_non_mutation_limit_error() {
     );
 }
 
+/// (d″) **A failed exists-probe must not mask the ingest error** (IDIO-9). When an `append` commit
+/// fails with anything other than `AlreadyExists`, the driver probes `INFORMATION_SCHEMA.TABLES` to
+/// choose between the contract's `NotFound` (table absent) and `AlreadyExists` (schema mismatch).
+/// Here the probe *itself* fails — as it would for a principal that may write but not read
+/// `INFORMATION_SCHEMA`, or during a transport blip — and the driver must surface the original
+/// commit error untouched rather than the probe's. The probe only *refines* a failure the user's own
+/// operation already produced, so a probe that answers nothing may not replace it with an error
+/// about a metadata query the caller never issued.
+///
+/// The probe-call assertion keeps this honest: without it the test would pass vacuously if the
+/// remap never probed at all.
+#[test]
+fn ingest_append_keeps_the_original_error_when_the_exists_probe_fails() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "ingest_append_keeps_the_original_error_when_the_exists_probe_fails",
+    );
+
+    let probes = Arc::new(AtomicUsize::new(0));
+    let probes_in_mock = probes.clone();
+    let server = MockServer::start(move |mock| {
+        serve_begin_transaction(mock);
+        // Fail the insert for a reason the append contract wants reinterpreted: not `AlreadyExists`
+        // (annotated without probing) and not the "too many mutations" rejection (bisected instead).
+        mock.expect_commit().returning(|_| {
+            Err(tonic::Status::invalid_argument(
+                "Invalid value for column c in table MockTable",
+            ))
+        });
+        // The exists-probe is the only query this ingest issues — the rows ship as mutations.
+        mock.expect_execute_streaming_sql().returning(move |_| {
+            probes_in_mock.fetch_add(1, Ordering::SeqCst);
+            Err(tonic::Status::permission_denied(
+                "spanner.databases.select denied on INFORMATION_SCHEMA",
+            ))
+        });
+    });
+
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("MockTable".into()),
+        )
+        .expect("set target table");
+    statement
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .expect("set ingest mode append");
+    statement.bind(ingest_batch(1)).expect("bind ingest data");
+
+    let error = statement
+        .execute_update()
+        .expect_err("the failing commit must fail the ingest");
+
+    assert_eq!(
+        probes.load(Ordering::SeqCst),
+        1,
+        "the append remap must have run the exists probe — otherwise this test is vacuous"
+    );
+    // The original commit error survives whole: status, message and vendor_code.
+    assert_eq!(
+        error.status,
+        AdbcStatus::InvalidArguments,
+        "the probe's own failure must not replace the ingest error; got: {error}"
+    );
+    assert!(
+        error.message.contains("Invalid value for column c"),
+        "the original commit error's message must survive; got: {}",
+        error.message
+    );
+    assert!(
+        !error.message.contains("INFORMATION_SCHEMA"),
+        "the probe's error must not surface in the ingest error; got: {}",
+        error.message
+    );
+    assert_eq!(
+        error.vendor_code, 3,
+        "the untouched original error keeps INVALID_ARGUMENT = 3; got: {error}"
+    );
+}
+
 /// (d‴) **BatchWrite per-group failure.** The `spanner.ingest.batch_write` transport reports a
 /// failed mutation group *in band* — a `google.rpc.Status` embedded in a streamed
 /// `BatchWriteResponse`, not a gRPC trailer — so it never passes through `from_spanner`. This is the

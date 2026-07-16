@@ -359,33 +359,49 @@ impl SpannerStatement {
         Ok(Some(statements))
     }
 
+    /// Whether `table` exists in the ingest target schema (`adbc.ingest.target_db_schema`; empty =
+    /// Spanner's default, unnamed schema), via the shared
+    /// [`table_exists`](crate::connection::table_exists) probe. Shared by the two ingest error
+    /// remaps below.
+    fn ingest_table_exists(&self, table: &str) -> Result<bool> {
+        crate::connection::table_exists(
+            &self.runtime,
+            &self.client,
+            &self.cancel.current(),
+            self.timeouts.query_timeout(),
+            self.target_db_schema.as_deref().unwrap_or(""),
+            table,
+        )
+    }
+
     /// Remap a failed `append`- or `create_append`-mode bulk ingest onto the statuses the ADBC
     /// bulk-ingest contract mandates.
     ///
-    /// A successful (or, in manual-transaction mode, merely buffered) outcome is returned unchanged.
+    /// Both modes insert into a table that may already exist, so the spec wants their insert
+    /// failure remapped: for `append` a missing table is [`Status::NotFound`] and a present one is a
+    /// schema mismatch ([`Status::AlreadyExists`]); for `create_append` the `CREATE TABLE IF NOT
+    /// EXISTS` step guarantees the table is present, so only the schema-mismatch side can surface
+    /// (its spec contract: "error if the table exists, but the schema does not match"). `create` and
+    /// `replace` keep the raw insert error — their DDL step already owns the table-existence
+    /// contract ([`remap_ingest_create_error`](Self::remap_ingest_create_error)).
+    ///
     /// A failure that already carries [`Status::AlreadyExists`] — a bound row duplicating a primary
     /// key already in the table, since insert mutations keep `INSERT` semantics — keeps that status
-    /// and just gets the target table's name folded into the message. Any other failure probes the
-    /// target table via the shared [`table_exists`](crate::connection::table_exists) query: a
-    /// missing table becomes [`Status::NotFound`], and an existing table — so the insert must have
-    /// failed because the bound data's schema is incompatible with the table's — becomes
-    /// [`Status::AlreadyExists`]. Only these cases are remapped; the original Spanner error's
-    /// detail is folded into the message. If the probe itself fails (e.g. a transport error) that
-    /// probe error is surfaced instead, so a genuine outage is not masked as a schema mismatch.
-    fn remap_ingest_append_error(
-        &self,
-        table: &str,
-        result: Result<Option<i64>>,
-    ) -> Result<Option<i64>> {
-        let error = match result {
-            Ok(count) => return Ok(count),
-            Err(error) => error,
-        };
+    /// and just gets the target table's name folded into the message. Any other failure is
+    /// reinterpreted from the [`ingest_table_exists`](Self::ingest_table_exists) probe; the original
+    /// Spanner error's detail is folded into the message.
+    fn remap_ingest_append_error(&self, table: &str, error: Error) -> Error {
+        if !matches!(
+            self.ingest_mode,
+            Some(IngestMode::Append) | Some(IngestMode::CreateAppend)
+        ) {
+            return error;
+        }
         // A driver-side transaction-state rejection (ingesting in a manual transaction that began
         // with a query) is not an insert failure, so the spec's NotFound/AlreadyExists
         // append contract does not apply — it propagates unchanged.
         if error.status == Status::InvalidState {
-            return Err(error);
+            return error;
         }
         // Already `AlreadyExists`: a duplicate primary key. The status is the one the contract
         // wants — name the target table (consumers key off it) instead of running the exists
@@ -405,36 +421,27 @@ impl SpannerStatement {
             // neither.)
             named.vendor_code = error.vendor_code;
             named.details = error.details;
-            return Err(named);
+            return named;
         }
-        // Probe the target table in its schema (`adbc.ingest.target_db_schema`, empty = Spanner's
-        // default, unnamed schema).
-        let db_schema = self.target_db_schema.as_deref().unwrap_or("");
-        let exists = crate::connection::table_exists(
-            &self.runtime,
-            &self.client,
-            &self.cancel.current(),
-            self.timeouts.query_timeout(),
-            db_schema,
-            table,
-        )?;
-        if exists {
-            Err(err(
+        match self.ingest_table_exists(table) {
+            Ok(true) => err(
                 format!(
                     "bulk ingest append into table {table:?} failed: the bound data is \
                      incompatible with the existing table's schema ({})",
                     error.message
                 ),
                 Status::AlreadyExists,
-            ))
-        } else {
-            Err(err(
+            ),
+            Ok(false) => err(
                 format!(
                     "bulk ingest append target table {table:?} not found ({})",
                     error.message
                 ),
                 Status::NotFound,
-            ))
+            ),
+            // A failed probe teaches us nothing about the table, so the insert error stands (see
+            // `table_exists`).
+            Err(_) => error,
         }
     }
 
@@ -493,23 +500,10 @@ impl SpannerStatement {
             self.run_ddl(ddl)
                 .map_err(|error| self.remap_ingest_create_error(table, error))?;
         }
-        let result = self.run_ingest_mutations(table);
-        // `append` and `create_append` both insert into a table that may already exist, so the
-        // ADBC spec wants their insert failure remapped to NotFound / AlreadyExists. For
-        // `append` a missing table is NotFound and a present one is a schema mismatch
-        // (AlreadyExists); for `create_append` the `CREATE TABLE IF NOT EXISTS` above guarantees
-        // the table is present, so only the schema-mismatch AlreadyExists side can surface (its
-        // spec contract: "error if the table exists, but the schema does not match"). `create`
-        // and `replace` keep the raw insert error — their DDL step already owns the
-        // table-existence contract (`remap_ingest_create_error`).
-        if matches!(
-            self.ingest_mode,
-            Some(IngestMode::Append) | Some(IngestMode::CreateAppend)
-        ) {
-            self.remap_ingest_append_error(table, result)
-        } else {
-            result
-        }
+        // Each remap gates on the ingest mode itself: the DDL failure above is `create`'s to
+        // reinterpret, the insert failure below `append`/`create_append`'s.
+        self.run_ingest_mutations(table)
+            .map_err(|error| self.remap_ingest_append_error(table, error))
     }
 
     /// Remap a failed `create`-mode ingest DDL onto [`Status::AlreadyExists`] when the target
@@ -528,15 +522,7 @@ impl SpannerStatement {
         if !matches!(self.ingest_mode, None | Some(IngestMode::Create)) {
             return error;
         }
-        let db_schema = self.target_db_schema.as_deref().unwrap_or("");
-        match crate::connection::table_exists(
-            &self.runtime,
-            &self.client,
-            &self.cancel.current(),
-            self.timeouts.query_timeout(),
-            db_schema,
-            table,
-        ) {
+        match self.ingest_table_exists(table) {
             Ok(true) => err(
                 format!(
                     "bulk ingest create target table {table:?} already exists ({})",
@@ -544,7 +530,9 @@ impl SpannerStatement {
                 ),
                 Status::AlreadyExists,
             ),
-            _ => error,
+            // An absent table means the DDL failed for some other reason; a failed probe teaches us
+            // nothing. Either way the original DDL error stands (see `table_exists`).
+            Ok(false) | Err(_) => error,
         }
     }
 

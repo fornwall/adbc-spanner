@@ -1092,6 +1092,16 @@ fn check_lookup_catalog(catalog: Option<&str>) -> Result<()> {
 /// A free function (rather than only a [`SpannerConnection`] method) so the statement's bulk-ingest
 /// error path can reuse the exact same probe to remap a failed `append` to the spec-mandated status
 /// (a missing table → `NotFound`, an existing-but-incompatible table → `AlreadyExists`).
+///
+/// **Probe-failure policy, shared by every caller that probes on an error path**
+/// ([`SpannerConnection::get_table_schema`], [`SpannerStatement`](crate::statement::SpannerStatement)'s
+/// two ingest remaps): the probe only *refines* an error the user's own operation already produced,
+/// so when the probe itself fails — a transport blip, a cancel, or simply no `INFORMATION_SCHEMA`
+/// read permission on a connection that may still write — that original error is returned unchanged.
+/// It is the error from the operation the caller actually asked for, and on a genuine outage it
+/// already reports the outage; replacing it with a failure from an internal metadata query the
+/// caller never issued would only hide the cause. So each site matches
+/// `Ok(true)`/`Ok(false)`/`Err(_) => original`, and none propagates the probe error with `?`.
 pub(crate) fn table_exists(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
@@ -1529,16 +1539,15 @@ impl Connection for SpannerConnection {
             // A missing table surfaces from the query analyzer as `INVALID_ARGUMENT` ("Table not
             // found"), but ADBC wants `NotFound`. Only touch `INFORMATION_SCHEMA` on the error path
             // so the common (table exists) case stays a single query.
-            Err(error) => {
-                if self.table_exists(db_schema.unwrap_or(""), table_name)? {
-                    Err(error)
-                } else {
-                    Err(err(
-                        format!("table {table_name:?} not found"),
-                        Status::NotFound,
-                    ))
-                }
-            }
+            Err(error) => Err(
+                match self.table_exists(db_schema.unwrap_or(""), table_name) {
+                    Ok(false) => err(format!("table {table_name:?} not found"), Status::NotFound),
+                    // The table is there (so the query failed for some other reason), or the probe
+                    // itself failed and teaches us nothing. Either way the original error stands (see
+                    // `table_exists`).
+                    Ok(true) | Err(_) => error,
+                },
+            ),
         }
     }
 
