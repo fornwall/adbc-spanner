@@ -196,8 +196,15 @@ const CHUNK_BYTE_BUDGET: usize = 32 * 1024 * 1024;
 
 /// Pull up to `max` rows from a Spanner result set, stopping early when the stream ends — or, as an
 /// additional cap, once the accumulated rows exceed [`CHUNK_BYTE_BUDGET`] approximate bytes.
+///
+/// `max` is a *cap*, not a prediction: the result set streams, so the row count is unknown until it
+/// ends, and most chunks are short (a `SELECT` of 3 rows, the driver's own metadata queries, the
+/// last chunk of any scan). Reserving `max` up front would allocate for the cap regardless — 384 KiB
+/// per chunk at the default 8192, and unbounded for a large `spanner.rows_per_batch`, which takes no
+/// upper bound. So `rows` just grows; `Vec`'s amortised doubling costs nothing measurable next to a
+/// chunk's RPC and Arrow conversion, even when the chunk does fill.
 async fn pull_chunk(rs: &mut ResultSet, max: usize) -> Result<Vec<Row>> {
-    let mut rows = Vec::with_capacity(max);
+    let mut rows = Vec::new();
     let mut bytes: usize = 0;
     while rows.len() < max {
         match rs.next().await {
