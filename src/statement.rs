@@ -18,7 +18,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{IngestMode, OptionStatement, OptionValue};
@@ -29,7 +28,6 @@ use google_cloud_lro::Poller as _;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::model::PartitionOptions;
 use google_cloud_spanner::model::execute_sql_request::QueryMode;
-use google_cloud_spanner::model::transaction_options::IsolationLevel;
 use google_cloud_spanner::mutation::{Mutation, MutationGroup};
 use google_cloud_spanner::statement::{Statement as SpannerSql, StatementBuilder};
 use google_cloud_spanner::transaction::{MultiUseReadOnlyTransaction, ReadWriteTransaction};
@@ -39,19 +37,16 @@ use crate::connection::{SharedTxn, TxnKind, apply_isolation, write_mutations_txn
 use crate::conversion::{
     BoundStatementSource, TimestampPrecision, result_set_to_batch, stream_bound_query, stream_query,
 };
-use crate::directed_read::DirectedRead;
 use crate::driver::SharedDatabaseAdmin;
 use crate::error::{
     err, from_builder, from_spanner, from_status_parts, invalid_argument, invalid_state,
     not_implemented,
 };
-use crate::options::{bool_option, impl_shared_option_dispatch, impl_typed_option_getters};
-use crate::query_options::QueryOptionsConfig;
-use crate::request::{CommitStats, RequestConfig};
-use crate::retry::RetryConfig;
+use crate::options::{
+    SharedConfig, bool_option, impl_shared_option_dispatch, impl_typed_option_getters,
+};
 use crate::runtime::{CancelSlot, SharedRuntime, block_on_cancellable};
-use crate::staleness::ReadStaleness;
-use crate::timeout::{RpcTimeouts, with_timeout};
+use crate::timeout::with_timeout;
 
 /// Default number of rows converted into each streamed Arrow batch (see
 /// [`OPTION_ROWS_PER_BATCH`](crate::OPTION_ROWS_PER_BATCH)). Also used by
@@ -122,13 +117,12 @@ pub struct SpannerStatement {
     /// statement minted from the database's cached client stack: the first DDL statement builds it
     /// and later ones clone it (see [`SharedDatabaseAdmin`]).
     admin: SharedDatabaseAdmin,
-    /// The connection's `adbc.connection.readonly` flag, shared live (`Arc`) rather than
-    /// snapshotted: each write path loads it at execution time, so toggling the option on the
-    /// connection immediately affects this statement in both directions.
-    read_only: Arc<AtomicBool>,
-    /// Isolation level for this statement's read/write transactions, inherited from the connection
-    /// at creation time (see the standard `adbc.connection.transaction.isolation_level` option).
-    isolation: IsolationLevel,
+    /// Every option-settable value on this statement, inherited from the connection at creation
+    /// time ([`SharedConfig::inherit`]) and overridable here for the fields the statement also
+    /// exposes. See [`SharedConfig`] for the per-field detail — including which values are
+    /// connection-set only (the readonly flag, live-shared; the isolation level) and which are
+    /// per-object rather than inherited (the commit-stats cell).
+    config: SharedConfig,
     txn: SharedTxn,
     sql: Option<String>,
     /// Parameter / bulk-ingest data bound via [`Statement::bind`] or [`Statement::bind_stream`].
@@ -168,42 +162,6 @@ pub struct SpannerStatement {
     rows_per_batch: usize,
     /// Enable Data Boost for partitioned execution (`spanner.data_boost`).
     data_boost: bool,
-    /// Read bound for this statement's read-only queries (`spanner.read.staleness`), inherited from
-    /// the connection at creation time and overridable per statement. Default is a strong read.
-    read_staleness: ReadStaleness,
-    /// Request priority and request/transaction tags (`spanner.request.priority` /
-    /// `spanner.request.tag`), inherited from the connection at creation time; the priority and
-    /// request tag are overridable per statement. The transaction tag (connection-level only)
-    /// rides along for the read/write transaction runners this statement builds.
-    request: RequestConfig,
-    /// Directed-read replica selection (`spanner.directed_read`), inherited from the connection at
-    /// creation time and overridable per statement. Applied to this statement's read-only query
-    /// paths only (Spanner rejects it on writes). Unset by default (Spanner's own routing).
-    directed_read: DirectedRead,
-    /// Query optimizer options (`spanner.query.optimizer_version` /
-    /// `spanner.query.optimizer_statistics_package`), inherited from the connection at creation time
-    /// and overridable per statement. Applied to every query statement builder this statement
-    /// produces (via [`Self::sql_builder`]).
-    query_options: QueryOptionsConfig,
-    /// How `TIMESTAMP` columns map to Arrow (`spanner.max_timestamp_precision`), inherited from
-    /// the connection at creation time and overridable per statement. Applied uniformly to every
-    /// result path of this statement: `execute` (plain and bound queries), DML `THEN RETURN`
-    /// rows, `execute_schema`, and the `execute_partitions` schema probe.
-    timestamp_precision: TimestampPrecision,
-    /// RPC timeouts (`spanner.rpc.timeout_seconds.{query,update,fetch}`), inherited from the
-    /// connection at creation time and overridable per statement. Unset (the default) means no
-    /// deadline; an expired deadline fails with [`Status::Timeout`].
-    timeouts: RpcTimeouts,
-    /// Retry-policy tuning (`spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds`),
-    /// inherited from the connection at creation time and overridable per statement. Unset (the
-    /// default) leaves the client's own retry policy; when set it bounds the client's retrying on
-    /// every statement/DML/transaction builder this statement produces.
-    retry: RetryConfig,
-    /// Mutation count captured from this statement's most recent commit that requested commit
-    /// statistics (`spanner.commit_stats`) — autocommit DML or a bulk ingest — read back via
-    /// `spanner.commit_stats.mutation_count`. Statement-owned and **not** inherited from the
-    /// connection (the connection owns the manual-mode commit's stats); fresh (unset) per statement.
-    commit_stats: CommitStats,
     /// Per-operation cancellation for this statement (see [`Statement::cancel`]): each execution
     /// entry point mints a fresh [`crate::runtime::CancelSignal`] here, and `cancel()` latches the
     /// current one — forever, so a cancelled streamed reader stays cancelled even after this
@@ -217,22 +175,15 @@ impl SpannerStatement {
     // RPC timeouts, retry tuning, …) that the statement and connection dispatch identically.
     impl_shared_option_dispatch!();
 
-    #[allow(clippy::too_many_arguments)] // constructor threads the connection's config verbatim
+    /// `config` is the connection's [`SharedConfig::inherit`]ed configuration; everything else is a
+    /// handle cloned from the connection's client stack.
     pub(crate) fn new(
         runtime: SharedRuntime,
         client: DatabaseClient,
         spanner: Spanner,
         database: String,
         admin: SharedDatabaseAdmin,
-        read_only: Arc<AtomicBool>,
-        isolation: IsolationLevel,
-        read_staleness: ReadStaleness,
-        request: RequestConfig,
-        directed_read: DirectedRead,
-        query_options: QueryOptionsConfig,
-        timestamp_precision: TimestampPrecision,
-        timeouts: RpcTimeouts,
-        retry: RetryConfig,
+        config: SharedConfig,
         txn: SharedTxn,
     ) -> Self {
         Self {
@@ -241,8 +192,7 @@ impl SpannerStatement {
             spanner,
             database,
             admin,
-            read_only,
-            isolation,
+            config,
             txn,
             sql: None,
             bound: Vec::new(),
@@ -255,22 +205,8 @@ impl SpannerStatement {
             bind_by_name: false,
             rows_per_batch: DEFAULT_ROWS_PER_BATCH,
             data_boost: false,
-            read_staleness,
-            request,
-            directed_read,
-            query_options,
-            timestamp_precision,
-            timeouts,
-            retry,
-            commit_stats: CommitStats::default(),
             cancel: CancelSlot::new(),
         }
-    }
-
-    /// The *live* value of the connection's `adbc.connection.readonly` flag. Loaded at each write
-    /// attempt (never cached), so a toggle on the connection applies to this statement immediately.
-    fn is_read_only(&self) -> bool {
-        self.read_only.load(Ordering::Acquire)
     }
 
     /// A Spanner statement builder for `sql` with this statement's request priority / request tag
@@ -279,9 +215,12 @@ impl SpannerStatement {
     /// policy (`spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds`) applied. Every
     /// query/DML statement the driver builds goes through here so the options apply uniformly.
     fn sql_builder(&self, sql: &str) -> StatementBuilder {
-        self.retry.apply_to_statement(
-            self.query_options
-                .apply_to_statement(self.request.apply_to_statement(SpannerSql::builder(sql))),
+        self.config.retry.apply_to_statement(
+            self.config.query_options.apply_to_statement(
+                self.config
+                    .request
+                    .apply_to_statement(SpannerSql::builder(sql)),
+            ),
         )
     }
 
@@ -290,7 +229,9 @@ impl SpannerStatement {
     /// the read-only query paths — Spanner rejects directed reads on a read/write transaction, so the
     /// DML paths keep using [`sql_builder`](Self::sql_builder) directly.
     fn read_sql_builder(&self, sql: &str) -> StatementBuilder {
-        self.directed_read.apply_to_statement(self.sql_builder(sql))
+        self.config
+            .directed_read
+            .apply_to_statement(self.sql_builder(sql))
     }
 
     /// Build one Spanner statement per bound row for the **DML** (`THEN RETURN` / `ExecuteBatchDml`)
@@ -368,7 +309,7 @@ impl SpannerStatement {
             &self.runtime,
             &self.client,
             &self.cancel.current(),
-            self.timeouts.query_timeout(),
+            self.config.timeouts.query_timeout(),
             self.target_db_schema.as_deref().unwrap_or(""),
             table,
         )
@@ -478,7 +419,7 @@ impl SpannerStatement {
     /// mid-ingest failure leaves the earlier chunks' rows committed (the error reports their exact
     /// count — see [`note_rows_already_committed`]).
     fn run_ingest(&mut self, table: &str) -> Result<Option<i64>> {
-        if self.is_read_only() {
+        if self.config.is_read_only() {
             return Err(invalid_state("cannot ingest: the connection is read-only"));
         }
         if self.bound.is_empty() {
@@ -760,10 +701,7 @@ impl SpannerStatement {
             &self.runtime,
             &self.client,
             &self.cancel.current(),
-            self.request.clone(),
-            self.retry,
-            self.timeouts.update_timeout(),
-            &self.commit_stats,
+            &self.config,
             mutations,
         )?;
         Ok(count)
@@ -803,7 +741,7 @@ impl SpannerStatement {
             &self.runtime,
             &self.cancel.current(),
             with_timeout(
-                self.timeouts.update_timeout(),
+                self.config.timeouts.update_timeout(),
                 crate::OPTION_RPC_TIMEOUT_UPDATE,
                 async move {
                     let mut stream = client
@@ -870,11 +808,7 @@ impl SpannerStatement {
             &self.runtime,
             &self.client,
             &self.cancel.current(),
-            self.isolation.clone(),
-            self.request.clone(),
-            self.retry,
-            self.timeouts.update_timeout(),
-            &self.commit_stats,
+            &self.config,
             statements,
         )?;
         Ok(Some(count))
@@ -894,11 +828,11 @@ impl SpannerStatement {
         statements: Vec<SpannerSql>,
     ) -> Result<(Vec<RecordBatch>, SchemaRef, i64)> {
         let client = self.client.clone();
-        let isolation = self.isolation.clone();
-        let request = self.request.clone();
-        let retry = self.retry;
+        let isolation = self.config.isolation.clone();
+        let request = self.config.request.clone();
+        let retry = self.config.retry;
         // DML with THEN RETURN is a write path: the update timeout bounds the whole transaction.
-        let update_timeout = self.timeouts.update_timeout();
+        let update_timeout = self.config.timeouts.update_timeout();
         let transaction = async move {
             let runner =
                 retry
@@ -949,7 +883,7 @@ impl SpannerStatement {
                 transaction,
             ),
         )?;
-        self.commit_stats.record(mutation_count);
+        self.config.commit_stats.record(mutation_count);
 
         let mut schema = None;
         let mut batches = Vec::with_capacity(results.len());
@@ -958,7 +892,7 @@ impl SpannerStatement {
             let (sch, batch) = crate::conversion::rows_to_batch(
                 metadata.as_ref(),
                 rows,
-                self.timestamp_precision,
+                self.config.timestamp_precision,
             )?;
             schema.get_or_insert(sch);
             batches.push(batch);
@@ -1016,7 +950,7 @@ impl SpannerStatement {
     /// rows share one multi-use read-only transaction pinned at the statement's read bound. The
     /// bounded-staleness kinds (`max:` / `min:`), which Spanner only accepts on single-use
     /// transactions, are pinned to the most stale timestamp their window allows for the multi-row
-    /// case (see [`ReadStaleness::multi_use_timestamp_bound`]).
+    /// case (see [`ReadStaleness::multi_use_timestamp_bound`](crate::staleness::ReadStaleness::multi_use_timestamp_bound)).
     ///
     /// Results stream through the same bounded-chunk machinery as `execute`: rows are converted to
     /// Arrow in chunks of `spanner.rows_per_batch` (plus the byte budget) as the reader is
@@ -1051,11 +985,11 @@ impl SpannerStatement {
         let runtime = self.runtime.clone();
         let cancel = self.cancel.current();
         let batch_size = self.rows_per_batch;
-        let precision = self.timestamp_precision;
+        let precision = self.config.timestamp_precision;
         // The query timeout bounds the initial execution (through the first chunk); the fetch
         // timeout bounds each later chunk as the reader is iterated.
-        let query_timeout = self.timeouts.query_timeout();
-        let fetch_timeout = self.timeouts.fetch_timeout();
+        let query_timeout = self.config.timeouts.query_timeout();
+        let fetch_timeout = self.config.timeouts.fetch_timeout();
         if total_rows <= 1 {
             // Zero or one bound row. One statement is one snapshot already, and (in autocommit
             // mode) the single-use transaction keeps the exact semantics of the bounded-staleness
@@ -1064,7 +998,7 @@ impl SpannerStatement {
                 return Ok(Self::empty_reader());
             };
             let statement = bind::bind_params(base_builder, names, batch, 0)?.build();
-            let bound = self.read_staleness.timestamp_bound()?;
+            let bound = self.config.read_staleness.timestamp_bound()?;
             let reader = block_on_cancellable(
                 &self.runtime,
                 &self.cancel.current(),
@@ -1089,7 +1023,7 @@ impl SpannerStatement {
             )?;
             return Ok(Box::new(reader));
         }
-        let bound = self.read_staleness.multi_use_timestamp_bound()?;
+        let bound = self.config.read_staleness.multi_use_timestamp_bound()?;
         let statements: Box<dyn BoundStatementSource> = Box::new(LazyBoundStatements {
             base_builder,
             groups,
@@ -1167,10 +1101,10 @@ impl SpannerStatement {
         let runtime = self.runtime.clone();
         let cancel = self.cancel.current();
         let batch_size = self.rows_per_batch;
-        let precision = self.timestamp_precision;
-        let bound = self.read_staleness.timestamp_bound()?;
+        let precision = self.config.timestamp_precision;
+        let bound = self.config.read_staleness.timestamp_bound()?;
         let statement = self.read_sql_builder(&sql).build();
-        let fetch_timeout = self.timeouts.fetch_timeout();
+        let fetch_timeout = self.config.timeouts.fetch_timeout();
         // Stream the result: `stream_query` fetches the first chunk (settling the schema) and the
         // returned reader converts the rest to Arrow one bounded chunk at a time as it is
         // iterated, with a background task prefetching the next chunk ahead of the consumer.
@@ -1180,7 +1114,7 @@ impl SpannerStatement {
             &self.runtime,
             &self.cancel.current(),
             with_timeout(
-                self.timeouts.query_timeout(),
+                self.config.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
                 async move {
                     let result_set = match manual_txn {
@@ -1224,7 +1158,7 @@ impl SpannerStatement {
     /// polls without any bound). An expired deadline fails with `Status::Timeout`; unset (the
     /// default) leaves the poll unbounded.
     fn run_ddl(&self, statements: Vec<String>) -> Result<()> {
-        if self.is_read_only() {
+        if self.config.is_read_only() {
             return Err(invalid_state(
                 "cannot execute DDL: the connection is read-only",
             ));
@@ -1236,7 +1170,7 @@ impl SpannerStatement {
             &self.runtime,
             &self.cancel.current(),
             with_timeout(
-                self.timeouts.update_timeout(),
+                self.config.timeouts.update_timeout(),
                 crate::OPTION_RPC_TIMEOUT_UPDATE,
                 async move {
                     // Build the Database Admin client once per cached client stack and reuse it:
@@ -1327,10 +1261,10 @@ impl SpannerStatement {
         // The advertised schema carries this statement's timestamp precision. Note the partitions
         // themselves are decoded by `Connection::read_partition` under the **reading** connection's
         // `spanner.max_timestamp_precision`, so set the two to the same mode.
-        let precision = self.timestamp_precision;
+        let precision = self.config.timestamp_precision;
         // The partitioned read honours the statement's read staleness: it is baked into the batch
         // read-only transaction, so every partition executes at that bound wherever it is read back.
-        let bound = self.read_staleness.timestamp_bound()?;
+        let bound = self.config.read_staleness.timestamp_bound()?;
 
         // Partitioning is a query-side operation: the query timeout bounds the schema probe plus
         // the PartitionQuery call.
@@ -1370,7 +1304,7 @@ impl SpannerStatement {
             &self.runtime,
             &self.cancel.current(),
             with_timeout(
-                self.timeouts.query_timeout(),
+                self.config.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
                 partition_op,
             ),
@@ -1412,7 +1346,7 @@ impl SpannerStatement {
         // previous operation does not leak in (see `CancelSlot`).
         self.cancel.begin_operation();
         if crate::sql::is_dml(&sql) {
-            if self.is_read_only() {
+            if self.config.is_read_only() {
                 return Ok(BTreeMap::new());
             }
             return self.plan_dml_parameter_types(&sql);
@@ -1423,7 +1357,7 @@ impl SpannerStatement {
             &self.runtime,
             &self.cancel.current(),
             with_timeout(
-                self.timeouts.query_timeout(),
+                self.config.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
                 async move {
                     let transaction = client.single_use().build();
@@ -1450,14 +1384,14 @@ impl SpannerStatement {
             .set_query_mode(QueryMode::Plan)
             .build();
         let client = self.client.clone();
-        let isolation = self.isolation.clone();
-        let request = self.request.clone();
-        let retry = self.retry;
+        let isolation = self.config.isolation.clone();
+        let request = self.config.request.clone();
+        let retry = self.config.retry;
         block_on_cancellable(
             &self.runtime,
             &self.cancel.current(),
             with_timeout(
-                self.timeouts.query_timeout(),
+                self.config.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
                 async move {
                     let runner = retry
@@ -1523,7 +1457,7 @@ impl SpannerStatement {
     /// The first data-returning query of a manual transaction builds the transaction — pinned at
     /// this statement's read bound, with the bounded-staleness kinds pinned to their most-stale
     /// legal equivalent, since Spanner accepts those only on single-use transactions (see
-    /// [`ReadStaleness::multi_use_timestamp_bound`]) — and installs it in the shared [`TxnState`]
+    /// [`ReadStaleness::multi_use_timestamp_bound`](crate::staleness::ReadStaleness::multi_use_timestamp_bound)) — and installs it in the shared [`TxnState`]
     /// (fixing the transaction's kind to queries); every later query returns the installed
     /// handle, so all reads in the transaction observe one consistent snapshot. Later statements'
     /// staleness settings are ignored — the transaction is already pinned. Building issues no RPC
@@ -1541,7 +1475,7 @@ impl SpannerStatement {
                 return Ok(Some(txn));
             }
         }
-        let bound = self.read_staleness.multi_use_timestamp_bound()?;
+        let bound = self.config.read_staleness.multi_use_timestamp_bound()?;
         let client = self.client.clone();
         let built = block_on_cancellable(&self.runtime, &self.cancel.current(), async move {
             let mut builder = client.read_only_transaction();
@@ -1754,7 +1688,7 @@ impl Statement for SpannerStatement {
         // DML with a `THEN RETURN` clause returns its rows; plain DML yields an empty result (the
         // query interface has nowhere to report the affected-row count, so it is discarded).
         if crate::sql::is_dml(&sql) {
-            if self.is_read_only() {
+            if self.config.is_read_only() {
                 return Err(invalid_state(
                     "cannot execute DML: the connection is read-only",
                 ));
@@ -1820,7 +1754,7 @@ impl Statement for SpannerStatement {
             drain_discarding_rows(reader)?;
             return Ok(None);
         }
-        if self.is_read_only() {
+        if self.config.is_read_only() {
             return Err(invalid_state(
                 "cannot execute DML: the connection is read-only",
             ));
@@ -1852,7 +1786,7 @@ impl Statement for SpannerStatement {
         let bind_by_name = self.bind_by_name;
         // The PLAN probe's schema must carry the same timestamp unit as the data `execute` would
         // stream, so the advertised schema and the actual batches can never disagree.
-        let precision = self.timestamp_precision;
+        let precision = self.config.timestamp_precision;
         // QueryMode::Plan analyses the query and returns its column metadata without scanning
         // any data, so dbt can introspect a model's output columns without wrapping it in a
         // `SELECT ... WHERE false` subquery.
@@ -1862,7 +1796,7 @@ impl Statement for SpannerStatement {
             &self.runtime,
             &self.cancel.current(),
             with_timeout(
-                self.timeouts.query_timeout(),
+                self.config.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
                 async move {
                     let transaction = client.single_use().build();
@@ -1966,9 +1900,12 @@ impl Statement for SpannerStatement {
                 match ty {
                     // The field is built by the same mapping as result columns, so a `JSON`-typed
                     // parameter carries the `arrow.json` extension tag the bind path understands.
-                    Some(ty) => {
-                        crate::conversion::arrow_field(&name, ty, true, self.timestamp_precision)
-                    }
+                    Some(ty) => crate::conversion::arrow_field(
+                        &name,
+                        ty,
+                        true,
+                        self.config.timestamp_precision,
+                    ),
                     None => Ok(Field::new(name, DataType::Null, true)),
                 }
             })

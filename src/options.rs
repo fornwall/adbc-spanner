@@ -1,4 +1,6 @@
-//! Shared coercions from an ADBC [`OptionValue`] into concrete Rust types.
+//! The option surface shared by more than one ADBC object: coercions from an [`OptionValue`] into
+//! concrete Rust types, the [`SharedConfig`] bundle a connection and its statements both carry, and
+//! the [`impl_shared_option_dispatch`] macro that routes option keys to that bundle for both.
 //!
 //! The driver, connection and statement all accept the same handful of option shapes — booleans
 //! (as exactly the string `true`/`false`), plain strings, positive integers (as an integer or a
@@ -16,10 +18,21 @@
 
 use std::time::Duration;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use adbc_core::error::Result;
 use adbc_core::options::OptionValue;
+use google_cloud_spanner::model::transaction_options::IsolationLevel;
 
+use crate::conversion::TimestampPrecision;
+use crate::directed_read::DirectedRead;
 use crate::error::invalid_argument;
+use crate::query_options::QueryOptionsConfig;
+use crate::request::{CommitStats, RequestConfig};
+use crate::retry::RetryConfig;
+use crate::staleness::ReadStaleness;
+use crate::timeout::RpcTimeouts;
 
 /// Parse a boolean option, accepted as exactly the string `true` or `false` (lowercase — the
 /// ADBC canonical spellings, matching `adbc_core`'s own `TryFrom<OptionValue> for bool` and the
@@ -202,13 +215,122 @@ macro_rules! impl_typed_option_getters {
 }
 pub(crate) use impl_typed_option_getters;
 
+/// The configuration a [`SpannerConnection`](crate::connection::SpannerConnection) and every
+/// [`SpannerStatement`](crate::statement::SpannerStatement) it creates both carry: everything
+/// option-settable that is *not* a client handle.
+///
+/// A connection starts from [`Default`] and applies its own options on top; each new statement
+/// takes an [`inherit`](Self::inherit)ed copy, and may then override the fields it also exposes
+/// (the "staleness pattern"). [`impl_shared_option_dispatch`] emits the key→setter / key→getter
+/// dispatch for these fields once, for both objects — which is why both must name their field
+/// `config`.
+///
+/// One struct because the values already travel together: the connection handed all of them to
+/// `SpannerStatement::new`, and both objects hand the commit-relevant ones to the shared
+/// [`run_batch_dml`](crate::connection::run_batch_dml) /
+/// [`run_batch_txn`](crate::connection::run_batch_txn) /
+/// [`write_mutations_txn`](crate::connection::write_mutations_txn) helpers. As loose positional
+/// parameters that made those four signatures 9–14 arguments wide — a new knob meant a new
+/// parameter on each, with only argument order keeping the same-typed ones apart. Bundled, adding
+/// an option touches this struct and the macro, and no signature at all (IDIO-2).
+#[derive(Debug, Clone)]
+pub(crate) struct SharedConfig {
+    /// The standard `adbc.connection.readonly` flag: a connection that has it set rejects all
+    /// writes (DML/DDL/ingest fail with `InvalidState`; queries still run), including the *commit*
+    /// of already-buffered work. Behind an `Arc` and read at execution time rather than snapshotted
+    /// — see [`is_read_only`](Self::is_read_only).
+    pub(crate) read_only: Arc<AtomicBool>,
+    /// Isolation level applied to read/write transactions (autocommit DML and the manual-mode
+    /// commit), set via the standard `adbc.connection.transaction.isolation_level` option. It
+    /// reaches only the DML paths — queries take a timestamp bound instead (see
+    /// [`apply_isolation`](crate::connection::apply_isolation)) — and
+    /// [`IsolationLevel::Unspecified`] (the default) sends no level, which Spanner reads as
+    /// `SERIALIZABLE`. Connection-set only: a statement inherits it but exposes no setter of its
+    /// own.
+    pub(crate) isolation: IsolationLevel,
+    /// Read bound for read-only queries (`spanner.read.staleness`). The default is a strong read.
+    pub(crate) read_staleness: ReadStaleness,
+    /// Request priority and request/transaction tags (`spanner.request.priority` /
+    /// `spanner.request.tag` / `spanner.transaction.tag`), plus the commit knobs
+    /// `spanner.commit.max_delay` and `spanner.commit_stats`. Unset by default. A statement may
+    /// override the priority and request tag; the transaction tag is connection-level only, but
+    /// rides along for the read/write transaction runners a statement builds.
+    pub(crate) request: RequestConfig,
+    /// Directed-read replica selection for read-only queries (`spanner.directed_read`). Unset by
+    /// default (Spanner's own routing).
+    pub(crate) directed_read: DirectedRead,
+    /// Query optimizer options (`spanner.query.optimizer_version` /
+    /// `spanner.query.optimizer_statistics_package`). Unset by default; applied to every query
+    /// statement builder (via `SpannerStatement::sql_builder`).
+    pub(crate) query_options: QueryOptionsConfig,
+    /// How `TIMESTAMP` columns map to Arrow (`spanner.max_timestamp_precision`): nanoseconds that
+    /// error on out-of-range instants (the default) or microseconds covering Spanner's full range.
+    /// Applied uniformly to every result path — `execute` (plain and bound queries), DML
+    /// `THEN RETURN` rows, `execute_schema`, the `execute_partitions` schema probe — and, on the
+    /// connection, to `get_table_schema` and `read_partition` (which have no statement).
+    pub(crate) timestamp_precision: TimestampPrecision,
+    /// RPC timeouts (`spanner.rpc.timeout_seconds.{query,update,fetch}`). Unset by default (no
+    /// deadline); an expired deadline fails with `Status::Timeout`. The connection applies the
+    /// update timeout to its commit paths and the query/fetch timeouts to `read_partition`.
+    pub(crate) timeouts: RpcTimeouts,
+    /// Retry-policy and backoff tuning (`spanner.retry.*`). Unset by default, leaving the client's
+    /// own policy; when set it bounds the client's retrying on every statement/DML/transaction
+    /// builder the owning object produces.
+    pub(crate) retry: RetryConfig,
+    /// Mutation count captured from this object's most recent commit that requested commit
+    /// statistics (`spanner.commit_stats`), read back via `spanner.commit_stats.mutation_count`.
+    /// Per-object rather than inherited — a statement records its autocommit DML / bulk-ingest
+    /// commits here, a connection its manual-mode commit — so [`inherit`](Self::inherit) resets it.
+    pub(crate) commit_stats: CommitStats,
+}
+
+impl Default for SharedConfig {
+    fn default() -> Self {
+        Self {
+            read_only: Arc::new(AtomicBool::new(false)),
+            // `IsolationLevel` is a `#[non_exhaustive]` client enum with no `Default` impl, which
+            // is the only reason this whole impl is hand-written rather than derived.
+            isolation: IsolationLevel::Unspecified,
+            read_staleness: ReadStaleness::default(),
+            request: RequestConfig::default(),
+            directed_read: DirectedRead::default(),
+            query_options: QueryOptionsConfig::default(),
+            timestamp_precision: TimestampPrecision::default(),
+            timeouts: RpcTimeouts::default(),
+            retry: RetryConfig::default(),
+            commit_stats: CommitStats::default(),
+        }
+    }
+}
+
+impl SharedConfig {
+    /// The config a statement created on this connection starts from.
+    ///
+    /// Everything is inherited except [`commit_stats`](Self::commit_stats), which is per-object:
+    /// the statement's own commits record there, never into the connection's cell. Note the
+    /// difference in how the two `Arc` fields come across — `read_only` is deliberately *aliased*
+    /// (a later toggle on the connection reaches statements it has already created), while
+    /// `commit_stats` starts fresh.
+    pub(crate) fn inherit(&self) -> Self {
+        Self {
+            commit_stats: CommitStats::default(),
+            ..self.clone()
+        }
+    }
+
+    /// The *live* value of the `adbc.connection.readonly` flag. Loaded on each check, never cached,
+    /// so a toggle on the connection applies immediately to the statements it already created.
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.read_only.load(Ordering::Acquire)
+    }
+}
+
 /// Generate the two shared option-dispatch helpers that `SpannerConnection` and `SpannerStatement`
 /// share verbatim.
 ///
-/// Both objects carry the same "staleness-pattern" config fields (`read_staleness`, `request`,
-/// `directed_read`, `query_options`, `timestamp_precision`, `timeouts`, `retry`, `commit_stats`)
-/// with identical setters/getters, so the key→setter and key→getter dispatch for those options was
-/// duplicated as ~20 near-identical `Other(k) if k == OPTION_X => …` match arms in each of
+/// Both objects carry a [`SharedConfig`] — as a field named `config` — whose fields have identical
+/// setters/getters on either object, so the key→setter and key→getter dispatch for those options
+/// was duplicated as ~20 near-identical `Other(k) if k == OPTION_X => …` match arms in each of
 /// `connection.rs` and `statement.rs`. This macro emits that dispatch once as two inherent methods:
 ///
 /// - `set_shared_option(key, value)` applies a shared option, returning `Ok(Some(()))` when the key
@@ -229,36 +351,39 @@ macro_rules! impl_shared_option_dispatch {
         /// `Ok(None)` = `key` is not a shared option. See [`impl_shared_option_dispatch`].
         fn set_shared_option(&mut self, key: &str, value: OptionValue) -> Result<Option<()>> {
             match key {
-                crate::OPTION_READ_STALENESS => self.read_staleness.set_staleness(value)?,
-                crate::OPTION_REQUEST_PRIORITY => self.request.set_priority(value)?,
-                crate::OPTION_REQUEST_TAG => self.request.set_request_tag(value)?,
-                crate::OPTION_DIRECTED_READ => self.directed_read.set(value)?,
-                crate::OPTION_MAX_COMMIT_DELAY => self.request.set_max_commit_delay(value)?,
-                crate::OPTION_COMMIT_STATS => self.request.set_commit_stats(value)?,
+                crate::OPTION_READ_STALENESS => self.config.read_staleness.set_staleness(value)?,
+                crate::OPTION_REQUEST_PRIORITY => self.config.request.set_priority(value)?,
+                crate::OPTION_REQUEST_TAG => self.config.request.set_request_tag(value)?,
+                crate::OPTION_DIRECTED_READ => self.config.directed_read.set(value)?,
+                crate::OPTION_MAX_COMMIT_DELAY => {
+                    self.config.request.set_max_commit_delay(value)?
+                }
+                crate::OPTION_COMMIT_STATS => self.config.request.set_commit_stats(value)?,
                 crate::OPTION_QUERY_OPTIMIZER_VERSION => {
-                    self.query_options.set_optimizer_version(value)?
+                    self.config.query_options.set_optimizer_version(value)?
                 }
-                crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
-                    self.query_options.set_optimizer_statistics_package(value)?
-                }
+                crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => self
+                    .config
+                    .query_options
+                    .set_optimizer_statistics_package(value)?,
                 crate::OPTION_MAX_TIMESTAMP_PRECISION => {
-                    self.timestamp_precision = TimestampPrecision::parse_option(value)?
+                    self.config.timestamp_precision = TimestampPrecision::parse_option(value)?
                 }
-                crate::OPTION_RPC_TIMEOUT_QUERY => self.timeouts.set_query(value)?,
-                crate::OPTION_RPC_TIMEOUT_UPDATE => self.timeouts.set_update(value)?,
-                crate::OPTION_RPC_TIMEOUT_FETCH => self.timeouts.set_fetch(value)?,
-                crate::OPTION_RETRY_MAX_ATTEMPTS => self.retry.set_max_attempts(value)?,
+                crate::OPTION_RPC_TIMEOUT_QUERY => self.config.timeouts.set_query(value)?,
+                crate::OPTION_RPC_TIMEOUT_UPDATE => self.config.timeouts.set_update(value)?,
+                crate::OPTION_RPC_TIMEOUT_FETCH => self.config.timeouts.set_fetch(value)?,
+                crate::OPTION_RETRY_MAX_ATTEMPTS => self.config.retry.set_max_attempts(value)?,
                 crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
-                    self.retry.set_max_elapsed_seconds(value)?
+                    self.config.retry.set_max_elapsed_seconds(value)?
                 }
                 crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS => {
-                    self.retry.set_backoff_initial_seconds(value)?
+                    self.config.retry.set_backoff_initial_seconds(value)?
                 }
                 crate::OPTION_RETRY_BACKOFF_MAX_SECONDS => {
-                    self.retry.set_backoff_max_seconds(value)?
+                    self.config.retry.set_backoff_max_seconds(value)?
                 }
                 crate::OPTION_RETRY_BACKOFF_MULTIPLIER => {
-                    self.retry.set_backoff_multiplier(value)?
+                    self.config.retry.set_backoff_multiplier(value)?
                 }
                 _ => return Ok(None),
             }
@@ -269,49 +394,69 @@ macro_rules! impl_shared_option_dispatch {
         /// a shared option. See [`impl_shared_option_dispatch`].
         fn shared_option_string(&self, key: &str) -> Result<String> {
             let value: Option<String> = match key {
-                crate::OPTION_READ_STALENESS => {
-                    self.read_staleness.staleness_string().map(str::to_string)
-                }
+                crate::OPTION_READ_STALENESS => self
+                    .config
+                    .read_staleness
+                    .staleness_string()
+                    .map(str::to_string),
                 crate::OPTION_REQUEST_PRIORITY => {
-                    self.request.priority_string().map(str::to_string)
+                    self.config.request.priority_string().map(str::to_string)
                 }
-                crate::OPTION_REQUEST_TAG => self.request.request_tag_string().map(str::to_string),
-                crate::OPTION_DIRECTED_READ => {
-                    self.directed_read.option_string().map(str::to_string)
+                crate::OPTION_REQUEST_TAG => {
+                    self.config.request.request_tag_string().map(str::to_string)
                 }
-                crate::OPTION_MAX_COMMIT_DELAY => {
-                    self.request.max_commit_delay_string().map(str::to_string)
-                }
+                crate::OPTION_DIRECTED_READ => self
+                    .config
+                    .directed_read
+                    .option_string()
+                    .map(str::to_string),
+                crate::OPTION_MAX_COMMIT_DELAY => self
+                    .config
+                    .request
+                    .max_commit_delay_string()
+                    .map(str::to_string),
                 // A plain boolean; always reports the effective value ("true"/"false", default
                 // "false").
-                crate::OPTION_COMMIT_STATS => Some(self.request.commit_stats_string().to_string()),
+                crate::OPTION_COMMIT_STATS => {
+                    Some(self.config.request.commit_stats_string().to_string())
+                }
                 // The captured mutation count from the most recent commit that requested commit
                 // stats; None → NotFound below.
-                crate::OPTION_COMMIT_STATS_MUTATION_COUNT => {
-                    self.commit_stats.mutation_count().map(|n| n.to_string())
-                }
+                crate::OPTION_COMMIT_STATS_MUTATION_COUNT => self
+                    .config
+                    .commit_stats
+                    .mutation_count()
+                    .map(|n| n.to_string()),
                 crate::OPTION_QUERY_OPTIMIZER_VERSION => self
+                    .config
                     .query_options
                     .optimizer_version_string()
                     .map(str::to_string),
                 crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => self
+                    .config
                     .query_options
                     .optimizer_statistics_package_string()
                     .map(str::to_string),
                 // Always set (there is a default mode), so the effective value is always reported.
                 crate::OPTION_MAX_TIMESTAMP_PRECISION => {
-                    Some(self.timestamp_precision.as_str().to_string())
+                    Some(self.config.timestamp_precision.as_str().to_string())
                 }
-                crate::OPTION_RPC_TIMEOUT_QUERY => self.timeouts.query_string(),
-                crate::OPTION_RPC_TIMEOUT_UPDATE => self.timeouts.update_string(),
-                crate::OPTION_RPC_TIMEOUT_FETCH => self.timeouts.fetch_string(),
-                crate::OPTION_RETRY_MAX_ATTEMPTS => self.retry.max_attempts_string(),
-                crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => self.retry.max_elapsed_seconds_string(),
+                crate::OPTION_RPC_TIMEOUT_QUERY => self.config.timeouts.query_string(),
+                crate::OPTION_RPC_TIMEOUT_UPDATE => self.config.timeouts.update_string(),
+                crate::OPTION_RPC_TIMEOUT_FETCH => self.config.timeouts.fetch_string(),
+                crate::OPTION_RETRY_MAX_ATTEMPTS => self.config.retry.max_attempts_string(),
+                crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
+                    self.config.retry.max_elapsed_seconds_string()
+                }
                 crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS => {
-                    self.retry.backoff_initial_seconds_string()
+                    self.config.retry.backoff_initial_seconds_string()
                 }
-                crate::OPTION_RETRY_BACKOFF_MAX_SECONDS => self.retry.backoff_max_seconds_string(),
-                crate::OPTION_RETRY_BACKOFF_MULTIPLIER => self.retry.backoff_multiplier_string(),
+                crate::OPTION_RETRY_BACKOFF_MAX_SECONDS => {
+                    self.config.retry.backoff_max_seconds_string()
+                }
+                crate::OPTION_RETRY_BACKOFF_MULTIPLIER => {
+                    self.config.retry.backoff_multiplier_string()
+                }
                 _ => None,
             };
             value.ok_or_else(|| err(format!("option {key} is not set"), Status::NotFound))
