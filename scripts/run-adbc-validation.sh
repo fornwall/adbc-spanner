@@ -162,16 +162,19 @@ EXCLUDED=(
   #     model) expects — and the suite's SchemaField cannot even express
   #     Decimal128(precision, scale) to assert such a round-trip. So it is unmapped.
   #
-  #   - Interval / Duration (emulator limitation): both would map to a Spanner
+  #   - Interval / Duration (unmapped, and unverifiable in CI regardless): the
+  #     driver maps neither type, so both fail at ingest with "cannot create a
+  #     Spanner column for Arrow type ...". The natural target would be Spanner's
   #     INTERVAL column, but the Cloud Spanner *emulator* — which is what every CI
-  #     suite runs against — does not support the INTERVAL column type. A create-
-  #     mode ingest that declares an INTERVAL column fails at CREATE TABLE with a
-  #     backend GOOGLESQL_RET_CHECK ("IsSupportedColumnType"), so neither case can
-  #     pass in CI regardless of driver support. (Arrow Interval(MonthDayNano) is a
-  #     clean 1:1 with Spanner INTERVAL on *real* Spanner — same months/days/nanos
-  #     model — but that is unverifiable here; Arrow Duration additionally has no
-  #     fixed-unit counterpart in Spanner and the suite's ValidateIngestedTemporalData
-  #     FAILs any non-TIMESTAMP temporal readback.)
+  #     suite runs against — does not support the INTERVAL column type (a CREATE
+  #     TABLE declaring one fails with a backend GOOGLESQL_RET_CHECK,
+  #     "IsSupportedColumnType"), so neither case could pass in CI even with driver
+  #     support. Arrow Interval(MonthDayNano) IS a clean 1:1 with Spanner INTERVAL
+  #     on *real* Spanner (same months/days/nanos model) and is a candidate for a
+  #     future, real-Spanner-verified PR; Arrow Duration additionally has no
+  #     fixed-unit counterpart in Spanner (one INTERVAL column can read back as only
+  #     one Arrow type) and the suite's ValidateIngestedTemporalData FAILs any
+  #     non-TIMESTAMP temporal readback.
   #
   # NOT here anymore (now mapped and gate-enforced): SqlIngestUInt8/UInt16/UInt32
   # widen losslessly to INT64 (u8/u16/u32 max < i64::MAX); SqlIngestFixedSizeBinary

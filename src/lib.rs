@@ -135,7 +135,6 @@ mod error;
 #[allow(unsafe_code)] // `export_driver!` generates the C-ABI `unsafe extern "C"` entrypoints.
 mod ffi;
 mod info;
-mod interval;
 mod nested;
 mod objects;
 mod options;

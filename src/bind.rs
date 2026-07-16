@@ -16,8 +16,6 @@
 //! — `u64::MAX` exceeds `i64::MAX`),
 //! `Float64`, `Float32`, `Boolean`, `Utf8`/`LargeUtf8`/`Utf8View`,
 //! `Binary`/`LargeBinary`/`BinaryView`/`FixedSizeBinary` (all → Spanner `BYTES`),
-//! `Interval(MonthDayNano)` (→ Spanner `INTERVAL`; real Spanner only — the emulator has no
-//! `INTERVAL` column type),
 //! `Date32`/`Date64` (→ `DATE`), `Timestamp` at any `TimeUnit`
 //! (Second/Millisecond/Microsecond/Nanosecond, → `TIMESTAMP`), `Decimal128` (→ `NUMERIC`), and
 //! their nulls. `List`/`LargeList` of any of those scalar element types binds to a Spanner
@@ -63,12 +61,11 @@ use adbc_core::error::Result;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     ArrowPrimitiveType, Date32Type, Date64Type, Decimal128Type, Float32Type, Float64Type, Int8Type,
-    Int16Type, Int32Type, Int64Type, IntervalMonthDayNanoType, TimestampMicrosecondType,
-    TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type,
-    UInt32Type,
+    Int16Type, Int32Type, Int64Type, TimestampMicrosecondType, TimestampMillisecondType,
+    TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type, UInt32Type,
 };
 use arrow_array::{Array, ArrayRef, RecordBatch, downcast_dictionary_array};
-use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit};
+use arrow_schema::{DataType, Field, TimeUnit};
 use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Utc};
 use google_cloud_spanner::mutation::Mutation;
 use google_cloud_spanner::statement::StatementBuilder;
@@ -381,19 +378,6 @@ fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
                 numeric_string(a.as_primitive::<Decimal128Type>().value(i), scale)
             }))
         },
-        // Arrow `Interval(MonthDayNano)` maps 1:1 to Spanner INTERVAL (both are months + days +
-        // nanoseconds, neither normalized across the boundaries); the value is formatted to the ISO
-        // 8601 duration string Spanner encodes INTERVAL as (see [`crate::interval`]). Only the
-        // MonthDayNano layout carries all three components, so it is the only interval unit bound.
-        // (Spanner INTERVAL works against real Spanner but not the emulator — see the module doc.)
-        DataType::Interval(IntervalUnit::MonthDayNano) => |_, _, a, i| {
-            Ok(scalar_value(a.is_null(i), || {
-                let (months, days, nanos) = IntervalMonthDayNanoType::to_parts(
-                    a.as_primitive::<IntervalMonthDayNanoType>().value(i),
-                );
-                crate::interval::format_month_day_nano(months, days, nanos)
-            }))
-        },
         // A `Null`-typed column has no values by definition: every cell binds as NULL. This is
         // the shape ADBC's own contract produces — `get_parameter_schema` types an undetermined
         // parameter `Null` (adbc.h: "the type of the corresponding field will be NA"), so a
@@ -641,7 +625,6 @@ pub(crate) fn spanner_column_type(data_type: &DataType) -> Result<String> {
         DataType::Date32 | DataType::Date64 => "DATE".to_string(),
         DataType::Timestamp(_, _) => "TIMESTAMP".to_string(),
         DataType::Decimal128(_, _) => "NUMERIC".to_string(),
-        DataType::Interval(IntervalUnit::MonthDayNano) => "INTERVAL".to_string(),
         DataType::List(field) | DataType::LargeList(field) => {
             format!("ARRAY<{}>", spanner_column_type(field.data_type())?)
         }
@@ -825,38 +808,6 @@ mod tests {
         // A null fixed cell stays NULL.
         let dbg = format!("{:?}", insert_mutation("t", &b, 1).unwrap());
         assert!(dbg.contains("NullValue"), "null fixed cell: {dbg}");
-    }
-
-    #[test]
-    fn binds_interval_month_day_nano_as_iso8601() {
-        // Arrow Interval(MonthDayNano) binds to a Spanner INTERVAL as its ISO 8601 duration string.
-        // (End-to-end INTERVAL only works against real Spanner — the emulator has no INTERVAL column
-        // type — so this covers the bind encoding offline; the codec itself is in `crate::interval`.)
-        use arrow_array::IntervalMonthDayNanoArray;
-        let v = IntervalMonthDayNanoType::make_value(-5, -5, -42_000);
-        let b = batch(
-            vec![Field::new(
-                "iv",
-                DataType::Interval(IntervalUnit::MonthDayNano),
-                true,
-            )],
-            vec![Arc::new(IntervalMonthDayNanoArray::from(vec![
-                Some(v),
-                None,
-            ]))],
-        );
-        let dbg = format!("{:?}", insert_mutation("t", &b, 0).unwrap());
-        assert!(
-            dbg.contains(r#"StringValue("P-5M-5DT-0.000042S")"#),
-            "interval cell must ship as its ISO 8601 string: {dbg}"
-        );
-        let dbg = format!("{:?}", insert_mutation("t", &b, 1).unwrap());
-        assert!(dbg.contains("NullValue"), "null interval cell: {dbg}");
-        // The create-mode column type is Spanner INTERVAL.
-        assert_eq!(
-            spanner_column_type(&DataType::Interval(IntervalUnit::MonthDayNano)).unwrap(),
-            "INTERVAL"
-        );
     }
 
     /// A nullable string-family field tagged with the canonical `arrow.json` extension, as the

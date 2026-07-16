@@ -18,8 +18,7 @@
 //! | `TIMESTAMP`                                 | `Timestamp(Nanosecond, "UTC")` (default) or `Timestamp(Microsecond, "UTC")` |
 //! | `NUMERIC`                                   | `Decimal128(38, 9)`               |
 //! | `BYTES`                                     | `Binary`                          |
-//! | `STRING`/`UUID`                             | `Utf8`                            |
-//! | `INTERVAL`                                  | `Interval(MonthDayNano)`          |
+//! | `STRING`/`UUID`/`INTERVAL`                   | `Utf8`                            |
 //! | `JSON`                                      | `Utf8` + `arrow.json` extension   |
 //! | `ENUM`                                      | `Int64` (integer ordinal)         |
 //! | `PROTO`                                     | `Binary` (raw serialized bytes)   |
@@ -61,16 +60,13 @@ use adbc_core::options::OptionValue;
 use arrow_array::builder::{BinaryBuilder, BooleanBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_array::types::{
     ArrowPrimitiveType, Date32Type, Decimal128Type, Float32Type, Float64Type, Int64Type,
-    IntervalMonthDayNanoType,
 };
 use arrow_array::{
     ArrayRef, ListArray, PrimitiveArray, RecordBatch, RecordBatchReader, StructArray,
     TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
-use arrow_schema::{
-    ArrowError, DataType, Field, FieldRef, Fields, IntervalUnit, Schema, SchemaRef, TimeUnit,
-};
+use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 use base64::Engine;
 use google_cloud_spanner::result::{ResultSet, ResultSetMetadata, Row};
 use google_cloud_spanner::statement::Statement as SpannerSql;
@@ -715,12 +711,7 @@ fn arrow_type(ty: &Type, precision: TimestampPrecision) -> Result<DataType> {
         // `CAST(col AS STRING)` in SQL (enum member name / proto text format) instead.
         TypeCode::Enum => DataType::Int64,
         TypeCode::Proto => DataType::Binary,
-        // INTERVAL maps to Arrow `Interval(MonthDayNano)`, the one Arrow interval layout with the
-        // same months + days + nanoseconds model (see [`crate::interval`]); the wire value is an ISO
-        // 8601 duration string parsed back into those components on read. (Works against real
-        // Spanner; the emulator has no INTERVAL column type — see the `crate::interval` module doc.)
-        TypeCode::Interval => DataType::Interval(IntervalUnit::MonthDayNano),
-        // STRING, JSON, UUID and any future/unknown code are UTF-8 text.
+        // STRING, JSON, UUID, INTERVAL and any future/unknown code are UTF-8 text.
         _ => DataType::Utf8,
     })
 }
@@ -938,19 +929,6 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
                 }
             }
             Arc::new(builder.finish())
-        }
-        // Spanner INTERVAL arrives as an ISO 8601 duration string; parse it back into Arrow
-        // `Interval(MonthDayNano)` components (see [`crate::interval`]).
-        DataType::Interval(IntervalUnit::MonthDayNano) => {
-            Arc::new(build_primitive::<IntervalMonthDayNanoType>(
-                values,
-                "INTERVAL",
-                |v| {
-                    v.try_as_string()
-                        .and_then(crate::interval::parse_month_day_nano)
-                        .map(|(m, d, n)| IntervalMonthDayNanoType::make_value(m, d, n))
-                },
-            )?)
         }
         DataType::List(field) => build_list(field, values)?,
         DataType::Struct(fields) => build_struct(fields, values)?,
@@ -1399,40 +1377,6 @@ mod tests {
             .unwrap();
         assert_eq!(ints.len(), 1);
         assert_eq!(ints.value(0), 2);
-    }
-
-    #[test]
-    fn interval_maps_to_month_day_nano_and_round_trips() {
-        use google_cloud_spanner::model;
-        // A Spanner INTERVAL column type maps to Arrow Interval(MonthDayNano).
-        let ty: Type = model::Type::new()
-            .set_code(model::TypeCode::Interval)
-            .into();
-        let field = arrow_field("iv", &ty, true, TimestampPrecision::default()).unwrap();
-        assert_eq!(
-            field.data_type(),
-            &DataType::Interval(IntervalUnit::MonthDayNano)
-        );
-
-        // The wire value is an ISO 8601 duration string; it decodes into (months, days, nanos) and
-        // round-trips the exact triple the bind path would have written (see `crate::interval`).
-        let value = "P-5M-5DT-0.000042S".to_value();
-        let null = None::<&str>.to_value();
-        let array = build_array(
-            &DataType::Interval(IntervalUnit::MonthDayNano),
-            &[Some(&value), Some(&null)],
-        )
-        .unwrap();
-        let ivs = array
-            .as_any()
-            .downcast_ref::<arrow_array::IntervalMonthDayNanoArray>()
-            .unwrap();
-        assert_eq!(ivs.len(), 2);
-        assert_eq!(
-            IntervalMonthDayNanoType::to_parts(ivs.value(0)),
-            (-5, -5, -42_000)
-        );
-        assert!(ivs.is_null(1));
     }
 
     #[test]
