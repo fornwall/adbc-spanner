@@ -1,6 +1,6 @@
 #![no_main]
 
-use adbc_spanner::fuzzing::{ensure_scheme, exercise_database_options, OptValue};
+use adbc_spanner::fuzzing::{OptValue, ensure_scheme, exercise_database_options};
 use libfuzzer_sys::fuzz_target;
 
 // Fuzz the driver's option-handling boundary — the surface a C ABI driver manager pushes untrusted

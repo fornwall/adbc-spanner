@@ -1,3 +1,15 @@
+# `fuzz/` is a member of this workspace, not a workspace of its own, so the whole repo
+# resolves to ONE `Cargo.lock` (this file's). That makes fuzz dependency drift structurally
+# impossible: the fuzz targets share this crate's exact dependency graph — same git pins, same
+# `adbc-spanner` version — instead of re-resolving them independently into a second, silently
+# staleable `fuzz/Cargo.lock`. `default-members` keeps the default build/test/clippy scope to
+# this crate alone, so `cargo build`/`cargo test`/`cargo clippy` never pull in `libfuzzer-sys`
+# or need nightly; the fuzz member is built only by `cargo fuzz` (or an explicit `-p`). See
+# TEST-13 in REVIEW.md and the CLAUDE.md "Fuzzing" note.
+[workspace]
+members = ["fuzz"]
+default-members = ["."]
+
 [package]
 name = "adbc-spanner"
 version = "0.7.0"
