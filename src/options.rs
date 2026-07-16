@@ -1,13 +1,16 @@
 //! Shared coercions from an ADBC [`OptionValue`] into concrete Rust types.
 //!
 //! The driver, connection and statement all accept the same handful of option shapes — booleans
-//! (as exactly the string `true`/`false`), plain strings, and positive integers (as an integer or
-//! a numeric string). These used to be copy-pasted (with slightly divergent error text) into
-//! `driver.rs`, `connection.rs` and `statement.rs`; they live here so every level parses an option
-//! identically and returns the same `InvalidArguments` status on bad input.
+//! (as exactly the string `true`/`false`), plain strings, positive integers (as an integer or a
+//! numeric string), and `f64` seconds ([`f64_option`]). These used to be copy-pasted (with slightly
+//! divergent error text) into `driver.rs`, `connection.rs` and `statement.rs`; they live here so
+//! every level parses an option identically and returns the same `InvalidArguments` status on bad
+//! input.
 //!
-//! Each helper takes a `what` label describing the option (e.g. `"option spanner.emulator"` or
-//! `"rows_per_batch"`) so the shared error message names the offending option.
+//! `"rows_per_batch"`) so the shared error message names the offending option. [`f64_option`] is
+//! the exception: it takes the bare option key and prefixes `option ` itself.
+
+use std::time::Duration;
 
 use adbc_core::error::Result;
 use adbc_core::options::OptionValue;
@@ -55,6 +58,66 @@ pub(crate) fn string_option(value: OptionValue, what: &str) -> Result<String> {
 /// callers whose grammar tolerates surrounding whitespace trim it themselves.
 pub(crate) fn non_empty_string_option(value: OptionValue, what: &str) -> Result<Option<String>> {
     Ok(Some(string_option(value, what)?).filter(|s| !s.is_empty()))
+}
+
+/// The accepted range of an [`f64_option`], which also fixes the wording of its rejection.
+///
+/// The two `*Seconds` variants additionally require the value to be representable as a
+/// [`Duration`], so the sites that convert one with `Duration::from_secs_f64` can never fail: the
+/// (astronomically large) overflow is rejected at set time instead. [`PositiveFactor`] is a bare
+/// number, not a duration, so it carries no such bound.
+///
+/// [`PositiveFactor`]: F64Range::PositiveFactor
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum F64Range {
+    /// Finite, strictly positive seconds: zero is rejected.
+    PositiveSeconds,
+    /// Finite, non-negative seconds: zero is accepted (the RPC timeouts read it as "disabled").
+    NonNegativeSeconds,
+    /// A finite, strictly positive plain factor (no `Duration` bound, and the error says "number"
+    /// rather than "number of seconds").
+    PositiveFactor,
+}
+
+/// Parse an `f64` option in `range` — the shape shared by every "seconds" knob in the driver
+/// (`spanner.rpc.timeout_seconds.*`, `spanner.retry.max_elapsed_seconds`,
+/// `spanner.retry.backoff.*`): a numeric string (trimmed; fractions allowed), an integer, or a
+/// double. An empty string yields `None` (unset); `NaN`, the infinities, out-of-range values,
+/// other value kinds and non-numeric input are rejected with `InvalidArguments`, naming `what`.
+pub(crate) fn f64_option(value: OptionValue, what: &str, range: F64Range) -> Result<Option<f64>> {
+    let (bound, unit) = match range {
+        F64Range::PositiveSeconds => ("strictly positive", " of seconds"),
+        F64Range::NonNegativeSeconds => ("non-negative", " of seconds"),
+        F64Range::PositiveFactor => ("strictly positive", ""),
+    };
+    let reject = || {
+        invalid_argument(format!(
+            "option {what} must be a finite, {bound} number{unit}"
+        ))
+    };
+    let n = match value {
+        OptionValue::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            trimmed.parse::<f64>().map_err(|_| reject())?
+        }
+        OptionValue::Double(d) => d,
+        OptionValue::Int(i) => i as f64,
+        _ => return Err(reject()),
+    };
+    let in_range = match range {
+        F64Range::NonNegativeSeconds => n >= 0.0,
+        F64Range::PositiveSeconds | F64Range::PositiveFactor => n > 0.0,
+    };
+    if !n.is_finite() || !in_range {
+        return Err(reject());
+    }
+    if range != F64Range::PositiveFactor && Duration::try_from_secs_f64(n).is_err() {
+        return Err(reject());
+    }
+    Ok(Some(n))
 }
 
 /// Parse a strictly-positive `i64` option, accepted as an integer or a numeric string. Zero,

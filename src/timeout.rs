@@ -42,7 +42,8 @@ use std::time::Duration;
 use adbc_core::error::{Result, Status};
 use adbc_core::options::OptionValue;
 
-use crate::error::{err, invalid_argument};
+use crate::error::err;
+use crate::options::{F64Range, f64_option};
 
 /// The RPC timeout configuration held by a connection or statement
 /// (`spanner.rpc.timeout_seconds.{query,update,fetch}`).
@@ -66,19 +67,31 @@ pub(crate) struct RpcTimeouts {
 impl RpcTimeouts {
     /// Handle a `set_option` for `spanner.rpc.timeout_seconds.query`. An empty string unsets it.
     pub(crate) fn set_query(&mut self, value: OptionValue) -> Result<()> {
-        self.query = parse_timeout_seconds(value, crate::OPTION_RPC_TIMEOUT_QUERY)?;
+        self.query = f64_option(
+            value,
+            crate::OPTION_RPC_TIMEOUT_QUERY,
+            F64Range::NonNegativeSeconds,
+        )?;
         Ok(())
     }
 
     /// Handle a `set_option` for `spanner.rpc.timeout_seconds.update`. An empty string unsets it.
     pub(crate) fn set_update(&mut self, value: OptionValue) -> Result<()> {
-        self.update = parse_timeout_seconds(value, crate::OPTION_RPC_TIMEOUT_UPDATE)?;
+        self.update = f64_option(
+            value,
+            crate::OPTION_RPC_TIMEOUT_UPDATE,
+            F64Range::NonNegativeSeconds,
+        )?;
         Ok(())
     }
 
     /// Handle a `set_option` for `spanner.rpc.timeout_seconds.fetch`. An empty string unsets it.
     pub(crate) fn set_fetch(&mut self, value: OptionValue) -> Result<()> {
-        self.fetch = parse_timeout_seconds(value, crate::OPTION_RPC_TIMEOUT_FETCH)?;
+        self.fetch = f64_option(
+            value,
+            crate::OPTION_RPC_TIMEOUT_FETCH,
+            F64Range::NonNegativeSeconds,
+        )?;
         Ok(())
     }
 
@@ -113,41 +126,8 @@ impl RpcTimeouts {
     }
 }
 
-/// Parse one `spanner.rpc.timeout_seconds.*` value: a finite, non-negative number of seconds, as a
-/// numeric string (trimmed; fractions allowed), an integer, or a double. `NaN`, the infinities,
-/// negatives, values too large for a [`Duration`], and non-numeric input are rejected with
-/// `InvalidArguments`; an empty string yields `None` (unset).
-fn parse_timeout_seconds(value: OptionValue, what: &str) -> Result<Option<f64>> {
-    let reject = || {
-        invalid_argument(format!(
-            "option {what} must be a finite, non-negative number of seconds"
-        ))
-    };
-    let seconds = match value {
-        OptionValue::String(s) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                return Ok(None);
-            }
-            trimmed.parse::<f64>().map_err(|_| reject())?
-        }
-        OptionValue::Double(d) => d,
-        OptionValue::Int(i) => i as f64,
-        _ => return Err(reject()),
-    };
-    if !seconds.is_finite() || seconds < 0.0 {
-        return Err(reject());
-    }
-    // A non-zero value must convert to a Duration, so enforcement can never fail later; reject the
-    // (astronomically large) overflow case at set time instead.
-    if seconds > 0.0 && Duration::try_from_secs_f64(seconds).is_err() {
-        return Err(reject());
-    }
-    Ok(Some(seconds))
-}
-
 /// The effective [`Duration`] of a stored seconds value: `None` when unset or `0` (both meaning
-/// "no timeout"). Conversion cannot fail — [`parse_timeout_seconds`] validated it at set time.
+/// "no timeout"). Conversion cannot fail — [`f64_option`] validated it at set time.
 fn as_duration(seconds: Option<f64>) -> Option<Duration> {
     let seconds = seconds?;
     if seconds > 0.0 {

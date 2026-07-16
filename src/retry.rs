@@ -105,6 +105,7 @@ use google_cloud_spanner::retry_policy::SpannerRetryPolicy;
 use google_cloud_spanner::statement::StatementBuilder;
 
 use crate::error::invalid_argument;
+use crate::options::{F64Range, f64_option};
 
 /// Emit an `apply_to_*` method applying the retry and backoff policies to the Begin and Commit RPCs
 /// of one of the client's commit builders.
@@ -168,7 +169,11 @@ impl RetryConfig {
 
     /// Handle a `set_option` for `spanner.retry.max_elapsed_seconds`. An empty string unsets it.
     pub(crate) fn set_max_elapsed_seconds(&mut self, value: OptionValue) -> Result<()> {
-        self.max_elapsed_seconds = parse_max_elapsed_seconds(value)?;
+        self.max_elapsed_seconds = f64_option(
+            value,
+            crate::OPTION_RETRY_MAX_ELAPSED_SECONDS,
+            F64Range::PositiveSeconds,
+        )?;
         Ok(())
     }
 
@@ -184,21 +189,31 @@ impl RetryConfig {
 
     /// Handle a `set_option` for `spanner.retry.backoff.initial_seconds`. An empty string unsets it.
     pub(crate) fn set_backoff_initial_seconds(&mut self, value: OptionValue) -> Result<()> {
-        self.backoff_initial_seconds =
-            parse_backoff_seconds(value, crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS)?;
+        self.backoff_initial_seconds = f64_option(
+            value,
+            crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS,
+            F64Range::PositiveSeconds,
+        )?;
         Ok(())
     }
 
     /// Handle a `set_option` for `spanner.retry.backoff.max_seconds`. An empty string unsets it.
     pub(crate) fn set_backoff_max_seconds(&mut self, value: OptionValue) -> Result<()> {
-        self.backoff_max_seconds =
-            parse_backoff_seconds(value, crate::OPTION_RETRY_BACKOFF_MAX_SECONDS)?;
+        self.backoff_max_seconds = f64_option(
+            value,
+            crate::OPTION_RETRY_BACKOFF_MAX_SECONDS,
+            F64Range::PositiveSeconds,
+        )?;
         Ok(())
     }
 
     /// Handle a `set_option` for `spanner.retry.backoff.multiplier`. An empty string unsets it.
     pub(crate) fn set_backoff_multiplier(&mut self, value: OptionValue) -> Result<()> {
-        self.backoff_multiplier = parse_backoff_multiplier(value)?;
+        self.backoff_multiplier = f64_option(
+            value,
+            crate::OPTION_RETRY_BACKOFF_MULTIPLIER,
+            F64Range::PositiveFactor,
+        )?;
         Ok(())
     }
 
@@ -218,7 +233,7 @@ impl RetryConfig {
     }
 
     /// The effective total retry budget as a [`Duration`] (`None` when unset). Conversion cannot
-    /// fail — [`parse_max_elapsed_seconds`] validated it at set time.
+    /// fail — [`f64_option`] validated it at set time.
     fn max_elapsed_duration(&self) -> Option<Duration> {
         self.max_elapsed_seconds
             .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
@@ -265,7 +280,7 @@ impl RetryConfig {
         }
         let mut builder = ExponentialBackoffBuilder::new();
         if let Some(initial) = self.backoff_initial_seconds {
-            // `parse_backoff_seconds` validated Duration-representability, so this cannot fail.
+            // `f64_option` validated Duration-representability, so this cannot fail.
             builder = builder.with_initial_delay(Duration::from_secs_f64(initial));
         }
         if let Some(maximum) = self.backoff_max_seconds {
@@ -343,101 +358,6 @@ fn parse_max_attempts(value: OptionValue) -> Result<Option<u32>> {
         return Err(reject());
     }
     Ok(Some(attempts as u32))
-}
-
-/// Parse a `spanner.retry.max_elapsed_seconds` value: a finite, strictly positive number of seconds
-/// (fractions allowed), accepted as a numeric string, an integer, or a double. Zero, `NaN`, the
-/// infinities, negatives, values too large for a [`Duration`], and non-numeric input are rejected
-/// with `InvalidArguments`; an empty string yields `None` (unset).
-fn parse_max_elapsed_seconds(value: OptionValue) -> Result<Option<f64>> {
-    let reject = || {
-        invalid_argument(format!(
-            "option {} must be a finite, strictly positive number of seconds",
-            crate::OPTION_RETRY_MAX_ELAPSED_SECONDS
-        ))
-    };
-    let seconds = match value {
-        OptionValue::String(s) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                return Ok(None);
-            }
-            trimmed.parse::<f64>().map_err(|_| reject())?
-        }
-        OptionValue::Double(d) => d,
-        OptionValue::Int(i) => i as f64,
-        _ => return Err(reject()),
-    };
-    if !seconds.is_finite() || seconds <= 0.0 {
-        return Err(reject());
-    }
-    // Enforce Duration-representability at set time so `max_elapsed_duration` can never fail later.
-    if Duration::try_from_secs_f64(seconds).is_err() {
-        return Err(reject());
-    }
-    Ok(Some(seconds))
-}
-
-/// Parse a `spanner.retry.backoff.{initial,max}_seconds` value: a finite, strictly positive number
-/// of seconds (fractions allowed), accepted as a numeric string, an integer, or a double. Zero,
-/// `NaN`, the infinities, negatives, values too large for a [`Duration`], and non-numeric input are
-/// rejected with `InvalidArguments`; an empty string yields `None` (unset). `option` names the key
-/// for the error message.
-fn parse_backoff_seconds(value: OptionValue, option: &str) -> Result<Option<f64>> {
-    let reject = || {
-        invalid_argument(format!(
-            "option {option} must be a finite, strictly positive number of seconds"
-        ))
-    };
-    let seconds = match value {
-        OptionValue::String(s) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                return Ok(None);
-            }
-            trimmed.parse::<f64>().map_err(|_| reject())?
-        }
-        OptionValue::Double(d) => d,
-        OptionValue::Int(i) => i as f64,
-        _ => return Err(reject()),
-    };
-    if !seconds.is_finite() || seconds <= 0.0 {
-        return Err(reject());
-    }
-    // Enforce Duration-representability at set time so `backoff_policy_arg` can never fail later.
-    if Duration::try_from_secs_f64(seconds).is_err() {
-        return Err(reject());
-    }
-    Ok(Some(seconds))
-}
-
-/// Parse a `spanner.retry.backoff.multiplier` value: a finite, strictly positive growth factor,
-/// accepted as a numeric string, an integer, or a double. `NaN`, the infinities, zero, negatives and
-/// non-numeric input are rejected with `InvalidArguments`; an empty string yields `None` (unset).
-/// A value below `1.0` is floored to `1.0` (a constant backoff) when the policy is built.
-fn parse_backoff_multiplier(value: OptionValue) -> Result<Option<f64>> {
-    let reject = || {
-        invalid_argument(format!(
-            "option {} must be a finite, strictly positive number",
-            crate::OPTION_RETRY_BACKOFF_MULTIPLIER
-        ))
-    };
-    let multiplier = match value {
-        OptionValue::String(s) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                return Ok(None);
-            }
-            trimmed.parse::<f64>().map_err(|_| reject())?
-        }
-        OptionValue::Double(d) => d,
-        OptionValue::Int(i) => i as f64,
-        _ => return Err(reject()),
-    };
-    if !multiplier.is_finite() || multiplier <= 0.0 {
-        return Err(reject());
-    }
-    Ok(Some(multiplier))
 }
 
 #[cfg(test)]
