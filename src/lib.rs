@@ -513,11 +513,6 @@ pub const OPTION_ROWS_PER_BATCH: &str = "spanner.rows_per_batch";
 /// connection or worker — honours it. Accepts a boolean; defaults to `false`.
 pub const OPTION_DATA_BOOST: &str = "spanner.data_boost";
 
-/// Driver-specific statement option: the maximum number of partitions to request from
-/// [`Statement::execute_partitions`](adbc_core::Statement::execute_partitions). This is a hint —
-/// Spanner may return fewer. Accepts a positive integer; unset lets Spanner choose.
-pub const OPTION_MAX_PARTITIONS: &str = "spanner.partition.max_count";
-
 /// Statement option controlling how bound Arrow columns pair with the query's `@name` parameters,
 /// following the ADBC SQLite reference driver's `bind_by_name` convention
 /// ([apache/arrow-adbc#3362](https://github.com/apache/arrow-adbc/issues/3362)). A boolean,
@@ -899,7 +894,6 @@ mod options_doc_tests {
             crate::OPTION_QUOTA_PROJECT,
             crate::OPTION_ROWS_PER_BATCH,
             crate::OPTION_DATA_BOOST,
-            crate::OPTION_MAX_PARTITIONS,
             crate::OPTION_INGEST_PRIMARY_KEY,
             crate::OPTION_READ_STALENESS,
             crate::OPTION_REQUEST_PRIORITY,

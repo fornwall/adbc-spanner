@@ -129,7 +129,7 @@ Early, tested end-to-end against the Spanner emulator.
   partitions via Spanner's `PartitionQuery` API, each serialized as a self-contained opaque ADBC
   descriptor, and `Connection::read_partition()` streams one partition's rows back as Arrow.
   `spanner.data_boost` bakes [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview)
-  into the descriptors; `spanner.partition.max_count` hints the partition count.
+  into the descriptors; Spanner chooses the partition count.
   **A descriptor is opaque but *executable*** — it carries the SQL text plus the session and
   transaction identity, and `read_partition()` runs whatever it contains with the connection's
   credentials — and it is **not** authenticated, so transport descriptors only over trusted channels

@@ -114,9 +114,9 @@ def test_bulk_ingest_append(emulator_database):
 def test_execute_partitions_round_trip(emulator_database):
     # Partitioned execution: adbc_execute_partitions splits a scan into opaque
     # descriptors and adbc_read_partition reads each back; their union must be the
-    # full result set, each row once. Data Boost + max_partitions are statement
-    # options set on the underlying ADBC statement (the emulator ignores Data
-    # Boost but still accepts the flag, exercising the plumbing).
+    # full result set, each row once. Data Boost is a statement option set on the
+    # underlying ADBC statement (the emulator ignores Data Boost but still accepts
+    # the flag, exercising the plumbing).
     conn = _connect(emulator_database, autocommit=True)
     try:
         with conn.cursor() as cur:
@@ -131,7 +131,6 @@ def test_execute_partitions_round_trip(emulator_database):
             cur.adbc_statement.set_options(
                 **{
                     StatementOptions.DATA_BOOST.value: "true",
-                    StatementOptions.MAX_PARTITIONS.value: "4",
                 }
             )
             # A single-table scan is partitionable (no ORDER BY: not partitionable).

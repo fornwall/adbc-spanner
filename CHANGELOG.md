@@ -10,6 +10,16 @@ Releases are cut with [`cargo-release`](https://github.com/crate-ci/cargo-releas
 
 ## [Unreleased]
 
+### Removed
+
+- **Breaking:** the `spanner.partition.max_count` statement option (`OPTION_MAX_PARTITIONS`, Python
+  `StatementOptions.MAX_PARTITIONS`) is gone. It plumbed into `PartitionOptions.max_partitions`,
+  which Spanner's proto documents as "currently ignored by `PartitionQuery` and `PartitionRead`
+  requests" — the field's only two consumers in the v1 API — and whose returned count "can be
+  smaller **or larger**" than the request, so it was never a cap even in principle. Setting the key
+  now fails with `NotImplemented`, like any unknown statement option; `execute_partitions` is
+  otherwise unchanged and lets Spanner choose the partition count.
+
 ## [0.7.0] - 2026-07-16
 
 This release settles the driver's option-key layout: credentials moved under `spanner.auth.*`, the

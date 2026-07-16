@@ -168,9 +168,6 @@ pub struct SpannerStatement {
     rows_per_batch: usize,
     /// Enable Data Boost for partitioned execution (`spanner.data_boost`).
     data_boost: bool,
-    /// Maximum number of partitions to request from `execute_partitions`
-    /// (`spanner.partition.max_count`); `None` lets Spanner choose.
-    max_partitions: Option<i64>,
     /// Read bound for this statement's read-only queries (`spanner.read.staleness`), inherited from
     /// the connection at creation time and overridable per statement. Default is a strong read.
     read_staleness: ReadStaleness,
@@ -258,7 +255,6 @@ impl SpannerStatement {
             bind_by_name: false,
             rows_per_batch: DEFAULT_ROWS_PER_BATCH,
             data_boost: false,
-            max_partitions: None,
             read_staleness,
             request,
             directed_read,
@@ -1340,7 +1336,6 @@ impl SpannerStatement {
         let query_stmt = self.build_query_statement(sql, false)?;
         let client = self.client.clone();
         let data_boost = self.data_boost;
-        let max_partitions = self.max_partitions;
         // The advertised schema carries this statement's timestamp precision. Note the partitions
         // themselves are decoded by `Connection::read_partition` under the **reading** connection's
         // `spanner.max_timestamp_precision`, so set the two to the same mode.
@@ -1365,12 +1360,8 @@ impl SpannerStatement {
                 txn_builder = txn_builder.set_timestamp_bound(b);
             }
             let transaction = txn_builder.build().await.map_err(from_spanner)?;
-            let mut options = PartitionOptions::default();
-            if let Some(n) = max_partitions {
-                options = options.set_max_partitions(n);
-            }
             let partitions = transaction
-                .partition_query(query_stmt, options)
+                .partition_query(query_stmt, PartitionOptions::default())
                 .await
                 .map_err(from_spanner)?;
 
@@ -1648,9 +1639,6 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) if k == crate::OPTION_DATA_BOOST => {
                 self.data_boost = bool_option(value, "option spanner.data_boost")?;
             }
-            OptionStatement::Other(k) if k == crate::OPTION_MAX_PARTITIONS => {
-                self.max_partitions = Some(max_partitions_option(value)?);
-            }
             // Every remaining `spanner.*` option the statement and connection dispatch identically —
             // staleness, request priority/tag, directed read, max_commit_delay, commit_stats, query
             // optimizer opts, `spanner.max_timestamp_precision` (`""` resets to the driver default),
@@ -1704,9 +1692,6 @@ impl Optionable for SpannerStatement {
             }
             OptionStatement::Other(k) if k == crate::OPTION_DATA_BOOST => {
                 Some(self.data_boost.to_string())
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_MAX_PARTITIONS => {
-                self.max_partitions.map(|n| n.to_string())
             }
             // Every remaining `spanner.*` option the statement and connection report identically —
             // staleness, request priority/tag, directed read, max_commit_delay,
@@ -2208,11 +2193,6 @@ fn ingest_batch_write_option(value: OptionValue) -> Result<bool> {
         OptionValue::String(s) if s.trim().is_empty() => Ok(false),
         _ => crate::options::bool_option(value, "option spanner.ingest.batch_write"),
     }
-}
-
-/// Parse a positive `max_partitions` option, accepted as either an integer or a numeric string.
-fn max_partitions_option(value: OptionValue) -> Result<i64> {
-    crate::options::positive_i64(value, "max_partitions")
 }
 
 /// Parse a positive batch-size option, accepted as either an integer or a numeric string.
@@ -2734,32 +2714,6 @@ mod tests {
                 error.message
             );
         }
-    }
-
-    #[test]
-    fn max_partitions_option_accepts_positive_ints_and_strings() {
-        assert_eq!(max_partitions_option(OptionValue::Int(4)).unwrap(), 4);
-        assert_eq!(
-            max_partitions_option(OptionValue::String("16".into())).unwrap(),
-            16
-        );
-    }
-
-    #[test]
-    fn max_partitions_option_rejects_non_positive_and_malformed() {
-        // Zero and negatives are not positive partition counts.
-        for bad in [OptionValue::Int(0), OptionValue::Int(-1)] {
-            let error = max_partitions_option(bad).unwrap_err();
-            assert_eq!(error.status, Status::InvalidArguments);
-        }
-        // Strings must parse to a positive integer.
-        for bad in ["0", "-3", "abc", "1.5", ""] {
-            let error = max_partitions_option(OptionValue::String(bad.into())).unwrap_err();
-            assert_eq!(error.status, Status::InvalidArguments);
-        }
-        // A non-int, non-string value kind is rejected.
-        let error = max_partitions_option(OptionValue::Double(2.0)).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
     }
 
     #[test]
