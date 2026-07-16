@@ -3129,6 +3129,76 @@ fn bulk_ingest_edge_cases() {
         .execute_update()
         .expect("drop AdbcEdgeCreate");
 
+    // --- A stream that yields ZERO batches (not merely zero-row batches): the empty-array-stream
+    // shape `AdbcStatementBindStream` receives from a source with no data. The stream still declares
+    // a schema, which `bind_stream` preserves (in `ingest_schema`, separate from the bound parameter
+    // buffer) — the empty ingest must succeed, not be rejected as "no data has been bound". This is
+    // exactly the C++ adbc_validation `TestSqlIngestStreamZeroArrays` scenario.
+    let empty_stream = || {
+        RecordBatchIterator::new(
+            Vec::<std::result::Result<RecordBatch, arrow_schema::ArrowError>>::new(),
+            schema.clone(),
+        )
+    };
+    // Create mode: the table is built from the stream's declared schema alone, with zero rows.
+    let mut create_empty = connection.new_statement().expect("new statement");
+    create_empty
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcEdgeZero".into()),
+        )
+        .unwrap();
+    create_empty
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("create".into()),
+        )
+        .unwrap();
+    create_empty
+        .bind_stream(Box::new(empty_stream()))
+        .expect("bind a zero-batch stream");
+    assert_eq!(
+        create_empty
+            .execute_update()
+            .expect("create-mode ingest of a zero-batch stream must succeed"),
+        Some(0),
+        "a zero-batch ingest commits zero rows"
+    );
+    assert_eq!(
+        count_rows(&mut connection, "AdbcEdgeZero"),
+        0,
+        "the table must be created (from the stream's schema) with zero rows"
+    );
+    // Append mode into the now-existing table: a zero-batch stream is a clean no-op.
+    let mut append_empty = connection.new_statement().expect("new statement");
+    append_empty
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcEdgeZero".into()),
+        )
+        .unwrap();
+    append_empty
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .unwrap();
+    append_empty
+        .bind_stream(Box::new(empty_stream()))
+        .expect("bind a zero-batch stream for append");
+    assert_eq!(
+        append_empty
+            .execute_update()
+            .expect("append of a zero-batch stream must succeed"),
+        Some(0)
+    );
+    assert_eq!(count_rows(&mut connection, "AdbcEdgeZero"), 0);
+    let mut drop_edge_zero = connection.new_statement().expect("new statement");
+    drop_edge_zero
+        .set_sql_query("DROP TABLE AdbcEdgeZero")
+        .unwrap();
+    drop_edge_zero.execute_update().expect("drop AdbcEdgeZero");
+
     // --- Bind BEFORE the ingest options: the bound data and the ingest options may arrive in
     // either order.
     let mut before = connection.new_statement().expect("new statement");
@@ -3298,6 +3368,334 @@ fn bulk_ingest_edge_cases() {
     let mut drop_edge = connection.new_statement().expect("new statement");
     drop_edge.set_sql_query("DROP TABLE AdbcEdge").unwrap();
     drop_edge.execute_update().expect("drop edge table");
+}
+
+/// An empty (zero-batch) `bind_stream` declares a schema but binds no parameter rows. It must feed
+/// **only** the bulk-ingest path (which can build a table from the schema and commit zero rows) and
+/// must NOT hijack the non-ingest DML/query paths: those key off the bound *parameter* buffer, which
+/// an empty stream must leave empty. Regression test for the four defects found when an empty stream
+/// was synthesised into the shared `bound` buffer as a zero-row batch.
+#[test]
+fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
+    let Some(target) = test_target() else {
+        eprintln!(
+            "no Spanner target set — skipping bulk_ingest_empty_stream_does_not_hijack_other_paths"
+        );
+        return;
+    };
+    ensure_database_once(&target);
+    let _serial = serial_guard();
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_uri()),
+        )])
+        .expect("create database");
+    let mut connection = connect_with_retry(&database);
+
+    let mut ddl = connection.new_statement().expect("new statement");
+    ddl.set_sql_query(
+        "DROP TABLE IF EXISTS AdbcEmptyHijack; \
+         CREATE TABLE AdbcEmptyHijack (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
+    )
+    .unwrap();
+    ddl.execute_update().expect("create hijack table");
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("Id", DataType::Int64, false),
+        Field::new("Name", DataType::Utf8, false),
+    ]));
+    // A stream that yields ZERO batches but still declares `schema`.
+    let empty_stream = {
+        let schema = schema.clone();
+        move || {
+            RecordBatchIterator::new(
+                Vec::<std::result::Result<RecordBatch, arrow_schema::ArrowError>>::new(),
+                schema.clone(),
+            )
+        }
+    };
+
+    // Seed three rows via a normal INSERT so the DML/query cases below have data to act on.
+    let mut seed = connection.new_statement().expect("new statement");
+    seed.set_sql_query(
+        "INSERT INTO AdbcEmptyHijack (Id, Name) VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    )
+    .unwrap();
+    assert_eq!(seed.execute_update().expect("seed rows"), Some(3));
+
+    // (1) Empty bind_stream then DELETE: the DML must actually execute unparameterized and affect
+    // the matching rows — not be routed through the (empty) bound-parameter path and silently no-op.
+    let mut delete_after_empty = connection.new_statement().expect("new statement");
+    delete_after_empty
+        .bind_stream(Box::new(empty_stream()))
+        .expect("bind empty stream before DML");
+    delete_after_empty
+        .set_sql_query("DELETE FROM AdbcEmptyHijack WHERE Id IN (2, 3)")
+        .unwrap();
+    assert_eq!(
+        delete_after_empty
+            .execute_update()
+            .expect("DELETE after an empty bind_stream must execute"),
+        Some(2),
+        "an empty bind_stream must not silently no-op a subsequent DELETE"
+    );
+    assert_eq!(count_rows(&mut connection, "AdbcEmptyHijack"), 1);
+
+    // (2) Empty bind_stream then SELECT: the query must run and return the real row, not empty.
+    let mut select_after_empty = connection.new_statement().expect("new statement");
+    select_after_empty
+        .bind_stream(Box::new(empty_stream()))
+        .expect("bind empty stream before query");
+    select_after_empty
+        .set_sql_query("SELECT Id FROM AdbcEmptyHijack")
+        .unwrap();
+    let select_rows: usize = select_after_empty
+        .execute()
+        .expect("SELECT after an empty bind_stream must execute")
+        .map(|b| b.expect("batch").num_rows())
+        .sum();
+    assert_eq!(
+        select_rows, 1,
+        "an empty bind_stream must not make a subsequent SELECT return zero rows"
+    );
+
+    // (2b) A parameterized (bound) query whose result is EMPTY must yield zero batches — true
+    // end-of-stream — not a spurious 0-row batch. This exercises the BoundQueryBatchReader path
+    // (bound parameter rows), parallel to the plain reader's empty-result behaviour.
+    let mut empty_bound_query = connection.new_statement().expect("new statement");
+    empty_bound_query
+        .set_sql_query("SELECT Id FROM AdbcEmptyHijack WHERE Id = @p")
+        .unwrap();
+    empty_bound_query
+        .bind(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("p", DataType::Int64, false)])),
+                vec![Arc::new(Int64Array::from(vec![999_i64]))],
+            )
+            .unwrap(),
+        )
+        .expect("bind a param matching no row");
+    let bound_query_batches = empty_bound_query
+        .execute()
+        .expect("bound query with an empty result must execute")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read bound-query batches");
+    assert_eq!(
+        bound_query_batches.len(),
+        0,
+        "an empty bound-query result must yield zero batches, not a spurious empty batch"
+    );
+
+    // (3) Empty APPEND to a nonexistent table must still surface NotFound. An empty append ships
+    // nothing, so the missing-table insert error never fires; the driver probes existence directly.
+    let mut append_missing_empty = connection.new_statement().expect("new statement");
+    append_missing_empty
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcNoSuchZeroTable".into()),
+        )
+        .unwrap();
+    append_missing_empty
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .unwrap();
+    append_missing_empty
+        .bind_stream(Box::new(empty_stream()))
+        .expect("bind empty stream for missing-table append");
+    let append_missing_err = append_missing_empty
+        .execute_update()
+        .expect_err("empty append to a nonexistent table must fail");
+    assert_eq!(
+        append_missing_err.status,
+        adbc_core::error::Status::NotFound,
+        "empty append to a nonexistent table must be NotFound, got: {append_missing_err:?}"
+    );
+
+    // (3b) Stale-schema leak on a reused handle: an empty bind_stream sets the ingest schema; a
+    // subsequent non-ingest execution (here a DML) must clear it along with the bound buffer, so a
+    // *later* ingest with no fresh bind sees genuinely-nothing-bound and errors InvalidState rather
+    // than creating a table from the stale schema. (`clear_bound` ties the two fields' lifetimes.)
+    let mut reused = connection.new_statement().expect("new statement");
+    reused
+        .bind_stream(Box::new(empty_stream()))
+        .expect("bind empty stream on a reused handle");
+    reused
+        .set_sql_query("DELETE FROM AdbcEmptyHijack WHERE Id = -1")
+        .unwrap();
+    reused.execute_update().expect("run a DML on the handle");
+    // Now reuse the SAME handle for an ingest without rebinding. Setting the target table clears the
+    // SQL (they are mutually exclusive), routing execute_update to the ingest path.
+    reused
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcStaleLeak".into()),
+        )
+        .unwrap();
+    reused
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("create".into()),
+        )
+        .unwrap();
+    let stale_err = reused
+        .execute_update()
+        .expect_err("an ingest with no bound data (schema was cleared) must fail");
+    assert_eq!(
+        stale_err.status,
+        adbc_core::error::Status::InvalidState,
+        "a stale empty-stream schema must not survive a DML execution: {stale_err:?}"
+    );
+    // Confirm no table was created from a stale schema: a create-mode ingest onto AdbcStaleLeak now
+    // succeeds (it does not already exist), which it could not if the leak had created it.
+    let mut stale_probe = connection.new_statement().expect("new statement");
+    stale_probe
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcStaleLeak".into()),
+        )
+        .unwrap();
+    stale_probe
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("create".into()),
+        )
+        .unwrap();
+    stale_probe
+        .bind_stream(Box::new(empty_stream()))
+        .expect("bind empty stream to confirm the table was not leaked");
+    assert_eq!(
+        stale_probe
+            .execute_update()
+            .expect("AdbcStaleLeak must not exist yet, so create must succeed"),
+        Some(0),
+        "the InvalidState ingest must not have created a table from the stale schema"
+    );
+
+    // (3c) An empty APPEND to a nonexistent table in MANUAL mode must also surface NotFound (the
+    // probe fires on the manual path too, not just autocommit — a manual empty append would
+    // otherwise buffer nothing and commit clean).
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("disable autocommit for manual empty append");
+    let mut manual_append_missing = connection.new_statement().expect("new statement");
+    manual_append_missing
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcNoSuchManualZeroTable".into()),
+        )
+        .unwrap();
+    manual_append_missing
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .unwrap();
+    manual_append_missing
+        .bind_stream(Box::new(empty_stream()))
+        .expect("bind empty stream for manual missing-table append");
+    let manual_append_err = manual_append_missing
+        .execute_update()
+        .expect_err("manual-mode empty append to a nonexistent table must fail");
+    assert_eq!(
+        manual_append_err.status,
+        adbc_core::error::Status::NotFound,
+        "manual empty append to a nonexistent table must be NotFound, got: {manual_append_err:?}"
+    );
+    connection.rollback().expect("end the manual transaction");
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("true".into()),
+        )
+        .expect("re-enable autocommit after manual empty append");
+
+    // (4) A CREATE-mode empty ingest inside a manual *query* transaction must be rejected with
+    // InvalidState BEFORE the CREATE TABLE DDL runs — no table may be left behind as a side effect.
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("disable autocommit");
+    // Fix the transaction's kind to a query (read) by running a SELECT first.
+    let mut fix_read = connection.new_statement().expect("new statement");
+    fix_read
+        .set_sql_query("SELECT Id FROM AdbcEmptyHijack")
+        .unwrap();
+    drop(fix_read.execute().expect("open a read transaction"));
+    let mut create_in_read = connection.new_statement().expect("new statement");
+    create_in_read
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcEmptyReadTxn".into()),
+        )
+        .unwrap();
+    create_in_read
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("create".into()),
+        )
+        .unwrap();
+    create_in_read
+        .bind_stream(Box::new(empty_stream()))
+        .expect("bind empty stream for create in a read txn");
+    let create_in_read_err = create_in_read
+        .execute_update()
+        .expect_err("create-mode ingest in a query transaction must be rejected");
+    assert_eq!(
+        create_in_read_err.status,
+        adbc_core::error::Status::InvalidState,
+        "a DML-kind ingest in a query transaction must be InvalidState, got: {create_in_read_err:?}"
+    );
+    connection.rollback().expect("end the read transaction");
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("true".into()),
+        )
+        .expect("re-enable autocommit");
+    // The rejected create-mode ingest must NOT have created the table (the kind check runs before
+    // the DDL side effect). A create-mode ingest onto a truly-absent table succeeds, so if the
+    // earlier attempt had leaked the table this create would instead fail with AlreadyExists.
+    let mut probe_not_created = connection.new_statement().expect("new statement");
+    probe_not_created
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("AdbcEmptyReadTxn".into()),
+        )
+        .unwrap();
+    probe_not_created
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("create".into()),
+        )
+        .unwrap();
+    probe_not_created
+        .bind_stream(Box::new(empty_stream()))
+        .expect("bind empty stream to confirm the table was not created");
+    assert_eq!(
+        probe_not_created
+            .execute_update()
+            .expect("the table must not exist yet, so create must succeed"),
+        Some(0),
+        "the rejected in-txn create must not have left a table behind"
+    );
+
+    for table in ["AdbcEmptyReadTxn", "AdbcStaleLeak", "AdbcEmptyHijack"] {
+        let mut drop_stmt = connection.new_statement().expect("new statement");
+        drop_stmt
+            .set_sql_query(format!("DROP TABLE {table}"))
+            .unwrap();
+        drop_stmt.execute_update().expect("drop table");
+    }
 }
 
 /// A multi-chunk autocommit ingest that fails midway — a later chunk duplicates a primary key an
@@ -7287,12 +7685,24 @@ fn connection_cancel_is_sticky_until_the_next_operation() {
         .set_sql_query("SELECT Id FROM AdbcConnCancel")
         .unwrap();
     let partitioned = statement.execute_partitions().expect("execute_partitions");
+    // The emulator may split the 200 rows across several partitions and leave some — possibly the
+    // first — empty; an empty partition now streams zero batches (no spurious 0-row batch), so its
+    // reader's first `next()` is `None` and there is nothing to cancel between. Probe for a
+    // partition that actually yields rows to exercise the mid-stream cancel on (the descriptors are
+    // re-executable, so a probe read does not consume them).
     let descriptor = partitioned
         .partitions
-        .first()
-        .expect("at least one partition");
+        .iter()
+        .find(|token| {
+            connection
+                .read_partition(token)
+                .expect("probe read_partition")
+                .next()
+                .is_some()
+        })
+        .expect("at least one non-empty partition");
 
-    // Stream one partition and consume the prefetched first chunk, leaving the stream idle
+    // Stream that partition and consume the prefetched first chunk, leaving the stream idle
     // between fetches — then cancel with nothing parked on the signal, exactly the window where
     // a non-sticky signal would be lost.
     let mut reader = connection

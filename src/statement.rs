@@ -127,6 +127,13 @@ pub struct SpannerStatement {
     sql: Option<String>,
     /// Parameter / bulk-ingest data bound via [`Statement::bind`] or [`Statement::bind_stream`].
     bound: Vec<RecordBatch>,
+    /// The Arrow schema declared by a [`Statement::bind_stream`] that yielded **zero** batches (an
+    /// empty bulk ingest). Kept *separate* from `bound` — rather than synthesised into it as a
+    /// zero-row batch — so an empty stream neither diverts the parameter-binding DML/query paths
+    /// (which key off `bound` being non-empty) nor is mistaken for a bound parameter row. It is
+    /// consumed **only** by the bulk-ingest paths: to build the target table from the schema in the
+    /// create/replace modes, and to permit a zero-row ingest. Cleared whenever `bound` is (re)set.
+    ingest_schema: Option<SchemaRef>,
     /// Target table for bulk ingest (`adbc.ingest.target_table`), if set.
     target_table: Option<String>,
     /// Named schema qualifying the ingest target table (`adbc.ingest.target_db_schema`), if set.
@@ -196,6 +203,7 @@ impl SpannerStatement {
             txn,
             sql: None,
             bound: Vec::new(),
+            ingest_schema: None,
             target_table: None,
             target_db_schema: None,
             target_catalog: None,
@@ -258,6 +266,28 @@ impl SpannerStatement {
         Ok(statements)
     }
 
+    /// The Arrow schema of the bound ingest data: the first bound batch's schema, or — when a bound
+    /// stream yielded zero batches — the schema that stream declared ([`ingest_schema`](Self)). Used
+    /// only by the bulk-ingest paths, so an empty ingest can still build its target table.
+    fn bound_ingest_schema(&self) -> Option<SchemaRef> {
+        self.bound
+            .first()
+            .map(RecordBatch::schema)
+            .or_else(|| self.ingest_schema.clone())
+    }
+
+    /// Discard all bound data, resetting **both** `bound` and its companion
+    /// [`ingest_schema`](Self) together so they can never desync. Every execution path that consumes
+    /// bound data (each `execute`/`execute_update` arm, the bound-query and partition paths, the
+    /// ingest path) calls this — a reused statement handle must not silently re-apply stale bound
+    /// rows *or* a stale empty-stream ingest schema to a later, unrelated execution. (The `bind` /
+    /// `bind_stream` setters overwrite both directly; the `set_sql_query` / ingest-option setters
+    /// deliberately leave bound data intact, since binding may precede setting the destination.)
+    fn clear_bound(&mut self) {
+        self.bound.clear();
+        self.ingest_schema = None;
+    }
+
     /// DDL to run before an ingest, for the create/replace ingest modes (`None` for append).
     ///
     /// `create` (the default — see [`ingest_mode`](Self::ingest_mode)) builds the table (erroring
@@ -278,10 +308,8 @@ impl SpannerStatement {
             Some(IngestMode::Replace) => (false, true),
         };
         let schema = self
-            .bound
-            .first()
-            .ok_or_else(|| invalid_state("cannot create the ingest table: no data is bound"))?
-            .schema();
+            .bound_ingest_schema()
+            .ok_or_else(|| invalid_state("cannot create the ingest table: no data is bound"))?;
         let db_schema = self.target_db_schema.as_deref();
         let mut statements = Vec::new();
         if drop_first {
@@ -422,20 +450,44 @@ impl SpannerStatement {
         if self.config.is_read_only() {
             return Err(invalid_state("cannot ingest: the connection is read-only"));
         }
-        if self.bound.is_empty() {
+        // An empty (zero-batch) bound stream still declares a schema (`ingest_schema`), which is
+        // enough to create the table and commit zero rows — so only a statement with *neither*
+        // bound rows nor an ingest schema has genuinely bound nothing.
+        if self.bound.is_empty() && self.ingest_schema.is_none() {
             return Err(invalid_state("cannot ingest: no data has been bound"));
         }
         let result = self.run_bound_ingest(table);
         // The bound data is consumed by the ingest attempt either way — including a failed
         // create-mode DDL: a reused statement handle must not silently re-ingest stale rows after
         // a failure.
-        self.bound.clear();
+        self.clear_bound();
         result
     }
 
     /// The body of [`run_ingest`](Self::run_ingest), split out so its caller clears the bound data
     /// on every exit path (success, failed DDL, failed insert) in one place.
     fn run_bound_ingest(&self, table: &str) -> Result<Option<i64>> {
+        // Reject a DML-kind ingest issued inside a manual *query* transaction BEFORE any DDL side
+        // effect. DDL is not transaction-aware and runs immediately, so a create/replace-mode ingest
+        // would otherwise create (or drop) the table before `run_ingest_mutations`'s kind check
+        // rejects the ingest, leaving a table behind. This early guard changes no state; the
+        // authoritative kind check still runs under the txn lock when the mutations buffer.
+        //
+        // This closes the race only for the common single-threaded case. A concurrent statement on
+        // the same connection could still fix the transaction to query-kind in the window between
+        // this check and the DDL below, and the DDL — not being transaction-aware — would run
+        // anyway, orphaning the table while the later authoritative buffer-time check fails. Fully
+        // closing it would mean holding the connection-wide txn lock across a multi-second admin
+        // `UpdateDatabaseDdl` RPC, which would stall every other statement's txn-state access; that
+        // trade is not worth it. The residual window is exactly the documented "DDL is not
+        // transaction-aware / DML–DDL reorder" caveat (see CLAUDE.md, `run_ddl`): DDL side effects
+        // are never governed by, nor rolled back with, a manual transaction.
+        {
+            let txn = self.txn.lock().unwrap();
+            if !txn.autocommit() {
+                txn.check_kind_allowed(TxnKind::Dml)?;
+            }
+        }
         let ingest_ddl = self.build_ingest_table_ddl(table, self.ingest_mode)?;
         if let Some(ddl) = ingest_ddl {
             self.run_ddl(ddl)
@@ -542,6 +594,11 @@ impl SpannerStatement {
             // txn-state users are not stalled behind it, and a build panic cannot poison it.
             let rows = self.bound.iter().map(RecordBatch::num_rows).sum();
             let mutations = self.build_range_mutations(&target, 0, rows)?;
+            // An empty append buffers nothing and would commit clean, so a missing target table
+            // would never surface — probe existence now (as the autocommit path does, and outside
+            // the txn lock) so a manual-mode empty append to an absent table still fails NotFound,
+            // consistent with what a non-empty manual append surfaces at commit.
+            self.check_empty_append_target(table, rows as i64)?;
             let mut txn = self.txn.lock().unwrap();
             if !txn.autocommit() {
                 // `buffer_mutation` re-checks the DML kind under this lock (a concurrent
@@ -585,7 +642,32 @@ impl SpannerStatement {
             }
         }
         total += self.commit_ingest_range(&target, chunk_start, row_index, total)?;
+        self.check_empty_append_target(table, total)?;
         Ok(Some(total))
+    }
+
+    /// Surface [`Status::NotFound`] for an **empty** `append` ingest whose target table is absent.
+    ///
+    /// A zero-row ingest ships nothing, so the insert error that normally drives
+    /// [`remap_ingest_append_error`](Self::remap_ingest_append_error)'s NotFound never fires — yet
+    /// the ADBC append contract is NotFound for an absent table regardless of row count. Both ingest
+    /// paths call this after a zero-row ingest (`ingested == 0`): the autocommit path after its
+    /// (no-op) commit, the manual path before buffering nothing. Only `append` needs it —
+    /// `create_append`'s `CREATE TABLE IF NOT EXISTS` guarantees the table exists, and
+    /// `create`/`replace` own existence via their own DDL. A probe that itself fails teaches nothing
+    /// about the table, so — as everywhere else — the empty ingest just succeeds (see
+    /// [`table_exists`](crate::connection::table_exists)).
+    fn check_empty_append_target(&self, table: &str, ingested: i64) -> Result<()> {
+        if ingested == 0
+            && matches!(self.ingest_mode, Some(IngestMode::Append))
+            && matches!(self.ingest_table_exists(table), Ok(false))
+        {
+            return Err(err(
+                format!("bulk ingest append target table {table:?} not found"),
+                Status::NotFound,
+            ));
+        }
+        Ok(())
     }
 
     /// Build the insert mutations for the flattened row range `[start, end)` across the bound
@@ -1093,7 +1175,7 @@ impl SpannerStatement {
         // Parameterized query: run once per bound row.
         if !self.bound.is_empty() {
             let reader = self.execute_bound_query(&sql)?;
-            self.bound.clear();
+            self.clear_bound();
             return Ok(reader);
         }
         let manual_txn = self.manual_read_transaction()?;
@@ -1425,7 +1507,10 @@ impl SpannerStatement {
     /// execution time — and the message names both remedies, instead of the plain "no SQL query
     /// set" error that would hide the missing ingest option.
     fn check_bound_has_destination(&self) -> Result<()> {
-        if self.sql.is_none() && self.target_table.is_none() && !self.bound.is_empty() {
+        if self.sql.is_none()
+            && self.target_table.is_none()
+            && (!self.bound.is_empty() || self.ingest_schema.is_some())
+        {
             return Err(invalid_state(
                 "data has been bound but no SQL query or bulk-ingest target is set; call \
                  set_sql_query or set the adbc.ingest.target_table option before executing",
@@ -1638,10 +1723,17 @@ impl Optionable for SpannerStatement {
 impl Statement for SpannerStatement {
     fn bind(&mut self, batch: RecordBatch) -> Result<()> {
         self.bound = vec![batch];
+        // Real bound data supersedes any empty-stream ingest schema from a prior bind_stream.
+        self.ingest_schema = None;
         Ok(())
     }
 
     fn bind_stream(&mut self, reader: Box<dyn RecordBatchReader + Send>) -> Result<()> {
+        // Capture the stream's schema up front: a stream may yield *zero* batches yet still declare a
+        // schema (an empty bulk ingest — `AdbcStatementBindStream` of an empty array stream). Without
+        // it a zero-batch ingest would lose the schema entirely and be rejected as "no data has been
+        // bound", when it should create the table from the schema and commit zero rows.
+        let schema = reader.schema();
         let mut batches = Vec::new();
         for batch in reader {
             batches.push(batch.map_err(|e| {
@@ -1651,6 +1743,10 @@ impl Statement for SpannerStatement {
                 )
             })?);
         }
+        // Preserve an empty stream's schema *separately* (not as a synthetic zero-row batch in
+        // `bound`, which would make the parameter-binding DML/query paths treat this statement as
+        // having bound rows and silently no-op — see `ingest_schema`). A non-empty stream clears it.
+        self.ingest_schema = batches.is_empty().then_some(schema);
         self.bound = batches;
         Ok(())
     }
@@ -1677,7 +1773,7 @@ impl Statement for SpannerStatement {
         if crate::sql::is_ddl(&sql) {
             self.run_ddl(crate::sql::split_statements(&sql))?;
             // A reused statement handle must not silently re-bind stale rows past a DDL statement.
-            self.bound.clear();
+            self.clear_bound();
             // DDL has no result set — return an empty reader with an empty schema.
             return Ok(Self::empty_reader());
         }
@@ -1694,7 +1790,7 @@ impl Statement for SpannerStatement {
                 ));
             }
             let result = self.run_dml(&sql);
-            self.bound.clear();
+            self.clear_bound();
             return match result? {
                 DmlOutcome::Returning {
                     batches, schema, ..
@@ -1731,7 +1827,7 @@ impl Statement for SpannerStatement {
         if crate::sql::is_ddl(&sql) {
             self.run_ddl(crate::sql::split_statements(&sql))?;
             // A reused statement handle must not silently re-bind stale rows past a DDL statement.
-            self.bound.clear();
+            self.clear_bound();
             // DDL does not report an affected-row count (and is never transactional in Spanner,
             // so it always runs immediately rather than buffering).
             return Ok(None);
@@ -1760,7 +1856,7 @@ impl Statement for SpannerStatement {
             ));
         }
         let result = self.run_dml(&sql);
-        self.bound.clear();
+        self.clear_bound();
         match result? {
             // THEN RETURN through the update entry point: the rows are discarded (this interface
             // only reports a count), taken from the result-set stats.
@@ -1863,7 +1959,7 @@ impl Statement for SpannerStatement {
         // The bound parameter row is consumed by the partitioning attempt either way — including a
         // failed one — matching the DML paths: a reused statement handle must not silently re-apply
         // stale bound rows to a later, unrelated execution.
-        self.bound.clear();
+        self.clear_bound();
         result
     }
 
