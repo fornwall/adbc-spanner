@@ -7685,12 +7685,24 @@ fn connection_cancel_is_sticky_until_the_next_operation() {
         .set_sql_query("SELECT Id FROM AdbcConnCancel")
         .unwrap();
     let partitioned = statement.execute_partitions().expect("execute_partitions");
+    // The emulator may split the 200 rows across several partitions and leave some — possibly the
+    // first — empty; an empty partition now streams zero batches (no spurious 0-row batch), so its
+    // reader's first `next()` is `None` and there is nothing to cancel between. Probe for a
+    // partition that actually yields rows to exercise the mid-stream cancel on (the descriptors are
+    // re-executable, so a probe read does not consume them).
     let descriptor = partitioned
         .partitions
-        .first()
-        .expect("at least one partition");
+        .iter()
+        .find(|token| {
+            connection
+                .read_partition(token)
+                .expect("probe read_partition")
+                .next()
+                .is_some()
+        })
+        .expect("at least one non-empty partition");
 
-    // Stream one partition and consume the prefetched first chunk, leaving the stream idle
+    // Stream that partition and consume the prefetched first chunk, leaving the stream idle
     // between fetches — then cancel with nothing parked on the signal, exactly the window where
     // a non-sticky signal would be lost.
     let mut reader = connection
