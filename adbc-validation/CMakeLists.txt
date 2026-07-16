@@ -47,12 +47,16 @@ if(SPANNER_VALIDATION_SANITIZE)
   add_link_options(-fsanitize=${SPANNER_VALIDATION_SANITIZE})
 endif()
 
-# Pin to an apache/arrow-adbc `main` revision.
+# TEMPORARILY pinned to a fornwall/arrow-adbc fork branch that carries one
+# unmerged upstream PR, apache/arrow-adbc#4534. As soon as that PR merges,
+# revert GIT_REPOSITORY (below) to apache/arrow-adbc.git and bump the tag onto a
+# `main` rev containing it — the fork is the *only* reason this points anywhere
+# but apache/arrow-adbc.
 #
 # This is the same *family* as the adbc_core / adbc_ffi git pin the driver
 # builds on (see Cargo.toml), but the two revisions are bumped independently
 # and may differ — this one only selects the C++ validation-suite sources.
-# Its apache/arrow-adbc base (rather than the 0.23 release tag) carries four
+# Its apache/arrow-adbc base (rather than the 0.23 release tag) carries five
 # C++ validation fixes this suite relies on:
 # apache/arrow-adbc#4493 — TestSqlPartitionedInts now allows >1 partition, so
 # SpannerStatementTest.SqlPartitionedInts is gate-enforced instead of excluded;
@@ -65,7 +69,10 @@ endif()
 # double-quoting); and apache/arrow-adbc#4514, which routes the statement
 # tests' remaining hardcoded dialect-sensitive SQL (non-Spanner CREATE TABLEs,
 # INSERTs without a column list, `SELECT *` ingest readbacks, NULLS
-# FIRST/LAST) through RewriteSql under stable query ids. The Spanner quirks
+# FIRST/LAST) through RewriteSql under stable query ids; and
+# apache/arrow-adbc#4534, which makes the two TestSqlPrepareUpdate readbacks
+# order-deterministic (`ORDER BY <col> ASC NULLS FIRST` plus sorted expected
+# vectors) so a dialect quirk can make them pass. The Spanner quirks
 # override RewriteSql (spanner_validation.cc) to substitute GoogleSQL per query
 # id, which unlocks most of the former ingest-readback and non-Spanner-DDL
 # exclusions (see EXCLUDED in scripts/run-adbc-validation.sh for the
@@ -76,8 +83,8 @@ endif()
 # exists, so a stale `CMakeCache.txt` (e.g. one restored from a run on the old
 # rev) would silently keep the previous tag and rebuild against the wrong
 # arrow-adbc source. FORCE makes a rev bump here authoritative.
-set(ARROW_ADBC_TAG "1ba7fe665fd8224939ae824e7739df550bbea086"
-    CACHE STRING "arrow-adbc main revision" FORCE)
+set(ARROW_ADBC_TAG "4dc3be825cafb4357a91fae720c6de57594976fe"
+    CACHE STRING "arrow-adbc revision (TEMP: fornwall fork branch, see above)" FORCE)
 
 include(FetchContent)
 
@@ -101,7 +108,9 @@ set(ADBC_DRIVER_BIGQUERY OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
   arrow_adbc
-  GIT_REPOSITORY https://github.com/apache/arrow-adbc.git
+  # TEMPORARY: fornwall/arrow-adbc fork branch for unmerged apache/arrow-adbc#4534;
+  # revert to https://github.com/apache/arrow-adbc.git once #4534 merges (see above).
+  GIT_REPOSITORY https://github.com/fornwall/arrow-adbc.git
   GIT_TAG ${ARROW_ADBC_TAG}
   # NOT GIT_SHALLOW: ARROW_ADBC_TAG is a specific `main` commit, and a shallow clone
   # (`--depth 1`) fetches only upstream's current tip — so checking out the pinned SHA
