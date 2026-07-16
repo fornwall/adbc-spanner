@@ -5,8 +5,9 @@
 //! uses to arbitrate CPU between workloads, a free-form **request tag** for
 //! [troubleshooting with tags](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags)
 //! (surfaced in query and transaction statistics), and a **transaction tag** attached to every
-//! operation of a read/write transaction. This module parses the three driver options that expose
-//! them and applies the stored values onto the client's builders:
+//! operation of a read/write transaction. This module parses the driver options that expose them —
+//! together with the related commit-batching and commit-stats knobs — and applies the stored values
+//! onto the client's builders:
 //!
 //! - [`OPTION_REQUEST_PRIORITY`](crate::OPTION_REQUEST_PRIORITY) (`spanner.request.priority`) —
 //!   `low` / `medium` / `high` (exact lowercase). Applied to every query/DML statement the driver
