@@ -152,12 +152,31 @@ EXCLUDED=(
   # the gate tolerates — no expected-failure bookkeeping needed.
 
   # --- Bucket 2: Arrow types the driver cannot map to a Spanner column ---------
-  # These fail at ingest time with "cannot create a Spanner column for Arrow
-  # type ...": the driver maps no unsigned integer type (UInt64 cannot fit
-  # INT64; UInt8/16/32 *could* widen losslessly to INT64 but that mapping does
-  # not exist yet), and Duration / Interval(MonthDayNano) / FixedSizeBinary have
-  # no bind/create mapping either (Spanner INTERVAL is not wired up). Expected
-  # failures until the driver grows those mappings.
+  # These three cannot pass, for two distinct reasons:
+  #
+  #   - UInt64 (ingest-time "cannot create a Spanner column"): u64::MAX (1.8e19)
+  #     exceeds i64::MAX (9.2e18), so it cannot widen to INT64 losslessly (a
+  #     wrapping cast would silently corrupt large values). It *would* fit Spanner
+  #     NUMERIC, but that reads back as Decimal128, not the INT64 the shared
+  #     IngestSelectRoundTripType quirk (and the driver's uniform integer→INT64
+  #     model) expects — and the suite's SchemaField cannot even express
+  #     Decimal128(precision, scale) to assert such a round-trip. So it is unmapped.
+  #
+  #   - Interval / Duration (emulator limitation): both would map to a Spanner
+  #     INTERVAL column, but the Cloud Spanner *emulator* — which is what every CI
+  #     suite runs against — does not support the INTERVAL column type. A create-
+  #     mode ingest that declares an INTERVAL column fails at CREATE TABLE with a
+  #     backend GOOGLESQL_RET_CHECK ("IsSupportedColumnType"), so neither case can
+  #     pass in CI regardless of driver support. (Arrow Interval(MonthDayNano) is a
+  #     clean 1:1 with Spanner INTERVAL on *real* Spanner — same months/days/nanos
+  #     model — but that is unverifiable here; Arrow Duration additionally has no
+  #     fixed-unit counterpart in Spanner and the suite's ValidateIngestedTemporalData
+  #     FAILs any non-TIMESTAMP temporal readback.)
+  #
+  # NOT here anymore (now mapped and gate-enforced): SqlIngestUInt8/UInt16/UInt32
+  # widen losslessly to INT64 (u8/u16/u32 max < i64::MAX); SqlIngestFixedSizeBinary
+  # maps to BYTES like the other binary kinds (readback Binary via
+  # IngestSelectRoundTripType).
   #
   # The rest of the former ingest-readback bucket is NOT here anymore: the
   # readback SQL is routed through RewriteSql (apache/arrow-adbc#4514), and the
@@ -183,12 +202,8 @@ EXCLUDED=(
   # (SqlIngestErrors is NOT here: it exercises only the ingest error paths, with no
   # readback and no non-Spanner DDL, so it passes cleanly and is enforced by the gate.)
   'SpannerStatementTest.SqlIngestDuration'
-  'SpannerStatementTest.SqlIngestFixedSizeBinary'
   'SpannerStatementTest.SqlIngestInterval'
-  'SpannerStatementTest.SqlIngestUInt16'
-  'SpannerStatementTest.SqlIngestUInt32'
   'SpannerStatementTest.SqlIngestUInt64'
-  'SpannerStatementTest.SqlIngestUInt8'
 
   # --- Bucket 3: empty-stream ingest -------------------------------------------
   # Ingesting a stream with zero batches fails with InvalidState "cannot ingest:

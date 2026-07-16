@@ -351,7 +351,8 @@ behaviour can only be observed against a real project, not the emulator.
 | `TIMESTAMP`                                 | `Timestamp(Nanosecond, "UTC")` (default) or `Timestamp(Microsecond, "UTC")` — see below |
 | `NUMERIC`                                   | `Decimal128(38, 9)`               |
 | `BYTES`                                     | `Binary`                          |
-| `STRING` / `UUID` / `INTERVAL`               | `Utf8`                            |
+| `STRING` / `UUID`                            | `Utf8`                            |
+| `INTERVAL`                                  | `Interval(MonthDayNano)` (real Spanner only — see below) |
 | `JSON`                                      | `Utf8` + `arrow.json` extension   |
 | `ARRAY<T>`                                  | `List<T>` (recursive)             |
 | `STRUCT<..>`                                | `Struct<..>` (recursive)          |
@@ -391,6 +392,19 @@ carrying `arrow.json` binds as a Spanner `JSON`-typed parameter (a list of tagge
 `STRING` parameters to `JSON` (without the tag, wrap the parameter in `PARSE_JSON(@p)` instead).
 Bulk-ingest create modes likewise create a `JSON` column for a tagged field. So JSON values
 round-trip: what `execute` reads from a `JSON` column can be bound straight back into one.
+
+`INTERVAL` maps to Arrow `Interval(MonthDayNano)`, the one Arrow interval layout with Spanner's
+exact months + days + nanoseconds model (neither side normalizes across the boundaries), so the two
+round-trip losslessly in both directions — bind an `Interval(MonthDayNano)` parameter/ingest column
+and it becomes a Spanner `INTERVAL`, read an `INTERVAL` column back and it decodes to
+`Interval(MonthDayNano)`. **This works only against real Cloud Spanner:** the Spanner *emulator*
+does not implement the `INTERVAL` column type (a `CREATE TABLE` declaring one fails), so the
+`INTERVAL` round-trip is not exercised by the emulator-based CI (the C++ `adbc_validation`
+`SqlIngestInterval` case stays excluded for this reason). Arrow `Duration` is **not** mapped: Spanner
+has no fixed-unit elapsed-time type, and a single `INTERVAL` column can only read back as one Arrow
+type. Unsigned Arrow integers that fit `i64` losslessly — `UInt8`/`UInt16`/`UInt32` — widen to
+`INT64` on bind/ingest (like the signed widths); `UInt64` is unsupported (`u64::MAX` exceeds
+`i64::MAX`). `FixedSizeBinary` binds as `BYTES` like the other binary layouts.
 
 `TIMESTAMP` is read at full nanosecond precision by default (matching the bind/write path). Arrow
 stores `Timestamp(Nanosecond)` as an `i64` count of nanoseconds since the Unix epoch, which spans
