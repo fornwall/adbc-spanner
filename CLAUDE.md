@@ -315,8 +315,8 @@ is cross-compiled, off the universal Apple toolchain) and installs NASM only on 
 ## Fuzzing
 
 `fuzz/` holds the `cargo-fuzz` targets (`sql`, `values`, `like`, `options`, `keyword`, `params`,
-`partition`), each a `libfuzzer-sys` harness over a `#[cfg(feature = "fuzzing")] pub mod fuzzing`
-wrapper in `src/lib.rs`. Run one with `cargo +nightly fuzz run <target>`; CI runs them nightly via
+`partition`, `staleness`, `directed_read`, `uri`), each a `libfuzzer-sys` harness over a
+`#[cfg(feature = "fuzzing")] pub mod fuzzing` wrapper in `src/lib.rs`. Run one with `cargo +nightly fuzz run <target>`; CI runs them nightly via
 `.github/workflows/fuzz.yml` (see the TEST-9 gaps in REVIEW.md for targets still worth adding).
 
 `fuzz/` is a **member of the root workspace** (its manifest has no `[workspace]` of its own — the
