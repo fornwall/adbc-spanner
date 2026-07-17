@@ -2249,23 +2249,39 @@ fn rows_per_batch_option(value: OptionValue) -> Result<usize> {
 /// [`SpannerStatement::run_ingest_mutations`]), so a mid-ingest failure leaves the earlier chunks'
 /// rows in the table. On the write-only path a chunk is atomic, so `committed` is just the earlier
 /// chunks; on the non-atomic BatchWrite path it also includes the failing chunk's groups that did
-/// apply (COR-5). Either way the count is known exactly, and reporting it tells the caller what
-/// state the table was left in instead of making them guess. A first-chunk failure that committed
-/// nothing passes through unchanged.
+/// apply (COR-5). Either way that count is known exactly, and reporting it tells the caller what
+/// state the table was left in instead of making them guess.
+///
+/// A [`Status::Timeout`]/[`Status::Cancelled`] failure is the exception (CON-5): cancel/timeout
+/// *drops* the in-flight `Commit` future, which may still land server-side, so the **failing
+/// chunk's own** outcome is unknown — a caller-driven retry could duplicate its rows. There the
+/// exact count still covers the earlier work, but the annotation also flags the ambiguity rather
+/// than implying the failing chunk committed nothing. Other statuses keep the plain accounting; a
+/// first-chunk failure with a known outcome (nothing committed) passes through unchanged.
 /// The status and `vendor_code` are preserved, so callers still branch on the underlying failure
 /// (e.g. `AlreadyExists` for a duplicate primary key).
 fn note_rows_already_committed(error: Error, committed: i64) -> Error {
-    if committed == 0 {
+    let outcome_unknown = matches!(error.status, Status::Timeout | Status::Cancelled);
+    if committed == 0 && !outcome_unknown {
         return error;
     }
-    let mut annotated = err(
-        format!(
-            "{} ({committed} row(s) from this bulk ingest were already committed and remain \
-             in the table)",
-            error.message
-        ),
-        error.status,
-    );
+    let mut note = String::new();
+    if committed > 0 {
+        note.push_str(&format!(
+            "{committed} row(s) from this bulk ingest were already committed and remain in the \
+             table"
+        ));
+    }
+    if outcome_unknown {
+        if !note.is_empty() {
+            note.push_str("; ");
+        }
+        note.push_str(
+            "this chunk's own commit outcome is unknown — it may still have landed server-side, so \
+             retrying could duplicate rows",
+        );
+    }
+    let mut annotated = err(format!("{} ({note})", error.message), error.status);
     // Pure annotation, like the append remap's `AlreadyExists` branch: vendor code and forwarded
     // `google.rpc.Status` details survive the rebuilt message.
     annotated.vendor_code = error.vendor_code;
@@ -2441,6 +2457,41 @@ mod tests {
         assert_eq!(annotated.status, Status::AlreadyExists);
         assert_eq!(annotated.vendor_code, 6);
         assert_eq!(annotated.details, source().details);
+    }
+
+    #[test]
+    fn timed_out_or_cancelled_chunk_reports_unknown_outcome() {
+        // CON-5: a cancel/timeout drops the in-flight `Commit` future, which may still land
+        // server-side, so the failing chunk's own outcome is unknown — the annotation must flag
+        // the ambiguity (and the duplicate-row risk) rather than implying exact accounting.
+        for status in [Status::Timeout, Status::Cancelled] {
+            // Even a first-chunk failure (nothing counted as committed) must warn, because the
+            // failing chunk itself may have landed.
+            let first = note_rows_already_committed(err("commit interrupted", status), 0);
+            assert_eq!(first.status, status);
+            assert!(
+                first.message.contains("outcome is unknown")
+                    && first.message.contains("duplicate rows"),
+                "an interrupted first chunk must flag the ambiguous outcome: {}",
+                first.message
+            );
+
+            // A later-chunk failure keeps the exact earlier-chunk count *and* flags the failing
+            // chunk's unknown outcome.
+            let later = note_rows_already_committed(err("commit interrupted", status), 4_000);
+            assert!(
+                later
+                    .message
+                    .contains("4000 row(s) from this bulk ingest were already committed"),
+                "the exact earlier-chunk count must survive: {}",
+                later.message
+            );
+            assert!(
+                later.message.contains("outcome is unknown"),
+                "the failing chunk's ambiguity must still be flagged: {}",
+                later.message
+            );
+        }
     }
 
     #[test]
