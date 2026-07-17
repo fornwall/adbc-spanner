@@ -868,6 +868,52 @@ impl SpannerStatement {
         )
     }
 
+    /// Run a `QueryMode::Plan` probe of `sql` and return its result schema without scanning any
+    /// rows. Binds parameter values from the first bound batch when it has rows (the values are
+    /// irrelevant to the schema, but they let `@param` references resolve). Shared by
+    /// [`Statement::execute_schema`] and the zero-row arm of
+    /// [`execute_bound_query`](Self::execute_bound_query), so both advertise the query's real schema.
+    fn plan_query_schema(&self, sql: &str) -> Result<SchemaRef> {
+        let client = self.client.clone();
+        let bound = self.bound.clone();
+        let bind_by_name = self.bind_by_name;
+        let sql = sql.to_string();
+        // The PLAN probe's schema must carry the same timestamp unit as the data `execute` would
+        // stream, so the advertised schema and the actual batches can never disagree.
+        let precision = self.config.timestamp_precision;
+        // QueryMode::Plan analyses the query and returns its column metadata without scanning
+        // any data, so dbt can introspect a model's output columns without wrapping it in a
+        // `SELECT ... WHERE false` subquery.
+        let plan_builder = self.read_sql_builder(&sql).set_query_mode(QueryMode::Plan);
+        // The schema probe is a query execution, so the query timeout bounds it.
+        block_on_cancellable(
+            &self.runtime,
+            &self.cancel.current(),
+            with_timeout(
+                self.config.timeouts.query_timeout(),
+                crate::OPTION_RPC_TIMEOUT_QUERY,
+                async move {
+                    let transaction = client.single_use().build();
+                    let mut builder = plan_builder;
+                    // Bind parameters if any were provided (values are irrelevant to the schema) so
+                    // that `@param` references resolve.
+                    if let Some(batch) = bound.first()
+                        && batch.num_rows() > 0
+                    {
+                        let names = bind::resolve_parameter_names(&sql, batch, bind_by_name)?;
+                        builder = bind::bind_params(builder, &names, batch, 0)?;
+                    }
+                    let result_set = transaction
+                        .execute_query(builder.build())
+                        .await
+                        .map_err(from_spanner)?;
+                    let (schema, _batch) = result_set_to_batch(result_set, precision).await?;
+                    Ok::<SchemaRef, Error>(schema)
+                },
+            ),
+        )
+    }
+
     /// An empty result reader (empty schema, no rows), for statements that yield no result set.
     fn empty_reader() -> Box<dyn RecordBatchReader + Send + 'static> {
         let schema = Arc::new(Schema::empty());
@@ -1084,7 +1130,13 @@ impl SpannerStatement {
             // mode) the single-use transaction keeps the exact semantics of the bounded-staleness
             // kinds.
             let Some((names, batch)) = groups.first() else {
-                return Ok(Self::empty_reader());
+                // Zero total bound rows (e.g. a DBAPI `executemany` with an empty parameter set):
+                // there is nothing to run, but returning an empty schema would disagree with every
+                // non-empty execution. Advertise the query's real schema via the PLAN probe and
+                // return a zero-row reader (COR-9).
+                let schema = self.plan_query_schema(sql)?;
+                let empty: Vec<std::result::Result<RecordBatch, ArrowError>> = Vec::new();
+                return Ok(Box::new(RecordBatchIterator::new(empty, schema)));
             };
             let statement = bind::bind_params(base_builder, names, batch, 0)?.build();
             let bound = self.config.read_staleness.timestamp_bound()?;
@@ -1873,44 +1925,7 @@ impl Statement for SpannerStatement {
         // ExecuteSql surface, which rejects a trailing `;` ("Expected end of input but got `;`"),
         // yet introspection callers routinely append one (e.g. `SELECT current_date;`).
         let sql = crate::sql::strip_trailing_terminators(&sql);
-        let client = self.client.clone();
-        let bound = self.bound.clone();
-        let bind_by_name = self.bind_by_name;
-        // The PLAN probe's schema must carry the same timestamp unit as the data `execute` would
-        // stream, so the advertised schema and the actual batches can never disagree.
-        let precision = self.config.timestamp_precision;
-        // QueryMode::Plan analyses the query and returns its column metadata without scanning
-        // any data, so dbt can introspect a model's output columns without wrapping it in a
-        // `SELECT ... WHERE false` subquery.
-        let plan_builder = self.read_sql_builder(&sql).set_query_mode(QueryMode::Plan);
-        // The schema probe is a query execution, so the query timeout bounds it.
-        let schema = block_on_cancellable(
-            &self.runtime,
-            &self.cancel.current(),
-            with_timeout(
-                self.config.timeouts.query_timeout(),
-                crate::OPTION_RPC_TIMEOUT_QUERY,
-                async move {
-                    let transaction = client.single_use().build();
-                    let mut builder = plan_builder;
-                    // Bind parameters if any were provided (values are irrelevant to the schema) so
-                    // that `@param` references resolve.
-                    if let Some(batch) = bound.first()
-                        && batch.num_rows() > 0
-                    {
-                        let names = bind::resolve_parameter_names(&sql, batch, bind_by_name)?;
-                        builder = bind::bind_params(builder, &names, batch, 0)?;
-                    }
-                    let result_set = transaction
-                        .execute_query(builder.build())
-                        .await
-                        .map_err(from_spanner)?;
-                    let (schema, _batch) = result_set_to_batch(result_set, precision).await?;
-                    Ok::<SchemaRef, Error>(schema)
-                },
-            ),
-        )?;
-        Ok((*schema).clone())
+        Ok((*self.plan_query_schema(&sql)?).clone())
     }
 
     /// Partition this query and return one opaque descriptor per partition, to be executed later by

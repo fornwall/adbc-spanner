@@ -3479,6 +3479,53 @@ fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
         "an empty bound-query result must yield zero batches, not a spurious empty batch"
     );
 
+    // (2c) A parameterized (bound) query with ZERO *total* bound rows — a DBAPI `executemany` with
+    // an empty parameter set — has nothing to run, but must still advertise the query's real schema
+    // (via the PLAN probe), matching every non-empty execution, not a spurious empty schema (COR-9).
+    let param_schema = Arc::new(Schema::new(vec![Field::new("p", DataType::Int64, false)]));
+    // Reference schema from a NON-empty execution of the same query.
+    let mut one_row_bound = connection.new_statement().expect("new statement");
+    one_row_bound
+        .set_sql_query("SELECT Id FROM AdbcEmptyHijack WHERE Id = @p")
+        .unwrap();
+    one_row_bound
+        .bind(
+            RecordBatch::try_new(
+                param_schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![1_i64]))],
+            )
+            .unwrap(),
+        )
+        .expect("bind one param row");
+    let non_empty_schema = one_row_bound
+        .execute()
+        .expect("non-empty bound query")
+        .schema();
+    // Now the same query with a zero-row parameter set.
+    let mut zero_row_bound = connection.new_statement().expect("new statement");
+    zero_row_bound
+        .set_sql_query("SELECT Id FROM AdbcEmptyHijack WHERE Id = @p")
+        .unwrap();
+    zero_row_bound
+        .bind(RecordBatch::new_empty(param_schema.clone()))
+        .expect("bind a zero-row parameter set");
+    let zero_row_reader = zero_row_bound
+        .execute()
+        .expect("zero-row bound query must execute");
+    assert_eq!(
+        zero_row_reader.schema(),
+        non_empty_schema,
+        "a zero-row bound query must advertise the query's real schema, not an empty one (COR-9)"
+    );
+    let zero_row_batches = zero_row_reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read zero-row bound-query batches");
+    assert_eq!(
+        zero_row_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        0,
+        "a zero-row bound query returns no rows"
+    );
+
     // (3) Empty APPEND to a nonexistent table must still surface NotFound. An empty append ships
     // nothing, so the missing-table insert error never fires; the driver probes existence directly.
     let mut append_missing_empty = connection.new_statement().expect("new statement");
