@@ -665,6 +665,10 @@ impl SpannerStatement {
     /// The same cheap Arrow→Spanner build the forward path uses ([`bind::insert_mutation`]), so a
     /// bisected retry rebuilds a half's mutations straight from the batches — no `Vec<Mutation>` is
     /// cloned on the happy path solely to keep a copy around for a retry that usually never happens.
+    ///
+    /// A conversion failure here (e.g. an out-of-range date) on a *later* chunk is annotated by the
+    /// autocommit callers with the earlier chunks' committed-row count (COR-6), like a commit
+    /// failure, so the `run_ingest` "reports their exact count" contract holds for build errors too.
     fn build_range_mutations(
         &self,
         target: &str,
@@ -714,7 +718,9 @@ impl SpannerStatement {
             // per-commit mutation cap does not bind it the way a write-only `Commit` is bound — it
             // is deliberately left out of the mutation-limit bisect. (Its own per-request size limit
             // could warrant a follow-up, but is not this backstop's concern.)
-            let mutations = self.build_range_mutations(target, start, end)?;
+            let mutations = self
+                .build_range_mutations(target, start, end)
+                .map_err(|e| note_rows_already_committed(e, prior_total))?;
             self.batch_write_chunk(mutations, prior_total)
         } else {
             self.write_mutation_range(target, start, end, prior_total)
@@ -743,7 +749,9 @@ impl SpannerStatement {
         end: usize,
         prior_total: i64,
     ) -> Result<i64> {
-        let mutations = self.build_range_mutations(target, start, end)?;
+        let mutations = self
+            .build_range_mutations(target, start, end)
+            .map_err(|e| note_rows_already_committed(e, prior_total))?;
         match self.write_mutation_chunk(mutations) {
             Ok(count) => Ok(count),
             Err(error) if end - start > 1 && is_mutation_limit_exceeded(&error) => {
