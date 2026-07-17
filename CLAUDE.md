@@ -110,7 +110,7 @@ Key design points:
     `spanner.read.staleness` via `multi_use_timestamp_bound` (bounded kinds pinned, as on the
     bound-query path; later statements' staleness is ignored — the snapshot is already pinned).
     Every later query — plain `execute`, the bound-query path (whose
-    `stream_bound_query`/`BoundQueryBatchReader` take an `Arc<MultiUseReadOnlyTransaction>`),
+    `stream_bound_query`/`BoundQueryChunks` take an `Arc<MultiUseReadOnlyTransaction>`),
     and a query routed through `execute_update` — runs on it, so all reads share one snapshot.
     `commit`/`rollback` just drop it (read-only transactions need no commit/rollback RPC).
     `execute_partitions` is allowed in a query transaction but uses its own batch read-only
@@ -181,7 +181,7 @@ Key design points:
   `single_use()` query sites plus the partition batch read-only transaction via
   `staleness::single_use`. A bound (parameterized) query over several bound rows runs all its per-row
   statements in **one** multi-use read-only transaction pinned at the same bound (streaming via
-  `BoundQueryBatchReader` in `src/conversion.rs`); since Spanner accepts the bounded-staleness kinds
+  `stream_bound_query`'s `BoundQueryChunks` source in `src/conversion.rs`); since Spanner accepts the bounded-staleness kinds
   only on single-use transactions, `max:`/`min:` are pinned there to their most-stale legal
   equivalent (`ReadBound::pinned_for_multi_use`). The option exists at connection **and** statement
   level (statement inherits the connection's, then overrides); it holds one bound at a time (a new

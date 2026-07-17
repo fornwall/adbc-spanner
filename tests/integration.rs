@@ -3453,8 +3453,9 @@ fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
     );
 
     // (2b) A parameterized (bound) query whose result is EMPTY must yield zero batches — true
-    // end-of-stream — not a spurious 0-row batch. This exercises the BoundQueryBatchReader path
-    // (bound parameter rows), parallel to the plain reader's empty-result behaviour.
+    // end-of-stream — not a spurious 0-row batch. This exercises the bound-query stream path
+    // (`stream_bound_query`, bound parameter rows), parallel to the plain reader's empty-result
+    // behaviour.
     let mut empty_bound_query = connection.new_statement().expect("new statement");
     empty_bound_query
         .set_sql_query("SELECT Id FROM AdbcEmptyHijack WHERE Id = @p")
@@ -8140,7 +8141,7 @@ fn schema_fidelity_cases() -> Vec<SchemaFidelityCase> {
 ///    degrading to the Utf8 fallback;
 /// 2. `execute_schema` (the PLAN probe) reports that same schema, for the with-rows and the
 ///    zero-row statement alike;
-/// 3. the bound-parameter path (`BoundQueryBatchReader`, several bound rows in one multi-use
+/// 3. the bound-parameter path (`stream_bound_query`, several bound rows in one multi-use
 ///    read-only snapshot) reports that same schema even when every bound row matches nothing.
 #[test]
 fn zero_row_schema_fidelity() {
@@ -8231,7 +8232,7 @@ fn zero_row_schema_fidelity() {
     let schema = plan.execute_schema().expect("execute_schema (zero rows)");
     assert_expected_schema(&schema, "execute_schema (zero rows)");
 
-    // (3) The bound-parameter path: several bound rows stream through BoundQueryBatchReader (one
+    // (3) The bound-parameter path: several bound rows stream through stream_bound_query (one
     // shared read-only snapshot, one execution per bound row). With no bound row matching
     // anything, the schema must still come out fully typed from the first (empty) result set's
     // metadata.
