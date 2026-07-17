@@ -407,8 +407,8 @@ impl RecordBatchReader for SpannerBatchReader {
     }
 }
 
-/// A lazy source of the per-bound-row query statements a [`BoundQueryBatchReader`] executes, one at
-/// a time. Each `SpannerSql` (its query text plus bound parameter map) is materialised only right
+/// A lazy source of the per-bound-row query statements a [`BoundQueryChunks`] source executes, one
+/// at a time. Each `SpannerSql` (its query text plus bound parameter map) is materialised only right
 /// before it is handed to Spanner, so a large `executemany` SELECT holds a single statement in
 /// memory rather than one per bound row. Implemented in `src/statement.rs`. `next_statement` yields
 /// `None` once every bound row is drained; a per-row bind failure surfaces as `Some(Err(..))` at
@@ -417,30 +417,20 @@ pub(crate) trait BoundStatementSource: Send {
     fn next_statement(&mut self) -> Option<Result<SpannerSql>>;
 }
 
-/// An exhausted [`BoundStatementSource`], installed on a [`BoundQueryBatchReader`] after it surfaces
-/// an error so any subsequent `next` yields `None` rather than executing more statements.
-struct NoBoundStatements;
-
-impl BoundStatementSource for NoBoundStatements {
-    fn next_statement(&mut self) -> Option<Result<SpannerSql>> {
-        None
-    }
-}
-
 /// Wrap a lazy source of per-bound-row query statements as one streaming Arrow
 /// [`RecordBatchReader`], executing every statement inside the same **multi-use read-only
 /// transaction** so all bound rows see a single, mutually consistent snapshot.
 ///
 /// The first statement is built and executed here and its first chunk pulled (settling the schema —
-/// every statement is the same SQL, so the schema is shared); the reader then streams the remaining
-/// chunks and statements lazily, building **and** executing each subsequent statement only once its
-/// predecessor's result set drains — so at most one per-row `SpannerSql` resides in memory at a
-/// time. Like [`stream_query`], rows are converted to Arrow in bounded chunks of `batch_size` (plus
-/// the [`CHUNK_BYTE_BUDGET`]), so the concatenated result is never fully materialised. The reader
-/// holds `transaction` (`Arc`-shared: in a manual transaction it is the connection's shared
-/// snapshot, in autocommit a dedicated one), keeping the snapshot alive for as long as it is
-/// iterated; Spanner read-only transactions need no commit/rollback, so dropping it is cleanup
-/// enough.
+/// every statement is the same SQL, so the schema is shared); the rest streams through the exact
+/// same machinery as [`stream_query`] — a [`BoundQueryChunks`] [`ChunkSource`] handed to
+/// [`spawn_prefetch`], so the fetch (and, when the current result set drains, the execution of the
+/// next bound row's statement) overlaps the consumer's processing of the previous chunk, and rows
+/// are converted to Arrow in bounded chunks of `batch_size` (plus the [`CHUNK_BYTE_BUDGET`]) rather
+/// than fully materialised (PERF-1). The `transaction` (`Arc`-shared: in a manual transaction the
+/// connection's shared snapshot, in autocommit a dedicated one) is owned by the source, hence by the
+/// prefetch task, keeping the snapshot alive for as long as chunks are pulled; Spanner read-only
+/// transactions need no commit/rollback, so dropping it is cleanup enough.
 pub(crate) async fn stream_bound_query(
     runtime: SharedRuntime,
     cancel: CancelSignal,
@@ -449,7 +439,7 @@ pub(crate) async fn stream_bound_query(
     batch_size: usize,
     precision: TimestampPrecision,
     fetch_timeout: Option<Duration>,
-) -> Result<BoundQueryBatchReader> {
+) -> Result<SpannerBatchReader> {
     let mut result_set = match statements.next_statement() {
         Some(statement) => Some(
             transaction
@@ -468,43 +458,71 @@ pub(crate) async fn stream_bound_query(
         }
         None => (None, Arc::new(Schema::empty())),
     };
-    Ok(BoundQueryBatchReader {
-        runtime,
-        cancel,
-        schema,
+    let source = BoundQueryChunks {
         transaction,
         statements,
         result_set,
-        first,
         batch_size,
         fetch_timeout,
+    };
+    let (chunks, task) = spawn_prefetch(&runtime, cancel.clone(), source);
+    Ok(SpannerBatchReader {
+        runtime,
+        cancel,
+        schema,
+        first,
+        chunks: Some(chunks),
+        task,
     })
 }
 
-/// A streaming [`RecordBatchReader`] over the successive result sets of a bound (parameterized)
-/// query — one execution per bound row, all inside one shared read-only snapshot. See
-/// [`stream_bound_query`].
-pub(crate) struct BoundQueryBatchReader {
-    runtime: SharedRuntime,
-    cancel: CancelSignal,
-    schema: SchemaRef,
-    /// The shared snapshot every statement executes in; held so it outlives lazy iteration.
+/// The prefetch task's view of a bound (parameterized) query: the successive per-bound-row result
+/// sets, drained in bounded chunks, all inside one shared multi-use read-only transaction. Owns the
+/// `Arc<MultiUseReadOnlyTransaction>` (so the shared snapshot outlives lazy iteration — the prefetch
+/// task holds the source) and the lazy statement source; each `next_chunk` is bounded by the
+/// statement's fetch timeout (`spanner.rpc.timeout_seconds.fetch`), covering both the chunk pull and
+/// the execution of the next bound row's statement when the current result set drains.
+struct BoundQueryChunks {
+    /// The shared snapshot every statement executes in.
     transaction: Arc<MultiUseReadOnlyTransaction>,
     /// The lazy source of not-yet-built, not-yet-executed per-bound-row statements.
     statements: Box<dyn BoundStatementSource>,
     /// The live result set of the statement currently being drained, if any.
     result_set: Option<ResultSet>,
-    /// The first chunk of rows, fetched up front to settle the schema; emitted on the first `next`.
-    first: Option<Vec<Row>>,
     batch_size: usize,
-    /// Deadline for each subsequent chunk fetch (`spanner.rpc.timeout_seconds.fetch`), when set.
-    /// Also covers executing the next per-row statement when the current result set drains.
     fetch_timeout: Option<Duration>,
 }
 
-/// Pull the next non-empty chunk for [`BoundQueryBatchReader`]: drain the current result set in
-/// bounded chunks, and when it ends, build and execute the next statement in the same `transaction`
-/// — looping so a bound row with an empty result never surfaces as a spurious empty batch. `None`
+impl ChunkSource for BoundQueryChunks {
+    type Row = Row;
+
+    fn next_chunk(&mut self) -> impl std::future::Future<Output = Result<Vec<Row>>> + Send {
+        let Self {
+            transaction,
+            statements,
+            result_set,
+            batch_size,
+            fetch_timeout,
+        } = self;
+        with_timeout(
+            *fetch_timeout,
+            crate::OPTION_RPC_TIMEOUT_FETCH,
+            async move {
+                // A drained source (`None`) becomes an empty chunk, the `ChunkSource` end-of-stream
+                // signal that closes the prefetch channel.
+                Ok(
+                    next_bound_chunk(transaction, statements.as_mut(), result_set, *batch_size)
+                        .await?
+                        .unwrap_or_default(),
+                )
+            },
+        )
+    }
+}
+
+/// Pull the next non-empty chunk for [`BoundQueryChunks`]: drain the current result set in bounded
+/// chunks, and when it ends, build and execute the next statement in the same `transaction` —
+/// looping so a bound row with an empty result never surfaces as a spurious empty batch. `None`
 /// means everything is drained.
 async fn next_bound_chunk(
     transaction: &MultiUseReadOnlyTransaction,
@@ -531,58 +549,6 @@ async fn next_bound_chunk(
             }
             None => return Ok(None),
         }
-    }
-}
-
-impl Iterator for BoundQueryBatchReader {
-    type Item = std::result::Result<RecordBatch, ArrowError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // Emit the prefetched first chunk (which settled the schema) before pulling any more, but
-        // skip it when it is *empty* — an empty first chunk must not surface as a spurious 0-row
-        // batch (mirroring `SpannerBatchReader`). Falling through hands off to `next_bound_chunk`,
-        // which continues into the remaining bound rows' statements (an empty first bound row may
-        // still precede rows) and yields true end-of-stream only once every statement is drained.
-        if let Some(rows) = self.first.take()
-            && !rows.is_empty()
-        {
-            return Some(build_batch(self.schema.clone(), &rows).map_err(to_arrow_error));
-        }
-        let Self {
-            runtime,
-            cancel,
-            transaction,
-            statements,
-            result_set,
-            batch_size,
-            fetch_timeout,
-            ..
-        } = self;
-        match block_on_cancellable(
-            runtime,
-            cancel,
-            with_timeout(
-                *fetch_timeout,
-                crate::OPTION_RPC_TIMEOUT_FETCH,
-                next_bound_chunk(transaction, statements.as_mut(), result_set, *batch_size),
-            ),
-        ) {
-            Ok(None) => None,
-            Ok(Some(rows)) => Some(build_batch(self.schema.clone(), &rows).map_err(to_arrow_error)),
-            Err(e) => {
-                // Stop after surfacing the error: drop the live result set and any statements
-                // still pending.
-                self.result_set = None;
-                self.statements = Box::new(NoBoundStatements);
-                Some(Err(to_arrow_error(e)))
-            }
-        }
-    }
-}
-
-impl RecordBatchReader for BoundQueryBatchReader {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
     }
 }
 
