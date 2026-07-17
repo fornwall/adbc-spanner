@@ -32,52 +32,41 @@ pub(crate) fn invalid_argument(message: impl Into<String>) -> Error {
 ///
 /// The Spanner preview client (and its LRO poller) surface every failure as
 /// `google_cloud_spanner::Error` (a re-export of `google_cloud_gax::error::Error`). When that error
-/// carries a gRPC status, we map its canonical code onto the closest [`Status`] variant so callers
-/// can distinguish, say, "table not found" from a backend failure instead of collapsing everything
-/// to [`Status::Internal`] — and preserve the **numeric gRPC code** in the ADBC error's
-/// `vendor_code`, so callers can recover exactly what failed (e.g. a retry loop looking for
+/// carries a gRPC status, its canonical code maps onto the closest [`Status`] variant (rather than
+/// collapsing everything to [`Status::Internal`]) and the **numeric gRPC code** is preserved in
+/// `vendor_code`, so a caller can recover exactly what failed (e.g. a retry loop looking for
 /// `ABORTED` = 10) even where several codes share one ADBC status. Errors without a status
 /// (transport/serialization/etc.) fall back to [`Status::Internal`] with `vendor_code` 0.
 ///
 /// # Structured error details
 ///
-/// A `google.rpc.Status` may also carry structured *details* that describe *why* a call failed
-/// beyond its status code — e.g. `google.rpc.QuotaFailure` on `RESOURCE_EXHAUSTED`,
-/// `google.rpc.BadRequest` or `google.rpc.ErrorInfo` on `INVALID_ARGUMENT`,
-/// `google.rpc.PreconditionFailure` on `FAILED_PRECONDITION`, or `google.rpc.RetryInfo` on
-/// `ABORTED`. Each detail is forwarded into the ADBC error's `details` vector as a `(key, value)`
-/// pair:
+/// A `google.rpc.Status` may also carry structured *details* — e.g. `QuotaFailure` on
+/// `RESOURCE_EXHAUSTED`, `BadRequest`/`ErrorInfo` on `INVALID_ARGUMENT`, `PreconditionFailure` on
+/// `FAILED_PRECONDITION`, `RetryInfo` on `ABORTED`. Each is forwarded into the ADBC error's
+/// `details` vector as a `(key, value)` pair:
 ///
-/// - **key** — the lowercased fully-qualified protobuf type name of the detail message, e.g.
-///   `google.rpc.retryinfo`, `google.rpc.errorinfo`, `google.rpc.badrequest`, `google.rpc.help`.
-///   This follows the Flight SQL / gRPC metadata key style; there is no `-bin` suffix because the
-///   value is UTF-8 text, not binary protobuf (`-bin` marks binary values in that convention).
+/// - **key** — the lowercased fully-qualified protobuf type name, e.g. `google.rpc.retryinfo`.
+///   Flight SQL / gRPC metadata key style, but with no `-bin` suffix: that marks binary values, and
+///   the value here is UTF-8 text.
 /// - **value** — the detail's **ProtoJSON** encoding as UTF-8 bytes, self-describing via its
-///   `"@type"` field — i.e. the canonical JSON form of the `google.protobuf.Any` that carried the
-///   detail on the wire, e.g. `{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"0.010s"}`.
-///   ProtoJSON (rather than binary protobuf) because the preview client decodes details into
-///   serde-modelled types whose only supported wire encoding is ProtoJSON; the format is a stable,
-///   documented protobuf encoding that any JSON parser can consume.
+///   `"@type"` field, e.g. `{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"0.010s"}`.
+///   ProtoJSON rather than binary protobuf because the preview client decodes details into
+///   serde-modelled types whose only supported wire encoding is ProtoJSON.
 ///
 /// This per-detail, type-name-keyed ProtoJSON layout deliberately diverges from the Flight SQL ADBC
-/// driver's convention (a single `grpc-status-details-bin` detail carrying the whole `google.rpc.Status`
-/// as binary protobuf), so a consumer written to that convention won't interoperate; the pinned
-/// preview client offers no binary-protobuf encoding of details, only ProtoJSON.
+/// driver's convention (one `grpc-status-details-bin` detail carrying the whole `google.rpc.Status`
+/// as binary protobuf), so a consumer written to that convention won't interoperate — the pinned
+/// preview client offers no binary-protobuf encoding of details.
 ///
-/// Together with `vendor_code`, these details give a caller structured diagnostics beyond the ADBC
-/// status. Note that `RetryInfo` on `ABORTED` rarely reaches here in practice: the Spanner client's
-/// read/write transaction runner — and the write-only mutation (bulk-ingest) path — retry aborted
-/// transactions internally, *consuming* the `retryDelay` for their own backoff, under a default
-/// policy that retries indefinitely (`BasicTransactionRetryPolicy::default` in the client's
-/// `transaction_retry_policy` / `transaction_runner` modules; the driver installs no bounded
-/// override). So an `ABORTED` normally never surfaces from a DML / commit / ingest call — it is
-/// forwarded like any other detail only in the rare cases one does (a caller with its own bounded
-/// retry policy can still key off `vendor_code == 10`). Errors without a gRPC status, and statuses
-/// without details, leave `details` as `None` (never `Some(vec![])`).
+/// `RetryInfo` on `ABORTED` rarely reaches here: the client's read/write transaction runner and the
+/// write-only mutation (bulk-ingest) path retry aborted transactions internally, *consuming* the
+/// `retryDelay`, under a default policy that retries indefinitely
+/// (`BasicTransactionRetryPolicy::default`; the driver installs no bounded override). It is
+/// forwarded like any other detail in the rare cases one does surface. Errors without a gRPC
+/// status, and statuses without details, leave `details` as `None` (never `Some(vec![])`).
 pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
-    // `Error::status()` yields the structured gRPC status when present. We map its `Code` enum
-    // directly — no string round-trip, and every mapped arm is compile-checked rather than a
-    // stringly-typed match on a `Display` message.
+    // Match the structured status' `Code` enum directly — no string round-trip, and every mapped
+    // arm is compile-checked rather than a stringly-typed match on a `Display` message.
     let (status, vendor_code, details, code) =
         error
             .status()
@@ -90,9 +79,7 @@ pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
                 )
             });
     let mut message = format!("Spanner error: {error}");
-    // On PERMISSION_DENIED, append the fixed IAM guidance (see [`PERMISSION_DENIED_GUIDANCE`]). It is
-    // only *appended* — the original message (which already names the missing permission), status,
-    // vendor_code and forwarded details are all left untouched.
+    // Appended only; the original message, status, vendor_code and details are untouched.
     if code == Some(Code::PermissionDenied) {
         message.push_str(PERMISSION_DENIED_GUIDANCE);
     }
@@ -104,21 +91,18 @@ pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
 
 /// Fixed IAM guidance appended to every `PERMISSION_DENIED` error message.
 ///
-/// A Spanner `PERMISSION_DENIED` means the caller's principal lacks the IAM permission the operation
-/// needs. Cloud Spanner's own status message already *names* the missing permission (e.g.
-/// `... is missing IAM permission: spanner.databases.select on resource ...`), which we preserve
-/// verbatim — so rather than re-parse that permission, we simply append a constant hint that a role
-/// including it must be granted, plus the IAM docs link. We deliberately name **no specific roles**:
-/// this mirrors the ADBC BigQuery driver, whose only fixed auth guidance (`reauthGuidance`, a RAPT
-/// re-authentication hint plus a support-doc link) likewise leaves the server's message intact and
-/// names no IAM roles — its access-denied path just maps to `Unauthorized` and preserves the
-/// verbatim server text. Enumerating roles here risks steering the caller to an over-broad or
-/// wrong-scoped role, so we point at the docs and let them pick.
+/// Spanner's own status message already *names* the missing permission (e.g. `... is missing IAM
+/// permission: spanner.databases.select on resource ...`) and is preserved verbatim, so rather than
+/// re-parse it we append a constant hint to grant a role including that permission, plus the IAM
+/// docs link. Deliberately naming **no specific roles**: this mirrors the ADBC BigQuery driver,
+/// whose only fixed auth guidance (`reauthGuidance`, a RAPT re-auth hint plus a doc link) likewise
+/// leaves the server's message intact and names no roles. Enumerating roles risks steering the
+/// caller to an over-broad or wrong-scoped one.
 ///
-/// The guidance is only ever *appended* — it augments, never replaces, and leaves the message text,
-/// status, `vendor_code` and forwarded `details` untouched. The emulator does not enforce IAM, so
-/// this path is exercised by the unit tests here and by a mock-server test (`tests/mock_spanner.rs`)
-/// that returns a synthetic `PERMISSION_DENIED`, not by the emulator integration test.
+/// The guidance is only ever *appended* — message text, status, `vendor_code` and forwarded
+/// `details` are untouched. The emulator does not enforce IAM, so this path is covered by the unit
+/// tests here plus a `tests/mock_spanner.rs` synthetic `PERMISSION_DENIED`, not by the emulator
+/// integration test.
 const PERMISSION_DENIED_GUIDANCE: &str = " (the caller lacks the required Spanner IAM permission; \
     grant an IAM role that includes it — see https://cloud.google.com/spanner/docs/iam)";
 
@@ -135,19 +119,14 @@ fn details_for_adbc(details: &[StatusDetails]) -> Option<Vec<(String, Vec<u8>)>>
 
 /// Map one `google.rpc.Status` detail to its ADBC `(key, value)` pair, or `None` to skip it.
 ///
-/// Both halves derive from the detail's ProtoJSON form, so there is a single self-consistent path
-/// for every detail kind:
+/// Both halves derive from the detail's ProtoJSON form: the value is its UTF-8 bytes, the key the
+/// lowercased type name taken from that same `"@type"` (the path segment after the final `/`).
 ///
-/// - **value** — the ProtoJSON encoding as UTF-8 bytes, self-describing via its `"@type"` field.
-/// - **key** — the lowercased fully-qualified protobuf type name, taken from that same `"@type"`
-///   (the path segment after the final `/`), e.g. `google.rpc.retryinfo`.
-///
-/// Deriving the key from the serialized `@type` — rather than matching each [`StatusDetails`]
-/// variant against a hand-maintained table — means the well-known `google.rpc` types and an
-/// unrecognised [`StatusDetails::Other`] share one code path, *and* any new `google.rpc.*` detail
-/// type added to the `#[non_exhaustive]` enum upstream is forwarded automatically instead of being
-/// silently dropped. A detail that fails to serialize, or whose ProtoJSON carries no `@type`
-/// string, is skipped.
+/// Deriving the key from the serialized `@type` — rather than a hand-maintained table over the
+/// [`StatusDetails`] variants — means the well-known `google.rpc` types and an unrecognised
+/// [`StatusDetails::Other`] share one code path, *and* any new `google.rpc.*` type added to the
+/// `#[non_exhaustive]` enum upstream is forwarded automatically instead of being silently dropped.
+/// A detail that fails to serialize, or whose ProtoJSON carries no `@type` string, is skipped.
 fn map_detail(detail: &StatusDetails) -> Option<(String, Vec<u8>)> {
     let value = serde_json::to_value(detail).ok()?;
     let type_url = value.get("@type")?.as_str()?;
@@ -163,27 +142,23 @@ fn map_detail(detail: &StatusDetails) -> Option<(String, Vec<u8>)> {
 /// details.
 ///
 /// The BatchWrite (`spanner.ingest.batch_write`) path surfaces a failed mutation group as a
-/// `google.rpc.Status` embedded in a streamed `BatchWriteResponse` — rather than as a
+/// `google.rpc.Status` embedded in a streamed `BatchWriteResponse` — not as a
 /// `google_cloud_spanner::Error` — so it reaches the driver as loose parts instead of through
-/// [`from_spanner`]. This keeps the two paths' output identical: the numeric code maps onto the
-/// closest ADBC [`Status`] through the very same [`status_for_grpc_code`] table (turning the number
-/// into a [`Code`] via [`Code::from`]) and survives in `vendor_code`, a `PERMISSION_DENIED` gains
-/// the same [`PERMISSION_DENIED_GUIDANCE`], and the `details` are forwarded through the same
-/// [`details_for_adbc`] mapping — same lowercased-type-name keys, same ProtoJSON values (see
-/// [`from_spanner`] for the full contract). A duplicate primary key therefore surfaces as
-/// [`Status::AlreadyExists`] exactly as it does on the write-only commit path, so the bulk-ingest
-/// append/create error remaps still fire identically for both ingest transports.
+/// [`from_spanner`]. This keeps the two paths' output identical: same [`status_for_grpc_code`]
+/// table (via [`Code::from`]), same `vendor_code`, same [`PERMISSION_DENIED_GUIDANCE`], and details
+/// forwarded through the same [`details_for_adbc`] mapping (see [`from_spanner`] for the contract).
+/// A duplicate primary key therefore surfaces as [`Status::AlreadyExists`] exactly as on the
+/// write-only commit path, so the bulk-ingest append/create error remaps fire identically for both
+/// ingest transports.
 ///
-/// The `details` arrive as the wire [`Any`]s of the embedded status (the response message models
-/// them as such) rather than as decoded [`StatusDetails`]; they are decoded here with the very
-/// conversion the client itself applies when it turns a `google.rpc.Status` into the gax error
-/// status [`from_spanner`] reads, so a given detail maps to byte-identical output on either path.
+/// The `details` arrive as the wire [`Any`]s of the embedded status rather than decoded
+/// [`StatusDetails`]; they are decoded here with the very conversion the client itself applies when
+/// building the gax error status [`from_spanner`] reads, so a given detail maps to byte-identical
+/// output on either path.
 pub(crate) fn from_status_parts(code: i32, message: &str, details: &[Any]) -> Error {
     let status = status_for_grpc_code(Code::from(code));
     let mut full = format!("Spanner batch-write error: {message}");
-    // A per-group `PERMISSION_DENIED` on the BatchWrite path gets the same fixed IAM guidance the
-    // `from_spanner` commit path adds (see [`PERMISSION_DENIED_GUIDANCE`]); the original message,
-    // `vendor_code` and forwarded details are preserved.
+    // Appended only, exactly as on the `from_spanner` commit path.
     if Code::from(code) == Code::PermissionDenied {
         full.push_str(PERMISSION_DENIED_GUIDANCE);
     }
@@ -230,13 +205,10 @@ fn status_for_grpc_code(code: Code) -> Status {
         // The operation is not implemented / not supported by the backend — ADBC has a dedicated
         // variant that fits this far better than the "driver bug" Internal fallback.
         Code::Unimplemented => Status::NotImplemented,
-        // Aborted is Spanner's routine "transaction contended, please retry" signal. The client's
-        // read/write runner retries it internally (indefinitely under the default policy the driver
-        // uses), so a DML/commit/ingest caller does not normally see it; it reaches here only in the
-        // rare case the runner surfaces it. It is transient and environmental, not a driver or
-        // database defect, so it maps to IO rather than Internal (which reads as "driver bug"). ADBC
-        // has no closer variant; the exact code survives in `vendor_code` (Aborted = 10) for callers
-        // with their own retry logic.
+        // Aborted is Spanner's routine "transaction contended, please retry" signal, normally
+        // consumed by the client's read/write runner (see `from_spanner`). Transient and
+        // environmental, not a driver/database defect, so IO rather than the "driver bug"-flavoured
+        // Internal; ADBC has no closer variant, and the exact code survives in `vendor_code` (10).
         Code::Aborted => Status::IO,
         // ResourceExhausted, Internal, Unknown, DataLoss, Ok and anything unrecognised.
         _ => Status::Internal,

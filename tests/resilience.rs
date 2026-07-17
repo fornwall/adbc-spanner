@@ -16,38 +16,22 @@
 //!
 //! Toxiproxy injects **transport** faults only — latency, bandwidth, connection resets/timeouts. It
 //! cannot make the emulator emit a gRPC status such as `ABORTED`, so these tests do **not** exercise
-//! Spanner's ABORTED-driven transaction replay. What they *do* exercise:
+//! Spanner's ABORTED-driven transaction replay. What they *do* exercise (each test's own doc comment
+//! carries the detail):
 //!
-//! - **`cancel_interrupts_in_flight_query`** — with a bandwidth toxic throttling a multi-MB result to
-//!   a trickle so each streamed chunk fetch blocks for seconds, `Statement::cancel` (the
-//!   `CancelSignal` → `block_on_cancellable` path) interrupts a query whose result is still
-//!   streaming, and it returns promptly with an error rather than blocking for the full (slow) read.
-//!   This is the strongest assertion: it drives real driver code.
-//! - **`reset_peer_surfaces_error_then_recovers`** — a `reset_peer` toxic makes RPCs fail; the driver
-//!   surfaces a clean ADBC error (no panic/hang, bounded by a watchdog), and once the toxic is
-//!   removed a subsequent query **recovers** (the gRPC channel re-establishes through the proxy).
+//! - **`cancel_interrupts_in_flight_query`** — `Statement::cancel` interrupts a query blocked in a
+//!   throttled streamed fetch. The strongest assertion: it drives real driver code.
+//! - **`reset_peer_surfaces_error_then_recovers`** — a reset makes RPCs fail cleanly, and the driver
+//!   recovers once the toxic is removed.
 //! - **`commit_under_transport_fault_never_loses_the_write`** — a manual-transaction `commit()`
-//!   started under a `reset_peer` toxic must not lose the buffered DML: the write has to land
-//!   once the fault clears. (Verified along the way: the pinned client marks all data-plane RPCs
-//!   idempotent and retries transport faults without an attempt cap, so such a commit *blocks and
-//!   heals* rather than erroring — a driver-level commit failure cannot be transport-injected;
-//!   the failed-commit/retry contract is covered at the SQL level in `tests/integration.rs`.)
-//! - **`update_timeout_bounds_a_faulted_write_then_recovers_when_unset`** — with
-//!   `spanner.rpc.timeout_seconds.update` set, a write launched under a persistent `reset_peer`
-//!   toxic (which otherwise block-and-heals, per the test above) fails with `Status::Timeout`
-//!   within the deadline — naming the option — instead of hanging; and with the deadline unset and
-//!   the fault cleared the same write succeeds, showing the expired deadline poisoned nothing.
-//! - **`mid_stream_disconnect_after_batches_surfaces_error_then_recovers`** — a `reset_peer` toxic
-//!   injected *after* the consumer has already pulled several real batches off a streaming reader
-//!   makes the next (post-buffer) chunk fetch surface a clean ADBC error rather than hang or panic
-//!   (bounded by a watchdog), and once the toxic is removed a fresh query recovers. Exercises the
-//!   resumption path, complementing `reset_peer_surfaces_error_then_recovers` (which resets a query
-//!   *before* it starts).
-//! - **`truncated_stream_surfaces_error_then_recovers`** — a `limit_data` toxic closes the
-//!   connection cleanly after a byte cap that sits above the receive buffer but well below the full
-//!   result, truncating the stream mid-flight; the reader must surface an error on the fetch past
-//!   the cap (never a silently-short "successful" result), and a fresh query recovers once the cap
-//!   is removed.
+//!   under a reset must not lose the buffered DML.
+//! - **`update_timeout_bounds_a_faulted_write_then_recovers_when_unset`** —
+//!   `spanner.rpc.timeout_seconds.update` turns an otherwise unbounded faulted write into a prompt
+//!   `Status::Timeout`, and unsetting it lets the same write succeed.
+//! - **`mid_stream_disconnect_after_batches_surfaces_error_then_recovers`** — a reset *after* real
+//!   batches were consumed surfaces an error on the next chunk fetch, then recovers.
+//! - **`truncated_stream_surfaces_error_then_recovers`** — a `limit_data` byte cap truncates the
+//!   stream mid-flight; the reader must error, never return a silently-short "successful" result.
 
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -412,8 +396,7 @@ fn cancel_interrupts_in_flight_query() {
         eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
         return;
     };
-    // Enforce the single-threaded contract that makes the env swap in `ensure_setup` sound. Placed
-    // after the skip check so a plain multi-threaded `cargo test` (env unset) still self-skips.
+    // Placed after the skip check so a plain multi-threaded `cargo test` (env unset) still skips.
     let _serial = SerialGuard::new();
     ensure_setup();
 
@@ -506,8 +489,7 @@ fn reset_peer_surfaces_error_then_recovers() {
         eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
         return;
     };
-    // Enforce the single-threaded contract that makes the env swap in `ensure_setup` sound. Placed
-    // after the skip check so a plain multi-threaded `cargo test` (env unset) still self-skips.
+    // Placed after the skip check so a plain multi-threaded `cargo test` (env unset) still skips.
     let _serial = SerialGuard::new();
     ensure_setup();
 
@@ -577,8 +559,7 @@ fn commit_under_transport_fault_never_loses_the_write() {
         eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
         return;
     };
-    // Enforce the single-threaded contract that makes the env swap in `ensure_setup` sound. Placed
-    // after the skip check so a plain multi-threaded `cargo test` (env unset) still self-skips.
+    // Placed after the skip check so a plain multi-threaded `cargo test` (env unset) still skips.
     let _serial = SerialGuard::new();
     ensure_setup();
 
@@ -868,8 +849,7 @@ fn mid_stream_disconnect_after_batches_surfaces_error_then_recovers() {
         eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
         return;
     };
-    // Enforce the single-threaded contract that makes the env swap in `ensure_setup` sound. Placed
-    // after the skip check so a plain multi-threaded `cargo test` (env unset) still self-skips.
+    // Placed after the skip check so a plain multi-threaded `cargo test` (env unset) still skips.
     let _serial = SerialGuard::new();
     ensure_setup();
 
@@ -974,8 +954,7 @@ fn truncated_stream_surfaces_error_then_recovers() {
         eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
         return;
     };
-    // Enforce the single-threaded contract that makes the env swap in `ensure_setup` sound. Placed
-    // after the skip check so a plain multi-threaded `cargo test` (env unset) still self-skips.
+    // Placed after the skip check so a plain multi-threaded `cargo test` (env unset) still skips.
     let _serial = SerialGuard::new();
     ensure_setup();
 

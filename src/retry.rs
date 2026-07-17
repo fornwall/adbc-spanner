@@ -77,8 +77,7 @@
 //! **Preserving the client's behaviour under a limit.** Setting a policy on a request builder
 //! *replaces* the client's default [`SpannerRetryPolicy`], so to keep the
 //! transport-error-on-idempotent retrying while adding a bound, the base policy applied here is that
-//! very same client policy (exported since googleapis/google-cloud-rust#6048 — the driver used to
-//! carry a behavioural copy of the then-private type), with the configured
+//! very same client policy (public since googleapis/google-cloud-rust#6048), with the configured
 //! [`with_attempt_limit`](google_cloud_gax::retry_policy::RetryPolicyExt::with_attempt_limit) /
 //! [`with_time_limit`](google_cloud_gax::retry_policy::RetryPolicyExt::with_time_limit) wrappers on
 //! top. The policy is applied to every user statement/DML builder, the read/write transaction
@@ -111,9 +110,9 @@ use crate::options::{F64Range, f64_option};
 /// of one of the client's commit builders.
 ///
 /// [`TransactionRunnerBuilder`] and [`WriteOnlyTransactionBuilder`] expose these four setters with
-/// identical signatures but share no common trait, so the two methods were byte-identical copies
-/// naming different types. The body now lives here once — the same reasoning as the macro of the
-/// same name in `request.rs`, kept file-local since the two bodies apply different settings.
+/// identical signatures but share no common trait, so the body lives here once rather than as two
+/// byte-identical copies naming different types — the same reasoning as the macro of the same name
+/// in `request.rs`, kept file-local since the two bodies apply different settings.
 macro_rules! apply_to_commit_builder {
     ($(#[$attr:meta])* $name:ident($builder:ty)) => {
         $(#[$attr])*

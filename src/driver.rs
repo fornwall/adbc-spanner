@@ -45,11 +45,10 @@ const DEFAULT_IMPERSONATION_LIFETIME_SECS: u64 = 3600;
 /// from its configured options by [`SpannerDatabase::credential_choice`] and built by
 /// [`SpannerDatabase::build_credentials`].
 ///
-/// Naming the choice splits the *ladder* — the precedence rules, pure and unit-tested offline —
-/// from building the credential it names, which reaches for the ambient environment (a key file on
-/// disk, Application Default Credentials, a Tokio context) and so cannot be tested the same way.
-/// Deliberately payload-free: every variant's input is re-read from the database, so a bearer token
-/// never lands in a `Debug`-derived type.
+/// Naming the choice splits the *ladder* — pure precedence rules, unit-tested offline — from
+/// building the credential it names, which reaches for the ambient environment (a key file, ADC, a
+/// Tokio context) and so cannot be tested the same way. Deliberately payload-free: every variant's
+/// input is re-read from the database, so a bearer token never lands in a `Debug`-derived type.
 #[derive(Debug, PartialEq, Eq)]
 enum CredentialChoice {
     /// Emulator mode: anonymous credentials over plaintext `http://`. Wins outright — the guards in
@@ -174,9 +173,8 @@ pub struct SpannerDatabase {
 
 impl std::fmt::Debug for SpannerDatabase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Redact the three credential fields: show presence (`Some("<redacted>")` / `None`) but
-        // never the secret value (`keyfile_json` is a private key, `access_token` a live bearer
-        // token). Every other field renders normally.
+        // Presence-only for the three credential fields; never the secret value (see the struct
+        // docs). Every other field renders normally.
         let redact = |value: &Option<String>| value.as_ref().map(|_| "<redacted>");
         f.debug_struct("SpannerDatabase")
             .field("runtime", &self.runtime)
@@ -309,11 +307,10 @@ impl SpannerDatabase {
     ///
     /// Only *driver-level* credential configuration counts: a keyfile (path or inline JSON), an
     /// impersonation target, or an explicit access token. Ambient Application Default Credentials
-    /// (e.g. the
-    /// `GOOGLE_APPLICATION_CREDENTIALS` environment variable or a gcloud login) are deliberately
-    /// *not* reported — they are the environment's business, not an explicit driver option, and
-    /// must not prevent emulator use. The remaining `spanner.auth.impersonate.*` options are inert
-    /// without a target principal, so they do not count either.
+    /// (`GOOGLE_APPLICATION_CREDENTIALS`, a gcloud login) are deliberately *not* reported — they
+    /// are the environment's business, not an explicit driver option, and must not prevent
+    /// emulator use. The remaining `spanner.auth.impersonate.*` options are inert without a target
+    /// principal, so they do not count either.
     ///
     /// The ladder's order is load-bearing: [`OPTION_ACCESS_TOKEN`] comes last so that
     /// [`conflicting_credential_with_access_token`](Self::conflicting_credential_with_access_token)
@@ -383,8 +380,8 @@ impl SpannerDatabase {
         // header (access token). `None` leaves the credential's own project in charge.
         let quota_project = self.quota_project.as_deref();
         match self.credential_choice(emulator) {
-            // Emulator mode: anonymous credentials over plaintext `http://`. The guard in
-            // `connect` has already refused every credential option, so nothing is dropped here.
+            // Anonymous over plaintext `http://`; `connect`'s guard has already refused every
+            // credential option, so nothing is dropped here.
             CredentialChoice::Anonymous => Ok(Some(AnonymousCredentials::new().build())),
             // A caller-supplied OAuth2 bearer token, sent verbatim with no refresh (plus the
             // quota-project header, if any). Mutual exclusion with the keyfile/impersonation
@@ -949,8 +946,8 @@ const SUPPORTED_CREDENTIAL_TYPES: &str =
 /// for credentials it loads itself from the environment (the `GOOGLE_APPLICATION_CREDENTIALS` var or
 /// the well-known ADC file). It offers no entry point that takes inline JSON, so the dispatch has to
 /// happen here for the JSON supplied through the `spanner.auth.keyfile` / `spanner.auth.keyfile_json`
-/// options. Previously every keyfile was forced through the `service_account` builder, which failed
-/// (or misbehaved) for any other credential type.
+/// options — do not funnel every keyfile through the `service_account` builder instead: any other
+/// type then fails or misbehaves.
 ///
 /// `quota_project`, when `Some`, is attached to whichever builder is selected via its
 /// `with_quota_project_id`, so the resulting credentials send the `x-goog-user-project` billing
@@ -1013,17 +1010,15 @@ fn build_credentials_from_json(json: &str, quota_project: Option<&str>) -> Resul
 
 /// Reduce a `google-cloud-auth` credential-builder error to a fixed, secret-free category phrase.
 ///
-/// The auth crate's own `Display` (and the `#[source]` chain behind it) is outside this crate's
-/// control: its `Parsing` / `Loading` variants wrap the underlying `serde_json` error produced while
-/// deserializing the credential JSON, which — depending on the failure mode, and on future versions
-/// of the crate — can echo fragments of the very JSON it was reading (potentially `private_key` or
-/// `refresh_token` material). So we never interpolate that `Display` into an ADBC error message.
-/// Instead we classify the failure with the crate's own public predicates and surface only one of a
-/// handful of fixed phrases, guaranteeing no key material can reach an error message regardless of
-/// what the auth crate puts in its `Display` now or later. The credential *type* and (on the keyfile
-/// path) the file *path* are still reported by the callers — those are user-supplied configuration,
-/// not secrets — upholding the driver's rule that keyfile JSON bodies never appear in error
-/// messages.
+/// The auth crate's `Display` (and the `#[source]` chain behind it) is outside this crate's
+/// control: its `Parsing` / `Loading` variants wrap the `serde_json` error from deserializing the
+/// credential JSON, which — depending on the failure mode, and on future versions of the crate —
+/// can echo fragments of that JSON (potentially `private_key` or `refresh_token` material). So it
+/// is never interpolated into an ADBC error message; instead the failure is classified with the
+/// crate's own public predicates into one of a handful of fixed phrases, so no key material can
+/// reach an error message whatever the auth crate's `Display` does now or later. The credential
+/// *type* and (on the keyfile path) the file *path* are still reported by the callers — those are
+/// user-supplied configuration, not secrets.
 fn scrub_credential_error(error: &google_cloud_auth::build_errors::Error) -> &'static str {
     if error.is_missing_field() {
         "a required field is missing or has the wrong type"
@@ -1863,9 +1858,8 @@ mod tests {
 
     // An `authorized_user` (end-user ADC) keyfile with all required fields is accepted and routed to
     // the user-account flow — no service-account private key required, and no network is touched
-    // (token exchange happens lazily on first use). This is exactly the case the previous
-    // service-account-only code path mishandled. The builder spawns a token-cache task, so it must
-    // run inside a Tokio runtime — exactly as `connect()` does inside its `block_on`.
+    // (token exchange happens lazily on first use). The builder spawns a token-cache task, so it
+    // must run inside a Tokio runtime — exactly as `connect()` does inside its `block_on`.
     #[test]
     fn authorized_user_credential_json_is_accepted() {
         let json = r#"{
@@ -1897,11 +1891,11 @@ mod tests {
     }
 
     // A credential-build failure must never echo the credential JSON body into the ADBC error
-    // message: the auth crate's `Display` (which we no longer interpolate — see
-    // `scrub_credential_error`) can carry `serde_json`-derived fragments of the input, and the
-    // input holds the private key. Here a `service_account` key carries a recognizable fake secret
-    // but omits the required `client_email`, so `.build()` fails; the surfaced message must name the
-    // detected type and a safe category, and must not contain the secret material.
+    // message: the auth crate's `Display` — never interpolated, see `scrub_credential_error` — can
+    // carry `serde_json`-derived fragments of the input, and the input holds the private key. Here
+    // a `service_account` key carries a recognizable fake secret but omits the required
+    // `client_email`, so `.build()` fails; the surfaced message must name the detected type and a
+    // safe category, and must not contain the secret material.
     #[test]
     fn credential_build_failure_never_leaks_key_material() {
         const SECRET: &str = "SUPER-SECRET-PRIVATE-KEY-DO-NOT-LEAK-abc123";

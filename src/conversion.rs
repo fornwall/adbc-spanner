@@ -199,21 +199,19 @@ pub(crate) fn rows_to_batch(
 /// The row cap alone bounds rows, not bytes: 8192 rows of `STRING(MAX)`/`BYTES(MAX)` (up to ~10 MB
 /// each) would be tens of GB per chunk, and a chunk is held roughly twice — the [`Row`]s plus the
 /// Arrow batch built from them — during conversion. So `pull_chunk` also cuts a chunk once its
-/// accumulated (approximate) wire size crosses this budget. 32 MiB sits in the middle of the
-/// 16–64 MB range: large enough that ordinary rows still batch efficiently, small enough to cap
-/// peak memory. A single row larger than the whole budget still forms its own one-row chunk (the
-/// check runs *after* the row is buffered), so streaming never stalls or emits an empty chunk.
+/// accumulated (approximate) wire size crosses this budget. 32 MiB is large enough that ordinary
+/// rows still batch efficiently, small enough to cap peak memory. A single row larger than the whole
+/// budget still forms its own one-row chunk (the check runs *after* the row is buffered), so
+/// streaming never stalls or emits an empty chunk.
 const CHUNK_BYTE_BUDGET: usize = 32 * 1024 * 1024;
 
 /// Pull up to `max` rows from a Spanner result set, stopping early when the stream ends — or, as an
 /// additional cap, once the accumulated rows exceed [`CHUNK_BYTE_BUDGET`] approximate bytes.
 ///
-/// `max` is a *cap*, not a prediction: the result set streams, so the row count is unknown until it
-/// ends, and most chunks are short (a `SELECT` of 3 rows, the driver's own metadata queries, the
-/// last chunk of any scan). Reserving `max` up front would allocate for the cap regardless — 384 KiB
-/// per chunk at the default 8192, and unbounded for a large `spanner.rows_per_batch`, which takes no
-/// upper bound. So `rows` just grows; `Vec`'s amortised doubling costs nothing measurable next to a
-/// chunk's RPC and Arrow conversion, even when the chunk does fill.
+/// `rows` is deliberately not pre-reserved to `max`: `max` is a *cap*, not a prediction (most chunks
+/// are short), and reserving it would allocate for the cap regardless — unbounded for a large
+/// `spanner.rows_per_batch`, which takes no upper bound. `Vec`'s amortised doubling costs nothing
+/// measurable next to a chunk's RPC and Arrow conversion.
 async fn pull_chunk(rs: &mut ResultSet, max: usize) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
     let mut bytes: usize = 0;
@@ -221,9 +219,8 @@ async fn pull_chunk(rs: &mut ResultSet, max: usize) -> Result<Vec<Row>> {
         match rs.next().await {
             Some(row) => {
                 let row = row.map_err(from_spanner)?;
-                // Approximate the row's wire size from the values already in hand (see
-                // `approx_row_bytes`); base64 BYTES over-estimate the decoded size, which only makes
-                // the budget slightly more conservative. This is a rough estimate, not exact.
+                // Approximate (see `approx_row_bytes`); base64 BYTES over-estimate the decoded
+                // size, which only makes the budget slightly more conservative.
                 bytes = bytes.saturating_add(approx_row_bytes(&row));
                 rows.push(row);
                 // The row is already buffered, so an oversized single row still yields a one-row
@@ -238,9 +235,8 @@ async fn pull_chunk(rs: &mut ResultSet, max: usize) -> Result<Vec<Row>> {
     Ok(rows)
 }
 
-/// Roughly estimate a row's byte size from its Spanner values, used only to drive the
-/// [`CHUNK_BYTE_BUDGET`] early-cut — never for correctness. It sums the string lengths of the
-/// values (recursively through lists and structs); scalars count as a few bytes each.
+/// Roughly estimate a row's byte size, used only to drive the [`CHUNK_BYTE_BUDGET`] early-cut —
+/// never for correctness.
 fn approx_row_bytes(row: &Row) -> usize {
     row.raw_values().iter().map(approx_value_bytes).sum()
 }
@@ -248,7 +244,7 @@ fn approx_row_bytes(row: &Row) -> usize {
 /// Approximate the byte size of a single Spanner [`Value`] (see [`approx_row_bytes`]). Strings —
 /// which is how Spanner ships `STRING`, `BYTES` (base64), `INT64`, `NUMERIC`, `DATE`, `TIMESTAMP`,
 /// `JSON`, … over the wire — count their UTF-8 length; nested lists/structs recurse; other scalars
-/// count as a small fixed size. Deliberately cheap and approximate.
+/// count as a small fixed size.
 fn approx_value_bytes(value: &Value) -> usize {
     match value.kind() {
         Kind::Null => 0,
@@ -376,8 +372,7 @@ impl Iterator for SpannerBatchReader {
         // stream is already exhausted — so skip it and fall through to end the stream: an empty
         // result yields zero batches (its schema is still exposed via `schema()`), the Arrow-standard
         // end-of-stream shape the ADBC contract expects (adbc_validation's empty-readback case reads
-        // a released/NULL array, not a spurious 0-row batch). A non-empty first chunk is emitted as
-        // the result's first batch.
+        // a released/NULL array, not a spurious 0-row batch).
         if let Some(rows) = self.first.take()
             && !rows.is_empty()
         {
@@ -747,15 +742,11 @@ fn arrow_type(ty: &Type, precision: TimestampPrecision, depth: usize) -> Result<
             }
             _ => DataType::Utf8,
         },
-        // ENUM maps to its integer ordinal: the wire value is a bare enum number (delivered as a
-        // decimal string, like INT64), so `Int64` is a lossless, honest mapping. PROTO maps to its
-        // raw serialized message bytes (delivered base64-encoded, exactly like BYTES) as `Binary` —
-        // also lossless: the caller gets the precise proto2 wire bytes and can decode them with their
-        // own compiled `.proto`. Neither type's *structure* (enum member names / proto field layout)
-        // travels in the query metadata — it lives only in the database's proto descriptor bundle,
-        // reachable via the admin `GetDatabaseDdl` RPC, not the data-plane read — so a faithful
-        // label `Dictionary` / decoded `Struct` is not reachable here; callers who want them can
-        // `CAST(col AS STRING)` in SQL (enum member name / proto text format) instead.
+        // ENUM's wire value is a bare ordinal (a decimal string, like INT64); PROTO's is the raw
+        // serialized message base64-encoded (exactly like BYTES). Both mappings are lossless. Their
+        // *structure* (enum member names / proto field layout) travels only in the database's proto
+        // descriptor bundle (admin `GetDatabaseDdl`), not the query metadata, so a label
+        // `Dictionary` / decoded `Struct` is not reachable here — see the module doc.
         TypeCode::Enum => DataType::Int64,
         TypeCode::Proto => DataType::Binary,
         // Unlike JSON (whose `arrow.json` tag also drives the bind path), ENUM/PROTO/INTERVAL/UUID
@@ -906,9 +897,9 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
             v.try_as_string().and_then(parse_date_days)
         })?),
         DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
-            // A genuine SQL NULL (or absent value) becomes a null slot. A present value errors if
-            // it is not a timestamp string at all, or — since Arrow stores nanoseconds as an
-            // `i64` — if it is a valid instant outside the representable range.
+            // A present value errors if it is not a timestamp string at all, or — since Arrow
+            // stores nanoseconds as an `i64` — if it is a valid instant outside the representable
+            // range.
             let mut builder = TimestampNanosecondArray::builder(values.len());
             for &value in values {
                 match present(value) {
@@ -1008,10 +999,9 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
 
 /// Build an Arrow `List` array: each Spanner value is a list (or null) of the element type.
 ///
-/// The strict-decode policy of the scalar arms applies here too: a SQL NULL (or absent value)
-/// becomes a null slot, but a *present* value that is not a wire list is an error (see
-/// [`decode_error`]), never a silent null. Elements recurse through [`build_array`], so an
-/// undecodable element — at any nesting depth — errors as well.
+/// [`build_array`]'s strict-decode policy applies here too: a present value that is not a wire list
+/// is an error, never a silent null. Elements recurse, so an undecodable element at any nesting
+/// depth errors as well.
 fn build_list(field: &FieldRef, values: &[Option<&Value>]) -> Result<ArrayRef> {
     let mut children: Vec<Option<&Value>> = Vec::new();
     let mut offsets: Vec<i32> = Vec::with_capacity(values.len() + 1);
@@ -1055,10 +1045,9 @@ fn build_list(field: &FieldRef, values: &[Option<&Value>]) -> Result<ArrayRef> {
 /// value (CONV-6), and a keyed `google.protobuf.Struct` wire value could not carry them apart in
 /// the first place, being a map.
 ///
-/// The strict-decode policy of the scalar arms applies here too: a SQL NULL (or absent value)
-/// becomes a null slot, but a *present* value that is not a wire list is an error (see
-/// [`decode_error`]), never a silent null. Field values recurse through [`build_array`], so an
-/// undecodable field — at any nesting depth — errors as well.
+/// [`build_array`]'s strict-decode policy applies here too: a present value that is not a wire list
+/// is an error, never a silent null. Field values recurse, so an undecodable field at any nesting
+/// depth errors as well.
 fn build_struct(fields: &Fields, values: &[Option<&Value>]) -> Result<ArrayRef> {
     let mut children: Vec<Vec<Option<&Value>>> =
         vec![Vec::with_capacity(values.len()); fields.len()];
@@ -1092,10 +1081,9 @@ fn build_struct(fields: &Fields, values: &[Option<&Value>]) -> Result<ArrayRef> 
 }
 
 /// Parse a Spanner `INT64` value. Integers always arrive as strings (Spanner encodes `INT64` as a
-/// JSON string precisely so magnitudes above 2^53 survive), so we only accept the string form. We
-/// deliberately do **not** fall back to a JSON number: an `f64` cannot represent every `i64`, and
-/// casting one to `i64` would silently round values above 2^53. A non-string (or non-integer) wire
-/// value is therefore a loud decode error rather than a truncated result.
+/// JSON string precisely so magnitudes above 2^53 survive), so only the string form is accepted:
+/// falling back to a JSON number would silently round values above 2^53, since an `f64` cannot
+/// represent every `i64`. A non-string wire value is a loud decode error instead.
 fn parse_int64(value: &Value) -> Option<i64> {
     value.try_as_string()?.parse::<i64>().ok()
 }

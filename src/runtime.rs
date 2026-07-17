@@ -30,14 +30,12 @@ pub(crate) type SharedRuntime = Arc<Runtime>;
 ///
 /// Once latched the flag stays set **forever** — there is deliberately no way to clear it. That is
 /// what makes cancelling a streamed result reliable: a query's result is streamed lazily, so a
-/// cancel that lands *between* two chunk fetches (while rows are being converted to Arrow, or
-/// while the consumer processes a batch) must still cancel the *next* fetch rather than evaporate
-/// — `Notify` alone wakes only currently-registered waiters and would lose exactly that signal.
-/// Scoping the signal to one operation is the other half: the owning statement/connection mints a
-/// **fresh** signal per operation via [`CancelSlot::begin_operation`], so a stale cancel aimed at
-/// a finished operation cannot leak into the next one, and — conversely — starting a new operation
-/// cannot un-cancel a still-live streamed reader from an earlier one (the reader keeps its own
-/// operation's signal, which nothing ever clears).
+/// cancel that lands *between* two chunk fetches must still cancel the *next* fetch rather than
+/// evaporate — `Notify` alone wakes only currently-registered waiters and would lose exactly that
+/// signal. Scoping the signal to one operation is the other half: the owning statement/connection
+/// mints a **fresh** signal per operation via [`CancelSlot::begin_operation`], so a stale cancel
+/// cannot leak into the next operation, and — conversely — a new operation cannot un-cancel a
+/// still-live streamed reader from an earlier one (the reader keeps its own signal).
 #[derive(Clone)]
 pub(crate) struct CancelSignal(Arc<CancelInner>);
 
@@ -91,7 +89,6 @@ impl CancelSignal {
                 return;
             }
             notified.await;
-            // Woken: loop to re-read the flag (defensive against spurious wakeups).
         }
     }
 }
@@ -101,15 +98,10 @@ impl CancelSignal {
 ///
 /// Each entry point that begins a new operation mints a fresh, uncancelled signal via
 /// [`CancelSlot::begin_operation`]; `cancel()` ([`CancelSlot::signal`]) always targets the
-/// current one. A superseded signal is *replaced*, never cleared — once latched it stays latched
-/// — which yields exactly the ADBC contract:
-///
-/// - a cancel aimed at a previous (or absent) operation does not leak into a new one (the new
-///   operation runs on its own fresh signal);
-/// - starting a new operation cannot **un-cancel** an earlier operation's still-live streamed
-///   reader, and a cancelled stream can never present as cleanly complete: the reader keeps a
-///   clone of its own operation's signal, whose latch nothing clears, so every subsequent fetch
-///   keeps failing with [`Status::Cancelled`].
+/// current one. A superseded signal is *replaced*, never cleared — once latched it stays latched —
+/// which yields exactly the ADBC contract described on [`CancelSignal`]: a stale cancel cannot leak
+/// into a new operation, and a new operation cannot revive an earlier one's cancelled stream, which
+/// keeps failing with [`Status::Cancelled`] rather than presenting as cleanly complete.
 #[derive(Debug)]
 pub(crate) struct CancelSlot(std::sync::Mutex<CancelSignal>);
 
@@ -153,13 +145,11 @@ pub(crate) fn block_on_cancellable<T>(
     future: impl Future<Output = Result<T>>,
 ) -> Result<T> {
     // Box the operation future onto the heap. `block_on` polls it on the *calling* thread's stack
-    // (in ADBC that is the application's own thread, whose stack size the driver cannot control),
-    // and the operations here compose deep client/timeout/retry/conversion futures whose debug-build
-    // state machines are large enough to sit right at the default 2 MiB thread stack. Holding the
-    // composite inline in this frame overflowed that stack on some paths (e.g. the driver-manager
-    // conformance and query/DML round-trips); the heap indirection keeps the frame flat regardless
-    // of the operation's size, at the cost of one allocation per bridged call — negligible against
-    // the RPC it wraps.
+    // (in ADBC the application's own thread, whose stack size the driver cannot control), and these
+    // operations compose deep client/timeout/retry/conversion futures whose debug-build state
+    // machines sit right at the default 2 MiB stack — held inline in this frame they overflowed it
+    // on some paths (driver-manager conformance, query/DML round-trips). The heap indirection keeps
+    // the frame flat, at one allocation per bridged call — negligible against the RPC it wraps.
     let future = Box::pin(future);
     runtime.block_on(async move {
         tokio::select! {
@@ -296,8 +286,7 @@ mod tests {
     }
 
     // The signal is sticky: a cancel that lands while *no* operation is parked (for a streamed
-    // result, between two chunk fetches) still cancels the next operation on the same signal —
-    // previously it was silently lost and the stream ran to completion.
+    // result, between two chunk fetches) still cancels the next operation on the same signal.
     #[test]
     fn signal_between_operations_cancels_the_next_one() {
         let runtime = new_runtime().unwrap();
@@ -325,9 +314,8 @@ mod tests {
     }
 
     // The converse: beginning a new operation must not *un-cancel* an earlier operation's signal —
-    // a streamed reader holding it keeps failing with Cancelled (previously a shared resettable
-    // signal let a new operation silently revive a cancelled stream, or worse, let it end cleanly
-    // truncated).
+    // a streamed reader holding it keeps failing with Cancelled. (A shared resettable signal would
+    // let a new operation silently revive a cancelled stream, or let it end cleanly truncated.)
     #[test]
     fn begin_operation_does_not_uncancel_an_earlier_operations_signal() {
         let runtime = new_runtime().unwrap();

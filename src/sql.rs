@@ -47,15 +47,14 @@ pub(crate) fn is_dml(sql: &str) -> bool {
 /// Return `true` if `sql` contains a top-level `THEN RETURN` clause — DML that returns rows
 /// (`INSERT`/`UPDATE`/`DELETE ... THEN RETURN <columns>`).
 ///
-/// Scans word tokens outside string/identifier literals and comments — via the shared
-/// [`Lexer`] — for the keyword `THEN` immediately followed by `RETURN`,
-/// case-insensitively — but only at `CASE` expression nesting depth zero. GoogleSQL's `THEN
-/// RETURN` clause appears only at the top level, at the end of a DML statement; a `THEN` inside a
-/// `CASE WHEN … THEN … END` expression belongs to the CASE, so a branch expression that is a
-/// column literally named `return` (`RETURN` is not a reserved keyword) must not match. `CASE` and
-/// `END` are tracked as a nesting depth (`END` only closes `CASE` in GoogleSQL expressions);
-/// quoted identifiers and literals never affect the depth, and an unbalanced `END` (invalid SQL)
-/// saturates at zero rather than underflowing.
+/// Scans word tokens outside literals and comments — via the shared [`Lexer`] — for `THEN`
+/// immediately followed by `RETURN`, case-insensitively, but only at `CASE` nesting depth zero.
+/// GoogleSQL's `THEN RETURN` clause appears only at the top level, at the end of a DML statement; a
+/// `THEN` inside `CASE WHEN … THEN … END` belongs to the CASE, so a branch expression that is a
+/// column literally named `return` (`RETURN` is not a reserved keyword) must not match. `CASE`/`END`
+/// are tracked as a nesting depth (`END` only closes `CASE` in GoogleSQL expressions); quoted
+/// identifiers and literals never affect it, and an unbalanced `END` (invalid SQL) saturates at zero
+/// rather than underflowing.
 pub(crate) fn is_dml_returning(sql: &str) -> bool {
     let mut previous_was_then = false;
     let mut case_depth = 0usize;
@@ -87,8 +86,8 @@ pub(crate) fn is_dml_returning(sql: &str) -> bool {
 /// an ordinary character rather than an escape. A plain bytes prefix (`b`) keeps backslash
 /// escapes, so it needs no special handling.
 fn is_raw_prefix(word: &str) -> bool {
-    // `eq_ignore_ascii_case` keeps this allocation-free — this runs once per word lexeme of every
-    // lexed SQL string, so a `to_ascii_lowercase()` here would allocate per word.
+    // `eq_ignore_ascii_case` keeps this allocation-free: it runs once per word lexeme of every lexed
+    // SQL string, so a `to_ascii_lowercase()` would allocate per word.
     word.eq_ignore_ascii_case("r")
         || word.eq_ignore_ascii_case("rb")
         || word.eq_ignore_ascii_case("br")
@@ -329,12 +328,11 @@ fn push_statement(statements: &mut Vec<String>, current: &mut String) {
 /// classified by its real leading keyword, not misread as "no keyword" and routed to the wrong
 /// execution path.
 ///
-/// The scan is delegated to the shared [`lex`] tokenizer (the same rules as
-/// [`split_statements`]/[`named_parameters`]): a hint body is lexed normally, so a `}` inside a
-/// string literal in the hint does not close it, and an unterminated hint or comment consumes the
-/// rest of the input — no keyword. Anything else before the first word — a quoted
-/// identifier/literal, punctuation, a bare `@param`/`@@var` — means the input does not start with
-/// a keyword, as does a first word that does not start with an ASCII letter.
+/// The scan is delegated to the shared [`lex`] tokenizer: a hint body is lexed normally, so a `}`
+/// inside a string literal in the hint does not close it, and an unterminated hint or comment
+/// consumes the rest of the input — no keyword. Anything else before the first word — a quoted
+/// identifier/literal, punctuation, a bare `@param`/`@@var` — means the input does not start with a
+/// keyword, as does a first word that does not start with an ASCII letter.
 pub(crate) fn first_keyword(sql: &str) -> Option<&str> {
     let mut lexemes = lex(sql).peekable();
     while let Some(lexeme) = lexemes.next() {
@@ -368,16 +366,13 @@ pub(crate) fn first_keyword(sql: &str) -> Option<&str> {
 /// Skips `@name` occurrences inside string / bytes literals and quoted identifiers — including
 /// triple-quoted (`'''…'''`/`"""…"""`) and raw (`r'…'`, `rb'…'`, …) forms — and comments
 /// (`-- …`, `# …`, `/* … */`), and does not treat statement hints (`@{…}`) or system variables
-/// (`@@var`) as parameters. The lexical scan is delegated to the shared [`lex`] tokenizer (the same
-/// rules as [`split_statements`]), so a `@name` marker is only a parameter when the `@` character
-/// stands as its own token — never inside a literal, comment or hint body. Used by
+/// (`@@var`) as parameters: the shared [`lex`] tokenizer folds those into their own lexeme, so a
+/// `@name` is only a parameter when the `@` stands as its own token. Used by
 /// `get_parameter_schema` when no parameter data has been bound yet.
 pub(crate) fn named_parameters(sql: &str) -> Vec<String> {
     let mut params: Vec<String> = Vec::new();
     let mut lexemes = lex(sql).peekable();
     while let Some(lexeme) = lexemes.next() {
-        // Only a bare `@` token can introduce a parameter; `@` inside a literal/comment/hint body
-        // is folded into that lexeme and never reaches here.
         if lexeme != Lexeme::Other('@') {
             continue;
         }
@@ -728,10 +723,8 @@ mod tests {
     fn split_drops_interleaved_comment_only_segment_in_ddl_batch() {
         // The dbt "swap" DDL batch is submitted as one `UpdateDatabaseDdl` call, so a stray
         // comment-only segment *between* two real DDL statements (not just trailing) must also be
-        // dropped — otherwise the empty `/* swap */` segment is sent as a DDL statement and Spanner
-        // rejects the whole schema change with INVALID_ARGUMENT. Here the block-comment-only segment
-        // sits between DROP and RENAME, and a trailing `# done` segment closes the batch; both
-        // vanish while the three real statements survive verbatim.
+        // dropped — otherwise the empty segment is sent as a DDL statement and Spanner rejects the
+        // whole schema change with INVALID_ARGUMENT.
         let batch = "CREATE TABLE tmp (id INT64) PRIMARY KEY (id);\n\
                      DROP TABLE target;\n\
                      /* swap in the rebuilt table */;\n\
@@ -750,8 +743,8 @@ mod tests {
     #[test]
     fn split_respects_raw_strings() {
         // In a raw string the backslash is an ordinary character, not an escape: `r'C:\'` ends at
-        // the quote, so the `;` after it is a real separator. (The old lexer consumed the closing
-        // quote as escaped and shipped the whole thing as one malformed statement.)
+        // the quote, so the `;` after it is a real separator. Treating `\'` as an escape here
+        // swallows the separator and ships the whole batch as one malformed statement.
         assert_eq!(
             split_statements(r"UPDATE t SET path = r'C:\'; DELETE FROM u WHERE stale"),
             vec![r"UPDATE t SET path = r'C:\'", "DELETE FROM u WHERE stale"]
@@ -882,8 +875,8 @@ mod tests {
     #[test]
     fn named_parameters_skip_raw_and_triple_quoted_strings() {
         // In a raw string the backslash is not an escape: the literal ends at the first quote and
-        // scanning resumes correctly after it. (The old lexer consumed `\'` as escaped, stayed in
-        // string mode, and swallowed the parameters that followed.)
+        // scanning resumes after it. Treating `\'` as escaped keeps the lexer in string mode and
+        // swallows the parameters that follow.
         assert_eq!(named_parameters(r"SELECT r'\', @p"), vec!["p"]);
         assert_eq!(named_parameters(r"SELECT rb'@x\', @p"), vec!["p"]);
         // `@name` inside a triple-quoted string is not a parameter; one after it is.

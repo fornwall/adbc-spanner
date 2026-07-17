@@ -95,12 +95,9 @@ pub(crate) fn collect_statistics(
     // Build ONE multi-use read-only transaction so the INFORMATION_SCHEMA discovery *and* every
     // per-table aggregate scan observe a single, consistent snapshot (SPAN-5): a table created
     // between discovery and its scan can no longer fail the call, and all counts are taken at one
-    // timestamp. This mirrors `collect_objects`, which runs its metadata queries on one shared
-    // read-only transaction; the bound-query path likewise shares an
-    // `Arc<MultiUseReadOnlyTransaction>` across statements. Honour the configured
-    // `spanner.read.staleness` (pinned to its multi-use-legal equivalent) on it, as `collect_objects`
-    // does, so a stale read still reads from one pinned timestamp. Building it issues no RPC — the
-    // begin is inline on the first query below.
+    // timestamp. Mirrors `collect_objects`, including honouring `spanner.read.staleness` (pinned to
+    // its multi-use-legal equivalent) so a stale read still reads from one pinned timestamp.
+    // Building it issues no RPC — the begin is inline on the first query below.
     let bound = read_staleness.multi_use_timestamp_bound()?;
     let txn = {
         let client = client.clone();
@@ -161,10 +158,9 @@ pub(crate) fn collect_statistics(
             .push((ccn.value(c).to_string(), is_groupable(ctype.value(c))));
     }
 
-    // Prepare each matching table's aggregate query up front, in deterministic `table_batch`
-    // order. The scans run concurrently below but their results are yielded back in this same
-    // order, so the output (tables, schemas and their statistics) is identical to a sequential
-    // loop regardless of completion order.
+    // Prepare each matching table's aggregate query up front, in deterministic `table_batch` order.
+    // The scans run concurrently below but yield their results in this same order, so the output is
+    // identical to a sequential loop regardless of completion order.
     // The `LIKE` patterns are loop-invariant, so compile each once and reuse it across every row.
     let db_schema_matcher = db_schema.map(LikeMatcher::new);
     let table_name_matcher = table_name.map(LikeMatcher::new);
@@ -196,14 +192,12 @@ pub(crate) fn collect_statistics(
         });
     }
 
-    // Run the per-table aggregate scans with bounded concurrency on the one shared runtime, all on
-    // the shared read-only transaction built above so every count is taken at the same snapshot as
-    // the discovery reads. `buffered` polls up to `STATISTICS_SCAN_CONCURRENCY` of them at once yet
-    // yields their results in input order, so the deterministic `prepared` order is preserved
-    // without reassembly. The whole stream is driven inside a single `block_on_cancellable`, so a
-    // `cancel` still interrupts an in-flight batch of scans, and any scan error ends the collect as
-    // an overall `Err`. The whole concurrent scan phase is one query-side operation, bounded by the
-    // same query timeout (so a stalled aggregate scan cannot hang the collector unboundedly).
+    // Run the per-table aggregate scans with bounded concurrency, on the shared read-only
+    // transaction so every count is taken at the discovery reads' snapshot. `buffered` polls up to
+    // `STATISTICS_SCAN_CONCURRENCY` at once yet yields results in input order, preserving the
+    // deterministic `prepared` order without reassembly. Driving the whole stream inside one
+    // `block_on_cancellable` keeps `cancel` able to interrupt an in-flight batch, makes any scan
+    // error the overall `Err`, and bounds the whole scan phase by the one query timeout.
     let batches: Vec<RecordBatch> = block_on_cancellable(
         runtime,
         cancel,

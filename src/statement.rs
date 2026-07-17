@@ -278,9 +278,8 @@ impl SpannerStatement {
 
     /// Discard all bound data, resetting **both** `bound` and its companion
     /// [`ingest_schema`](Self) together so they can never desync. Every execution path that consumes
-    /// bound data (each `execute`/`execute_update` arm, the bound-query and partition paths, the
-    /// ingest path) calls this — a reused statement handle must not silently re-apply stale bound
-    /// rows *or* a stale empty-stream ingest schema to a later, unrelated execution. (The `bind` /
+    /// bound data calls this — a reused statement handle must not silently re-apply stale bound rows
+    /// *or* a stale empty-stream ingest schema to a later, unrelated execution. (The `bind` /
     /// `bind_stream` setters overwrite both directly; the `set_sql_query` / ingest-option setters
     /// deliberately leave bound data intact, since binding may precede setting the destination.)
     fn clear_bound(&mut self) {
@@ -383,11 +382,9 @@ impl SpannerStatement {
                 ),
                 Status::AlreadyExists,
             );
-            // Pure annotation: this branch only names the table, so everything structured about the
-            // underlying failure — the numeric gRPC code and the forwarded `google.rpc.Status`
-            // details — carries through untouched. (The probe branches below *reinterpret* the
-            // error, deriving a new status from the table's existence, so they deliberately keep
-            // neither.)
+            // Pure annotation: this branch only names the table, so the vendor code and forwarded
+            // `google.rpc.Status` details carry through. (The probe branches below *reinterpret*
+            // the error, deriving a new status from the table's existence, so they keep neither.)
             named.vendor_code = error.vendor_code;
             named.details = error.details;
             return named;
@@ -457,9 +454,8 @@ impl SpannerStatement {
             return Err(invalid_state("cannot ingest: no data has been bound"));
         }
         let result = self.run_bound_ingest(table);
-        // The bound data is consumed by the ingest attempt either way — including a failed
-        // create-mode DDL: a reused statement handle must not silently re-ingest stale rows after
-        // a failure.
+        // Consumed by the attempt either way, including a failed create-mode DDL (see
+        // `clear_bound`).
         self.clear_bound();
         result
     }
@@ -467,21 +463,18 @@ impl SpannerStatement {
     /// The body of [`run_ingest`](Self::run_ingest), split out so its caller clears the bound data
     /// on every exit path (success, failed DDL, failed insert) in one place.
     fn run_bound_ingest(&self, table: &str) -> Result<Option<i64>> {
-        // Reject a DML-kind ingest issued inside a manual *query* transaction BEFORE any DDL side
-        // effect. DDL is not transaction-aware and runs immediately, so a create/replace-mode ingest
-        // would otherwise create (or drop) the table before `run_ingest_mutations`'s kind check
-        // rejects the ingest, leaving a table behind. This early guard changes no state; the
-        // authoritative kind check still runs under the txn lock when the mutations buffer.
+        // Reject a DML-kind ingest inside a manual *query* transaction BEFORE any DDL side effect:
+        // DDL is not transaction-aware and runs immediately, so a create/replace-mode ingest would
+        // otherwise create (or drop) the table before `run_ingest_mutations`'s kind check rejects
+        // it. This guard changes no state; the authoritative check still runs under the txn lock at
+        // buffer time.
         //
-        // This closes the race only for the common single-threaded case. A concurrent statement on
-        // the same connection could still fix the transaction to query-kind in the window between
-        // this check and the DDL below, and the DDL — not being transaction-aware — would run
-        // anyway, orphaning the table while the later authoritative buffer-time check fails. Fully
+        // It only closes the race for the single-threaded case: a concurrent statement could fix
+        // the transaction to query-kind between this check and the DDL, orphaning the table. Fully
         // closing it would mean holding the connection-wide txn lock across a multi-second admin
-        // `UpdateDatabaseDdl` RPC, which would stall every other statement's txn-state access; that
-        // trade is not worth it. The residual window is exactly the documented "DDL is not
-        // transaction-aware / DML–DDL reorder" caveat (see CLAUDE.md, `run_ddl`): DDL side effects
-        // are never governed by, nor rolled back with, a manual transaction.
+        // `UpdateDatabaseDdl` RPC — not worth stalling every other statement. The residual window
+        // is exactly the documented "DDL is not transaction-aware / DML–DDL reorder" caveat (see
+        // CLAUDE.md, `run_ddl`).
         {
             let txn = self.txn.lock().unwrap();
             if !txn.autocommit() {
@@ -532,13 +525,12 @@ impl SpannerStatement {
     /// Ship the bound rows as Spanner **insert mutations**, honouring the connection's transaction
     /// mode and Spanner's per-commit limits.
     ///
-    /// Mutations are the `Commit` RPC's native write format: unlike the per-row parameterized
-    /// `INSERT` DML this driver used to build, they carry no SQL for Spanner to parse and plan per
-    /// row, which makes them the fast path for bulk loads. Each cell converts through the same
-    /// Arrow→Spanner value mapping as parameter binding (see [`bind::insert_mutation`]). Insert
-    /// mutations keep `INSERT` semantics — ingesting a duplicate primary key fails with
-    /// `ALREADY_EXISTS`, as the DML path's `INSERT` did. (Mutations take no isolation level:
-    /// Spanner commits blind writes serializably.)
+    /// Mutations are the `Commit` RPC's native write format: no SQL for Spanner to parse and plan
+    /// per row (why they beat per-row `INSERT` DML for bulk loads). Each cell converts through the
+    /// same Arrow→Spanner value mapping as parameter binding (see [`bind::insert_mutation`]).
+    /// Insert mutations keep `INSERT` semantics — a duplicate primary key fails with
+    /// `ALREADY_EXISTS`. (Mutations take no isolation level: Spanner commits blind writes
+    /// serializably.)
     ///
     /// **Manual mode** buffers every row's mutation for the next `commit`, which applies them
     /// atomically in the *same* read/write transaction as any buffered DML — Spanner applies
@@ -555,12 +547,11 @@ impl SpannerStatement {
     /// — counted roughly as rows × columns, plus secondary-index entries — and ~100 MB, so one
     /// unchunked commit fails outright once the ingest crosses those cliffs (10k rows × 10 columns
     /// is already there). An ingest that fits [`IngestChunkBudget`]'s conservative budgets still
-    /// commits as a single atomic transaction; only an ingest big enough to need several chunks —
-    /// one that could not have committed at all as one transaction — loses whole-ingest atomicity.
-    /// When a later chunk's commit fails, the error reports exactly how many rows the earlier
-    /// chunks already committed (see [`note_rows_already_committed`]), so the caller knows the
-    /// table's state. Building per chunk also bounds memory: only one chunk of mutations is
-    /// materialised at a time, instead of all N rows up front.
+    /// commits as a single atomic transaction; only one big enough to need several chunks — which
+    /// could not have committed as one transaction anyway — loses whole-ingest atomicity, and a
+    /// later chunk's failure reports exactly how many rows the earlier chunks committed (see
+    /// [`note_rows_already_committed`]). Building per chunk also bounds memory to one chunk of
+    /// mutations at a time.
     ///
     /// The `rows × columns` budget cannot see the **secondary-index** entries that also count
     /// toward the per-commit cap, so a heavily-indexed table can overshoot it even inside a
@@ -586,12 +577,12 @@ impl SpannerStatement {
             }
         };
         if manual {
-            // Manual mode: build *every* row's mutation before touching the transaction buffer,
-            // and build outside the txn lock. All-or-nothing buffering keeps the commit contract
-            // honest — a mid-row conversion failure (e.g. an out-of-range date) must not strand
-            // the rows before it in the buffer for a later `commit` to apply silently. Keeping
-            // the O(rows) build out of the connection-wide mutex also means concurrent
-            // txn-state users are not stalled behind it, and a build panic cannot poison it.
+            // Manual mode: build *every* row's mutation before touching the buffer, and build
+            // outside the txn lock. All-or-nothing buffering keeps the commit contract honest — a
+            // mid-row conversion failure (e.g. an out-of-range date) must not strand the rows
+            // before it for a later `commit` to apply silently. Keeping the O(rows) build out of
+            // the connection-wide mutex also avoids stalling concurrent txn-state users and cannot
+            // poison the mutex on a panic.
             let rows = self.bound.iter().map(RecordBatch::num_rows).sum();
             let mutations = self.build_range_mutations(&target, 0, rows)?;
             // An empty append buffers nothing and would commit clean, so a missing target table
@@ -615,12 +606,10 @@ impl SpannerStatement {
             // below, exactly where a fresh mode check would have routed this ingest.
         }
         // Autocommit: walk the flattened row sequence (all bound batches concatenated), cutting it
-        // into commit chunks by the same [`IngestChunkBudget`]. A chunk is a contiguous
-        // `[start, end)` **range** over that sequence rather than a materialised `Vec<Mutation>`;
-        // its mutations are (re)built cheaply from the batches on demand
-        // ([`commit_ingest_range`](Self::commit_ingest_range)), so nothing is cloned up front just
-        // to enable the reactive bisect-and-retry the write-only path performs when a chunk
-        // overshoots Spanner's per-commit mutation cap.
+        // into commit chunks by `IngestChunkBudget`. A chunk is a contiguous `[start, end)` range
+        // rather than a materialised `Vec<Mutation>`; its mutations are (re)built cheaply from the
+        // batches on demand (`commit_ingest_range`), so nothing is cloned up front just to enable
+        // the write-only path's bisect-and-retry when a chunk overshoots the per-commit cap.
         let mut total = 0_i64;
         let mut budget = IngestChunkBudget::default();
         let mut chunk_start = 0_usize;
@@ -737,17 +726,16 @@ impl SpannerStatement {
     /// exceeding its per-commit mutation limit.
     ///
     /// The forward path sizes chunks by `rows × columns` mutations ([`IngestChunkBudget`]), but the
-    /// *true* commit-time mutation count also includes secondary-index entries the driver cannot
-    /// see, so a heavily-indexed table can overshoot Spanner's ~80,000-mutation cap even inside a
+    /// *true* commit-time count also includes secondary-index entries the driver cannot see, so a
+    /// heavily-indexed table can overshoot Spanner's ~80,000-mutation cap even inside a
     /// driver-"safe" chunk. This is the reactive backstop: on that specific error
-    /// ([`is_mutation_limit_exceeded`]) the range is bisected and each half retried, recursing down
-    /// to a single row. Every **other** error — a duplicate key (`AlreadyExists`), a bad value, a
-    /// timeout, a cancel, an `ABORTED` — propagates unchanged, so the append/create remaps and the
-    /// [`note_rows_already_committed`] annotation still fire. A single row that *still* overshoots
-    /// is genuinely un-splittable, so its error propagates too (no infinite recursion, no empty
-    /// commit). Like the multi-chunk ingest, a bisected chunk is **not atomic as a whole**; the
-    /// summed row count and the "rows already committed" accounting stay exact — `prior_total` is
-    /// threaded through the recursion so a mid-bisect failure reports every row committed before it.
+    /// ([`is_mutation_limit_exceeded`]) the range is bisected and each half retried, down to a
+    /// single row. Every **other** error — a duplicate key, a bad value, a timeout, a cancel, an
+    /// `ABORTED` — propagates unchanged, so the append/create remaps and
+    /// [`note_rows_already_committed`] still fire. A single row that *still* overshoots is
+    /// un-splittable, so its error propagates too (no infinite recursion, no empty commit). Like the
+    /// multi-chunk ingest, a bisected chunk is **not atomic as a whole**; `prior_total` is threaded
+    /// through the recursion so a mid-bisect failure reports every row committed before it.
     fn write_mutation_range(
         &self,
         target: &str,
@@ -793,17 +781,16 @@ impl SpannerStatement {
     ///
     /// Each row's insert mutation is sent as its own [`MutationGroup`]. BatchWrite applies groups
     /// **independently and non-atomically** — the same "not atomic as a whole" guarantee the
-    /// multi-chunk write-only path already carries, but now within a chunk too — which is what makes
-    /// it the cheaper firehose transport for large loads. Each streamed [`BatchWriteResponse`]
-    /// reports, per group index, whether it applied: an `OK`/absent status counts those rows as
-    /// applied, and the first non-`OK` group status — code, message *and* its `google.rpc.Status`
-    /// details — becomes the returned error via [`from_status_parts`] (so a duplicate primary key
-    /// still surfaces as `AlreadyExists`, its structured details reach `Error::details`, and the
-    /// append/create remaps fire, exactly as on the write-only path). Because a non-atomic batch may
-    /// have applied some groups before the failing one — or before a mid-stream transport error —
-    /// any error is annotated with the already-committed-row count via [`note_rows_already_committed`]
-    /// here (COR-5), folding this chunk's `applied` groups (one row each) into `prior_total` so the
-    /// count covers *both* earlier chunks and this chunk's committed rows.
+    /// multi-chunk write-only path carries, but now within a chunk too — which is what makes it the
+    /// cheaper firehose transport. Each streamed [`BatchWriteResponse`] reports, per group index,
+    /// whether it applied: an `OK`/absent status counts those rows as applied, and the first
+    /// non-`OK` group status — code, message *and* its `google.rpc.Status` details — becomes the
+    /// returned error via [`from_status_parts`] (so a duplicate primary key still surfaces as
+    /// `AlreadyExists`, its details reach `Error::details`, and the append/create remaps fire,
+    /// exactly as on the write-only path). Because a non-atomic batch may have applied some groups
+    /// before the failing one — or before a mid-stream transport error — any error is annotated via
+    /// [`note_rows_already_committed`] (COR-5), folding this chunk's `applied` groups (one row each)
+    /// into `prior_total` so the count covers earlier chunks *and* this chunk's committed rows.
     ///
     /// The request does carry `spanner.request.priority` and `spanner.transaction.tag`
     /// ([`RequestConfig::apply_to_batch_write`](crate::request::RequestConfig::apply_to_batch_write)).
@@ -1063,11 +1050,10 @@ impl SpannerStatement {
         &self,
         sql: &str,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        // Resolve the column→parameter mapping once per non-empty bound batch — the eager path's
-        // up-front count/name validation (it lexes `sql`), kept here so a structural mismatch still
-        // fails before any statement runs — pairing each mapping with its batch. Only the per-row
+        // Resolve the column→parameter mapping once per non-empty bound batch (it lexes `sql`), so
+        // a structural mismatch still fails before any statement runs. Only the per-row
         // `bind::bind_params` is deferred to the reader, so at most one `SpannerSql` resides in
-        // memory at a time (O(1)) rather than one per bound row (O(rows)).
+        // memory at a time rather than one per bound row.
         let mut groups: Vec<(Vec<String>, RecordBatch)> = Vec::new();
         let mut total_rows = 0usize;
         for batch in &self.bound {
@@ -1078,9 +1064,8 @@ impl SpannerStatement {
             total_rows += batch.num_rows();
             groups.push((names, batch.clone()));
         }
-        // One fully-configured read-only query builder (directed reads + request tags + query
-        // optimizer options + retry applied, exactly as the eager path's `read_sql_builder`), cloned
-        // per row before binding — the shared config is applied once, not re-resolved per row.
+        // One fully-configured read-only query builder, cloned per row before binding — the shared
+        // config is applied once, not re-resolved per row.
         let base_builder = self.read_sql_builder(sql);
         // In a manual transaction every bound row runs on the transaction's shared snapshot
         // (opening it if this query is the transaction's first statement).
@@ -1331,9 +1316,8 @@ impl SpannerStatement {
 
     /// Guard for `execute_partitions`: at most **one** bound parameter row. Partitioned execution
     /// has no per-row fan-out (each bound row would need its own partitioned query, and ADBC's
-    /// partition surface has no way to attribute descriptors back to rows), so silently truncating
-    /// several bound rows to the first — the old behaviour — misreported the result. Reject the
-    /// ambiguous case up front, before any RPC.
+    /// partition surface cannot attribute descriptors back to rows), so the ambiguous case is
+    /// rejected up front, before any RPC, rather than silently truncated to the first row.
     fn check_single_bound_row(&self) -> Result<()> {
         let rows: usize = self.bound.iter().map(RecordBatch::num_rows).sum();
         if rows > 1 {
@@ -1352,12 +1336,11 @@ impl SpannerStatement {
     fn run_partition_query(&self, sql: &str) -> Result<PartitionedResult> {
         // Several bound rows cannot be partitioned (no per-row fan-out) — reject before any RPC.
         self.check_single_bound_row()?;
-        // Probe the schema and create the partitions. The partition query runs inside a batch
-        // read-only transaction; each returned partition carries its session, transaction id and
-        // partition token and is independently serializable, so it maps directly onto ADBC's opaque
-        // partition descriptor. The (Arc-shared, multiplexed) session lives as long as the
-        // connection's `DatabaseClient`, so the descriptors stay valid after this statement is gone,
-        // to be executed later by `Connection::read_partition`.
+        // Probe the schema and create the partitions in a batch read-only transaction. Each
+        // partition carries its session, transaction id and partition token and is independently
+        // serializable, so it maps directly onto ADBC's opaque descriptor. The (Arc-shared,
+        // multiplexed) session lives as long as the connection's `DatabaseClient`, so descriptors
+        // stay valid after this statement is gone, for `Connection::read_partition`.
         let plan_stmt = self.build_query_statement(sql, true)?;
         let query_stmt = self.build_query_statement(sql, false)?;
         let client = self.client.clone();
@@ -1446,8 +1429,7 @@ impl SpannerStatement {
         if crate::sql::is_ddl(&sql) {
             return Ok(BTreeMap::new());
         }
-        // A new operation begins: mint a fresh cancel signal for it, so a stale cancel aimed at a
-        // previous operation does not leak in (see `CancelSlot`).
+        // Mint a fresh cancel signal for this operation (see `CancelSlot`).
         self.cancel.begin_operation();
         if crate::sql::is_dml(&sql) {
             if self.config.is_read_only() {
@@ -1544,15 +1526,14 @@ impl SpannerStatement {
     /// Guard the data-returning read paths against kind-mixing in a manual transaction.
     ///
     /// In manual mode the transaction's kind is fixed by its first statement: buffered DML (and
-    /// bulk-ingest mutations) only executes at `commit`, so a query could never observe it.
-    /// Rather than silently returning a pre-write result (e.g. an `INSERT` followed by
-    /// `SELECT COUNT(*)` reporting the *old* count), reject the query up front. Queries in an
-    /// unset or query-kind manual transaction, and every query in autocommit mode, pass. A
-    /// *query* routed through `execute_update` is guarded exactly like `execute` (both run
-    /// through [`execute_query_reader`](Self::execute_query_reader)); the DML path enforces its
-    /// own kind when buffering; DDL is not transaction-aware (it runs immediately, unguarded);
-    /// and `execute_schema` (a `QueryMode::Plan` probe returning no data) has no data-visibility
-    /// concern, so it is left working.
+    /// bulk-ingest mutations) only executes at `commit`, so a query could never observe it. Rather
+    /// than silently returning a pre-write result (e.g. an `INSERT` followed by `SELECT COUNT(*)`
+    /// reporting the *old* count), reject the query up front. Queries in an unset or query-kind
+    /// manual transaction, and every query in autocommit mode, pass. A *query* routed through
+    /// `execute_update` is guarded identically (both go through
+    /// [`execute_query_reader`](Self::execute_query_reader)); the DML path enforces its own kind
+    /// when buffering; DDL is not transaction-aware (unguarded); and `execute_schema` (a
+    /// `QueryMode::Plan` probe returning no data) has no data-visibility concern.
     fn ensure_query_allowed(&self) -> Result<()> {
         self.txn.lock().unwrap().check_kind_allowed(TxnKind::Read)
     }
@@ -1765,18 +1746,16 @@ impl Statement for SpannerStatement {
                 )
             })?);
         }
-        // Preserve an empty stream's schema *separately* (not as a synthetic zero-row batch in
-        // `bound`, which would make the parameter-binding DML/query paths treat this statement as
-        // having bound rows and silently no-op — see `ingest_schema`). A non-empty stream clears it.
+        // Kept *separately*, not as a synthetic zero-row batch in `bound` — that would make the
+        // parameter-binding DML/query paths see bound rows and silently no-op (see
+        // `ingest_schema`). A non-empty stream clears it.
         self.ingest_schema = batches.is_empty().then_some(schema);
         self.bound = batches;
         Ok(())
     }
 
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        // A new operation begins: mint a fresh cancel signal for it, so a stale cancel aimed at a
-        // previous operation does not leak in — and so no later operation can un-cancel this one's
-        // streamed reader (see `CancelSlot`).
+        // Mint a fresh cancel signal for this operation (see `CancelSlot`).
         self.cancel.begin_operation();
         // Bulk ingest arriving through the query entry point (needs no SQL query): a standard ADBC
         // FFI caller may drive an ingest via `execute` with a non-null stream out-pointer. Run it
@@ -1830,9 +1809,7 @@ impl Statement for SpannerStatement {
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
-        // A new operation begins: mint a fresh cancel signal for it, so a stale cancel aimed at a
-        // previous operation does not leak in — and so no later operation can un-cancel this one's
-        // streamed reader (see `CancelSlot`).
+        // Mint a fresh cancel signal for this operation (see `CancelSlot`).
         self.cancel.begin_operation();
         // Bulk ingest: insert the bound rows into the target table (needs no SQL query). Gate on
         // there being no SQL for the same reason as `execute` — a query and an ingest target are
@@ -1860,9 +1837,8 @@ impl Statement for SpannerStatement {
         // run the query through the same read-only machinery as `execute` — including the
         // manual-transaction read-your-writes guard and every read-side option — then drain and
         // discard the rows: this entry point only reports a count, and a read query has none.
-        // Routing it into the DML pipeline instead surfaced a raw, misleading `ExecuteBatchDml`
-        // error in autocommit mode and, in manual mode, silently buffered the query as pending
-        // "DML", poisoning the eventual commit.
+        // Do NOT route it into the DML pipeline: that surfaces a raw `ExecuteBatchDml` error in
+        // autocommit mode and buffers the query as pending "DML" in manual mode, poisoning commit.
         if !crate::sql::is_dml(&sql) {
             // A multi-statement `;`-batch whose first statement is not DML is neither a query nor
             // an all-DML batch — reject it up front with a clear message (the DML arm below gets
@@ -1888,9 +1864,7 @@ impl Statement for SpannerStatement {
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {
-        // A new operation begins: mint a fresh cancel signal for it, so a stale cancel aimed at a
-        // previous operation does not leak in — and so no later operation can un-cancel this one's
-        // streamed reader (see `CancelSlot`).
+        // Mint a fresh cancel signal for this operation (see `CancelSlot`).
         self.cancel.begin_operation();
         let sql = self.sql()?;
         check_schema_query(&sql)?;
@@ -1961,9 +1935,7 @@ impl Statement for SpannerStatement {
     /// blobs, not opaque data:
     /// transport them only over trusted channels and never accept one from an untrusted source.
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
-        // A new operation begins: mint a fresh cancel signal for it, so a stale cancel aimed at a
-        // previous operation does not leak in — and so no later operation can un-cancel this one's
-        // streamed reader (see `CancelSlot`).
+        // Mint a fresh cancel signal for this operation (see `CancelSlot`).
         self.cancel.begin_operation();
         let sql = self.sql()?;
         check_partition_query(&sql)?;
@@ -1978,9 +1950,7 @@ impl Statement for SpannerStatement {
         // it always runs in its own batch read-only transaction below.
         self.ensure_query_allowed()?;
         let result = self.run_partition_query(&sql);
-        // The bound parameter row is consumed by the partitioning attempt either way — including a
-        // failed one — matching the DML paths: a reused statement handle must not silently re-apply
-        // stale bound rows to a later, unrelated execution.
+        // Consumed by the attempt either way, including a failed one (see `clear_bound`).
         self.clear_bound();
         result
     }
@@ -2271,9 +2241,8 @@ fn note_rows_already_committed(error: Error, committed: i64) -> Error {
         ),
         error.status,
     );
-    // Pure annotation, like the append remap's `AlreadyExists` branch: the underlying failure's
-    // structured halves — numeric gRPC code and forwarded `google.rpc.Status` details — survive the
-    // rebuilt message.
+    // Pure annotation, like the append remap's `AlreadyExists` branch: vendor code and forwarded
+    // `google.rpc.Status` details survive the rebuilt message.
     annotated.vendor_code = error.vendor_code;
     annotated.details = error.details;
     annotated
@@ -2284,17 +2253,15 @@ fn note_rows_already_committed(error: Error, committed: i64) -> Error {
 /// chunk and retrying its halves (see [`SpannerStatement::write_mutation_range`]).
 ///
 /// Deliberately narrow. Spanner reports the per-commit mutation-count limit as an `INVALID_ARGUMENT`
-/// whose message reads "The transaction contains too many mutations. …Please reduce the number of
-/// writes, or use fewer indexes. (Maximum number: N)" — a phrasing that has stayed stable across the
-/// successive 20k→40k→80k limit bumps and names the exact cause (index entries) this backstop
-/// targets. We match on the ADBC [`Status::InvalidArguments`] **and** that anchor phrase so that no
-/// *other* `INVALID_ARGUMENT` — a malformed value, an unparseable literal, a schema mismatch — is
-/// ever mistaken for it and silently bisected; those must keep propagating so the ingest
-/// append/create remaps and [`note_rows_already_committed`] still fire. The numeric gRPC code stays
-/// available in the error's `vendor_code` (INVALID_ARGUMENT = 3). The companion commit-size limit
-/// (~100 MB / the gRPC request-size cap) is intentionally **not** matched here: the byte budget
-/// ([`INGEST_CHUNK_BYTE_BUDGET`]) already keeps chunks well under it, and its "request too large"
-/// wording is far less stable than the mutation-count phrasing.
+/// reading "The transaction contains too many mutations. …Please reduce the number of writes, or use
+/// fewer indexes. (Maximum number: N)" — a phrasing stable across the successive 20k→40k→80k limit
+/// bumps that names the exact cause (index entries) this backstop targets. Matching on
+/// [`Status::InvalidArguments`] **and** that anchor phrase keeps any *other* `INVALID_ARGUMENT` — a
+/// malformed value, a schema mismatch — from being silently bisected; those must keep propagating so
+/// the ingest append/create remaps and [`note_rows_already_committed`] still fire. The companion
+/// commit-size limit (~100 MB / the gRPC request-size cap) is intentionally **not** matched: the byte
+/// budget ([`INGEST_CHUNK_BYTE_BUDGET`]) already keeps chunks well under it, and its "request too
+/// large" wording is far less stable.
 fn is_mutation_limit_exceeded(error: &Error) -> bool {
     error.status == Status::InvalidArguments
         && error

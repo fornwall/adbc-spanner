@@ -256,8 +256,7 @@ pub(crate) fn collect_objects(
         // unbounded.
         with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async move {
             // All the metadata queries run concurrently, sharing ONE multi-use read-only
-            // transaction so they observe a single snapshot (the previous serial implementation
-            // used one single-use transaction per query, with no cross-query consistency).
+            // transaction so they observe a single snapshot.
             // INFORMATION_SCHEMA queries are allowed in read-only transactions, and the client
             // supports concurrent statements on one transaction: `execute_query` takes `&self`,
             // and the inline-begin state machine serialises the implicit `BeginTransaction`
@@ -327,7 +326,7 @@ fn assemble_objects(batches: &ObjectBatches, filters: &ObjectFilters<'_>) -> Res
         }
         let mut tables = Vec::new();
         // `tables_by_schema` is empty unless tables were populated, so this yields no tables at
-        // schema-only depth — matching the previous `if let Some(&table_batch)` guard.
+        // schema-only depth.
         for table in tables_by_schema.get(schema_name).into_iter().flatten() {
             let name = table.name;
             if table_name_matcher
@@ -344,8 +343,7 @@ fn assemble_objects(batches: &ObjectBatches, filters: &ObjectFilters<'_>) -> Res
             {
                 continue;
             }
-            // Empty maps (columns/constraints not populated at this depth) yield empty lists,
-            // matching the previous depth-gated `match` arms.
+            // Empty maps (columns/constraints not populated at this depth) yield empty lists.
             let columns = collect_columns(
                 &columns_by_table,
                 schema_name,
@@ -595,7 +593,7 @@ fn group_key_columns(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<Ke
 
 /// Group `INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS` by (constraint_schema, constraint_name),
 /// mapping each foreign key to its referenced (unique_schema, unique_name). Keeps the first row per
-/// key, matching the previous `find`.
+/// key.
 fn group_referential(batch: &RecordBatch) -> Result<ReferentialMap<'_>> {
     let (rcs, rcn, rus, run) = (
         str_col(batch, referential_constraints_col::CONSTRAINT_SCHEMA)?,
@@ -651,8 +649,6 @@ fn collect_constraints<'a>(
         .flatten()
     {
         let name = constraint.name;
-        // Columns for this constraint, in key order (the group keeps ORDINAL_POSITION order);
-        // check/... constraints have no key columns and get an empty list.
         let columns = key_columns_by_constraint
             .get(&(schema, name))
             .into_iter()
@@ -747,7 +743,6 @@ pub(crate) fn build(depth: ObjectDepth, schemas: Vec<DbSchema>) -> Result<Record
     let catalog_db_schemas: ArrayRef = if !populate_schemas {
         new_null_array(db_schemas_field.data_type(), 1)
     } else {
-        // Build the db_schema struct across all schemas.
         let schema_names: ArrayRef = Arc::new(StringArray::from_iter_values(
             schemas.iter().map(|s| s.name.as_str()),
         ));
@@ -756,7 +751,7 @@ pub(crate) fn build(depth: ObjectDepth, schemas: Vec<DbSchema>) -> Result<Record
         let db_schema_tables: ArrayRef = if !populate_tables {
             new_null_array(tables_field.data_type(), schemas.len())
         } else {
-            // Flatten tables across schemas; build the table struct.
+            // Tables are flattened across schemas, then re-split by `lengths` below.
             let tables: Vec<&Table> = schemas.iter().flat_map(|s| s.tables.iter()).collect();
             let table_item = list_item(&tables_field)?;
             let table_fields = struct_fields(&table_item)?;
@@ -880,7 +875,6 @@ fn build_constraint_struct(
     let flat_usages: Vec<&Usage> = constraints.iter().flat_map(|c| c.usages.iter()).collect();
     let usage_struct = build_usage_struct(&usage_fields, &flat_usages)?;
     let usage_lengths: Vec<usize> = constraints.iter().map(|c| c.usages.len()).collect();
-    // Only FOREIGN KEY constraints carry a usage list; the rest are NULL.
     let usage_valid: Vec<bool> = constraints
         .iter()
         .map(|c| c.constraint_type == "FOREIGN KEY")
@@ -1221,7 +1215,7 @@ mod tests {
 
     #[test]
     fn filtered_sql_pushes_present_filters_as_bound_params() {
-        // No filters: the base SQL is unchanged (identical to the pre-push-down queries).
+        // No filters: the base SQL is unchanged.
         let (sql, params) = filtered_sql(
             "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA",
             &[("SCHEMA_NAME", None)],
