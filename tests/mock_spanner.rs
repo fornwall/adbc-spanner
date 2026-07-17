@@ -1713,6 +1713,83 @@ fn ingest_does_not_bisect_a_non_mutation_limit_error() {
     );
 }
 
+/// (d‴) **A mutation-build failure on a later chunk still reports the earlier chunks' committed
+/// rows** (COR-6). An autocommit multi-chunk ingest commits chunk by chunk, so a failure *after* an
+/// earlier chunk has landed must carry the exact already-committed count — the `run_ingest` contract
+/// — whether the failure is a rejected commit *or* a conversion error raised while building a later
+/// chunk's mutations. Here each ~3 MiB row fills its own commit chunk (the 4 MiB/chunk byte budget),
+/// so row 0 commits cleanly and row 1 — an out-of-range `DATE` — fails to build. The driver must
+/// surface that `InvalidArguments` **annotated** with "1 row(s) already committed", not the raw
+/// conversion error.
+#[test]
+fn mutation_build_failure_on_a_later_chunk_notes_committed_rows() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "mutation_build_failure_on_a_later_chunk_notes_committed_rows",
+    );
+
+    let commits = Arc::new(AtomicUsize::new(0));
+    let commits_in_mock = commits.clone();
+    let server = MockServer::start(move |mock| {
+        serve_begin_transaction(mock);
+        mock.expect_commit().returning(move |_| {
+            commits_in_mock.fetch_add(1, Ordering::SeqCst);
+            commit_ok()
+        });
+    });
+
+    // Two rows, each with a ~3 MiB STRING cell so the byte budget puts exactly one row per commit
+    // chunk. Row 0's DATE is the epoch (valid); row 1's is `i32::MAX` days (~5.8M years), which the
+    // driver's DATE formatter rejects as out of range while building the *second* chunk — after the
+    // first chunk has already committed.
+    let big = "x".repeat(3 * 1024 * 1024);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("pad", DataType::Utf8, false),
+        Field::new("d", DataType::Date32, false),
+    ]));
+    let pad = StringArray::from(vec![big.clone(), big]);
+    let dates = Date32Array::from(vec![0, i32::MAX]);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(pad), Arc::new(dates)])
+        .expect("build ingest batch");
+
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("MockTable".into()),
+        )
+        .expect("set target table");
+    statement
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .expect("set ingest mode append");
+    statement.bind(batch).expect("bind ingest data");
+
+    let error = statement
+        .execute_update()
+        .expect_err("the out-of-range DATE in the second chunk must fail the ingest");
+
+    // The underlying conversion status is preserved, and the annotation reports exactly the one row
+    // the first chunk already committed (COR-6). Reverting the `note_rows_already_committed` wrapper
+    // on the build path drops the "already committed" clause and fails this assertion.
+    assert_eq!(error.status, AdbcStatus::InvalidArguments, "got: {error}");
+    assert!(
+        error
+            .message
+            .contains("1 row(s) from this bulk ingest were already committed"),
+        "the build failure must report the earlier chunk's committed row; got: {}",
+        error.message
+    );
+    assert_eq!(
+        commits.load(Ordering::SeqCst),
+        1,
+        "exactly the first chunk (row 0) must have committed before the build failure"
+    );
+}
+
 /// (d″) **A failed exists-probe must not mask the ingest error** (IDIO-9). When an `append` commit
 /// fails with anything other than `AlreadyExists`, the driver probes `INFORMATION_SCHEMA.TABLES` to
 /// choose between the contract's `NotFound` (table absent) and `AlreadyExists` (schema mismatch).
