@@ -1,0 +1,76 @@
+name: Bench smoke
+
+# The `benches/` criterion benchmarks have no other CI consumer — no push/PR job builds them — so
+# they can silently rot (fail to compile, or drift out of sync with a renamed `bench_support`
+# helper / bench arg). This nightly job is a bit-rot smoke, NOT a perf-regression gate: it compiles
+# every declared `[[bench]]` and runs each once via criterion's `--test` mode (single pass, no
+# measurement), asserting only "the benches still build and run". `cargo bench` runs every declared
+# bench without naming any, so adding a `[[bench]]` is all it takes to get smoked — there is no
+# hardcoded list to keep in sync (the fuzz.yml lesson: TEST-9/TEST-11).
+on:
+  schedule:
+    - cron: "0 4 * * *" # daily at 04:00 UTC (an hour after the nightly fuzz run)
+  workflow_dispatch:
+
+# Least privilege: only report-failure (below) writes, and only issues.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: build + run benches once
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # Compile every declared `[[bench]]` — catches a bench that no longer builds against the
+      # crate (a renamed `bench_support` export, a changed helper signature, a bumped criterion).
+      - name: Compile benches
+        run: cargo bench --no-run
+
+      # Run each benchmark exactly once with no measurement (criterion's `--test` mode), so the
+      # smoke is fast and stable — it exercises the benchmarked code paths / harness setup without
+      # timing anything. Not a perf gate: nothing here compares against a baseline.
+      - name: Run benches once (no measurement)
+        run: cargo bench -- --test
+
+  # A scheduled failure otherwise surfaces only as an email, and a scheduled workflow that keeps
+  # failing (or that nobody watches) auto-disables after 60 days. Open — or comment on an
+  # already-open — tracking issue so a nightly bench-rot stays visible in the repo. Mirrors
+  # fuzz.yml's report-failure job. Only fires on the nightly `schedule`, never on manual dispatch.
+  report-failure:
+    needs: bench
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    # Least privilege: only this job needs to write issues.
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          label="nightly-bench-failure"
+          title="Nightly bench smoke failed"
+          # Idempotent: ensure the tracking label exists, then reuse an already-open issue instead
+          # of opening a fresh one every night.
+          gh label create "$label" --color B60205 \
+            --description "Automated: a scheduled bench smoke failed" 2>/dev/null || true
+          body="A scheduled [bench smoke]($RUN_URL) failed (commit ${GITHUB_SHA})."
+          existing="$(gh issue list --state open --label "$label" --limit 1 --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --label "$label" --body "$body"
+          fi
