@@ -886,6 +886,10 @@ impl SpannerStatement {
         let bound = self.bound.clone();
         let bind_by_name = self.bind_by_name;
         let sql = sql.to_string();
+        // The PLAN probe runs in a single-use read-only transaction, so honour the statement's read
+        // staleness like `execute` and `execute_partitions`' probe do — schema is itself versioned,
+        // so a stale bound must observe the structure as of that timestamp, matching the data read.
+        let read_bound = self.config.read_staleness.timestamp_bound()?;
         // The PLAN probe's schema must carry the same timestamp unit as the data `execute` would
         // stream, so the advertised schema and the actual batches can never disagree.
         let precision = self.config.timestamp_precision;
@@ -901,7 +905,7 @@ impl SpannerStatement {
                 self.config.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
                 async move {
-                    let transaction = client.single_use().build();
+                    let transaction = crate::staleness::single_use(&client, read_bound);
                     let mut builder = plan_builder;
                     // Bind parameters if any were provided (values are irrelevant to the schema) so
                     // that `@param` references resolve.
