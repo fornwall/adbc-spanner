@@ -95,6 +95,21 @@ fn bench_conversion(c: &mut Criterion) {
         });
     }
 
+    // DATE-only chunk: `YYYY-MM-DD` → Date32 epoch-days, isolated from the combined temporal bench
+    // so the per-cell DATE conversion cost (PERF-3) reads directly. A sprinkle of SQL NULLs keeps
+    // the null path honest.
+    {
+        let dates = column(|i| {
+            if i % 16 == 0 {
+                None::<String>.to_value()
+            } else {
+                format!("2024-{:02}-{:02}", 1 + i % 12, 1 + i % 28).to_value()
+            }
+        });
+        let columns = [(DataType::Date32, refs(&dates))];
+        group.bench_function("dates_date32", |b| b.iter(|| convert(&columns)));
+    }
+
     // BYTES chunk: base64-encoded payloads (48 decoded bytes per cell) — the per-cell decode arm
     // (which reuses one scratch buffer across cells, PERF-2). A sprinkle of SQL NULLs keeps the
     // null path honest.

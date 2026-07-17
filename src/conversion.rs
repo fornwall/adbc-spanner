@@ -1127,8 +1127,12 @@ pub(crate) fn parse_date_days(s: &str) -> Option<i32> {
     let month = digit(5)? * 10 + digit(6)?;
     let day = digit(8)? * 10 + digit(9)?;
     let date = chrono::NaiveDate::from_ymd_opt(year as i32, month, day)?;
-    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?;
-    i32::try_from((date - epoch).num_days()).ok()
+    // Days since the Unix epoch, in closed form: `num_days_from_ce` counts days from 0001-01-01
+    // (day 1), and 1970-01-01 is day 719_163, so subtracting that constant yields epoch-relative
+    // days directly — no second `NaiveDate` for the epoch and no `Duration` subtraction. The
+    // result stays in `i32` for every valid Spanner DATE (0001-01-01 → -719_162, 9999-12-31 →
+    // 2_932_896), so no `try_from` guard is needed.
+    Some(chrono::Datelike::num_days_from_ce(&date) - 719_163)
 }
 
 /// Read two ASCII digits at `off` as a number, or `None` if either byte is not `0`–`9`.
@@ -1514,6 +1518,9 @@ mod tests {
         // Spanner's DATE range endpoints, via the fixed-offset fast path.
         assert_eq!(parse_date_days("0001-01-01"), Some(-719162));
         assert_eq!(parse_date_days("9999-12-31"), Some(2932896));
+        // Leap day, and the day after, exercise the closed-form epoch math across a Feb 29.
+        assert_eq!(parse_date_days("2024-02-29"), Some(19782));
+        assert_eq!(parse_date_days("2024-03-01"), Some(19783));
         // Malformed canonical-width inputs the fast path must reject (not misparse).
         assert_eq!(parse_date_days("2024-13-01"), None); // month out of range
         assert_eq!(parse_date_days("2024-02-30"), None); // day out of range for month
