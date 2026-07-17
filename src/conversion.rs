@@ -82,6 +82,14 @@ use crate::timeout::with_timeout;
 /// Field name used for the element of an Arrow `List` (the Arrow convention).
 const LIST_ITEM: &str = "item";
 
+/// Maximum nesting depth the server-provided `STRUCT`/`ARRAY` type walk ([`arrow_type`]) will
+/// descend before failing loudly. Defense-in-depth against a hostile endpoint returning
+/// pathological `STRUCT<STRUCT<…>>` metadata (SEC-5): the transport already bounds decode recursion
+/// (prost's `RECURSION_LIMIT = 100`, on by default — UP-8), but this cap makes the guarantee local
+/// to the driver's own recursion rather than resting on the transport. `100` matches prost's limit;
+/// no legitimate result type nests remotely this deep.
+const MAX_TYPE_NESTING_DEPTH: usize = 100;
+
 /// Precision and scale of Spanner's `NUMERIC` type (GoogleSQL `NUMERIC` is fixed at 38 / 9).
 const NUMERIC_PRECISION: u8 = 38;
 const NUMERIC_SCALE: i8 = 9;
@@ -639,7 +647,19 @@ pub(crate) fn arrow_field(
     nullable: bool,
     precision: TimestampPrecision,
 ) -> Result<Field> {
-    let field = Field::new(name, arrow_type(ty, precision)?, nullable);
+    arrow_field_at(name, ty, nullable, precision, 0)
+}
+
+/// [`arrow_field`] carrying the current nesting `depth` through the mutually-recursive type walk
+/// (see [`MAX_TYPE_NESTING_DEPTH`]). Public callers enter at depth `0`.
+fn arrow_field_at(
+    name: impl Into<String>,
+    ty: &Type,
+    nullable: bool,
+    precision: TimestampPrecision,
+    depth: usize,
+) -> Result<Field> {
+    let field = Field::new(name, arrow_type(ty, precision, depth)?, nullable);
     Ok(if ty.code() == TypeCode::Json {
         field.with_metadata(json_extension_metadata())
     } else {
@@ -686,7 +706,18 @@ fn json_extension_metadata() -> HashMap<String, String> {
 /// Map a Spanner column [`Type`] to an Arrow [`DataType`]. `precision` selects the `TIMESTAMP`
 /// unit (see [`TimestampPrecision`]) and is threaded recursively, so a `TIMESTAMP` nested in an
 /// `ARRAY`/`STRUCT` maps the same as a top-level column.
-fn arrow_type(ty: &Type, precision: TimestampPrecision) -> Result<DataType> {
+fn arrow_type(ty: &Type, precision: TimestampPrecision, depth: usize) -> Result<DataType> {
+    // Defense-in-depth: cap the recursion so a hostile endpoint's pathological nested STRUCT/ARRAY
+    // metadata fails loudly rather than exhausting the stack (SEC-5; the transport also bounds this
+    // via prost's decode recursion limit — UP-8).
+    if depth > MAX_TYPE_NESTING_DEPTH {
+        return Err(err(
+            format!(
+                "nested STRUCT/ARRAY type exceeds the maximum depth of {MAX_TYPE_NESTING_DEPTH}"
+            ),
+            Status::Internal,
+        ));
+    }
     Ok(match ty.code() {
         TypeCode::Bool => DataType::Boolean,
         TypeCode::Int64 => DataType::Int64,
@@ -698,7 +729,7 @@ fn arrow_type(ty: &Type, precision: TimestampPrecision) -> Result<DataType> {
             DataType::Timestamp(precision.time_unit(), Some(TIMESTAMP_TZ.into()))
         }
         TypeCode::Numeric => DataType::Decimal128(NUMERIC_PRECISION, NUMERIC_SCALE),
-        TypeCode::Struct => struct_arrow_type(ty, precision)?,
+        TypeCode::Struct => struct_arrow_type(ty, precision, depth)?,
         TypeCode::Array => match ty.array_element_type() {
             // ARRAY<T> → Arrow List<T> (recursively; T may itself be a STRUCT). The element field is
             // built via `arrow_field`, so an `ARRAY<JSON>` carries the `arrow.json` extension on the
@@ -706,7 +737,13 @@ fn arrow_type(ty: &Type, precision: TimestampPrecision) -> Result<DataType> {
             // scalars: `ARRAY<ENUM>` → `List<Int64>`, `ARRAY<PROTO>` → `List<Binary>`. Spanner does
             // not allow arrays of arrays; fall back to JSON text for anything else.
             Some(element) if !matches!(element.code(), TypeCode::Array | TypeCode::Unspecified) => {
-                DataType::List(Arc::new(arrow_field(LIST_ITEM, &element, true, precision)?))
+                DataType::List(Arc::new(arrow_field_at(
+                    LIST_ITEM,
+                    &element,
+                    true,
+                    precision,
+                    depth + 1,
+                )?))
             }
             _ => DataType::Utf8,
         },
@@ -734,9 +771,9 @@ fn arrow_type(ty: &Type, precision: TimestampPrecision) -> Result<DataType> {
 
 /// Map a Spanner `STRUCT` type to an Arrow `Struct`, using the field names and types from the
 /// result metadata. Falls back to `Utf8` if the struct type is somehow unavailable.
-fn struct_arrow_type(ty: &Type, precision: TimestampPrecision) -> Result<DataType> {
+fn struct_arrow_type(ty: &Type, precision: TimestampPrecision, depth: usize) -> Result<DataType> {
     match ty.struct_type() {
-        Some(st) => Ok(DataType::Struct(struct_fields(st, precision)?)),
+        Some(st) => Ok(DataType::Struct(struct_fields(st, precision, depth)?)),
         None => Ok(DataType::Utf8),
     }
 }
@@ -745,6 +782,7 @@ fn struct_arrow_type(ty: &Type, precision: TimestampPrecision) -> Result<DataTyp
 fn struct_fields(
     st: &google_cloud_spanner::model::StructType,
     precision: TimestampPrecision,
+    depth: usize,
 ) -> Result<Fields> {
     st.fields
         .iter()
@@ -755,7 +793,7 @@ fn struct_fields(
                 .cloned()
                 .map(Type::from)
                 .unwrap_or_default();
-            arrow_field(&f.name, &field_type, true, precision)
+            arrow_field_at(&f.name, &field_type, true, precision, depth + 1)
         })
         .collect()
 }
@@ -1395,6 +1433,46 @@ mod tests {
             .unwrap();
         assert_eq!(ints.len(), 1);
         assert_eq!(ints.value(0), 2);
+    }
+
+    #[test]
+    fn pathologically_nested_struct_type_fails_loudly_instead_of_overflowing() {
+        use google_cloud_spanner::model;
+
+        // A hostile endpoint could return `STRUCT<STRUCT<…>>` metadata nested far deeper than any
+        // legitimate result type. The type walk caps its recursion (SEC-5), so it must return a
+        // clean error rather than exhausting the stack. Build the nested type bottom-up (iterative,
+        // so *constructing* it doesn't recurse) well past MAX_TYPE_NESTING_DEPTH.
+        let mut ty = model::Type::new().set_code(model::TypeCode::Int64);
+        for _ in 0..(MAX_TYPE_NESTING_DEPTH + 5) {
+            ty = model::Type::new()
+                .set_code(model::TypeCode::Struct)
+                .set_struct_type(
+                    model::StructType::new()
+                        .set_fields([model::struct_type::Field::new().set_name("f").set_type(ty)]),
+                );
+        }
+        let ty: Type = ty.into();
+
+        let err = arrow_field("deep", &ty, true, TimestampPrecision::default()).unwrap_err();
+        assert_eq!(err.status, Status::Internal);
+        assert!(
+            err.message.contains("maximum depth"),
+            "unexpected message: {}",
+            err.message
+        );
+
+        // A shallow struct still maps fine — the cap doesn't perturb the happy path.
+        let shallow: Type = model::Type::new()
+            .set_code(model::TypeCode::Struct)
+            .set_struct_type(
+                model::StructType::new().set_fields([model::struct_type::Field::new()
+                    .set_name("n")
+                    .set_type(model::Type::new().set_code(model::TypeCode::Int64))]),
+            )
+            .into();
+        let field = arrow_field("s", &shallow, true, TimestampPrecision::default()).unwrap();
+        assert!(matches!(field.data_type(), DataType::Struct(_)));
     }
 
     #[test]
