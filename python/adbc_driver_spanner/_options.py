@@ -94,6 +94,8 @@ class ConnectionOptions(enum.Enum):
     MAX_COMMIT_DELAY = "spanner.commit.max_delay"
     #: ``"true"`` requests commit statistics on read/write commits.
     COMMIT_STATS = "spanner.commit_stats"
+    #: ``"true"`` excludes the transaction's writes from change-stream capture.
+    EXCLUDE_TXN_FROM_CHANGE_STREAMS = "spanner.transaction.exclude_from_change_streams"
     #: Overall deadline (seconds) on a query's initial execution; ``0`` disables.
     RPC_TIMEOUT_QUERY = "spanner.rpc.timeout_seconds.query"
     #: Overall deadline (seconds) on each write operation; ``0`` disables.
@@ -137,6 +139,9 @@ class StatementOptions(enum.Enum):
     MAX_COMMIT_DELAY = "spanner.commit.max_delay"
     #: Per-statement override of :attr:`ConnectionOptions.COMMIT_STATS`.
     COMMIT_STATS = "spanner.commit_stats"
+    #: Per-statement override of
+    #: :attr:`ConnectionOptions.EXCLUDE_TXN_FROM_CHANGE_STREAMS`.
+    EXCLUDE_TXN_FROM_CHANGE_STREAMS = "spanner.transaction.exclude_from_change_streams"
     #: Per-statement override of :attr:`ConnectionOptions.QUERY_OPTIMIZER_VERSION`.
     QUERY_OPTIMIZER_VERSION = "spanner.query.optimizer_version"
     #: Per-statement override of :attr:`ConnectionOptions.QUERY_OPTIMIZER_STATISTICS_PACKAGE`.
