@@ -231,19 +231,40 @@ The upshot: a result set of any size streams through bounded memory. The row →
 Arrow `List`/`Struct`, and so on) lives in [`src/conversion.rs`](../src/conversion.rs); the full
 table is in the [README type-mapping section](../README.md#type-mapping).
 
+One mapping is worth calling out, because Arrow is *narrower* than Spanner here: Arrow's nanosecond
+timestamp is an `i64` count of nanoseconds, which only spans ~1677–2262, while Spanner `TIMESTAMP`
+spans years 0001–9999. By default a value outside that window is a loud `InvalidArguments` error
+(never a silently wrapped one); set `spanner.max_timestamp_precision=microseconds` to map
+`TIMESTAMP` to a microsecond Arrow timestamp instead, which covers Spanner's whole range at the
+cost of truncating sub-microsecond digits.
+
 DML with a `THEN RETURN` clause also comes back through `execute()` as an Arrow result, since it
 produces rows.
 
 ### 5.4 Changing data — `execute_update`
 
 For DML (`INSERT`/`UPDATE`/`DELETE`) and DDL (`CREATE`/`ALTER`/`DROP`/…), you call `execute_update`
-instead. It returns the **affected-row count** rather than a result stream.
+instead. It returns an **affected-row count** rather than a result stream — or `None` when no count
+exists. Which of Spanner's three very different execution surfaces a statement lands on is decided
+from its leading keyword (autocommit mode shown; §5.5 covers manual transactions):
+
+```mermaid
+flowchart TD
+    A["execute_update()"] --> B{"leading keyword?"}
+    B -->|"DDL: CREATE / ALTER / DROP / …"| C["Database Admin API<br/>UpdateDatabaseDdl<br/>(returns None)"]
+    B -->|"DML: INSERT / UPDATE / DELETE"| D["read/write transaction<br/>(returns the row count)"]
+    B -->|"anything else: a query"| E["read-only query, rows drained<br/>and discarded (returns None)"]
+```
 
 - **DML** runs in a Spanner read/write transaction. A `;`-separated batch (e.g. `DELETE; INSERT`)
-  is sent as one atomic `ExecuteBatchDml`.
+  is sent as one atomic `ExecuteBatchDml`; such a batch must be **all** DML — mixing in a query or
+  DDL is rejected with `InvalidArguments` before anything runs.
 - **DDL** is not a normal query in Spanner — it goes through the separate Database Admin API
   (`UpdateDatabaseDdl`), which the driver detects and routes automatically. A `;`-separated DDL
-  batch is submitted as a single schema change.
+  batch is submitted as a single schema change. DDL reports no row count, so this returns `None`.
+- **A query** sent to `execute_update` is legal in ADBC (the caller simply does not want the rows).
+  It runs through the same read-only machinery as `execute()`, and its rows are drained and
+  discarded; there is no count, so this too returns `None`.
 
 The DML/DDL detection and statement splitting live in [`src/sql.rs`](../src/sql.rs); the execution
 in [`src/statement.rs`](../src/statement.rs).
@@ -258,6 +279,25 @@ Set the standard `adbc.connection.autocommit` option to `false` to enter **manua
 `commit()` or `rollback()` on the connection to end the transaction. A manual transaction is
 exactly one kind of work — **queries** or **DML** — fixed by its *first* statement; a statement of
 the other kind fails with `InvalidState` until the transaction ends:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unset: autocommit = false
+    Unset --> Queries: first statement is a query
+    Unset --> DML: first statement is DML
+    Queries --> Queries: another query — same snapshot
+    Queries --> Unset: commit() / rollback()
+    DML --> DML: more DML / ingest rows — buffered
+    DML --> Unset: commit() replays the buffer
+    DML --> Unset: rollback() drops it
+    note right of Queries
+        DML here → InvalidState
+    end note
+    note right of DML
+        a query here → InvalidState
+        (no read-your-writes)
+    end note
+```
 
 - **Queries** all run on one shared multi-use read-only transaction, so every read in the
   transaction observes a single consistent snapshot; `commit()`/`rollback()` simply drop it
@@ -275,6 +315,17 @@ driver: it always executes immediately through the admin `UpdateDatabaseDdl` API
 never transactional), whatever the transaction state, so DDL issued after buffered DML executes
 *before* it and `rollback()` cannot undo it.
 
+Two standard options ride along with this:
+
+- `adbc.connection.transaction.isolation_level` applies to **read/write** transactions only.
+  `serializable`, `repeatable_read` and `snapshot` map straight onto Spanner's own levels
+  (`snapshot` → `REPEATABLE_READ`, which is *how* Spanner implements snapshot isolation); weaker
+  spec levels are promoted up to the weakest level that still satisfies them; `default` sends no
+  level at all, which Spanner reads as `SERIALIZABLE`. It is inert on read-only queries, which take
+  a timestamp bound instead of an isolation level.
+- `adbc.connection.readonly` (default `false`) makes a connection reject every write — DML, DDL,
+  ingest and any commit of buffered work fail with `InvalidState`, while queries still run.
+
 This is a deliberate, documented trade-off; genuine read-your-writes waits on the client exposing
 real begin/commit handles. For the full model see the [`SpannerConnection`
 rustdoc](../src/connection.rs) and the [README transactions bullet](../README.md#status).
@@ -290,9 +341,10 @@ course — an Arrow result:
 | `get_info` | "What driver/vendor is this, what version?" | Static metadata ([`src/info.rs`](../src/info.rs)). |
 | `get_objects` | "What catalogs / schemas / tables / columns / constraints exist?" | Queries Spanner's `INFORMATION_SCHEMA` ([`src/objects.rs`](../src/objects.rs)). |
 | `get_table_schema` | "What is the Arrow schema of table X?" | Reads the table's columns and maps them to an Arrow schema. |
-| `get_table_types` | "What kinds of table exist?" (`TABLE`, `VIEW`, …) | A fixed, typed result set. |
-| `get_statistics` | "Row counts, distinct counts, null counts." | One aggregate scan per table for exact values ([`src/statistics.rs`](../src/statistics.rs)). |
-| `get_parameter_schema` | "What parameters does this statement take?" | Inspects the statement's bound parameters. |
+| `get_table_types` | "What kinds of table exist?" | A fixed, typed result set: `BASE TABLE` and `VIEW`. |
+| `get_statistics` | "Row counts, distinct counts, null counts." | One aggregate scan per table for exact values — Spanner has no cheaper source, so an `approximate=true` request gets the same exact numbers ([`src/statistics.rs`](../src/statistics.rs)). |
+| `get_statistic_names` | "What non-standard statistics exist?" | None — an empty (but correctly typed) result set. |
+| `get_parameter_schema` | "What parameters does this statement take?" | If data is already bound, its Arrow schema *is* the answer. Otherwise the `@name` parameters are read out of the SQL and typed by a PLAN-only probe; one the probe cannot type is reported as `Null`, ADBC's "type unknown". |
 
 The point of this table is not the details but the *shape*: ADBC turns "tell me about yourself"
 into ordinary calls that return Arrow, and this driver answers each by querying Spanner's own
@@ -309,9 +361,14 @@ parameter values to a statement before executing it. Two uses:
 - **Bulk ingest** — the fast bulk-load path. You point a statement at a target table, bind a big
   `RecordBatch` (or a whole stream of them via `bind_stream`), and the driver writes the rows.
   Crucially it ships them as native Spanner **insert mutations**, not one `INSERT` statement per
-  row, so nothing is SQL-parsed per row. Ingest can *create* the target table from the incoming
-  Arrow schema, *append* to an existing one, or *replace* it. Because Spanner caps how much one
-  commit may write, a large ingest is committed **chunk by chunk**.
+  row, so nothing is SQL-parsed per row. The standard `adbc.ingest.mode` option picks the
+  behaviour: `append` to an existing table, or `create` / `create_append` / `replace`, which build
+  the table via DDL from the incoming Arrow schema. Spanner requires every table to have a primary
+  key and Arrow data carries none, so the create modes add a hidden `adbc_ingest_key` UUID key
+  column — unless `spanner.ingest.primary_key` names existing columns to key on instead. Because
+  Spanner caps how much a single commit may write, a large ingest is committed **chunk by chunk**
+  (so it is not atomic as a whole; a failure reports how many rows earlier chunks already
+  committed).
 
 The Arrow → Spanner value mapping and the ingest table-building logic are in
 [`src/bind.rs`](../src/bind.rs).
@@ -321,6 +378,7 @@ The Arrow → Spanner value mapping and the ingest table-building logic are in
 A few more standard ADBC operations, in brief:
 
 - **`execute_schema`** — get a query's result schema *without running it*, via a PLAN-only probe.
+  Queries only: DML and DDL are rejected, since neither can be planned this way.
 - **`execute_partitions` / `read_partition`** — split a large read into independent partitions that
   can be executed in parallel, possibly on different machines. `execute_partitions` produces opaque,
   serializable partition descriptors; `read_partition` executes one and streams its rows. (Security
@@ -363,6 +421,12 @@ each gRPC code onto the closest ADBC status, keeps the original numeric gRPC cod
 `vendor_code` field so nothing is lost, and forwards Spanner's structured error details (quota
 failures, bad-request field violations, retry hints) into the ADBC error's `details`. So a caller
 gets a portable ADBC status *and* the Spanner-specific specifics if they want them.
+
+A few of the mappings are not one-to-one and are worth knowing: gRPC `PERMISSION_DENIED` becomes
+`Unauthorized` (and the driver appends a short hint about granting an IAM role — Spanner's own
+message already names the missing permission), `FAILED_PRECONDITION` becomes `InvalidState`,
+`DEADLINE_EXCEEDED` becomes `Timeout`, and anything with no close ADBC equivalent falls back to
+`Internal` with the original code still in `vendor_code`.
 
 ---
 
