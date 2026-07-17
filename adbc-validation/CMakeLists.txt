@@ -136,6 +136,18 @@ add_executable(spanner_validation spanner_validation.cc)
 target_link_libraries(spanner_validation PRIVATE adbc_validation
                                                  adbc_driver_manager_shared
                                                  GTest::gtest_main)
+
+# Warning hygiene for OUR C++ only, mirroring `clippy -D warnings` on the Rust side.
+# Deliberately target-scoped rather than add_compile_options(): the FetchContent-built
+# arrow-adbc / googletest sources are third-party and must not inherit -Werror (their
+# warnings are not ours to fix, and a new compiler release would break the build). Their
+# headers are already included SYSTEM here and via arrow-adbc's own targets, so warnings
+# from them stay silent in this target too. -Wconversion / -Wsign-conversion earn their
+# place in a harness that shuffles int64_t / size_t / enum codes across the C ABI.
+# gcc/clang only, like the -fsanitize flags above.
+target_compile_options(
+  spanner_validation PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconversion
+                             -Wsign-conversion -Werror)
 # Match the include layout the in-tree driver tests use.
 target_include_directories(
   spanner_validation SYSTEM

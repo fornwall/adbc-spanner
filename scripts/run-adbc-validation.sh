@@ -152,7 +152,10 @@ run_rust_asan_canary() {
   mkdir -p "$BUILD_DIR"
 
   echo ">> ASan canary: compiling the cross-boundary tripwire (${CXX:-clang++} -fsanitize=address)"
+  # Same warning hygiene as the CMake target (this compile is deliberately not a CMake
+  # target, so the flags are repeated here rather than inherited).
   "${CXX:-clang++}" -std=c++17 -g -O0 -fsanitize=address -fno-omit-frame-pointer \
+    -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Werror \
     "$src" -o "$bin" -ldl
 
   echo ">> ASan canary: running it against $lib (expecting a heap-buffer-overflow)"
