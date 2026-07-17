@@ -22,6 +22,15 @@ Early, tested end-to-end against the Spanner emulator.
   [batch DML](https://docs.cloud.google.com/spanner/docs/samples/spanner-dml-batch-update). A batch
   must be all-DML: mixing in a query or DDL is rejected up front with `InvalidArguments` (before
   anything is buffered in a manual transaction). TODO: Multiple DML in a transaction does the same?
+- [Partitioned DML](https://docs.cloud.google.com/spanner/docs/dml-partitioned): set
+  `spanner.partitioned_dml=true` (a statement option) to run an **autocommit** `UPDATE`/`DELETE` as
+  Partitioned DML — large-scale, idempotent, **non-atomic** DML that Spanner partitions and applies
+  to each partition independently. `execute_update` returns a **lower bound** on the rows modified
+  (a partition may be applied more than once, so the true count can be higher). It runs its own
+  implicitly-committed transaction, so it is only valid for a single autocommit statement: it is
+  rejected in a manual transaction (`InvalidState`), with a `THEN RETURN` clause, for a `;`-batch,
+  or for bound parameters (`InvalidArguments`). Spanner rejects any non-partitionable statement
+  (e.g. `INSERT`) at execution time.
 - DDL (`CREATE`/`ALTER`/`DROP`/`RENAME`/…): Routed to the Database Admin `UpdateDatabaseDdl` API. A
   `;`-separated batch (e.g. a intermediate-table build then rename swap) is submitted as a single
   [schema change](https://docs.cloud.google.com/spanner/docs/schema-updates) near-atomic (but not

@@ -717,6 +717,53 @@ fn query_and_dml_round_trip() {
         "the last_statement-optimized UPDATE must be durably committed"
     );
 
+    // --- Partitioned DML (SPAN-2) ---
+    //
+    // With `spanner.partitioned_dml=true`, an autocommit UPDATE runs as Spanner Partitioned DML: a
+    // large-scale, idempotent, non-atomic statement Spanner partitions and applies independently.
+    // `execute_update` reports a *lower bound* on the rows modified. Here every Singers row matches,
+    // so the lower bound must cover both rows.
+    let mut pdml = connection.new_statement().expect("new statement");
+    pdml.set_option(
+        OptionStatement::Other(adbc_spanner::OPTION_PARTITIONED_DML.into()),
+        OptionValue::String("true".into()),
+    )
+    .expect("enable partitioned dml");
+    pdml.set_sql_query("UPDATE Singers SET Active = true WHERE true")
+        .unwrap();
+    let pdml_count = pdml
+        .execute_update()
+        .expect("partitioned DML update")
+        .expect("partitioned DML reports a lower-bound count");
+    assert_eq!(
+        pdml_count, 2,
+        "the Partitioned DML lower bound must cover both Singers rows"
+    );
+
+    // The write is durably committed: both rows now read back Active = true.
+    let mut pdml_check = connection.new_statement().expect("new statement");
+    pdml_check
+        .set_sql_query("SELECT Active FROM Singers ORDER BY SingerId")
+        .unwrap();
+    let pdml_batches = pdml_check
+        .execute()
+        .expect("read back partitioned-DML result")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect partitioned-DML result");
+    for batch in &pdml_batches {
+        let active = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        for i in 0..active.len() {
+            assert!(
+                active.value(i),
+                "Partitioned DML must have set every row Active"
+            );
+        }
+    }
+
     // --- get_table_schema reflects the table's column types ---
 
     let singers_schema = connection

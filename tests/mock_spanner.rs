@@ -4451,3 +4451,175 @@ fn get_statistics_shares_one_read_only_transaction() {
         );
     }
 }
+
+/// A `PartialResultSet` carrying only Partitioned DML stats: a `row_count_lower_bound`, the single
+/// value the client's Partitioned DML path reads to report the affected-row count.
+fn partitioned_dml_result(lower_bound: i64) -> v1::PartialResultSet {
+    v1::PartialResultSet {
+        stats: Some(v1::ResultSetStats {
+            row_count: Some(v1::result_set_stats::RowCount::RowCountLowerBound(
+                lower_bound,
+            )),
+            ..Default::default()
+        }),
+        last: true,
+        ..Default::default()
+    }
+}
+
+/// SPAN-2: with `spanner.partitioned_dml=true`, an autocommit `UPDATE` runs through the client's
+/// Partitioned DML path — `BeginTransaction` with a `PartitionedDml` transaction mode, then
+/// `ExecuteStreamingSql` (no `Commit`; Partitioned DML is implicitly committed) — and
+/// `execute_update` returns the row-count **lower bound** from the result-set stats.
+#[test]
+fn partitioned_dml_runs_via_the_partitioned_dml_path() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "partitioned_dml_runs_via_the_partitioned_dml_path",
+    );
+
+    let saw_partitioned_mode = Arc::new(AtomicBool::new(false));
+    let saw_in_mock = saw_partitioned_mode.clone();
+    let server = MockServer::start(move |mock| {
+        mock.expect_begin_transaction().returning(move |request| {
+            let options = request
+                .into_inner()
+                .options
+                .expect("BeginTransaction carries transaction options");
+            saw_in_mock.store(
+                matches!(
+                    options.mode,
+                    Some(v1::transaction_options::Mode::PartitionedDml(_))
+                ),
+                Ordering::SeqCst,
+            );
+            Ok(tonic::Response::new(v1::Transaction {
+                id: b"pdml-txn".to_vec(),
+                ..Default::default()
+            }))
+        });
+        mock.expect_execute_streaming_sql().returning(|request| {
+            assert_eq!(
+                request.into_inner().sql,
+                "UPDATE MockTable SET c = 'x' WHERE TRUE",
+                "the Partitioned DML statement is sent verbatim"
+            );
+            Ok(stream_of(vec![Ok(partitioned_dml_result(500))]))
+        });
+    });
+
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_PARTITIONED_DML.into()),
+            OptionValue::String("true".into()),
+        )
+        .expect("enable partitioned dml");
+    // Round-trips through get_option as the effective boolean.
+    assert_eq!(
+        statement
+            .get_option_string(OptionStatement::Other(
+                adbc_spanner::OPTION_PARTITIONED_DML.into()
+            ))
+            .expect("read back partitioned_dml"),
+        "true"
+    );
+    statement
+        .set_sql_query("UPDATE MockTable SET c = 'x' WHERE TRUE")
+        .expect("set sql");
+
+    let count = statement
+        .execute_update()
+        .expect("partitioned DML must execute through the client's partitioned path");
+    assert_eq!(
+        count,
+        Some(500),
+        "execute_update returns the row-count lower bound from the stats"
+    );
+    assert!(
+        saw_partitioned_mode.load(Ordering::SeqCst),
+        "BeginTransaction must request the PartitionedDml transaction mode"
+    );
+}
+
+/// SPAN-2 guards: `spanner.partitioned_dml=true` is only valid for a single autocommit statement.
+/// A manual transaction, a `;`-batch, bound parameters and a `THEN RETURN` clause are each rejected
+/// **before** any RPC reaches the server (the mock scripts nothing, so any RPC would fail the test).
+#[test]
+fn partitioned_dml_guards_reject_unsupported_shapes() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "partitioned_dml_guards_reject_unsupported_shapes",
+    );
+
+    let server = MockServer::start(|_mock| {});
+    let mut connection = server.connect();
+
+    // The `Statement` trait is not dyn-compatible (it has generic methods), so this is a generic
+    // helper rather than a `&mut dyn Statement` closure.
+    fn enable<S: Statement>(statement: &mut S) {
+        statement
+            .set_option(
+                OptionStatement::Other(adbc_spanner::OPTION_PARTITIONED_DML.into()),
+                OptionValue::String("true".into()),
+            )
+            .expect("enable partitioned dml");
+    }
+
+    // A `;`-separated batch: Partitioned DML executes exactly one statement.
+    let mut batch = connection.new_statement().expect("new statement");
+    enable(&mut batch);
+    batch
+        .set_sql_query("UPDATE T SET a = 1 WHERE TRUE; UPDATE T SET b = 2 WHERE TRUE")
+        .expect("set batch sql");
+    let error = batch.execute_update().expect_err("a `;`-batch is rejected");
+    assert_eq!(error.status, AdbcStatus::InvalidArguments);
+    assert!(error.message.contains("multi-statement"), "{error}");
+
+    // A `THEN RETURN` clause: Partitioned DML reports only a count, not rows.
+    let mut returning = connection.new_statement().expect("new statement");
+    enable(&mut returning);
+    returning
+        .set_sql_query("UPDATE T SET a = 1 WHERE TRUE THEN RETURN a")
+        .expect("set returning sql");
+    let error = returning
+        .execute_update()
+        .expect_err("THEN RETURN is rejected");
+    assert_eq!(error.status, AdbcStatus::InvalidArguments);
+    assert!(error.message.contains("THEN RETURN"), "{error}");
+
+    // Bound parameters: Partitioned DML executes exactly one statement.
+    let mut bound = connection.new_statement().expect("new statement");
+    enable(&mut bound);
+    bound
+        .set_sql_query("UPDATE T SET a = @v WHERE TRUE")
+        .expect("set bound sql");
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let batch_rows = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))])
+        .expect("bind batch");
+    bound.bind(batch_rows).expect("bind params");
+    let error = bound
+        .execute_update()
+        .expect_err("bound parameters are rejected");
+    assert_eq!(error.status, AdbcStatus::InvalidArguments);
+    assert!(error.message.contains("bound parameters"), "{error}");
+
+    // A manual transaction: Partitioned DML runs its own implicitly-committed transaction.
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        )
+        .expect("disable autocommit");
+    let mut manual = connection.new_statement().expect("new statement");
+    enable(&mut manual);
+    manual
+        .set_sql_query("UPDATE T SET a = 1 WHERE TRUE")
+        .expect("set manual sql");
+    let error = manual
+        .execute_update()
+        .expect_err("a manual transaction is rejected");
+    assert_eq!(error.status, AdbcStatus::InvalidState);
+    assert!(error.message.contains("manual transaction"), "{error}");
+}
