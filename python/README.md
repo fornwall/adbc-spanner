@@ -46,13 +46,38 @@ helpers below add zero-copy Arrow output on top.
 
 ## Authentication
 
-By default the driver uses [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)
-(ADC) — the same credentials `gcloud auth application-default login` and Google Cloud runtimes
-provide. To use a service-account key instead, pass its path or its JSON as a raw option in
+The driver supports several credential sources. When you set *no* credential option it falls back to
+Application Default Credentials, so **ADC is the default** — most setups need no credential option
+at all.
+
+**[Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)
+(ADC)** — the default. Connect with only the URI and the driver picks up whatever ADC resolves in
+this environment:
+
+- `gcloud auth application-default login` for local development,
+- a service-account key at the path in the `GOOGLE_APPLICATION_CREDENTIALS` environment variable, or
+- the attached service account automatically, on a Google Cloud runtime (GCE, GKE, Cloud Run, Cloud
+  Functions) via the metadata server.
+
+```python docs-test: skip
+import adbc_driver_spanner.dbapi as spanner
+from adbc_driver_spanner import DatabaseOptions
+
+# No credential option -> Application Default Credentials.
+spanner.connect(db_kwargs={
+    DatabaseOptions.URI.value: "spanner:///projects/p/instances/i/databases/d",
+})
+```
+
+There is no flag to "enable" ADC: you select it by leaving every credential option
+(`DatabaseOptions.KEYFILE` / `KEYFILE_JSON` / `ACCESS_TOKEN` / `IMPERSONATE_TARGET_PRINCIPAL`) unset.
+Setting any of the options below overrides it. (Ambient ADC does *not* conflict with emulator mode —
+only an explicit credential option does; see the emulator note below.)
+
+**Service-account key** — to use a key instead of ADC, pass its path or its JSON as a raw option in
 `db_kwargs`:
 
-```python
-# docs-test: skip
+```python docs-test: skip
 import adbc_driver_spanner.dbapi as spanner
 from adbc_driver_spanner import DatabaseOptions
 
@@ -62,11 +87,10 @@ spanner.connect(db_kwargs={
 })
 ```
 
-To impersonate another service account on top of your base credentials, set
+**Impersonation** — to impersonate another service account on top of your base credentials, set
 `DatabaseOptions.IMPERSONATE_TARGET_PRINCIPAL`:
 
-```python
-# docs-test: skip
+```python docs-test: skip
 spanner.connect(db_kwargs={
     DatabaseOptions.URI.value: "spanner:///projects/p/instances/i/databases/d",
     DatabaseOptions.IMPERSONATE_TARGET_PRINCIPAL.value: "target@p.iam.gserviceaccount.com",
@@ -74,24 +98,24 @@ spanner.connect(db_kwargs={
 })
 ```
 
-Set `DatabaseOptions.ACCESS_TOKEN` to authenticate with an OAuth 2.0 bearer token you already hold
-(for example from `gcloud auth print-access-token`). It is sent verbatim with no refresh, and is
+**OAuth access token** — set `DatabaseOptions.ACCESS_TOKEN` to authenticate with an OAuth 2.0 bearer
+token you already hold (for example from `gcloud auth print-access-token`). It is sent verbatim with no refresh, and is
 mutually exclusive with `DatabaseOptions.KEYFILE` / `DatabaseOptions.KEYFILE_JSON` /
 `DatabaseOptions.IMPERSONATE_TARGET_PRINCIPAL`:
 
-```python
-# docs-test: skip
+```python docs-test: skip
 spanner.connect(db_kwargs={
     DatabaseOptions.URI.value: "spanner:///projects/p/instances/i/databases/d",
     DatabaseOptions.ACCESS_TOKEN.value: "ya29.a0Af...",
 })
 ```
 
-To talk to the [Spanner emulator](https://cloud.google.com/spanner/docs/emulator), point at its
-endpoint and set `DatabaseOptions.EMULATOR` to `"true"` (which connects with anonymous credentials):
+**Emulator** — to talk to the [Spanner emulator](https://cloud.google.com/spanner/docs/emulator),
+point at its endpoint and set `DatabaseOptions.EMULATOR` to `"true"` (which connects with anonymous
+credentials; combining it with an explicit credential option above is refused, but ambient ADC is
+fine):
 
-```python
-# docs-test: skip
+```python docs-test: skip
 spanner.connect(db_kwargs={
     DatabaseOptions.URI.value: "spanner:///projects/p/instances/i/databases/d",
     DatabaseOptions.ENDPOINT.value: "localhost:9010",
@@ -178,8 +202,7 @@ The enums cover the full option surface for the `db_kwargs=` / `conn_kwargs=` /
 Pass `conn_kwargs={ConnectionOptions.READONLY.value: "true"}` to guarantee a connection can only
 read — any `INSERT`/`UPDATE`/`DELETE`, DDL, or bulk ingest raises, while queries still run:
 
-```python
-# docs-test: skip
+```python docs-test: skip
 import adbc_driver_spanner.dbapi as spanner
 from adbc_driver_spanner import ConnectionOptions, DatabaseOptions
 

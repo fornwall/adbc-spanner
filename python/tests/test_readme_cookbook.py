@@ -1,7 +1,8 @@
 """Execute the README's Cookbook snippets against the emulator, so the docs can't drift.
 
 Each ```python fenced block in ../README.md is extracted and run as-is (blocks tagged
-`# docs-test: skip` on their first line, or that don't open a connection, are ignored). The only
+`docs-test: skip` in the fence info string — e.g. ```python docs-test: skip — or that don't open a
+connection, are ignored; a legacy `# docs-test: skip` first line is still honoured too). The only
 rewrite is transparent: `spanner.connect(...)` is redirected at the emulator test database, so the
 illustrative `projects/my-project/...` path in the docs stays readable. Self-skips without
 `SPANNER_EMULATOR_HOST` (see conftest).
@@ -19,10 +20,10 @@ README = pathlib.Path(__file__).resolve().parents[1] / "README.md"
 
 def _runnable_blocks():
     text = README.read_text()
-    blocks = re.findall(r"```python\n(.*?)```", text, re.DOTALL)
+    blocks = re.findall(r"```python([^\n]*)\n(.*?)```", text, re.DOTALL)
     runnable = []
-    for block in blocks:
-        if block.lstrip().startswith("# docs-test: skip"):
+    for info, block in blocks:
+        if "docs-test: skip" in info or block.lstrip().startswith("# docs-test: skip"):
             continue
         if "spanner.connect" not in block:
             continue
