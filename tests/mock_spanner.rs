@@ -3800,6 +3800,185 @@ fn batch_write_carries_the_priority_and_transaction_tag_but_not_the_request_tag(
     );
 }
 
+/// TEST-4 (wire): the request priority / tag options are round-trip-tested offline (`src/request.rs`)
+/// and covered on the batch-DML / BatchWrite paths above, but the integration test that was meant to
+/// prove they reach a **query** and a **commit** is wire-vacuous — the emulator ignores
+/// `RequestOptions` entirely, so it can neither observe the driver sending them nor a metadata read
+/// *not* sending them. This mock pins all three on one connection, in order:
+///
+/// 1. A user **query** carries the priority + request tag in its `ExecuteStreamingSql`
+///    `RequestOptions` (`RequestConfig::apply_to_statement`).
+/// 2. An autocommit **DML** carries the priority + request tag on its `ExecuteBatchDml`
+///    (`apply_to_batch_dml`) *and* the priority + transaction tag on the `Commit` that ends its
+///    read/write transaction (`apply_to_runner`'s commit priority + transaction tag).
+/// 3. A driver-internal **metadata** read (`get_table_schema`) sends **empty** `RequestOptions` —
+///    the driver deliberately leaves its own introspection queries untagged, so nothing a user tags
+///    leaks onto the metadata path. This is the non-vacuous half: the query above proves the options
+///    *do* flow when a user sets them, so an empty-options metadata query proves the driver is
+///    choosing not to tag it, not merely that the options were never set.
+#[test]
+fn request_priority_and_tags_reach_queries_and_commits_but_not_metadata() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "request_priority_and_tags_reach_queries_and_commits_but_not_metadata",
+    );
+
+    const USER_QUERY: &str = "SELECT c FROM MockTable";
+    const DML_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
+
+    // Every ExecuteStreamingSql (user query + the metadata read) and every Commit, in order.
+    let queries: Arc<Mutex<Vec<v1::ExecuteSqlRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let batch_dml: Arc<Mutex<Vec<v1::ExecuteBatchDmlRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let commits: Arc<Mutex<Vec<v1::CommitRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let (rec_q, rec_b, rec_c) = (queries.clone(), batch_dml.clone(), commits.clone());
+    let server = MockServer::start(move |mock| {
+        serve_begin_transaction(mock);
+        mock.expect_execute_streaming_sql()
+            .returning(move |request| {
+                rec_q.lock().unwrap().push(request.into_inner());
+                Ok(stream_of(vec![Ok(partial_result_set(
+                    true,
+                    &["v"],
+                    b"t",
+                    true,
+                ))]))
+            });
+        mock.expect_execute_batch_dml().returning(move |request| {
+            let request = request.into_inner();
+            let inline_begin = matches!(
+                request
+                    .transaction
+                    .as_ref()
+                    .and_then(|t| t.selector.as_ref()),
+                Some(v1::transaction_selector::Selector::Begin(_))
+            );
+            rec_b.lock().unwrap().push(request);
+            Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
+                result_sets: vec![v1::ResultSet {
+                    metadata: Some(v1::ResultSetMetadata {
+                        transaction: inline_begin.then(|| v1::Transaction {
+                            id: b"dml-txn".to_vec(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    stats: Some(v1::ResultSetStats {
+                        row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                status: Some(spanner_grpc_mock::google::rpc::Status {
+                    code: 0,
+                    message: "OK".into(),
+                    details: vec![],
+                }),
+                ..Default::default()
+            }))
+        });
+        mock.expect_commit().returning(move |request| {
+            rec_c.lock().unwrap().push(request.into_inner());
+            commit_ok()
+        });
+    });
+
+    let mut connection = server.connect();
+    for (key, value) in [
+        (adbc_spanner::OPTION_REQUEST_PRIORITY, "high"),
+        (adbc_spanner::OPTION_REQUEST_TAG, "user-req"),
+        (adbc_spanner::OPTION_TRANSACTION_TAG, "user-txn"),
+    ] {
+        connection
+            .set_option(
+                OptionConnection::Other(key.into()),
+                OptionValue::String(value.into()),
+            )
+            .unwrap_or_else(|_| panic!("set {key}"));
+    }
+
+    // 1. A user query.
+    let mut query = connection.new_statement().expect("new statement");
+    query.set_sql_query(USER_QUERY).unwrap();
+    let reader = query.execute().expect("run the user query");
+    for batch in reader {
+        batch.expect("scripted query batch");
+    }
+
+    // 2. An autocommit DML (drives ExecuteBatchDml + Commit).
+    let mut dml = connection.new_statement().expect("new statement");
+    dml.set_sql_query(DML_SQL).unwrap();
+    assert_eq!(dml.execute_update().expect("autocommit DML"), Some(1));
+
+    // 3. A driver-internal metadata read.
+    connection
+        .get_table_schema(None, None, "MockTable")
+        .expect("get_table_schema");
+
+    let high = v1::request_options::Priority::High as i32;
+
+    // The two ExecuteStreamingSql requests: the user query is tagged, the metadata read is not.
+    let queries = queries.lock().unwrap();
+    let user = queries
+        .iter()
+        .find(|q| q.sql == USER_QUERY)
+        .expect("the user query reached ExecuteStreamingSql");
+    let user_options = user
+        .request_options
+        .as_ref()
+        .expect("the user query must carry RequestOptions");
+    assert_eq!(
+        user_options.priority, high,
+        "spanner.request.priority must reach the query's ExecuteStreamingSql RequestOptions"
+    );
+    assert_eq!(
+        user_options.request_tag, "user-req",
+        "spanner.request.tag must reach the query's ExecuteStreamingSql RequestOptions"
+    );
+
+    let metadata = queries
+        .iter()
+        .find(|q| q.sql != USER_QUERY)
+        .expect("get_table_schema issued a metadata ExecuteStreamingSql");
+    // Untagged: whether the driver omits RequestOptions entirely or sends a default-valued one, the
+    // effective priority/tags must be empty — nothing the user set may leak onto the metadata path.
+    let metadata_options = metadata.request_options.clone().unwrap_or_default();
+    assert_eq!(
+        metadata_options,
+        v1::RequestOptions::default(),
+        "a driver-internal metadata read must send empty RequestOptions (no priority, no tags)"
+    );
+
+    // The ExecuteBatchDml carries the priority + request tag.
+    let batch_dml = batch_dml.lock().unwrap();
+    assert_eq!(
+        batch_dml.len(),
+        1,
+        "the INSERT rides a single ExecuteBatchDml"
+    );
+    let dml_options = batch_dml[0]
+        .request_options
+        .as_ref()
+        .expect("the ExecuteBatchDml must carry RequestOptions");
+    assert_eq!(dml_options.priority, high);
+    assert_eq!(dml_options.request_tag, "user-req");
+
+    // The Commit that ends the DML transaction carries the commit priority + transaction tag.
+    let commits = commits.lock().unwrap();
+    assert_eq!(commits.len(), 1, "one autocommit DML ⇒ one Commit");
+    let commit_options = commits[0]
+        .request_options
+        .as_ref()
+        .expect("the Commit must carry RequestOptions");
+    assert_eq!(
+        commit_options.priority, high,
+        "spanner.request.priority must reach the Commit as the commit priority"
+    );
+    assert_eq!(
+        commit_options.transaction_tag, "user-txn",
+        "spanner.transaction.tag must tag the read/write transaction's Commit"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Shared client stack (SPAN-1)
 // ---------------------------------------------------------------------------
