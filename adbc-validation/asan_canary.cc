@@ -23,9 +23,9 @@
 // `ASAN_OPTIONS=...abort_on_error=1` ASan aborts the process on the finding, which the script
 // captures and inspects.
 
+#include <dlfcn.h>
 #include <cstdio>
 #include <cstdlib>
-#include <dlfcn.h>
 
 typedef void (*canary_fn)(unsigned char* ptr, size_t len);
 
@@ -58,17 +58,19 @@ int main(int argc, char** argv) {
   const size_t len = 16;
   unsigned char* buf = new unsigned char[len];
 
-  std::fprintf(stderr,
-               "canary: calling instrumented Rust adbc_spanner_asan_canary to write 1 byte past a "
-               "%zu-byte C++ heap buffer\n",
-               len);
+  std::fprintf(
+      stderr,
+      "canary: calling instrumented Rust adbc_spanner_asan_canary to write 1 byte past a "
+      "%zu-byte C++ heap buffer\n",
+      len);
   std::fflush(stderr);
 
   // Instrumented Rust writes buf[len] — one past the end. ASan should abort here.
   canary(buf, len);
 
   // If we reach this line, the out-of-bounds write went undetected: the cdylib is NOT ASan-armed.
-  std::fprintf(stderr, "canary: RETURNED without an ASan report — the cdylib is not ASan-armed\n");
+  std::fprintf(
+      stderr, "canary: RETURNED without an ASan report — the cdylib is not ASan-armed\n");
   delete[] buf;
   return 0;
 }

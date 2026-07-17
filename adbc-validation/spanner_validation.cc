@@ -40,8 +40,7 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
     // database. The driver auto-detects SPANNER_EMULATOR_HOST from the env.
     RAISE_ADBC(AdbcDatabaseSetOption(database, "driver",
                                      EnvOr("ADBC_SPANNER_LIBRARY", "").c_str(), error));
-    RAISE_ADBC(
-        AdbcDatabaseSetOption(database, "entrypoint", "AdbcSpannerInit", error));
+    RAISE_ADBC(AdbcDatabaseSetOption(database, "entrypoint", "AdbcSpannerInit", error));
     RAISE_ADBC(AdbcDatabaseSetOption(database, "uri",
                                      EnvOr("ADBC_SPANNER_URI", "").c_str(), error));
     return ADBC_STATUS_OK;
@@ -58,12 +57,13 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   AdbcStatusCode DropTable(struct AdbcConnection* connection, const std::string& name,
                            const std::string& db_schema,
                            struct AdbcError* error) const override {
-    return RunIgnoringResult(
-        connection, "DROP TABLE IF EXISTS " + Qualified(name, db_schema), error);
+    return RunIgnoringResult(connection,
+                             "DROP TABLE IF EXISTS " + Qualified(name, db_schema), error);
   }
 
   // Spanner has named schemas (CREATE SCHEMA), so db-schema-scoped metadata can be tested.
-  AdbcStatusCode EnsureDbSchema(struct AdbcConnection* connection, const std::string& name,
+  AdbcStatusCode EnsureDbSchema(struct AdbcConnection* connection,
+                                const std::string& name,
                                 struct AdbcError* error) const override {
     return RunIgnoringResult(connection, "CREATE SCHEMA IF NOT EXISTS `" + name + "`",
                              error);
@@ -82,14 +82,16 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
                                    const std::string& name, const std::string& schema,
                                    struct AdbcError* error) const override {
     const std::string table = Qualified(name, schema);
-    RAISE_ADBC(RunIgnoringResult(
+    RAISE_ADBC(
+        RunIgnoringResult(connection,
+                          "CREATE TABLE " + table +
+                              " (int64s INT64, strings STRING(MAX)) PRIMARY KEY (int64s)",
+                          error));
+    return RunIgnoringResult(
         connection,
-        "CREATE TABLE " + table + " (int64s INT64, strings STRING(MAX)) PRIMARY KEY (int64s)",
-        error));
-    return RunIgnoringResult(connection,
-                             "INSERT INTO " + table +
-                                 " (int64s, strings) VALUES (42, 'foo'), (-42, NULL), (NULL, '')",
-                             error);
+        "INSERT INTO " + table +
+            " (int64s, strings) VALUES (42, 'foo'), (-42, NULL), (NULL, '')",
+        error);
   }
 
   std::optional<std::string> PrimaryKeyTableDdl(std::string_view name) const override {
@@ -104,8 +106,7 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   // bit-reversed, so even a DEFAULT sequence key cannot satisfy the case's
   // `ORDER BY id` readback that expects insertion order. Returning nullopt is
   // the quirk's sanctioned way to say so; the case self-skips.
-  std::optional<std::string> PrimaryKeyIngestTableDdl(
-      std::string_view) const override {
+  std::optional<std::string> PrimaryKeyIngestTableDdl(std::string_view) const override {
     return std::nullopt;
   }
 
@@ -127,7 +128,8 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
            "CONSTRAINT fk_single FOREIGN KEY (id_child_col3) REFERENCES `" +
            std::string(parent_name_1) +
            "` (id), "
-           "CONSTRAINT fk_composite FOREIGN KEY (id_child_col1, id_child_col2) REFERENCES `" +
+           "CONSTRAINT fk_composite FOREIGN KEY (id_child_col1, id_child_col2) "
+           "REFERENCES `" +
            std::string(parent_name_2) +
            "` (id_primary_col1, id_primary_col2)) PRIMARY KEY (id_child_col1)";
   }
