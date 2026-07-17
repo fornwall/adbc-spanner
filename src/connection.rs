@@ -1717,10 +1717,9 @@ fn check_unnamed_catalog_or_schema(value: OptionValue, what: &str) -> Result<()>
     if s.is_empty() {
         Ok(())
     } else {
-        Err(err(
-            format!("Spanner has no settable {what}; only \"\" is valid, got {s:?}"),
-            Status::NotImplemented,
-        ))
+        Err(not_implemented(&format!(
+            "setting the {what} to {s:?} (Spanner has no settable {what}; only \"\" is valid)"
+        )))
     }
 }
 
