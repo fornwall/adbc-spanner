@@ -1,0 +1,20 @@
+# Formatting for the C++ validation harness, enforced by .github/workflows/clang-format.yml.
+#
+# The first four settings are upstream apache/arrow-adbc's .clang-format verbatim (minus its
+# ASF license header, which does not apply here). Deliberately copied rather than tuned: this
+# harness subclasses their DriverQuirks and is read side-by-side with their
+# adbc_validation_*.cc, so matching their wrapping keeps the two diffable.
+#
+# ReflowComments is the one deviation. Upstream leaves it on (Google default), but our comments
+# are long hand-wrapped prose — numbered lists, hanging indents, aligned continuations — and
+# reflowing them to 90 columns mangles that structure without improving anything. Off means
+# clang-format formats code and leaves comment prose alone.
+#
+# Scoped to this directory — clang-format walks up from each file, so nothing outside
+# adbc-validation/ is affected.
+---
+BasedOnStyle: Google
+ColumnLimit: 90
+DerivePointerAlignment: false
+IncludeBlocks: Preserve
+ReflowComments: false

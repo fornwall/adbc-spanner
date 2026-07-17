@@ -1,0 +1,49 @@
+name: clang-format
+
+# Formatting check for the C++ validation harness (adbc-validation/), the counterpart to
+# `cargo fmt --all --check` on the Rust side. Its own workflow rather than a job in
+# adbc-validation.yml because GitHub's `paths:` filter is workflow-level: that workflow must
+# run on every change (it exercises the driver's C ABI), while this one only has anything to
+# say when the C++ sources or the style config move.
+#
+# The two `paths:` lists are duplicated rather than shared via a YAML anchor: the Actions
+# workflow parser does not support anchors/aliases. Keep them in sync.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'adbc-validation/**.cc'
+      - 'adbc-validation/.clang-format'
+      - '.github/workflows/clang-format.yml'
+  pull_request:
+    paths:
+      - 'adbc-validation/**.cc'
+      - 'adbc-validation/.clang-format'
+      - '.github/workflows/clang-format.yml'
+
+# Cancel superseded PR runs (a rapid re-push cancels the in-flight run for the same
+# ref); pushes to main are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege: nothing in this workflow needs to write to the repository.
+permissions:
+  contents: read
+
+jobs:
+  clang-format:
+    name: clang-format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pinned exactly: clang-format's output drifts between releases, so an unpinned
+      # runner-provided binary would reformat on its own schedule and turn an unrelated PR
+      # red. The PyPI package ships the upstream LLVM binary, so a contributor gets a
+      # byte-identical formatter from `pipx install clang-format==22.1.8`.
+      - name: Install clang-format
+        run: pipx install clang-format==22.1.8
+
+      - name: Check formatting
+        run: clang-format --dry-run --Werror --verbose adbc-validation/*.cc
