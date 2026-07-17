@@ -59,8 +59,7 @@ this environment:
 - the attached service account automatically, on a Google Cloud runtime (GCE, GKE, Cloud Run, Cloud
   Functions) via the metadata server.
 
-```python
-# docs-test: skip
+```python docs-test: skip
 import adbc_driver_spanner.dbapi as spanner
 from adbc_driver_spanner import DatabaseOptions
 
@@ -78,8 +77,7 @@ only an explicit credential option does; see the emulator note below.)
 **Service-account key** — to use a key instead of ADC, pass its path or its JSON as a raw option in
 `db_kwargs`:
 
-```python
-# docs-test: skip
+```python docs-test: skip
 import adbc_driver_spanner.dbapi as spanner
 from adbc_driver_spanner import DatabaseOptions
 
@@ -92,8 +90,7 @@ spanner.connect(db_kwargs={
 **Impersonation** — to impersonate another service account on top of your base credentials, set
 `DatabaseOptions.IMPERSONATE_TARGET_PRINCIPAL`:
 
-```python
-# docs-test: skip
+```python docs-test: skip
 spanner.connect(db_kwargs={
     DatabaseOptions.URI.value: "spanner:///projects/p/instances/i/databases/d",
     DatabaseOptions.IMPERSONATE_TARGET_PRINCIPAL.value: "target@p.iam.gserviceaccount.com",
@@ -106,8 +103,7 @@ token you already hold (for example from `gcloud auth print-access-token`). It i
 mutually exclusive with `DatabaseOptions.KEYFILE` / `DatabaseOptions.KEYFILE_JSON` /
 `DatabaseOptions.IMPERSONATE_TARGET_PRINCIPAL`:
 
-```python
-# docs-test: skip
+```python docs-test: skip
 spanner.connect(db_kwargs={
     DatabaseOptions.URI.value: "spanner:///projects/p/instances/i/databases/d",
     DatabaseOptions.ACCESS_TOKEN.value: "ya29.a0Af...",
@@ -119,8 +115,7 @@ point at its endpoint and set `DatabaseOptions.EMULATOR` to `"true"` (which conn
 credentials; combining it with an explicit credential option above is refused, but ambient ADC is
 fine):
 
-```python
-# docs-test: skip
+```python docs-test: skip
 spanner.connect(db_kwargs={
     DatabaseOptions.URI.value: "spanner:///projects/p/instances/i/databases/d",
     DatabaseOptions.ENDPOINT.value: "localhost:9010",
@@ -207,8 +202,7 @@ The enums cover the full option surface for the `db_kwargs=` / `conn_kwargs=` /
 Pass `conn_kwargs={ConnectionOptions.READONLY.value: "true"}` to guarantee a connection can only
 read — any `INSERT`/`UPDATE`/`DELETE`, DDL, or bulk ingest raises, while queries still run:
 
-```python
-# docs-test: skip
+```python docs-test: skip
 import adbc_driver_spanner.dbapi as spanner
 from adbc_driver_spanner import ConnectionOptions, DatabaseOptions
 
