@@ -313,6 +313,26 @@ fn string_column_metadata() -> v1::ResultSetMetadata {
     }
 }
 
+/// Result metadata for an arbitrary list of `(name, type)` columns — used by the `get_statistics`
+/// mock, whose discovery queries return STRING columns and whose aggregate scans return INT64 ones.
+fn result_metadata(fields: &[(&str, v1::TypeCode)]) -> v1::ResultSetMetadata {
+    v1::ResultSetMetadata {
+        row_type: Some(v1::StructType {
+            fields: fields
+                .iter()
+                .map(|(name, code)| v1::struct_type::Field {
+                    name: name.to_string(),
+                    r#type: Some(v1::Type {
+                        code: *code as i32,
+                        ..Default::default()
+                    }),
+                })
+                .collect(),
+        }),
+        ..Default::default()
+    }
+}
+
 fn string_value(s: &str) -> prost_types::Value {
     prost_types::Value {
         kind: Some(prost_types::value::Kind::StringValue(s.to_string())),
@@ -3934,4 +3954,135 @@ fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_pat
          mock's own cap is what stops it; a change here means the pinned client's stream-resume \
          accounting moved — update src/retry.rs, docs/options.md and REVIEW.md's UP-14 to match"
     );
+}
+
+/// SPAN-5: `get_statistics` must take its `INFORMATION_SCHEMA` discovery reads *and* every
+/// per-table aggregate scan at ONE consistent snapshot, so a table created between discovery and
+/// its scan cannot fail the call and every count is taken at the same timestamp. The driver does
+/// this by running them all on a single multi-use read-only transaction (as `get_objects` does),
+/// rather than a fresh single-use transaction per query.
+///
+/// This captures every `ExecuteStreamingSql` transaction selector and asserts the first query
+/// begins ONE read-only transaction inline and every later query — the rest of discovery and all
+/// aggregate scans — reuses it by id. The previous per-query single-use implementation would show a
+/// fresh `single_use` selector on every request instead.
+#[test]
+fn get_statistics_shares_one_read_only_transaction() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "get_statistics_shares_one_read_only_transaction",
+    );
+
+    let selectors: Arc<Mutex<Vec<Option<v1::TransactionSelector>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let server = {
+        let record = selectors.clone();
+        MockServer::start(move |mock| {
+            let record = record.clone();
+            mock.expect_execute_streaming_sql()
+                .returning(move |request| {
+                    let request = request.into_inner();
+                    let inline_begin = matches!(
+                        request
+                            .transaction
+                            .as_ref()
+                            .and_then(|t| t.selector.as_ref()),
+                        Some(v1::transaction_selector::Selector::Begin(_))
+                    );
+                    record.lock().unwrap().push(request.transaction);
+                    // Shape the result to whichever query the collector issued (it reads columns
+                    // positionally, so only the count and types matter, not the names).
+                    let (fields, values): (Vec<(&str, v1::TypeCode)>, Vec<&str>) =
+                        if request.sql.contains("INFORMATION_SCHEMA.TABLES") {
+                            (
+                                vec![
+                                    ("TABLE_SCHEMA", v1::TypeCode::String),
+                                    ("TABLE_NAME", v1::TypeCode::String),
+                                ],
+                                vec!["", "MockTable"],
+                            )
+                        } else if request.sql.contains("INFORMATION_SCHEMA.COLUMNS") {
+                            (
+                                vec![
+                                    ("TABLE_SCHEMA", v1::TypeCode::String),
+                                    ("TABLE_NAME", v1::TypeCode::String),
+                                    ("COLUMN_NAME", v1::TypeCode::String),
+                                    ("SPANNER_TYPE", v1::TypeCode::String),
+                                ],
+                                vec!["", "MockTable", "c", "STRING(MAX)"],
+                            )
+                        } else {
+                            // The single-scan aggregate for one groupable STRING column `c`:
+                            // COUNT(*), COUNTIF(c IS NULL), COUNT(DISTINCT c).
+                            (
+                                vec![
+                                    ("n", v1::TypeCode::Int64),
+                                    ("nulls", v1::TypeCode::Int64),
+                                    ("distinct", v1::TypeCode::Int64),
+                                ],
+                                vec!["3", "0", "3"],
+                            )
+                        };
+                    let mut metadata = result_metadata(&fields);
+                    if inline_begin {
+                        metadata.transaction = Some(v1::Transaction {
+                            id: b"stats-ro-txn".to_vec(),
+                            ..Default::default()
+                        });
+                    }
+                    let result = v1::PartialResultSet {
+                        metadata: Some(metadata),
+                        values: values.iter().map(|s| string_value(s)).collect(),
+                        resume_token: b"stat-1".to_vec(),
+                        last: true,
+                        ..Default::default()
+                    };
+                    Ok(stream_of(vec![Ok(result)]))
+                });
+        })
+    };
+
+    let connection = server.connect();
+    let reader = connection
+        .get_statistics(None, None, None, false)
+        .expect("get_statistics");
+    let batches: Vec<_> = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect statistics");
+    assert_eq!(batches.len(), 1, "one catalog batch");
+
+    let seen = selectors.lock().unwrap();
+    assert!(
+        seen.len() >= 3,
+        "discovery (TABLES + COLUMNS) plus at least one aggregate scan, got {}",
+        seen.len()
+    );
+    // The first query begins ONE read-only transaction inline.
+    let first = seen[0]
+        .as_ref()
+        .and_then(|s| s.selector.as_ref())
+        .expect("the first query must carry a transaction selector");
+    let v1::transaction_selector::Selector::Begin(options) = first else {
+        panic!("the first get_statistics query must begin the transaction, got: {first:?}");
+    };
+    assert!(
+        matches!(
+            options.mode,
+            Some(v1::transaction_options::Mode::ReadOnly(_))
+        ),
+        "the begun transaction must be read-only: {options:?}"
+    );
+    // Every later query reuses it by id — one shared snapshot across discovery and all scans, not a
+    // fresh single-use transaction per query.
+    for (i, selector) in seen.iter().enumerate().skip(1) {
+        let sel = selector
+            .as_ref()
+            .and_then(|s| s.selector.as_ref())
+            .unwrap_or_else(|| panic!("query {i} must carry a transaction selector"));
+        assert_eq!(
+            sel,
+            &v1::transaction_selector::Selector::Id(b"stats-ro-txn".to_vec()),
+            "query {i} must reuse the begun read-only transaction, not open its own"
+        );
+    }
 }
