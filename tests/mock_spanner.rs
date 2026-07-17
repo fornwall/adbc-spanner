@@ -3380,6 +3380,191 @@ fn autocommit_batch_dml_is_flagged_last_statements_but_manual_commit_is_not() {
     );
 }
 
+/// SPAN-8 (wire): `spanner.request.priority` must reach the `ExecuteBatchDml` RPC itself — the
+/// path *all* plain autocommit DML takes — and not only the transaction's commit. The client's
+/// `BatchDmlBuilder` gained the priority setter upstream (UP-4,
+/// googleapis/google-cloud-rust#6047); before it, the batch went out with
+/// `PRIORITY_UNSPECIFIED` while the caller had asked for `low`, so Spanner scheduled the actual
+/// DML work at the default priority. The request tag rides the same `RequestOptions`, so it is
+/// asserted here too.
+#[test]
+fn batch_dml_carries_the_request_priority_and_tag() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "batch_dml_carries_the_request_priority_and_tag",
+    );
+
+    let batch_dml: Arc<Mutex<Vec<v1::ExecuteBatchDmlRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let record = batch_dml.clone();
+    let server = MockServer::start(move |mock| {
+        serve_begin_transaction(mock);
+        mock.expect_execute_batch_dml().returning(move |request| {
+            record.lock().unwrap().push(request.into_inner());
+            Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
+                result_sets: vec![v1::ResultSet {
+                    metadata: Some(v1::ResultSetMetadata {
+                        transaction: Some(v1::Transaction {
+                            id: b"dml-txn".to_vec(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    stats: Some(v1::ResultSetStats {
+                        row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                status: Some(spanner_grpc_mock::google::rpc::Status {
+                    code: 0,
+                    message: "OK".into(),
+                    details: vec![],
+                }),
+                ..Default::default()
+            }))
+        });
+        mock.expect_commit().returning(|_| commit_ok());
+    });
+
+    let mut connection = server.connect();
+    connection
+        .set_option(
+            OptionConnection::Other(adbc_spanner::OPTION_REQUEST_PRIORITY.into()),
+            OptionValue::String("low".into()),
+        )
+        .expect("set the request priority");
+    connection
+        .set_option(
+            OptionConnection::Other(adbc_spanner::OPTION_REQUEST_TAG.into()),
+            OptionValue::String("etl-batch".into()),
+        )
+        .expect("set the request tag");
+
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_sql_query("INSERT INTO MockTable (c) VALUES ('x')")
+        .unwrap();
+    assert_eq!(statement.execute_update().expect("autocommit DML"), Some(1));
+
+    let seen = batch_dml.lock().unwrap();
+    assert_eq!(seen.len(), 1, "the INSERT rides a single ExecuteBatchDml");
+    let options = seen[0]
+        .request_options
+        .as_ref()
+        .expect("the batch must carry RequestOptions");
+    assert_eq!(
+        options.priority,
+        v1::request_options::Priority::Low as i32,
+        "spanner.request.priority must reach the ExecuteBatchDml request itself"
+    );
+    assert_eq!(options.request_tag, "etl-batch");
+}
+
+/// UP-5 (wire): the `spanner.ingest.batch_write` firehose path must carry
+/// `spanner.request.priority` and `spanner.transaction.tag` on its `BatchWrite` request — the
+/// client's `BatchWriteTransactionBuilder` gained those setters upstream
+/// (googleapis/google-cloud-rust#6073), before which a BatchWrite ingest silently ignored both.
+///
+/// The negative half is the contract's other side: `spanner.request.tag` must **not** appear.
+/// Spanner ignores per-request tags on BatchWrite (the reason the client exposes no setter for
+/// it), so the driver deliberately drops it rather than sending a tag that does nothing.
+#[test]
+fn batch_write_carries_the_priority_and_transaction_tag_but_not_the_request_tag() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "batch_write_carries_the_priority_and_transaction_tag_but_not_the_request_tag",
+    );
+
+    let requests: Arc<Mutex<Vec<v1::BatchWriteRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let record = requests.clone();
+    let server = MockServer::start(move |mock| {
+        mock.expect_batch_write().returning(move |request| {
+            record.lock().unwrap().push(request.into_inner());
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(Ok(v1::BatchWriteResponse {
+                indexes: vec![0],
+                status: Some(spanner_grpc_mock::google::rpc::Status {
+                    code: 0,
+                    message: "OK".into(),
+                    details: vec![],
+                }),
+                ..Default::default()
+            }))
+            .expect("scripted stream channel sized to fit");
+            Ok(tonic::Response::new(rx))
+        });
+    });
+
+    let mut connection = server.connect();
+    connection
+        .set_option(
+            OptionConnection::Other(adbc_spanner::OPTION_REQUEST_PRIORITY.into()),
+            OptionValue::String("high".into()),
+        )
+        .expect("set the request priority");
+    connection
+        .set_option(
+            OptionConnection::Other(adbc_spanner::OPTION_TRANSACTION_TAG.into()),
+            OptionValue::String("nightly-etl".into()),
+        )
+        .expect("set the transaction tag");
+    connection
+        .set_option(
+            OptionConnection::Other(adbc_spanner::OPTION_REQUEST_TAG.into()),
+            OptionValue::String("ignored-by-batch-write".into()),
+        )
+        .expect("set the request tag");
+
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("MockTable".into()),
+        )
+        .expect("set target table");
+    statement
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .expect("set ingest mode append");
+    statement
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_INGEST_BATCH_WRITE.into()),
+            OptionValue::String("true".into()),
+        )
+        .expect("route the ingest through BatchWrite");
+    statement.bind(ingest_batch(1)).expect("bind ingest data");
+    assert_eq!(
+        statement.execute_update().expect("BatchWrite ingest"),
+        Some(1)
+    );
+
+    let seen = requests.lock().unwrap();
+    assert_eq!(seen.len(), 1, "one chunk ⇒ one BatchWrite request");
+    let options = seen[0]
+        .request_options
+        .as_ref()
+        .expect("the BatchWrite must carry RequestOptions");
+    assert_eq!(
+        options.priority,
+        v1::request_options::Priority::High as i32,
+        "spanner.request.priority must reach the BatchWrite request"
+    );
+    assert_eq!(
+        options.transaction_tag, "nightly-etl",
+        "spanner.transaction.tag must tag the transactions the BatchWrite creates"
+    );
+    assert_eq!(
+        options.request_tag, "",
+        "spanner.request.tag must NOT be sent — Spanner ignores per-request tags on BatchWrite"
+    );
+    assert!(
+        !seen[0].exclude_txn_from_change_streams,
+        "no driver option exposes change-stream exclusion yet, so the default must go out"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Shared client stack (SPAN-1)
 // ---------------------------------------------------------------------------

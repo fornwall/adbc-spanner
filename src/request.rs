@@ -10,15 +10,17 @@
 //! onto the client's builders:
 //!
 //! - [`OPTION_REQUEST_PRIORITY`](crate::OPTION_REQUEST_PRIORITY) (`spanner.request.priority`) —
-//!   `low` / `medium` / `high` (exact lowercase). Applied to every query/DML statement the driver
-//!   builds and, as the commit priority, to every read/write transaction runner. Connection and
-//!   statement level.
+//!   `low` / `medium` / `high` (exact lowercase). Applied to every query/DML statement and
+//!   `ExecuteBatchDml` batch the driver builds, to the `BatchWrite` ingest request, and — as the
+//!   commit priority — to every read/write transaction runner. Connection and statement level.
 //! - [`OPTION_REQUEST_TAG`](crate::OPTION_REQUEST_TAG) (`spanner.request.tag`) — a free-form
 //!   per-request tag, applied to every statement and `ExecuteBatchDml` batch the driver builds.
-//!   Connection and statement level.
+//!   Not applied to `BatchWrite`, which ignores request tags server-side. Connection and statement
+//!   level.
 //! - [`OPTION_TRANSACTION_TAG`](crate::OPTION_TRANSACTION_TAG) (`spanner.transaction.tag`) — a
 //!   free-form per-transaction tag, applied wherever a read/write transaction runner is built
-//!   (autocommit DML, the manual-mode commit, ingest commits). Connection level only.
+//!   (autocommit DML, the manual-mode commit, ingest commits) and to the transactions a
+//!   `BatchWrite` ingest creates. Connection level only.
 //! - [`OPTION_MAX_COMMIT_DELAY`](crate::OPTION_MAX_COMMIT_DELAY) (`spanner.commit.max_delay`) — the
 //!   maximum amount of time Spanner may delay a **commit** to batch it with others (a
 //!   throughput-for-latency trade-off). A duration in `0..=500ms`, applied at every read/write
@@ -43,7 +45,8 @@ use std::time::Duration;
 use adbc_core::error::Result;
 use adbc_core::options::OptionValue;
 use google_cloud_spanner::builder::{
-    BatchDmlBuilder, TransactionRunnerBuilder, WriteOnlyTransactionBuilder,
+    BatchDmlBuilder, BatchWriteTransactionBuilder, TransactionRunnerBuilder,
+    WriteOnlyTransactionBuilder,
 };
 use google_cloud_spanner::model::request_options::Priority;
 use google_cloud_spanner::statement::StatementBuilder;
@@ -254,13 +257,38 @@ impl RequestConfig {
         builder
     }
 
-    /// Apply the request tag to an `ExecuteBatchDml` batch builder. (The batch request carries a
-    /// single request-level tag; the client exposes no batch-level priority setter — the runner's
-    /// commit priority, from [`Self::apply_to_runner`], covers the transaction's commit instead.)
+    /// Apply the priority and request tag to an `ExecuteBatchDml` batch builder. The batch request
+    /// carries a single request-level `RequestOptions`, so both apply to the batch as a whole (the
+    /// runner's commit priority, from [`Self::apply_to_runner`], still covers the transaction's
+    /// commit).
     #[must_use]
     pub(crate) fn apply_to_batch_dml(&self, mut builder: BatchDmlBuilder) -> BatchDmlBuilder {
+        if let Some(priority) = self.priority {
+            builder = builder.set_priority(priority.to_client());
+        }
         if let Some(tag) = &self.request_tag {
             builder = builder.set_request_tag(tag.as_str());
+        }
+        builder
+    }
+
+    /// Apply the priority and transaction tag to a `BatchWrite` builder (the
+    /// `spanner.ingest.batch_write` firehose ingest path).
+    ///
+    /// The **request** tag is deliberately not applied: per-request tags apply only to queries and
+    /// reads, and Spanner ignores them on `BatchWrite` (the client's builder exposes no setter for
+    /// that reason). Nor is there a commit delay or commit-stats setter — BatchWrite carries no
+    /// per-request commit options — so this is not one of the `apply_to_commit_builder!` sites.
+    #[must_use]
+    pub(crate) fn apply_to_batch_write(
+        &self,
+        mut builder: BatchWriteTransactionBuilder,
+    ) -> BatchWriteTransactionBuilder {
+        if let Some(priority) = self.priority {
+            builder = builder.set_priority(priority.to_client());
+        }
+        if let Some(tag) = &self.transaction_tag {
+            builder = builder.set_transaction_tag(tag.as_str());
         }
         builder
     }

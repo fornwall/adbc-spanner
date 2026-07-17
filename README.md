@@ -55,8 +55,9 @@ Early, tested end-to-end against the Spanner emulator.
       ingest's per-chunk mutations through Spanner's **BatchWrite** RPC instead of a write-only
       transaction (insert/count/error semantics and chunking preserved; BatchWrite applies its mutation
       groups non-atomically). It only affects autocommit ingests — a manual transaction ignores it and
-      still buffers and commits atomically — and, since BatchWrite carries no per-request commit options,
-      the priority / request-tag / `commit.max_delay` / `commit_stats` options do not apply on that path.
+      still buffers and commits atomically. The priority and transaction-tag options apply on that path;
+      the request-tag option does not (Spanner ignores per-request tags on BatchWrite), and neither do
+      `commit.max_delay` / `commit_stats`, since BatchWrite carries no per-request commit options.
       TODO: Move BatchWrite to section below. perhaps a dedicated bulk ingestion explaining everything around
       that - supported moves, BatchWrite, transaction splitting, transaction behaviour, etc.
 - Manual transactions (setting `adbc.connection.autocommit=false` plus `commit()`/`rollback()`):

@@ -620,10 +620,11 @@ pub const OPTION_INGEST_PRIMARY_KEY: &str = "spanner.ingest.primary_key";
 ///
 /// Only affects **autocommit** ingests. In manual-transaction mode ingests buffer their mutations
 /// and commit atomically with the surrounding transaction, so BatchWrite does not apply there and
-/// this flag is ignored. Because `BatchWrite` takes no per-request commit options, the
-/// `spanner.request.priority` / `spanner.request.tag` / `spanner.commit.max_delay` /
-/// `spanner.commit_stats` settings are **not** applied on this path (and `spanner.commit_stats`
-/// consequently reports no `mutation_count` for a BatchWrite ingest).
+/// this flag is ignored. `spanner.request.priority` and `spanner.transaction.tag` do reach this
+/// path, but `spanner.request.tag` does not (Spanner ignores per-request tags on `BatchWrite`),
+/// and neither do `spanner.commit.max_delay` / `spanner.commit_stats` — `BatchWrite` takes no
+/// per-request commit options (so `spanner.commit_stats` reports no `mutation_count` for a
+/// BatchWrite ingest).
 ///
 /// `""` (empty) unsets it, back to the write-only-transaction path. `get_option` round-trips the
 /// effective value as `"true"`/`"false"`.
