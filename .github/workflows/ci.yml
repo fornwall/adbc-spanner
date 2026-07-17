@@ -89,7 +89,12 @@ jobs:
           exit 1
 
       - name: Unit tests
-        run: cargo test --lib
+        # --features fuzzing so the `#[cfg(feature = "fuzzing")]` unit tests run in CI too — in
+        # particular `fuzzing::tests::partition_seed_corpus_satisfies_the_oracle`, which guards the
+        # fuzz seed corpus against the decode oracle. The feature only adds the `fuzzing` helper
+        # module (pulling in `arbitrary`); it needs no nightly, and libFuzzer is not involved (the
+        # nightly `fuzz.yml` runs `cargo fuzz run`, which never executes these `#[test]`s).
+        run: cargo test --lib --features fuzzing
 
       - name: Doctests
         # Neither `--lib` nor `--all-targets` runs doctests, so run them
