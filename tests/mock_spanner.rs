@@ -928,6 +928,67 @@ fn execute_partitions_rejects_multiple_bound_rows_and_consumes_them() {
     );
 }
 
+/// COR-12 regression: a **failed** parameterized (bound) query must still consume its bound rows,
+/// exactly like the DML/ingest/partition paths — otherwise a reused statement handle would silently
+/// re-apply the stale bound rows to a later, unrelated execution. The old bound-query path cleared
+/// `self.bound` only on success (the error propagated out via `?` before the clear), so a query that
+/// failed at the RPC left the rows behind.
+///
+/// The server returns `FAILED_PRECONDITION` for the streaming query, so `execute` fails. The proof
+/// the bound rows were consumed: `get_parameter_schema` then falls back to the SQL's `@name`
+/// references (a single field named `p`) instead of reflecting the stale bound batch's schema (whose
+/// column is named `c`).
+#[test]
+fn failed_bound_query_still_consumes_bound_rows() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "failed_bound_query_still_consumes_bound_rows",
+    );
+
+    let server = MockServer::start(|mock| {
+        mock.expect_execute_streaming_sql().returning(|_| {
+            Err(tonic::Status::failed_precondition(
+                "the mock server rejected the bound query",
+            ))
+        });
+    });
+
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_sql_query("SELECT c FROM MockTable WHERE c = @p")
+        .unwrap();
+    // The bound column is named `c` (positional binding ignores the name): it maps to the sole
+    // `@p` parameter. If the failed query fails to consume it, `get_parameter_schema` below would
+    // report a field named `c` rather than `p`.
+    let param_schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Utf8, false)]));
+    let param_batch =
+        RecordBatch::try_new(param_schema, vec![Arc::new(StringArray::from(vec!["v1"]))])
+            .expect("build bound batch");
+    statement.bind(param_batch).expect("bind parameter row");
+
+    let error = statement
+        .execute()
+        .err()
+        .expect("the bound query must fail (the server rejects it), not hang or succeed");
+    assert_eq!(error.status, AdbcStatus::InvalidState, "got error: {error}");
+
+    // The failed attempt consumed the bound rows: `get_parameter_schema` now derives the parameter
+    // from the SQL's `@p` reference (field `p`) rather than the stale bound batch (field `c`).
+    let params = statement.get_parameter_schema().expect("parameter schema");
+    assert_eq!(
+        params.fields().len(),
+        1,
+        "the parameter schema must come from the SQL's @name references, not stale bound rows"
+    );
+    assert_eq!(
+        params.field(0).name(),
+        "p",
+        "a surviving bound batch would report its own column name (`c`); consuming it falls back \
+         to the SQL parameter name (`p`)"
+    );
+}
+
 /// COR-3 regression, manual-mode half: in a manual transaction `execute_update` on a SELECT must
 /// run it immediately as a read-only query (on the transaction's shared multi-use read-only
 /// transaction, which it begins) and buffer **nothing** to commit — the old mis-routing buffered

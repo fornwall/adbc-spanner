@@ -1179,11 +1179,13 @@ impl SpannerStatement {
         // in a manual transaction that began with DML — the buffered work only executes at
         // commit, so the query would not observe it (no read-your-writes).
         self.ensure_query_allowed()?;
-        // Parameterized query: run once per bound row.
+        // Parameterized query: run once per bound row. The attempt consumes the bound rows on
+        // every exit path — following the DML/ingest/partition convention (see `clear_bound`), a
+        // failed bound query must not leave stale rows for a later, unrelated `execute` (COR-12).
         if !self.bound.is_empty() {
-            let reader = self.execute_bound_query(&sql)?;
+            let result = self.execute_bound_query(&sql);
             self.clear_bound();
-            return Ok(reader);
+            return result;
         }
         let manual_txn = self.manual_read_transaction()?;
         let client = self.client.clone();
