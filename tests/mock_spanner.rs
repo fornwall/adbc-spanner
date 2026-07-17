@@ -507,6 +507,16 @@ fn batch_write_group_already_exists() -> v1::BatchWriteResponse {
     }
 }
 
+/// One streamed `BatchWriteResponse` reporting that the mutation groups `indexes` applied (an
+/// absent/`OK` status is BatchWrite's "these groups committed" signal).
+fn batch_write_groups_ok(indexes: Vec<i32>) -> v1::BatchWriteResponse {
+    v1::BatchWriteResponse {
+        indexes,
+        status: None,
+        commit_timestamp: Some(prost_types::Timestamp::default()),
+    }
+}
+
 /// Serve `BeginTransaction` (the write-only ingest path begins a read/write transaction before each
 /// `Commit`), returning a fixed transaction id.
 fn serve_begin_transaction(mock: &mut MockSpanner) {
@@ -1847,6 +1857,78 @@ fn batch_write_group_failure_forwards_status_details() {
     assert_eq!(
         json["domain"], "spanner.googleapis.com",
         "the ErrorInfo's domain must round-trip what the mock sent, got: {json}"
+    );
+}
+
+/// (d⁗) **BatchWrite same-chunk applied rows (COR-5).** BatchWrite applies mutation groups
+/// non-atomically, so groups *before* a failing one within the same chunk stay committed. The error
+/// annotation must therefore report those same-chunk applied rows — not just whole earlier chunks —
+/// so the caller learns the true table state. The mock streams two OK groups then a failing one in a
+/// single chunk; before the fix `applied` was discarded and the count would be zero (no annotation).
+#[test]
+fn batch_write_folds_same_chunk_applied_rows_into_committed_count() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "batch_write_folds_same_chunk_applied_rows_into_committed_count",
+    );
+
+    let server = MockServer::start(move |mock| {
+        mock.expect_batch_write().returning(move |_| {
+            let (tx, rx) = tokio::sync::mpsc::channel(2);
+            // Two groups apply, then a third fails — all within this one chunk.
+            tx.try_send(Ok(batch_write_groups_ok(vec![0, 1])))
+                .expect("scripted stream channel sized to fit");
+            tx.try_send(Ok(batch_write_group_already_exists()))
+                .expect("scripted stream channel sized to fit");
+            Ok(tonic::Response::new(rx))
+        });
+    });
+
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("MockTable".into()),
+        )
+        .expect("set target table");
+    statement
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .expect("set ingest mode append");
+    statement
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_INGEST_BATCH_WRITE.into()),
+            OptionValue::String("true".into()),
+        )
+        .expect("route the ingest through BatchWrite");
+    // Three rows ⇒ three MutationGroups in one chunk; the mock scripts two applied + one failed.
+    statement.bind(ingest_batch(3)).expect("bind ingest data");
+
+    let error = statement
+        .execute_update()
+        .expect_err("a failed mutation group must fail the ingest");
+
+    // The underlying failure survives the annotation (status + remap naming the table).
+    assert_eq!(
+        error.status,
+        AdbcStatus::AlreadyExists,
+        "got error: {error}"
+    );
+    assert!(
+        error.message.contains("MockTable"),
+        "the append remap should name the target table; got: {}",
+        error.message
+    );
+    // COR-5: the two groups that applied within this same chunk are folded into the count.
+    assert!(
+        error
+            .message
+            .contains("2 row(s) from this bulk ingest were already committed"),
+        "the same-chunk applied groups must be reported; got: {}",
+        error.message
     );
 }
 

@@ -726,8 +726,7 @@ impl SpannerStatement {
             // is deliberately left out of the mutation-limit bisect. (Its own per-request size limit
             // could warrant a follow-up, but is not this backstop's concern.)
             let mutations = self.build_range_mutations(target, start, end)?;
-            self.batch_write_chunk(mutations)
-                .map_err(|e| note_rows_already_committed(e, prior_total))
+            self.batch_write_chunk(mutations, prior_total)
         } else {
             self.write_mutation_range(target, start, end, prior_total)
         }
@@ -801,8 +800,10 @@ impl SpannerStatement {
     /// details — becomes the returned error via [`from_status_parts`] (so a duplicate primary key
     /// still surfaces as `AlreadyExists`, its structured details reach `Error::details`, and the
     /// append/create remaps fire, exactly as on the write-only path). Because a non-atomic batch may
-    /// have applied some groups before the failing one, an error here is combined with the
-    /// already-committed-rows annotation by the caller ([`run_ingest_mutations`](Self::run_ingest_mutations)).
+    /// have applied some groups before the failing one — or before a mid-stream transport error —
+    /// any error is annotated with the already-committed-row count via [`note_rows_already_committed`]
+    /// here (COR-5), folding this chunk's `applied` groups (one row each) into `prior_total` so the
+    /// count covers *both* earlier chunks and this chunk's committed rows.
     ///
     /// The request does carry `spanner.request.priority` and `spanner.transaction.tag`
     /// ([`RequestConfig::apply_to_batch_write`](crate::request::RequestConfig::apply_to_batch_write)).
@@ -810,7 +811,7 @@ impl SpannerStatement {
     /// `spanner.commit.max_delay` and `spanner.commit_stats` do not apply on this path; nor does
     /// `spanner.request.tag`, which Spanner ignores for BatchWrite (documented on
     /// [`OPTION_INGEST_BATCH_WRITE`](crate::OPTION_INGEST_BATCH_WRITE)).
-    fn batch_write_chunk(&self, mutations: Vec<Mutation>) -> Result<i64> {
+    fn batch_write_chunk(&self, mutations: Vec<Mutation>, prior_total: i64) -> Result<i64> {
         if mutations.is_empty() {
             return Ok(0);
         }
@@ -832,14 +833,27 @@ impl SpannerStatement {
                 self.config.timeouts.update_timeout(),
                 crate::OPTION_RPC_TIMEOUT_UPDATE,
                 async move {
-                    let mut stream = transaction
-                        .execute_streaming(groups)
-                        .await
-                        .map_err(from_spanner)?;
+                    let mut stream = match transaction.execute_streaming(groups).await {
+                        Ok(stream) => stream,
+                        // Nothing streamed yet, so only earlier chunks are committed.
+                        Err(e) => {
+                            return Err(note_rows_already_committed(from_spanner(e), prior_total));
+                        }
+                    };
                     let mut applied = 0_i64;
                     let mut first_error: Option<Error> = None;
                     while let Some(response) = stream.next().await {
-                        let response = response.map_err(from_spanner)?;
+                        // A mid-stream transport error: the groups reported OK so far stay
+                        // committed (BatchWrite is non-atomic), so fold `applied` into the count.
+                        let response = match response {
+                            Ok(response) => response,
+                            Err(e) => {
+                                return Err(note_rows_already_committed(
+                                    from_spanner(e),
+                                    prior_total + applied,
+                                ));
+                            }
+                        };
                         // An `OK` (or absent) status means the referenced groups applied; any other
                         // status marks them failed — capture the first such failure to return.
                         match response.status.as_ref().filter(|s| s.code != 0) {
@@ -855,7 +869,11 @@ impl SpannerStatement {
                         }
                     }
                     match first_error {
-                        Some(error) => Err(error),
+                        // A failing group is non-atomic with the rest, so the groups that did apply
+                        // (this chunk's `applied`, plus earlier chunks) are folded into the count.
+                        Some(error) => {
+                            Err(note_rows_already_committed(error, prior_total + applied))
+                        }
                         None => Ok(applied),
                     }
                 },
@@ -2228,14 +2246,16 @@ fn rows_per_batch_option(value: OptionValue) -> Result<usize> {
     crate::options::positive_usize(value, "option spanner.rows_per_batch")
 }
 
-/// Annotate a failed chunk commit of a multi-chunk autocommit ingest with the number of rows the
-/// earlier chunks have already committed.
+/// Annotate a failed autocommit ingest commit with the number of rows already committed and left in
+/// the table.
 ///
 /// Each chunk commits in its own transaction (see
 /// [`SpannerStatement::run_ingest_mutations`]), so a mid-ingest failure leaves the earlier chunks'
-/// rows in the table. The count is known exactly — it is the sum of the committed chunk sizes —
-/// and reporting it tells the caller what state the table was left in instead of making them
-/// guess. A failure in the first (or only) chunk committed nothing and passes through unchanged.
+/// rows in the table. On the write-only path a chunk is atomic, so `committed` is just the earlier
+/// chunks; on the non-atomic BatchWrite path it also includes the failing chunk's groups that did
+/// apply (COR-5). Either way the count is known exactly, and reporting it tells the caller what
+/// state the table was left in instead of making them guess. A first-chunk failure that committed
+/// nothing passes through unchanged.
 /// The status and `vendor_code` are preserved, so callers still branch on the underlying failure
 /// (e.g. `AlreadyExists` for a duplicate primary key).
 fn note_rows_already_committed(error: Error, committed: i64) -> Error {
@@ -2244,8 +2264,8 @@ fn note_rows_already_committed(error: Error, committed: i64) -> Error {
     }
     let mut annotated = err(
         format!(
-            "{} ({committed} row(s) from this bulk ingest's earlier chunks were already \
-             committed and remain in the table)",
+            "{} ({committed} row(s) from this bulk ingest were already committed and remain \
+             in the table)",
             error.message
         ),
         error.status,
@@ -2416,7 +2436,7 @@ mod tests {
         assert!(
             annotated
                 .message
-                .contains("4000 row(s) from this bulk ingest's earlier chunks were already"),
+                .contains("4000 row(s) from this bulk ingest were already committed"),
             "{}",
             annotated.message
         );

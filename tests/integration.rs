@@ -3794,7 +3794,7 @@ fn bulk_ingest_mid_chunk_failure_reports_committed_rows() {
     );
     assert!(
         error.message.contains(&format!(
-            "{committed} row(s) from this bulk ingest's earlier chunks were already committed"
+            "{committed} row(s) from this bulk ingest were already committed"
         )),
         "the error must report the rows already committed ({committed} found in the table): {error:?}"
     );
