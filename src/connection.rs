@@ -901,6 +901,47 @@ pub(crate) fn run_batch_dml(
     )
 }
 
+/// Execute a single DML statement as Spanner **Partitioned DML** via the client's
+/// `partitioned_dml_transaction()` path, returning a *lower bound* on the number of rows modified.
+///
+/// Partitioned DML begins its own implicitly-committed transaction (there is no separate `commit`
+/// RPC and it cannot be rolled back), which Spanner partitions and applies to each partition
+/// independently — large-scale, idempotent, **non-atomic** DML. Because the statement is
+/// idempotent, a partition may be applied more than once, so Spanner reports only a lower bound on
+/// the affected-row count; that lower bound is what this returns. This is only reached from
+/// autocommit mode for a single statement — the statement-level guards
+/// ([`SpannerStatement::run_partitioned_dml`](crate::statement::SpannerStatement::run_partitioned_dml))
+/// reject manual-transaction / `THEN RETURN` / batch / bound cases before this is called.
+///
+/// The caller's `spanner.rpc.timeout_seconds.update` value (`config.timeouts`) bounds the whole
+/// operation; expiry fails with [`Status::Timeout`]. Commit stats do not apply (there is no commit
+/// response to carry them). The request priority / tag, query optimizer and retry options already
+/// ride on the passed-in `statement` builder (built via
+/// [`SpannerStatement::sql_builder`](crate::statement::SpannerStatement)).
+pub(crate) fn run_partitioned_dml(
+    runtime: &SharedRuntime,
+    client: &DatabaseClient,
+    cancel: &CancelSignal,
+    config: &SharedConfig,
+    statement: SpannerSql,
+) -> Result<i64> {
+    let client = client.clone();
+    let timeout = config.timeouts.update_timeout();
+    let transaction = async move {
+        let txn = client
+            .partitioned_dml_transaction()
+            .build()
+            .await
+            .map_err(from_spanner)?;
+        txn.execute_update(statement).await.map_err(from_spanner)
+    };
+    block_on_cancellable(
+        runtime,
+        cancel,
+        with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_UPDATE, transaction),
+    )
+}
+
 /// Apply DML `statements` and buffered `mutations` atomically in **one** read/write transaction,
 /// returning the DML statements' total affected-row count (mutations report no count).
 ///

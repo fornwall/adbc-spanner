@@ -701,6 +701,36 @@ pub const OPTION_INGEST_PRIMARY_KEY: &str = "spanner.ingest.primary_key";
 /// effective value as `"true"`/`"false"`.
 pub const OPTION_INGEST_BATCH_WRITE: &str = "spanner.ingest.batch_write";
 
+/// Driver-specific **statement** option: run an **autocommit** DML statement as Spanner
+/// [Partitioned DML](https://docs.cloud.google.com/spanner/docs/dml-partitioned) — large-scale,
+/// idempotent, **non-atomic** DML that Spanner automatically partitions and applies to each
+/// partition independently (and may retry per partition), instead of the ordinary read/write
+/// transaction.
+///
+/// A boolean, default `false`. When `true`, a plain `UPDATE`/`DELETE` runs through the client's
+/// `partitioned_dml_transaction()` path, which begins an implicitly-committed Partitioned DML
+/// transaction and returns a **lower bound** on the number of rows modified (Partitioned DML may
+/// apply a partition more than once, so the true count can be higher — Spanner reports only the
+/// lower bound). Because a partitioned statement runs its own transaction and cannot be
+/// buffered/rolled back, this is only meaningful for a **single** autocommit statement. It is
+/// therefore rejected:
+///
+/// - in a **manual transaction** (`adbc.connection.autocommit=false`) — `InvalidState`; Partitioned
+///   DML cannot be buffered and committed with the surrounding transaction;
+/// - with a **`THEN RETURN`** clause — `InvalidArguments`; Partitioned DML returns only a row-count
+///   lower bound, not rows;
+/// - for a **`;`-separated multi-statement batch** or **bound parameters** — `InvalidArguments`;
+///   Partitioned DML executes exactly one statement.
+///
+/// The statement must be a partitionable DML statement (a fully-partitionable `UPDATE`/`DELETE`);
+/// Spanner rejects any other statement (e.g. `INSERT`, or a `WHERE` clause it cannot partition) at
+/// execution time. The `spanner.request.*` / `spanner.query.*` / `spanner.retry.*` /
+/// `spanner.rpc.timeout_seconds.update` options that ride on the statement builder apply here too.
+///
+/// `""` (empty) unsets it, back to the ordinary read/write DML path. `get_option` round-trips the
+/// effective value as `"true"`/`"false"`.
+pub const OPTION_PARTITIONED_DML: &str = "spanner.partitioned_dml";
+
 /// Driver-specific connection **and** statement option: the **read bound** for read-only queries.
 ///
 /// The value is one of four prefixed forms — two *relative* (a duration in the past) and two
@@ -1026,6 +1056,8 @@ mod options_doc_tests {
             crate::OPTION_ROWS_PER_BATCH,
             crate::OPTION_DATA_BOOST,
             crate::OPTION_INGEST_PRIMARY_KEY,
+            crate::OPTION_INGEST_BATCH_WRITE,
+            crate::OPTION_PARTITIONED_DML,
             crate::OPTION_READ_STALENESS,
             crate::OPTION_REQUEST_PRIORITY,
             crate::OPTION_REQUEST_TAG,

@@ -161,6 +161,12 @@ pub struct SpannerStatement {
     /// [`run_ingest_mutations`](Self::run_ingest_mutations). Ignored in manual-transaction mode,
     /// where ingests buffer and commit atomically with the surrounding transaction.
     ingest_batch_write: bool,
+    /// Run an autocommit DML statement as Spanner **Partitioned DML** (`spanner.partitioned_dml`,
+    /// boolean, default `false`) — large-scale, idempotent, non-atomic DML — instead of the ordinary
+    /// read/write transaction. See [`run_partitioned_dml`](Self::run_partitioned_dml). Only valid for
+    /// a single autocommit statement: rejected in manual-transaction mode, with `THEN RETURN`, for a
+    /// `;`-batch and for bound parameters.
+    partitioned_dml: bool,
     /// How bound columns pair with the query's `@name` parameters
     /// (`adbc.statement.bind_by_name`): `false` (the default) binds positionally, `true` forces
     /// strict by-name. See [`bind::resolve_parameter_names`].
@@ -210,6 +216,7 @@ impl SpannerStatement {
             ingest_mode: None,
             ingest_primary_key: None,
             ingest_batch_write: false,
+            partitioned_dml: false,
             bind_by_name: false,
             rows_per_batch: DEFAULT_ROWS_PER_BATCH,
             data_boost: false,
@@ -1055,6 +1062,18 @@ impl SpannerStatement {
     /// `commit`, and `ExecuteBatchDml` — the commit path — rejects `THEN RETURN` outright, so the
     /// returned rows would be silently unobtainable. It is rejected up front instead.
     fn run_dml(&self, sql: &str) -> Result<DmlOutcome> {
+        if self.partitioned_dml {
+            // Partitioned DML returns only a row-count lower bound, never rows, so `THEN RETURN` is
+            // incompatible with it. Reject the combination up front (the client's Partitioned DML
+            // path has nowhere to surface returned rows).
+            if crate::sql::is_dml_returning(sql) {
+                return Err(invalid_argument(
+                    "Partitioned DML (spanner.partitioned_dml) does not support THEN RETURN: it \
+                     reports only a lower bound on the affected-row count, not rows",
+                ));
+            }
+            return Ok(DmlOutcome::Plain(Some(self.run_partitioned_dml(sql)?)));
+        }
         if !crate::sql::is_dml_returning(sql) {
             let statements = self.build_dml_statements(sql)?;
             return Ok(DmlOutcome::Plain(self.run_or_buffer(statements)?));
@@ -1086,6 +1105,50 @@ impl SpannerStatement {
             schema,
             affected,
         })
+    }
+
+    /// Run a single autocommit DML statement as Spanner **Partitioned DML**
+    /// (`spanner.partitioned_dml`): large-scale, idempotent, non-atomic DML that Spanner partitions
+    /// and applies to each partition independently. Returns a *lower bound* on the number of rows
+    /// modified (a partition may be applied more than once, so the true count can be higher).
+    ///
+    /// Partitioned DML runs its own implicitly-committed transaction — it cannot be buffered,
+    /// committed with a surrounding transaction, or rolled back — so it is only meaningful for a
+    /// single statement in autocommit mode. This rejects the cases that break those invariants:
+    /// manual-transaction mode ([`Status::InvalidState`]), and a bound-parameter or `;`-batch
+    /// statement ([`Status::InvalidArguments`], since Partitioned DML executes exactly one
+    /// statement). `THEN RETURN` is rejected earlier, in [`run_dml`](Self::run_dml).
+    fn run_partitioned_dml(&self, sql: &str) -> Result<i64> {
+        if !lock_txn(&self.txn).autocommit() {
+            return Err(invalid_state(
+                "Partitioned DML (spanner.partitioned_dml) cannot run in a manual transaction: it \
+                 runs its own implicitly-committed transaction and cannot be buffered or committed \
+                 with the surrounding transaction. Re-enable autocommit to run it",
+            ));
+        }
+        if !self.bound.is_empty() {
+            return Err(invalid_argument(
+                "Partitioned DML (spanner.partitioned_dml) does not support bound parameters: it \
+                 executes exactly one statement",
+            ));
+        }
+        let parts = crate::sql::split_statements(sql);
+        if parts.len() > 1 {
+            return Err(invalid_argument(
+                "Partitioned DML (spanner.partitioned_dml) does not support a multi-statement \
+                 (`;`-separated) batch: it executes exactly one statement",
+            ));
+        }
+        let statement = self
+            .sql_builder(parts.first().map_or(sql, String::as_str))
+            .build();
+        crate::connection::run_partitioned_dml(
+            &self.runtime,
+            &self.client,
+            &self.cancel.current(),
+            &self.config,
+            statement,
+        )
     }
 
     /// Run a parameterized query once per bound row, streaming the concatenated results.
@@ -1701,6 +1764,9 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) if k == crate::OPTION_INGEST_BATCH_WRITE => {
                 self.ingest_batch_write = ingest_batch_write_option(value)?;
             }
+            OptionStatement::Other(k) if k == crate::OPTION_PARTITIONED_DML => {
+                self.partitioned_dml = partitioned_dml_option(value)?;
+            }
             OptionStatement::Other(k) if k == crate::OPTION_BIND_BY_NAME => {
                 self.bind_by_name =
                     crate::options::bool_option(value, "option adbc.statement.bind_by_name")?;
@@ -1754,6 +1820,10 @@ impl Optionable for SpannerStatement {
             // A plain boolean; reports "true"/"false" (the default is "false", write-only txn).
             OptionStatement::Other(k) if k == crate::OPTION_INGEST_BATCH_WRITE => {
                 Some(self.ingest_batch_write.to_string())
+            }
+            // A plain boolean; reports "true"/"false" (the default is "false", ordinary read/write DML).
+            OptionStatement::Other(k) if k == crate::OPTION_PARTITIONED_DML => {
+                Some(self.partitioned_dml.to_string())
             }
             // A plain boolean; reports "true"/"false" (the default is "false", positional).
             OptionStatement::Other(k) if k == crate::OPTION_BIND_BY_NAME => {
@@ -2236,6 +2306,17 @@ fn ingest_batch_write_option(value: OptionValue) -> Result<bool> {
     }
 }
 
+/// Parse the `spanner.partitioned_dml` statement option. Like the driver's other unset-able
+/// booleans (`spanner.ingest.batch_write`, `spanner.commit_stats`), an empty/whitespace string
+/// unsets it (back to `false`, the ordinary read/write DML path); otherwise it is a boolean string
+/// (exactly `true`/`false`).
+fn partitioned_dml_option(value: OptionValue) -> Result<bool> {
+    match &value {
+        OptionValue::String(s) if s.trim().is_empty() => Ok(false),
+        _ => crate::options::bool_option(value, "option spanner.partitioned_dml"),
+    }
+}
+
 /// Parse the positive `spanner.rows_per_batch` option, accepted as either an integer or a numeric
 /// string.
 fn rows_per_batch_option(value: OptionValue) -> Result<usize> {
@@ -2579,6 +2660,25 @@ mod tests {
             assert_eq!(error.status, Status::InvalidArguments, "{bad}");
         }
         let error = ingest_batch_write_option(OptionValue::Int(1)).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+    }
+
+    #[test]
+    fn partitioned_dml_option_coerces_and_unsets_on_empty() {
+        // The accepted boolean spellings coerce: exactly the strings "true"/"false".
+        assert!(partitioned_dml_option(OptionValue::String("true".into())).unwrap());
+        assert!(!partitioned_dml_option(OptionValue::String("false".into())).unwrap());
+        // Empty / whitespace unsets it, back to the default (false) — never an error.
+        for empty in ["", "   "] {
+            assert!(!partitioned_dml_option(OptionValue::String(empty.into())).unwrap());
+        }
+        // A non-bool string and an int-typed set are rejected with InvalidArguments (the shared
+        // boolean coercion), like the other unset-able booleans.
+        for bad in ["maybe", "TRUE", "1", "yes", "FALSE", "0", "no"] {
+            let error = partitioned_dml_option(OptionValue::String(bad.into())).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "{bad}");
+        }
+        let error = partitioned_dml_option(OptionValue::Int(1)).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
     }
 
