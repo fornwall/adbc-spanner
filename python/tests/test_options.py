@@ -66,6 +66,18 @@ _LEVELS = [
     ("Statement options", StatementOptions),
 ]
 
+# Each option *level* draws its documented keys from one or more `docs/options.md`
+# sections. The docs split the shared options — the ones available on BOTH the
+# connection and the statement — into their own `## Shared options …` section
+# rather than repeating them under each level, so that one section feeds both the
+# connection and the statement levels.
+_SHARED_SECTION = "Shared options (connection and statement)"
+_LEVEL_SECTIONS = {
+    "Database options": ["Database options"],
+    "Connection options": ["Connection-only options", _SHARED_SECTION],
+    "Statement options": ["Statement-only options", _SHARED_SECTION],
+}
+
 
 def _require_sources():
     if not _LIB_RS.is_file() or not _OPTIONS_MD.is_file():
@@ -80,14 +92,21 @@ def _driver_option_keys():
 
 
 def _documented_keys_by_level():
-    """`{level heading: {key, ...}}` from the per-level tables of `docs/options.md`."""
-    by_level = {}
+    """`{level name: {key, ...}}` — the option keys documented at each level.
+
+    A level aggregates the tables of one or more `docs/options.md` sections (see
+    `_LEVEL_SECTIONS`); the shared section, documenting options available on both
+    the connection and the statement, feeds both of those levels.
+    """
+    keys_by_section = {}
     for section in re.split(r"^## ", _OPTIONS_MD.read_text(), flags=re.M):
         heading = section.split("\n", 1)[0].strip()
-        if heading in {name for name, _ in _LEVELS}:
-            by_level[heading] = set(_DOC_TABLE_KEY_RE.findall(section))
-    missing = {name for name, _ in _LEVELS} - by_level.keys()
-    assert not missing, f"docs/options.md has no section(s) for {sorted(missing)}"
+        keys_by_section[heading] = set(_DOC_TABLE_KEY_RE.findall(section))
+    by_level = {}
+    for level, sections in _LEVEL_SECTIONS.items():
+        missing = [s for s in sections if s not in keys_by_section]
+        assert not missing, f"docs/options.md has no section(s) {missing} (for {level!r})"
+        by_level[level] = set().union(*(keys_by_section[s] for s in sections))
     return by_level
 
 
