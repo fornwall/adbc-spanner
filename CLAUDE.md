@@ -224,7 +224,7 @@ and **each is independently a crates.io publish blocker** — the crate cannot b
 lines plus `deny.toml` plus the docs; this list is the one place that enumerates every edit needed to
 revert a family to versioned crates.io releases. Current pinned revs:
 
-- `google-cloud-rust`: `deac9e2f8e72fc1251801f3e68b194984081cc70` (upstream `googleapis/google-cloud-rust` `main`)
+- `google-cloud-rust`: `5c1fe1315be4a85e66c6637a20fc8f626faa56a3` (upstream `googleapis/google-cloud-rust` `main`)
 - `apache/arrow-adbc`: `198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab`
 
 **Invariant:** the three arrow-adbc crates (`adbc_core`, `adbc_ffi`, `adbc_driver_manager`) must
@@ -474,9 +474,10 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   semantics, the row count and the append `NotFound`/`AlreadyExists` remap [a non-OK group status →
   `error::from_status_parts`, mapping the numeric gRPC code *and forwarding the status' details*
   like `from_spanner` — COR-8], is **ignored** in
-  manual mode [which buffers + commits atomically], and — since BatchWrite takes no per-request commit
-  options — bypasses the request priority/tag, `max_commit_delay` and `commit_stats` settings on that
-  path), `get_info` (static
+  manual mode [which buffers + commits atomically], and carries the request priority + transaction tag
+  [`RequestConfig::apply_to_batch_write`] but not the request tag [Spanner ignores per-request tags on
+  BatchWrite, so the client's builder exposes no setter] nor `max_commit_delay`/`commit_stats` [BatchWrite
+  takes no per-request commit options]), `get_info` (static
   driver/vendor metadata),
   `get_objects` (incl. foreign-key `constraint_column_usage`), `get_table_types`/`get_table_schema`,
   `get_parameter_schema`, `Connection`/`Statement::cancel` (a shared, sticky `CancelSignal`
@@ -508,8 +509,9 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   statement level [statement inherits, then overrides; `""` unsets — the staleness pattern],
   `spanner.transaction.tag` connection-only; parsed/applied via `RequestConfig` in `src/request.rs`
   — every user statement builder goes through `SpannerStatement::sql_builder`, `run_batch_dml`
-  tags the `ExecuteBatchDml` batch and the runner [commit priority + transaction tag; the client
-  has no batch-level priority setter], driver-internal metadata queries stay untagged), directed
+  applies the priority + request tag to the `ExecuteBatchDml` batch and the runner [commit priority +
+  transaction tag], `batch_write_chunk` the priority + transaction tag; driver-internal metadata
+  queries stay untagged), directed
   reads (`spanner.directed_read` at connection + statement level [statement inherits, then overrides;
   `""` unsets — the staleness pattern; round-trip via `get_option`] — a replica selection for
   read-only queries parsed by `DirectedRead`/`parse` in `src/directed_read.rs` [unit-tested offline]

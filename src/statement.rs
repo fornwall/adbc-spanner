@@ -804,21 +804,27 @@ impl SpannerStatement {
     /// have applied some groups before the failing one, an error here is combined with the
     /// already-committed-rows annotation by the caller ([`run_ingest_mutations`](Self::run_ingest_mutations)).
     ///
-    /// BatchWrite carries no per-request commit options and its response has no commit statistics,
-    /// so `spanner.request.priority` / `spanner.request.tag` / `spanner.commit.max_delay` /
-    /// `spanner.commit_stats` do not apply on this path (documented on
+    /// The request does carry `spanner.request.priority` and `spanner.transaction.tag`
+    /// ([`RequestConfig::apply_to_batch_write`](crate::request::RequestConfig::apply_to_batch_write)).
+    /// It has no per-request *commit* options and its response has no commit statistics, so
+    /// `spanner.commit.max_delay` and `spanner.commit_stats` do not apply on this path; nor does
+    /// `spanner.request.tag`, which Spanner ignores for BatchWrite (documented on
     /// [`OPTION_INGEST_BATCH_WRITE`](crate::OPTION_INGEST_BATCH_WRITE)).
     fn batch_write_chunk(&self, mutations: Vec<Mutation>) -> Result<i64> {
         if mutations.is_empty() {
             return Ok(0);
         }
-        let client = self.client.clone();
         // One mutation group per row: groups are applied independently, so per-row insert failures
         // (e.g. a duplicate key) do not roll back the rest of the chunk.
         let groups: Vec<MutationGroup> = mutations
             .into_iter()
             .map(|m| MutationGroup::new(vec![m]))
             .collect();
+        let transaction = self
+            .config
+            .request
+            .apply_to_batch_write(self.client.batch_write_transaction())
+            .build();
         block_on_cancellable(
             &self.runtime,
             &self.cancel.current(),
@@ -826,9 +832,7 @@ impl SpannerStatement {
                 self.config.timeouts.update_timeout(),
                 crate::OPTION_RPC_TIMEOUT_UPDATE,
                 async move {
-                    let mut stream = client
-                        .batch_write_transaction()
-                        .build()
+                    let mut stream = transaction
                         .execute_streaming(groups)
                         .await
                         .map_err(from_spanner)?;
