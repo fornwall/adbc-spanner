@@ -4,17 +4,15 @@
 //!
 //! The driver, connection and statement all accept the same handful of option shapes — booleans
 //! (as exactly the string `true`/`false`), plain strings, positive integers (as an integer or a
-//! numeric string), and `f64` seconds ([`f64_option`]). These used to be copy-pasted (with slightly
-//! divergent error text) into `driver.rs`, `connection.rs` and `statement.rs`; they live here so
-//! every level parses an option identically and returns the same `InvalidArguments` status on bad
-//! input.
+//! numeric string), and `f64` seconds ([`f64_option`]). They live here so every level parses an
+//! option identically and returns the same `InvalidArguments` status on bad input.
 //!
-//! Each helper takes a `what` label naming the offending option, so the shared error message can
-//! point at it. That label is always the option's **full key** (e.g. `"option spanner.emulator"`,
-//! not a short name like `"max_partitions"`): a caller reading the error needs the exact string
-//! they must fix, and a key spelled anywhere else can drift from the one actually dispatched on
-//! (IDIO-7). Callers whose key is an enum derive it — `format!("option {}", key.as_ref())`.
-//! [`f64_option`] is the exception: it takes the bare option key and prefixes `option ` itself.
+//! Each helper takes a `what` label naming the offending option. That label is always the option's
+//! **full key** (e.g. `"option spanner.emulator"`, not a short name like `"max_partitions"`): a
+//! caller reading the error needs the exact string they must fix, and a key spelled anywhere else
+//! can drift from the one actually dispatched on (IDIO-7). Callers whose key is an enum derive it —
+//! `format!("option {}", key.as_ref())`. [`f64_option`] is the exception: it takes the bare option
+//! key and prefixes `option ` itself.
 
 use std::time::Duration;
 
@@ -40,12 +38,10 @@ use crate::timeout::RpcTimeouts;
 /// including an int-typed value — is rejected with `InvalidArguments`.
 ///
 /// Int-typed sets are deliberately rejected rather than coerced: no surveyed ADBC driver accepts
-/// `SetOptionInt` for a boolean option (the C++ driver framework's `Option::AsBool` and Go's
-/// driverbase likewise reject/never route ints to booleans, and Rust `adbc_core`'s own
-/// `TryFrom<OptionValue> for bool` rejects `Int`). Accepting the int set would also break the
+/// `SetOptionInt` for a boolean option (the C++ framework's `Option::AsBool`, Go's driverbase and
+/// `adbc_core`'s `TryFrom<OptionValue> for bool` all reject it), and accepting one would break the
 /// spec's set/get type symmetry, since the getters serve the canonical `"true"`/`"false"` string
-/// (COR-4). The same survey drives the exact-string requirement: every surveyed driver
-/// exact-matches option values, none case-folds (COR-7).
+/// (COR-4).
 pub(crate) fn bool_option(value: OptionValue, what: &str) -> Result<bool> {
     match value {
         OptionValue::String(s) => match s.as_str() {
@@ -189,8 +185,8 @@ pub(crate) fn double_from_stored_string(stored: Result<String>, what: &str) -> R
 /// reinterpretations of its own `get_option_string`: bytes are its UTF-8, ints and doubles are it
 /// parsed by [`int_from_stored_string`] / [`double_from_stored_string`] (which propagate the string
 /// lookup's `NotFound` unchanged and report a set-but-unparsable value as `InvalidArguments`). Only
-/// `get_option_string` differs per level, so these three bodies were identical in all but the
-/// option-key type — `Self::Option`, whose `AsRef<str>` names the key for the error message.
+/// `get_option_string` differs per level; the key type is `Self::Option`, whose `AsRef<str>` names
+/// the key for the error message.
 ///
 /// This deliberately covers only the *typed* getters. The read-only
 /// `spanner.commit_stats.mutation_count` key and friends live in `get_option_string` (via
@@ -225,14 +221,12 @@ pub(crate) use impl_typed_option_getters;
 /// dispatch for these fields once, for both objects — which is why both must name their field
 /// `config`.
 ///
-/// One struct because the values already travel together: the connection handed all of them to
+/// One struct because the values already travel together: the connection hands all of them to
 /// `SpannerStatement::new`, and both objects hand the commit-relevant ones to the shared
 /// [`run_batch_dml`](crate::connection::run_batch_dml) /
 /// [`run_batch_txn`](crate::connection::run_batch_txn) /
-/// [`write_mutations_txn`](crate::connection::write_mutations_txn) helpers. As loose positional
-/// parameters that made those four signatures 9–14 arguments wide — a new knob meant a new
-/// parameter on each, with only argument order keeping the same-typed ones apart. Bundled, adding
-/// an option touches this struct and the macro, and no signature at all (IDIO-2).
+/// [`write_mutations_txn`](crate::connection::write_mutations_txn) helpers. Bundled, adding an
+/// option touches this struct and the macro, and no signature at all (IDIO-2).
 #[derive(Debug, Clone)]
 pub(crate) struct SharedConfig {
     /// The standard `adbc.connection.readonly` flag: a connection that has it set rejects all
@@ -329,9 +323,9 @@ impl SharedConfig {
 /// share verbatim.
 ///
 /// Both objects carry a [`SharedConfig`] — as a field named `config` — whose fields have identical
-/// setters/getters on either object, so the key→setter and key→getter dispatch for those options
-/// was duplicated as ~20 near-identical `Other(k) if k == OPTION_X => …` match arms in each of
-/// `connection.rs` and `statement.rs`. This macro emits that dispatch once as two inherent methods:
+/// setters/getters on either object, so this macro emits the key→setter / key→getter dispatch once
+/// (rather than ~20 near-identical match arms in each of `connection.rs` and `statement.rs`) as two
+/// inherent methods:
 ///
 /// - `set_shared_option(key, value)` applies a shared option, returning `Ok(Some(()))` when the key
 ///   was handled and `Ok(None)` when it is not a shared key (so the caller can fall through to its
@@ -341,10 +335,8 @@ impl SharedConfig {
 ///
 /// Object-specific options (ingest/bind/batch on the statement, `transaction.tag` on the
 /// connection, catalog/schema, autocommit, …) stay as explicit arms in each caller; only the
-/// mechanical glue lives here. The
-/// referenced names (`TimestampPrecision`, `err`, `Status`, `OptionValue`, `Result`) resolve at the
-/// expansion site, where both callers already import them, so the generated bodies read exactly like
-/// the arms they replace.
+/// mechanical glue lives here. The referenced names (`TimestampPrecision`, `err`, `Status`,
+/// `OptionValue`, `Result`) resolve at the expansion site, where both callers already import them.
 macro_rules! impl_shared_option_dispatch {
     () => {
         /// Apply one of the shared "staleness-pattern" options. `Ok(Some(()))` = handled;
@@ -481,9 +473,8 @@ mod tests {
 
     #[test]
     fn bool_option_accepts_exact_true_false_and_rejects_int_typed_values() {
-        // The string forms are exactly "true"/"false" (COR-7): the formerly-accepted lenient
-        // spellings (case variants, 1/0, yes/no) are rejected with an error naming the option
-        // and the expected spellings.
+        // The string forms are exactly "true"/"false" (COR-7): lenient spellings (case variants,
+        // 1/0, yes/no) are rejected with an error naming the option and the expected spellings.
         assert!(bool_option(OptionValue::String("true".into()), "option o").unwrap());
         assert!(!bool_option(OptionValue::String("false".into()), "option o").unwrap());
         for s in ["TRUE", "1", "yes", "0", "No", "maybe"] {

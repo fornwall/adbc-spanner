@@ -355,7 +355,7 @@ fn connect_via_connection_uri() {
 }
 
 /// Manual transactions have a **kind** fixed by their first statement (queries or DML); this
-/// covers what the older manual-transaction section of `query_and_dml_round_trip` does not:
+/// covers what the manual-transaction section of `query_and_dml_round_trip` does not:
 ///
 /// - **Query-kind**: the first query opens one multi-use read-only transaction whose snapshot
 ///   every later query in the transaction shares — a row committed by a *second* connection
@@ -610,7 +610,6 @@ fn query_and_dml_round_trip() {
         .unwrap();
     delete.execute_update().expect("delete");
 
-    // Insert two rows via DML and assert the affected-row count.
     let mut insert = connection.new_statement().expect("new statement");
     insert
         .set_sql_query(
@@ -620,14 +619,13 @@ fn query_and_dml_round_trip() {
         .unwrap();
     assert_eq!(insert.execute_update().expect("insert"), Some(2));
 
-    // Read the rows back through the driver as Arrow.
     let mut query = connection.new_statement().expect("new statement");
     query
         .set_sql_query("SELECT SingerId, Name, Active, Score FROM Singers ORDER BY SingerId")
         .unwrap();
     let reader = query.execute().expect("query");
 
-    // The Arrow schema should reflect the Spanner column types.
+    // The Arrow schema reflects the Spanner column types.
     let schema = reader.schema();
     assert_eq!(schema.field(0).name(), "SingerId");
     assert_eq!(schema.field(0).data_type(), &DataType::Int64);
@@ -685,11 +683,10 @@ fn query_and_dml_round_trip() {
     // --- autocommit DML carries the `last_statement` optimization ---
     //
     // An autocommit UPDATE is the entire read/write transaction, so the driver flags its
-    // `ExecuteBatchDml` batch as the transaction's last request (`last_statements=true` — set for
-    // every autocommit batch, single- or multi-statement), letting Spanner release the
-    // transaction as part of the same round-trip. The flag must not change the observable result:
-    // the statement still reports its exact affected-row count and the write is durably
-    // committed. Update one row, assert the count, and read it back.
+    // `ExecuteBatchDml` batch as the transaction's last request (`last_statements=true`, set for
+    // every autocommit batch, single- or multi-statement), letting Spanner release the transaction
+    // in the same round-trip. The flag must not change the observable result: the exact
+    // affected-row count is still reported and the write is durably committed.
     let mut update = connection.new_statement().expect("new statement");
     update
         .set_sql_query("UPDATE Singers SET Score = 9.5 WHERE SingerId = 1")
@@ -732,8 +729,8 @@ fn query_and_dml_round_trip() {
     assert_eq!(singers_schema.field(2).data_type(), &DataType::Boolean);
     assert_eq!(singers_schema.field(3).data_type(), &DataType::Float64);
 
-    // A name with an embedded backtick is escaped rather than interpolated into the SQL (which
-    // used to break the probe query), so it cleanly reports NotFound like any other absent table.
+    // A name with an embedded backtick must be escaped, not interpolated into the probe SQL, so it
+    // cleanly reports NotFound like any other absent table.
     let hostile = connection
         .get_table_schema(None, None, "no`such`table")
         .expect_err("hostile table name must not resolve");
@@ -781,8 +778,7 @@ fn query_and_dml_round_trip() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(ddl_rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
-    // Assert the stored value round-trips through the freshly-created table, not merely that a row
-    // exists: the `Note` column must read back as the exact string that was inserted.
+    // Assert the stored value, not merely that a row exists: `Note` must round-trip exactly.
     let ddl_note = ddl_rows[0]
         .column(0)
         .as_any()
@@ -806,7 +802,6 @@ fn query_and_dml_round_trip() {
         .unwrap();
     txn_ddl.execute_update().expect("create txn table");
 
-    // Enter manual transaction mode.
     connection
         .set_option(
             OptionConnection::AutoCommit,
@@ -847,9 +842,8 @@ fn query_and_dml_round_trip() {
         "rolled-back row must not appear"
     );
 
-    // Parameterized DML must honour manual-transaction buffering too. Regression test: a bound
-    // INSERT used to bypass the buffer and commit immediately in its own transaction, so it was
-    // visible before commit and survived a rollback.
+    // Parameterized DML must honour manual-transaction buffering too. Regression: a bound INSERT
+    // must not bypass the buffer and commit immediately in its own transaction.
     let buffer_param_insert = |connection: &mut SpannerConnection, id: i64| {
         let row = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, false)])),
@@ -933,10 +927,10 @@ fn query_and_dml_round_trip() {
     );
 
     // A FAILED commit must keep the buffered DML: the transaction stays open so the caller can
-    // retry (a genuine replay) or roll back. Regression test: the buffer used to be taken
-    // *before* the apply, so the DML was lost on error and a retried commit saw an empty batch
-    // and reported success with nothing written. Force the failure with DML that buffers fine
-    // (buffering never talks to Spanner) but cannot execute — an unknown table.
+    // retry (a genuine replay) or roll back. Regression: taking the buffer *before* the apply lost
+    // the DML on error, so a retried commit saw an empty batch and reported success having written
+    // nothing. Force the failure with DML that buffers fine (buffering never talks to Spanner) but
+    // cannot execute — an unknown table.
     connection
         .set_option(
             OptionConnection::AutoCommit,
@@ -1134,7 +1128,6 @@ fn query_and_dml_round_trip() {
         .unwrap();
     bind_ddl.execute_update().expect("create bind table");
 
-    // Bulk ingest: two rows of an Arrow batch inserted into the target table.
     let rows = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("Id", DataType::Int64, false),
@@ -1201,8 +1194,7 @@ fn query_and_dml_round_trip() {
     assert_eq!(count_rows(&mut connection, "AdbcBind"), 2);
 
     // With no ingest mode set, the driver defaults to `create` (the ADBC spec default), building
-    // the table from the bound data — not `append` into a pre-existing one. Ingesting into a fresh
-    // table name without a mode must therefore create it and insert the rows.
+    // the table from the bound data — not `append` into a pre-existing one.
     let default_mode_rows = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, false)])),
         vec![Arc::new(Int64Array::from(vec![7, 8]))],
@@ -1358,9 +1350,9 @@ fn query_and_dml_round_trip() {
     assert_eq!(count_rows(&mut connection, "AdbcBind"), 3);
 
     // Bound data is consumed by the execute that uses it. A client that reuses one statement handle
-    // (as the Python DBAPI does: adbc_ingest binds a stream, then the next cursor.execute is a query)
-    // must not replay the stale bound rows — which previously ran the follow-up query once per bound
-    // row, tripling its result.
+    // (as the Python DBAPI does: adbc_ingest binds a stream, then the next cursor.execute is a
+    // query) must not replay the stale bound rows — which would run the follow-up query once per
+    // bound row, tripling its result.
     let mut reuse_ddl = connection.new_statement().expect("new statement");
     reuse_ddl
         .set_sql_query(
@@ -1409,8 +1401,8 @@ fn query_and_dml_round_trip() {
 
     // Bulk ingest driven through the query entry point (`execute`, not `execute_update`): an ADBC
     // FFI caller supplying a non-null stream out-pointer must get the ingest performed and an empty
-    // stream back, not InvalidState ("no SQL query set"). Regression test for ingest only triggering
-    // through `execute_update`.
+    // stream back, not InvalidState ("no SQL query set") — ingest must not trigger only through
+    // `execute_update`.
     let mut ingest_via_execute = connection.new_statement().expect("new statement");
     ingest_via_execute
         .set_option(
@@ -1452,8 +1444,8 @@ fn query_and_dml_round_trip() {
     // Statement handle reused for an ingest after a SQL query — the pattern the Python DBAPI
     // `Cursor` produces (one statement per cursor: `cur.execute("CREATE TABLE …")` sets the query,
     // then `cur.adbc_ingest(…)` sets the ingest target without clearing it). Setting the target must
-    // win over the stale query, so the bound rows are ingested rather than the query re-run.
-    // Regression test for the ingest branch being skipped while a prior query is still set.
+    // win over the stale query, so the bound rows are ingested rather than the query re-run — the
+    // ingest branch must not be skipped while a prior query is still set.
     let mut reuse_query_then_ingest = connection.new_statement().expect("new statement");
     reuse_query_then_ingest
         .set_sql_query("SELECT 1")
@@ -1556,8 +1548,7 @@ fn query_and_dml_round_trip() {
         .unwrap();
     assert_eq!(created.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
     // Assert the replaced values, not just the count: `replace` drops + recreates, so the table
-    // holds exactly one copy of `create_rows()` — (10,"x"),(20,"y") — rather than the duplicated
-    // four rows an `append` would have left behind.
+    // holds exactly one copy of `create_rows()`, not the four rows an `append` would leave.
     let created_ids = created[0]
         .column(0)
         .as_any()
@@ -2526,7 +2517,6 @@ fn commit_stats_reports_mutation_count() {
         Status::NotImplemented
     );
 
-    // Clean up.
     let mut cleanup = connection.new_statement().expect("new statement");
     cleanup
         .set_sql_query("DELETE FROM Singers WHERE true")
@@ -4462,14 +4452,10 @@ fn prop_temporal_round_trip() {
 
 /// Regression guard: bound rows must not survive a DDL statement on a reused statement handle.
 ///
-/// The DDL branches of `execute`/`execute_update` used to return after `run_ddl(...)` without
-/// clearing `self.bound`, so a handle that had been bound, then ran a DDL statement, would silently
-/// feed those stale rows to the next parameterized DML — `bind(rows)` → `CREATE TABLE …` → set an
-/// `INSERT … VALUES(@id)` query without rebinding would insert the stale rows. The fix clears
-/// `self.bound` in both DDL branches. This test binds two `@id` rows, runs a `CREATE TABLE` through
-/// the same handle, then reuses it for a parameterized `INSERT` without rebinding and asserts that
-/// nothing was written: on the fixed code `self.bound` is empty so the unbound `@id` INSERT is a
-/// no-op error, while the buggy code would have leaked the two stale rows.
+/// Both DDL branches of `execute`/`execute_update` must clear `self.bound`; if they return after
+/// `run_ddl(...)` without doing so, `bind(rows)` → `CREATE TABLE …` → an `INSERT … VALUES(@id)`
+/// query without rebinding silently inserts the stale rows. Here the unbound `@id` INSERT is
+/// expected to error instead; the row-count assertion is what actually guards the fix.
 #[test]
 fn ddl_execute_clears_stale_bound_rows() {
     let Some(target) = test_target() else {
@@ -4511,9 +4497,8 @@ fn ddl_execute_clears_stale_bound_rows() {
     stmt.execute_update()
         .expect("create BoundLeak via the bound handle");
 
-    // Without rebinding, reuse the handle for a parameterized INSERT. On the fixed code `self.bound`
-    // is empty, so this errors on the unbound `@id`; on the buggy code it would insert the two stale
-    // rows. Either outcome is tolerated here — the assertion below is what actually guards the fix.
+    // Without rebinding, reuse the handle for a parameterized INSERT. Either outcome is tolerated
+    // here — the assertion below is what guards the fix.
     stmt.set_sql_query("INSERT INTO BoundLeak (id) VALUES (@id)")
         .unwrap();
     let _ = stmt.execute_update();
@@ -5555,7 +5540,6 @@ fn gql_graph_query_round_trip() {
         None
     );
 
-    // Populate three accounts and two transfers (1 -> 2 of 100.0, 2 -> 3 of 42.5).
     let mut ins = connection.new_statement().expect("new statement");
     ins.set_sql_query(
         "INSERT INTO GqlAccount (Id, Name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')",
@@ -5659,10 +5643,9 @@ fn gql_graph_query_round_trip() {
 ///
 /// Spanner reports its default (unnamed) schema as `TABLE_SCHEMA = ''`; a named schema reports its
 /// own name. Every other integration assertion uses the default schema, so this is the one test
-/// that drives the non-empty `db_schema` branches end-to-end against the emulator. The driver code
-/// already supports named schemas throughout (`INFORMATION_SCHEMA.SCHEMATA` enumeration in
-/// `collect_objects`, `qualified_table` in `get_table_schema`, `target_db_schema` on ingest); this
-/// test is the coverage that was missing.
+/// that drives the non-empty `db_schema` branches end-to-end against the emulator
+/// (`INFORMATION_SCHEMA.SCHEMATA` enumeration in `collect_objects`, `qualified_table` in
+/// `get_table_schema`, `target_db_schema` on ingest).
 #[test]
 fn named_schema_round_trip() {
     let Some(target) = test_target() else {
@@ -6021,7 +6004,6 @@ fn get_statistics_reports_real_counts() {
          (3, NULL, NULL)",
     );
 
-    // Exact statistics.
     let batches = connection
         .get_statistics(None, None, Some("AdbcStats"), false)
         .expect("get_statistics")
@@ -6327,7 +6309,6 @@ fn execute_streams_in_batches() {
         "DROP TABLE IF EXISTS AdbcStream; \
          CREATE TABLE AdbcStream (Id INT64) PRIMARY KEY (Id)",
     );
-    // 2500 rows in one DML via GENERATE_ARRAY.
     run(
         &mut connection,
         "INSERT INTO AdbcStream (Id) \
@@ -6543,7 +6524,7 @@ fn bound_query_streams_in_batches() {
         "DROP TABLE IF EXISTS AdbcBoundStream; \
          CREATE TABLE AdbcBoundStream (Id INT64, Grp INT64) PRIMARY KEY (Id)",
     );
-    // 1500 rows split across three groups of 500 via GENERATE_ARRAY.
+    // 1500 rows split across three groups of 500.
     run(
         &mut connection,
         "INSERT INTO AdbcBoundStream (Id, Grp) \
@@ -6575,8 +6556,8 @@ fn bound_query_streams_in_batches() {
         .collect::<Result<Vec<_>, _>>()
         .expect("collect streamed batches");
 
-    // 500 rows per bound row at 200 per batch → (200, 200, 100) per bound row, nine batches in
-    // total; the previous implementation materialised one monolithic batch per bound row.
+    // 500 rows per bound row at 200 per batch → (200, 200, 100) per bound row, nine in total — not
+    // one monolithic batch per bound row.
     let sizes: Vec<usize> = batches.iter().map(RecordBatch::num_rows).collect();
     assert_eq!(sizes, vec![200, 200, 100, 200, 200, 100, 200, 200, 100]);
     assert!(batches.iter().all(|b| b.schema() == schema));
@@ -6849,8 +6830,8 @@ fn view_and_narrow_types_bind_round_trip() {
 }
 
 /// DML behind a leading `@{…}` statement hint is still classified as DML and routed to the
-/// read/write path. Previously `first_keyword` saw no keyword at all, so hinted DML entering via
-/// `execute()` was sent to a read-only single-use transaction, which Spanner rejects.
+/// read/write path: if `first_keyword` sees no keyword behind the hint, hinted DML entering via
+/// `execute()` goes to a read-only single-use transaction, which Spanner rejects.
 #[test]
 fn hinted_dml_routes_to_the_read_write_path() {
     let Some(target) = test_target() else {
@@ -6877,9 +6858,7 @@ fn hinted_dml_routes_to_the_read_write_path() {
     // Through the query entry point (`execute`), exactly as ADBC clients issue DML.
     // `LOCK_SCANNED_RANGES` is a documented statement hint for read/write transactions, accepted
     // by both real Cloud Spanner and the emulator (which rejects most other statement hints as
-    // "Unsupported hint"). Before the fix this INSERT never reached a read/write transaction:
-    // `first_keyword` saw no keyword behind the hint, so the statement went to the read-only
-    // single-use query path and failed.
+    // "Unsupported hint").
     let mut insert = connection.new_statement().expect("new statement");
     insert
         .set_sql_query(
@@ -7234,8 +7213,7 @@ fn query_with_trailing_semicolons_returns_rows() {
 /// (a SELECT still runs), **deny** (DML, DDL and bulk ingest each fail with `InvalidState`), and
 /// **toggle/live** (the flag is shared live with every statement — not snapshotted at creation —
 /// so flipping the connection option immediately affects existing statements in both directions).
-/// Regression guard for the four read-only enforcement branches in `src/statement.rs`, which
-/// previously had no coverage.
+/// Guards the four read-only enforcement branches in `src/statement.rs`.
 #[test]
 fn readonly_connection_rejects_writes() {
     let Some(target) = test_target() else {
@@ -8263,7 +8241,7 @@ fn zero_row_schema_fidelity() {
 /// string **and** double getters at connection and statement level, statement inheritance and
 /// override, validation of bad values, generous deadlines leaving real operations untouched, and —
 /// the point of the feature — a deadline that actually fires against a live RPC surfacing ADBC
-/// `Timeout` (instead of the pre-existing behaviour, blocking until `cancel`).
+/// `Timeout` rather than blocking until `cancel`.
 ///
 /// The DDL path's deadline is proved in `tests/mock_spanner.rs` rather than here; see the comment
 /// at the DDL step below for why the emulator cannot assert it without racing.

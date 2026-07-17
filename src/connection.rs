@@ -17,11 +17,11 @@
 //!   the bounded-staleness kinds are pinned to their most-stale legal equivalent, as on any
 //!   multi-use transaction). Commit and rollback are local: a Spanner read-only transaction needs
 //!   no commit/rollback RPC, so the snapshot is simply dropped.
-//! - **DML** (first statement is DML or a bulk ingest): because Spanner's client only exposes
-//!   read/write transactions through a closure-based runner (there is no public begin/commit
-//!   handle), the driver *buffers* DML statements — and the insert **mutations** of any bulk
-//!   ingest — and applies the whole batch atomically in a single read/write transaction on
-//!   commit, which also makes the retry-on-abort safe, since the buffer is simply replayed.
+//! - **DML** (first statement is DML or a bulk ingest): Spanner's client exposes read/write
+//!   transactions only through a closure-based runner (no public begin/commit handle), so the
+//!   driver *buffers* DML statements — and the insert **mutations** of any bulk ingest — and
+//!   applies the whole batch atomically in a single read/write transaction on commit. That also
+//!   makes retry-on-abort safe: the buffer is simply replayed.
 //!
 //! **DDL is not transaction-aware.** Matching the ADBC BigQuery driver — which classifies
 //! nothing and sends every statement down its one execution path — DDL always executes
@@ -311,11 +311,10 @@ impl TxnState {
     /// buffered DML work, if any, must be committed first (a taken read-only transaction
     /// needs no commit; taking it out ends it by drop).
     ///
-    /// Doing both in one step — under the caller's single lock acquisition — is what closes the
-    /// enable-autocommit race: the buffer paths check the mode under this same mutex, so once the
-    /// mode reads autocommit no statement can add to the buffer, and the state taken here is the
-    /// complete transaction. Flipping only *after* the apply (in a later acquisition) would
-    /// strand any DML buffered while the commit RPC was in flight.
+    /// Both must happen in one lock acquisition: the buffer paths check the mode under this same
+    /// mutex, so once the mode reads autocommit no statement can add to the buffer and the state
+    /// taken here is the complete transaction. Flipping only *after* the apply (in a later
+    /// acquisition) would strand any DML buffered while the commit RPC was in flight.
     fn enter_autocommit(&mut self) -> ManualTxn {
         self.autocommit = true;
         std::mem::take(&mut self.txn)
@@ -324,9 +323,8 @@ impl TxnState {
     /// Re-enter manual mode with the taken state restored — the failure path of
     /// [`Self::enter_autocommit`], so a failed apply keeps the transaction open and replayable
     /// (retry the toggle or `commit`, or `rollback` to discard). Nothing can have buffered while
-    /// autocommit was on (`enter_autocommit` flips the mode and takes the state under one lock
-    /// acquisition, and every buffer path checks the mode under the same mutex), so the current
-    /// state is still `Unset` and the taken state simply moves back in.
+    /// autocommit was on (see [`Self::enter_autocommit`]), so the current state is still `Unset`
+    /// and the taken state simply moves back in.
     fn restore_manual(&mut self, work: ManualTxn) {
         self.autocommit = false;
         debug_assert!(matches!(self.txn, ManualTxn::Unset));
@@ -359,10 +357,10 @@ impl TxnState {
     }
 }
 
-/// Enforce `adbc.connection.readonly` on the commit paths: a read-only connection rejects **all**
-/// writes, and a commit of buffered DML / ingest mutations is a write like any other — the flag
-/// would otherwise be a statement-path-only guard that `commit()` (or the autocommit toggle, which
-/// commits pending work as a side effect) silently walks around.
+/// Enforce `adbc.connection.readonly` on the commit paths: committing buffered DML / ingest
+/// mutations is a write like any other, so without this the flag would be a statement-path-only
+/// guard that `commit()` — or the autocommit toggle, which commits pending work as a side effect —
+/// silently walks around.
 ///
 /// `read_only` is the flag's live value; `work` is the state the caller is about to apply. Only
 /// work that would actually *write* is rejected, so ending a transaction that writes nothing still
@@ -371,9 +369,9 @@ impl TxnState {
 ///
 /// The rejection leaves the buffer with the caller (`commit` never reaches `finish_commit`; the
 /// autocommit toggle restores the taken state via [`TxnState::restore_manual`]), so the
-/// transaction stays open and replayable — the same shape as any other failed commit. Clearing
-/// `adbc.connection.readonly` and committing again applies exactly the buffered work; `rollback`
-/// is never gated by the flag, since discarding buffered work writes nothing.
+/// transaction stays open and replayable, like any other failed commit. Clearing the flag and
+/// committing again applies exactly the buffered work; `rollback` is never gated, since discarding
+/// buffered work writes nothing.
 fn check_commit_writable(read_only: bool, work: &ManualTxn) -> Result<()> {
     if read_only && work.has_pending_work() {
         return Err(invalid_state(
@@ -679,9 +677,8 @@ impl SpannerConnection {
         statements: Vec<SpannerSql>,
         mutations: Vec<Mutation>,
     ) -> Result<()> {
-        // A new operation begins: mint a fresh cancel signal for it, so a stale cancel aimed at a
-        // previous operation does not leak in — and so no later operation can un-cancel this one's
-        // streamed reader (see `CancelSlot`).
+        // Mint a fresh cancel signal: a stale cancel cannot leak in, and no later operation can
+        // un-cancel this one's streamed reader (see `CancelSlot`).
         self.cancel.begin_operation();
         if statements.is_empty() {
             return write_mutations_txn(
@@ -758,14 +755,12 @@ pub(crate) fn apply_isolation(
 ///
 /// The remaining two levels are **promoted upward** to the weakest supported level that still
 /// satisfies their guarantees, rather than being rejected. Isolation levels are
-/// minimum-guarantee contracts — each names the *maximum* anomalies it permits (ANSI SQL defines
-/// them by permitted phenomena) — so a stronger level always satisfies a weaker one's request.
-/// Promoting upward therefore delivers *at least* what was asked, which is itself a valid way to
-/// **support** the level, not a deviation: the ADBC spec's "if the desired isolation level is not
-/// supported … return an appropriate error" is aimed at the opposite case, a driver that can only
-/// offer something *weaker* than requested — this driver never downgrades. The SQL standard and
-/// JDBC's `setTransactionIsolation` likewise sanction substituting a higher/more-restrictive
-/// level. (The one genuinely unsupported input, an unknown level string, is rejected below.)
+/// minimum-guarantee contracts — each names the *maximum* anomalies it permits — so a stronger
+/// level always satisfies a weaker one's request, and promoting upward delivers *at least* what
+/// was asked. The ADBC spec's "if the desired isolation level is not supported … return an
+/// appropriate error" targets the opposite case, a driver that can only offer something *weaker*;
+/// this driver never downgrades. The SQL standard and JDBC's `setTransactionIsolation` likewise
+/// sanction substituting a higher level. (An unknown level string is still rejected below.)
 ///
 /// | requested          | mapped to         | rationale                                                  |
 /// |--------------------|-------------------|------------------------------------------------------------|
@@ -830,15 +825,13 @@ fn isolation_to_adbc_string(isolation: &IsolationLevel) -> &'static str {
 /// applied immediately. Batches that belong to a manual transaction (and may carry buffered
 /// mutations) go through [`run_batch_txn`] instead.
 ///
-/// `last_statement` optimization: an autocommit batch — whether a single statement or a
-/// multi-statement `;`-batch — is by construction the transaction's *entire* content: the runner
-/// runs this one `ExecuteBatchDml` and immediately commits, with no further statement, read, or
-/// query in the transaction. Flagging the batch as the transaction's last request
-/// (`ExecuteBatchDmlRequest.last_statements`) lets Spanner release the transaction as part of the
-/// same round-trip, so the trailing `Commit` needs no extra server work — covering the common
-/// single-DML case and dbt-style `DELETE …; INSERT …` batches alike. Mutation-carrying /
-/// manual-commit batches instead go through [`run_batch_txn`] with the flag off (their commit
-/// still applies buffered mutations, so the batch is *not* the transaction's last request).
+/// `last_statement` optimization: an autocommit batch — single statement or `;`-batch — is by
+/// construction the transaction's *entire* content (the runner runs this one `ExecuteBatchDml`
+/// and commits, with nothing else in the transaction). Flagging it as the transaction's last
+/// request (`ExecuteBatchDmlRequest.last_statements`) lets Spanner release the transaction in the
+/// same round-trip, so the trailing `Commit` needs no extra server work. Mutation-carrying /
+/// manual-commit batches go through [`run_batch_txn`] with the flag off (their commit still
+/// applies buffered mutations, so the batch is *not* the transaction's last request).
 pub(crate) fn run_batch_dml(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
@@ -1115,8 +1108,8 @@ impl LikeMatcher {
     pub(crate) fn matches(&self, value: &str) -> bool {
         let p = &self.pattern;
         // Walk the value by byte offset, decoding one `char` at a time, so matching a candidate
-        // allocates nothing (the old code collected a `Vec<char>` per value). `_` still consumes
-        // exactly one *character*: every advance steps by the decoded char's UTF-8 width.
+        // allocates nothing. `_` still consumes exactly one *character*: every advance steps by
+        // the decoded char's UTF-8 width.
         let (mut pi, mut vi) = (0usize, 0usize);
         // Pattern index / value byte offset to backtrack to after the most recent `%`.
         let mut star: Option<(usize, usize)> = None;
@@ -1211,15 +1204,12 @@ impl Optionable for SpannerConnection {
                 let enable =
                     crate::options::bool_option(value, "option adbc.connection.autocommit")?;
                 // Enabling autocommit commits any active manual transaction. The mode flip and the
-                // state take happen in ONE lock acquisition (`enter_autocommit`): once the mode is
-                // autocommit, the buffer paths — which check-and-buffer under this same mutex —
-                // can no longer add work, so nothing a concurrent statement buffers can be
-                // stranded behind the flip (the old read/apply/flip-in-separate-acquisitions shape
-                // had exactly that race). Like `commit`, a failed apply must not lose the work:
-                // `restore_manual` re-enters manual mode with the state restored so the caller can
-                // retry the toggle (a genuine replay) or roll back. Apply from a borrow so the
-                // taken state is still around to restore. (A taken read-only transaction has
-                // nothing to apply; dropping it ends the snapshot.)
+                // state take are one lock acquisition (`enter_autocommit`), so nothing a
+                // concurrent statement buffers is stranded behind the flip. Like `commit`, a
+                // failed apply must not lose the work: `restore_manual` re-enters manual mode with
+                // the state restored, so apply from a borrow — the taken state must still be
+                // around to restore. (A taken read-only transaction has nothing to apply; dropping
+                // it ends the snapshot.)
                 let pending = {
                     let mut st = self.txn.lock().unwrap();
                     if enable && !st.autocommit {
@@ -1260,13 +1250,10 @@ impl Optionable for SpannerConnection {
                     )));
                 }
             }
-            // A Spanner database has a single, unnamed catalog, and — although Spanner supports named
-            // schemas (addressed by qualified name, e.g. `sales.Orders`, and enumerated by
-            // `get_objects`) — it exposes no settable session/current schema to point at one. So the
-            // "current" catalog and schema are both fixed at `""`, which is what the `get_option` side
-            // always reports; setting either to `""` is a conformant no-op, and setting a non-empty
-            // value is unsupported → `NotImplemented` (there is no such switchable current
-            // catalog/schema; matches the C++ PostgreSQL driver's treatment of this class).
+            // Spanner has no settable current catalog/schema (named schemas are addressed by
+            // qualified name and enumerated by `get_objects`, but none can be made "current"). Both
+            // are fixed at `""`: setting `""` is a conformant no-op, a non-empty value is
+            // unsupported → `NotImplemented` (see `check_unnamed_catalog_or_schema`).
             OptionConnection::CurrentCatalog => {
                 check_unnamed_catalog_or_schema(value, "current catalog")?;
             }
@@ -1373,9 +1360,8 @@ impl Connection for SpannerConnection {
         table_type: Option<Vec<&str>>,
         column_name: Option<&str>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        // A new operation begins: mint a fresh cancel signal for it, so a stale cancel aimed at a
-        // previous operation does not leak in — and so no later operation can un-cancel this one's
-        // streamed reader (see `CancelSlot`).
+        // Mint a fresh cancel signal: a stale cancel cannot leak in, and no later operation can
+        // un-cancel this one's streamed reader (see `CancelSlot`).
         self.cancel.begin_operation();
         let out_schema = adbc_core::schemas::GET_OBJECTS_SCHEMA.clone();
         // Spanner has a single catalog (""); a catalog filter that excludes it yields no rows.
@@ -1414,9 +1400,8 @@ impl Connection for SpannerConnection {
         db_schema: Option<&str>,
         table_name: &str,
     ) -> Result<Schema> {
-        // A new operation begins: mint a fresh cancel signal for it, so a stale cancel aimed at a
-        // previous operation does not leak in — and so no later operation can un-cancel this one's
-        // streamed reader (see `CancelSlot`).
+        // Mint a fresh cancel signal: a stale cancel cannot leak in, and no later operation can
+        // un-cancel this one's streamed reader (see `CancelSlot`).
         self.cancel.begin_operation();
         check_lookup_catalog(catalog)?;
         let table = qualified_table(db_schema, table_name);
@@ -1504,9 +1489,8 @@ impl Connection for SpannerConnection {
         table_name: Option<&str>,
         approximate: bool,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        // A new operation begins: mint a fresh cancel signal for it, so a stale cancel aimed at a
-        // previous operation does not leak in — and so no later operation can un-cancel this one's
-        // streamed reader (see `CancelSlot`).
+        // Mint a fresh cancel signal: a stale cancel cannot leak in, and no later operation can
+        // un-cancel this one's streamed reader (see `CancelSlot`).
         self.cancel.begin_operation();
         let out_schema = adbc_core::schemas::GET_STATISTICS_SCHEMA.clone();
         // Spanner is a single unnamed catalog (""); a catalog filter that excludes it yields nothing.
@@ -1590,9 +1574,8 @@ impl Connection for SpannerConnection {
         &self,
         partition: impl AsRef<[u8]>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        // A new operation begins: mint a fresh cancel signal for it, so a stale cancel aimed at a
-        // previous operation does not leak in — and so no later operation can un-cancel this one's
-        // streamed reader (see `CancelSlot`).
+        // Mint a fresh cancel signal: a stale cancel cannot leak in, and no later operation can
+        // un-cancel this one's streamed reader (see `CancelSlot`).
         self.cancel.begin_operation();
         // Decode the opaque descriptor produced by `Statement::execute_partitions`. It carries the
         // session, transaction id, partition token and Data Boost flag, so it executes on this

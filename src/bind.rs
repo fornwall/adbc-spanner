@@ -6,8 +6,7 @@
 //! parameters (`@name`), so a bind column named `id` binds to `@id` in the SQL — how the
 //! column→parameter pairing is decided (positionally by default, or by name via the
 //! `adbc.statement.bind_by_name` option) is documented on [`resolve_parameter_names`]. Bulk ingest
-//! does
-//! not go through SQL at all: each bound row becomes one insert [`Mutation`] (see
+//! does not go through SQL at all: each bound row becomes one insert [`Mutation`] (see
 //! [`insert_mutation`]), whose cells use the exact same Arrow→Spanner value mapping
 //! ([`cell_value`]) as parameter binding.
 //!
@@ -217,10 +216,8 @@ fn cell_value(
 ) -> Result<(Value, Option<Type>)> {
     let data_type = column.data_type();
     match data_type {
-        // ARRAY<...> values: an Arrow `List`/`LargeList` column maps to a Spanner array. Each
-        // element runs through the same [`scalar_binder`] mapping as a scalar bind (see
-        // [`list_cell_value`]); nested arrays and STRUCT elements are out of scope and rejected
-        // there.
+        // ARRAY<...>: an Arrow `List`/`LargeList` maps to a Spanner array. See
+        // [`list_cell_value`] — nested arrays and STRUCT elements are rejected there.
         DataType::List(item) => {
             let elem = (!column.is_null(row)).then(|| column.as_list::<i32>().value(row));
             list_cell_value(name, item, elem)
@@ -230,12 +227,11 @@ fn cell_value(
             list_cell_value(name, item, elem)
         }
         // A dictionary-encoded column is an index encoding of the same logical values, not a
-        // different logical type (the Arrow columnar format's "Dictionary-encoded Layout"; it is
-        // what pandas categoricals produce over the C data interface), so it binds as its *value*
-        // type: the key at `row` selects the dictionary value, which re-enters this same mapping —
-        // every bindable type, scalar or `ARRAY<...>`, is thereby accepted encoded, and an
-        // unsupported value type is rejected with the same error as its plain form. A null cell
-        // binds as NULL, its value type still validated so a bad schema fails loudly on every row.
+        // different logical type (see the module doc), so it binds as its *value* type: the key at
+        // `row` selects the dictionary value, which re-enters this same mapping — every bindable
+        // type, scalar or `ARRAY<...>`, is thereby accepted encoded, and an unsupported value type
+        // is rejected with the same error as its plain form. A null cell binds as NULL, its value
+        // type still validated so a bad schema fails loudly on every row.
         DataType::Dictionary(_, _) => downcast_dictionary_array!(
             column => match column.key(row) {
                 Some(value_row) => cell_value(name, field, column.values().as_ref(), value_row),
@@ -243,7 +239,6 @@ fn cell_value(
             },
             _ => unreachable!("downcast_dictionary_array dispatched a non-dictionary {data_type:?}")
         ),
-        // Every scalar type funnels through the one [`scalar_binder`] mapping.
         _ => {
             let bind = scalar_binder(data_type).ok_or_else(|| {
                 invalid_argument(format!(
@@ -287,8 +282,7 @@ type ScalarBinder = fn(&str, &DataType, &dyn Array, usize) -> Result<Value>;
 fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
     let bind: ScalarBinder = match data_type {
         // Spanner's only integer type is INT64, so every Arrow int width widens to it; both Arrow
-        // floats map to FLOAT64 (f32 widens losslessly). Each arm names its Arrow type and the
-        // Spanner-native type it widens into — the shared body lives in [`primitive_binder`].
+        // floats map to FLOAT64 (f32 widens losslessly).
         DataType::Int64 => primitive_binder::<Int64Type, i64>(),
         DataType::Int32 => primitive_binder::<Int32Type, i64>(),
         DataType::Int16 => primitive_binder::<Int16Type, i64>(),
@@ -1040,7 +1034,7 @@ mod tests {
         let dbg = format!("{:?}", insert_mutation("Users", &b, 1).unwrap());
         assert!(dbg.contains("NullValue"), "no NULL for row 1: {dbg}");
         // Reserved words and odd characters need no quoting: mutations carry raw proto names,
-        // not SQL (the removed SQL ingest path had to backtick-escape these).
+        // not SQL.
         let odd = batch(
             vec![Field::new("index", DataType::Int64, false)],
             vec![Arc::new(Int64Array::from(vec![42]))],
@@ -1270,8 +1264,7 @@ mod tests {
 
     #[test]
     fn binds_timestamp_at_every_unit() {
-        // Every Arrow TimestampArray unit binds without error (nanosecond, millisecond, second all
-        // previously fell through to the unsupported-type rejection).
+        // Every Arrow TimestampArray unit binds without error.
         let ns = 1_705_322_096_789_012_999i64;
         let b = batch(
             vec![

@@ -108,9 +108,9 @@ fn parse_priority(value: &str) -> Result<RequestPriority> {
 /// commit-stats flag to one of the client's commit builders.
 ///
 /// [`TransactionRunnerBuilder`] and [`WriteOnlyTransactionBuilder`] expose these four setters with
-/// identical signatures but share no common trait, so the two methods were byte-identical copies
-/// naming different types — every new commit setting had to be added to both. The body now lives
-/// here once; each method still names its own concrete builder type.
+/// identical signatures but share no common trait, so the body lives here once rather than as two
+/// byte-identical copies each needing every new commit setting added to it; each method still names
+/// its own concrete builder type.
 macro_rules! apply_to_commit_builder {
     ($(#[$attr:meta])* $name:ident($builder:ty)) => {
         $(#[$attr])*
@@ -508,8 +508,8 @@ mod tests {
         // Default is off, always reported as an effective boolean.
         assert_eq!(config.commit_stats_string(), "false");
 
-        // Accepts exactly the strings "true"/"false"; the formerly-accepted lenient spellings
-        // ("1", "yes", "TRUE", …) are rejected (COR-7).
+        // Accepts exactly the strings "true"/"false"; lenient spellings ("1", "yes", "TRUE", …)
+        // are rejected (COR-7).
         config.set_commit_stats(s("true")).unwrap();
         assert_eq!(config.commit_stats_string(), "true");
         // An int-typed set is rejected (COR-4) and leaves the stored value untouched.

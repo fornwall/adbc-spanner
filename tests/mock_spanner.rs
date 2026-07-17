@@ -615,7 +615,6 @@ fn query_while_dml_buffered_in_manual_txn_is_rejected() {
         .expect("collect autocommit batches");
     assert_eq!(batches[0].num_rows(), 2);
 
-    // Enter manual transaction mode.
     connection
         .set_option(
             OptionConnection::AutoCommit,
@@ -1033,9 +1032,8 @@ fn execute_update_query_in_manual_mode_buffers_nothing() {
 /// hand the caller the error, and the caller's own retry logic needs `vendor_code` 10 to
 /// recognise it (see `from_spanner` in `src/error.rs`).
 ///
-/// The mock attaches the `RetryInfo` detail Spanner really sends; once the driver forwards
-/// error details into ADBC `Error::details` (the `feat/error-details` branch, unmerged at the
-/// time of writing), this test is the place to assert the detail round-trips.
+/// The mock attaches the `RetryInfo` detail Spanner really sends; that the detail itself reaches
+/// `Error::details` is asserted by [`aborted_retry_info_detail_reaches_adbc_error_details`].
 #[test]
 fn aborted_surfaces_vendor_code_10() {
     let _watchdog = Watchdog::arm(Duration::from_secs(120), "aborted_surfaces_vendor_code_10");
@@ -1372,13 +1370,10 @@ fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
 /// its long-running-operation poll loop, which sit inside the same `with_timeout`, so bounding the
 /// wrapper bounds the poll loop that used to run unbounded.
 ///
-/// This is the deterministic replacement for an emulator assertion that raced (TEST-12). There, a
-/// *microsecond* deadline was pitted against a real `UpdateDatabaseDdl` on the premise that no
-/// real RPC could beat it. Both halves of that premise are wrong: tokio's timer wheel has ~1ms
-/// granularity, so a sub-millisecond deadline actually fires up to ~1ms late, while the emulator
-/// answers DDL over a warm local connection in well under that. Whichever won decided the result.
-///
-/// Here there is nothing to race. The admin endpoint is a black hole ([`GatedEndpoint`]), so the
+/// Do not "simplify" this back to racing a tiny deadline against a real emulator DDL (TEST-12):
+/// tokio's timer wheel has ~1ms granularity, so a sub-millisecond deadline fires up to ~1ms late,
+/// while the emulator answers DDL over a warm local connection in well under that — whichever won
+/// decided the result. Here there is nothing to race. The admin endpoint is a black hole ([`GatedEndpoint`]), so the
 /// DDL can never complete and the driver's deadline is the *only* way the call can return quickly
 /// — the deadline's value affects how long the test takes, not whether it passes. Unwiring the
 /// update timeout from `run_ddl` fails this test on the status assertion: the request then falls
