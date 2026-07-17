@@ -566,10 +566,58 @@ mod txn_state_tests {
                 .expect("committing nothing writes nothing, so read-only must allow it");
         }
     }
+
+    /// A panic while the txn mutex is held poisons it, but `TxnState` has no invariant a
+    /// poisoned-but-consistent state violates, so `lock_txn` must keep handing out a usable guard
+    /// rather than propagate the poison (which `.lock().unwrap()` would, bricking the connection).
+    #[test]
+    fn lock_txn_recovers_a_poisoned_mutex() {
+        use std::sync::{Arc, Mutex};
+
+        use super::lock_txn;
+
+        let shared: Arc<Mutex<TxnState>> = Arc::new(Mutex::new(manual()));
+
+        // Poison the mutex: panic while the guard is held.
+        let poisoner = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            let mut guard = poisoner.lock().unwrap();
+            guard.buffer_dml(vec![sql("UPDATE a")]).unwrap();
+            panic!("poison the txn mutex");
+        })
+        .join()
+        .unwrap_err();
+        assert!(
+            shared.is_poisoned(),
+            "the panic should have poisoned the mutex"
+        );
+
+        // The recovered guard still sees the state the poisoner left behind and stays usable.
+        let guard = lock_txn(&shared);
+        guard
+            .check_kind_allowed(TxnKind::Dml)
+            .expect("the recovered DML transaction is still consistent and usable");
+        assert_eq!(
+            guard.check_kind_allowed(TxnKind::Read).unwrap_err().status,
+            Status::InvalidState,
+        );
+    }
 }
 
 /// A handle to a connection's transaction state, shared with its statements.
 pub(crate) type SharedTxn = Arc<Mutex<TxnState>>;
+
+/// Lock the shared [`TxnState`], recovering the guard even if the mutex was poisoned.
+///
+/// `TxnState` holds no invariant a poisoned-but-consistent state could violate: every method
+/// leaves it well-formed, so a panic while the guard is held (e.g. in a callee) leaves the buffered
+/// work either wholly applied or wholly not, never half-updated. Propagating the poison via
+/// `.lock().unwrap()` would instead brick the whole connection — one panic latches the mutex and
+/// every later txn-state op panics across the C ABI — so we take the inner guard on poison.
+pub(crate) fn lock_txn(txn: &SharedTxn) -> std::sync::MutexGuard<'_, TxnState> {
+    txn.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// An ADBC connection to a Spanner database.
 ///
@@ -1211,7 +1259,7 @@ impl Optionable for SpannerConnection {
                 // around to restore. (A taken read-only transaction has nothing to apply; dropping
                 // it ends the snapshot.)
                 let pending = {
-                    let mut st = self.txn.lock().unwrap();
+                    let mut st = lock_txn(&self.txn);
                     if enable && !st.autocommit {
                         Some(st.enter_autocommit())
                     } else {
@@ -1222,7 +1270,7 @@ impl Optionable for SpannerConnection {
                 if let Some(work) = pending
                     && let Err(e) = self.apply_manual_txn(&work)
                 {
-                    self.txn.lock().unwrap().restore_manual(work);
+                    lock_txn(&self.txn).restore_manual(work);
                     return Err(e);
                 }
             }
@@ -1272,7 +1320,7 @@ impl Optionable for SpannerConnection {
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
         match &key {
-            OptionConnection::AutoCommit => Ok(self.txn.lock().unwrap().autocommit.to_string()),
+            OptionConnection::AutoCommit => Ok(lock_txn(&self.txn).autocommit.to_string()),
             OptionConnection::ReadOnly => Ok(self.config.is_read_only().to_string()),
             OptionConnection::IsolationLevel => {
                 Ok(isolation_to_adbc_string(&self.config.isolation).to_string())
@@ -1528,7 +1576,7 @@ impl Connection for SpannerConnection {
         // Committing a **read-only** transaction applies nothing: the snapshot is simply dropped
         // (Spanner read-only transactions need no commit RPC).
         let work = {
-            let st = self.txn.lock().unwrap();
+            let st = lock_txn(&self.txn);
             if st.autocommit {
                 return Err(invalid_state(
                     "commit invoked with autocommit enabled; no active transaction",
@@ -1537,12 +1585,12 @@ impl Connection for SpannerConnection {
             st.txn.clone()
         };
         self.apply_manual_txn(&work)?;
-        self.txn.lock().unwrap().finish_commit(&work);
+        lock_txn(&self.txn).finish_commit(&work);
         Ok(())
     }
 
     fn rollback(&mut self) -> Result<()> {
-        let mut st = self.txn.lock().unwrap();
+        let mut st = lock_txn(&self.txn);
         if st.autocommit {
             return Err(invalid_state(
                 "rollback invoked with autocommit enabled; no active transaction",

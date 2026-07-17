@@ -33,7 +33,7 @@ use google_cloud_spanner::statement::{Statement as SpannerSql, StatementBuilder}
 use google_cloud_spanner::transaction::{MultiUseReadOnlyTransaction, ReadWriteTransaction};
 
 use crate::bind;
-use crate::connection::{SharedTxn, TxnKind, apply_isolation, write_mutations_txn};
+use crate::connection::{SharedTxn, TxnKind, apply_isolation, lock_txn, write_mutations_txn};
 use crate::conversion::{
     BoundStatementSource, TimestampPrecision, result_set_to_batch, stream_bound_query, stream_query,
 };
@@ -476,7 +476,7 @@ impl SpannerStatement {
         // is exactly the documented "DDL is not transaction-aware / DML–DDL reorder" caveat (see
         // CLAUDE.md, `run_ddl`).
         {
-            let txn = self.txn.lock().unwrap();
+            let txn = lock_txn(&self.txn);
             if !txn.autocommit() {
                 txn.check_kind_allowed(TxnKind::Dml)?;
             }
@@ -566,7 +566,7 @@ impl SpannerStatement {
         // plain dot).
         let target = bind::mutation_table(self.target_db_schema.as_deref(), table);
         let manual = {
-            let txn = self.txn.lock().unwrap();
+            let txn = lock_txn(&self.txn);
             if txn.autocommit() {
                 false
             } else {
@@ -590,7 +590,7 @@ impl SpannerStatement {
             // the txn lock) so a manual-mode empty append to an absent table still fails NotFound,
             // consistent with what a non-empty manual append surfaces at commit.
             self.check_empty_append_target(table, rows as i64)?;
-            let mut txn = self.txn.lock().unwrap();
+            let mut txn = lock_txn(&self.txn);
             if !txn.autocommit() {
                 // `buffer_mutation` re-checks the DML kind under this lock (a concurrent
                 // statement may have fixed the transaction to queries in the unlocked window);
@@ -933,7 +933,7 @@ impl SpannerStatement {
     /// chunked.)
     fn run_or_buffer(&self, statements: Vec<SpannerSql>) -> Result<Option<i64>> {
         {
-            let mut txn = self.txn.lock().unwrap();
+            let mut txn = lock_txn(&self.txn);
             if !txn.autocommit() {
                 // Fixes the transaction's kind to DML — a transaction that began with a query
                 // rejects the buffer (kinds cannot mix).
@@ -1051,7 +1051,7 @@ impl SpannerStatement {
             let statements = self.build_dml_statements(sql)?;
             return Ok(DmlOutcome::Plain(self.run_or_buffer(statements)?));
         }
-        if !self.txn.lock().unwrap().autocommit() {
+        if !lock_txn(&self.txn).autocommit() {
             return Err(invalid_state(
                 "DML with THEN RETURN cannot run in a manual transaction: buffered DML is applied \
                  via ExecuteBatchDml on commit, which does not support THEN RETURN. Re-enable \
@@ -1589,7 +1589,7 @@ impl SpannerStatement {
     /// when buffering; DDL is not transaction-aware (unguarded); and `execute_schema` (a
     /// `QueryMode::Plan` probe returning no data) has no data-visibility concern.
     fn ensure_query_allowed(&self) -> Result<()> {
-        self.txn.lock().unwrap().check_kind_allowed(TxnKind::Read)
+        lock_txn(&self.txn).check_kind_allowed(TxnKind::Read)
     }
 
     /// The shared multi-use read-only transaction of a manual transaction that began (or begins
@@ -1609,7 +1609,7 @@ impl SpannerStatement {
     /// [`TxnState`]: crate::connection::TxnState
     fn manual_read_transaction(&self) -> Result<Option<Arc<MultiUseReadOnlyTransaction>>> {
         {
-            let st = self.txn.lock().unwrap();
+            let st = lock_txn(&self.txn);
             if st.autocommit() {
                 return Ok(None);
             }
@@ -1626,7 +1626,7 @@ impl SpannerStatement {
             }
             builder.build().await.map_err(from_spanner)
         })?;
-        let mut st = self.txn.lock().unwrap();
+        let mut st = lock_txn(&self.txn);
         if st.autocommit() {
             // The mode flipped to autocommit while the transaction was being built (which issued
             // no RPC): drop it and run the query as plain autocommit.
