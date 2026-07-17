@@ -214,9 +214,10 @@ and **each is independently a crates.io publish blocker** — the crate cannot b
    the standard release-twice idiom), `AdbcStatementExecuteQuery` writing `rows_affected = -1` on
    the query path (arrow-adbc PR #4469), and the exporter preserving the caller's
    `AdbcError.private_data` on the ADBC 1.0.0 path (arrow-adbc PR #4473 — this one lets the C++
-   `adbc_validation` `StatementTest.ErrorCompatibility` case pass, gated in
-   `scripts/run-adbc-validation.sh`). All three are now merged upstream, so this is a plain
-   `main`-tracking git pin (the fork it used to need is gone), still ahead of the 0.23 release.
+   `adbc_validation` `StatementTest.ErrorCompatibility` case pass; it is absent from the `EXCLUDED`
+   list in `scripts/run-adbc-validation.sh`, so that script's gate runs it and requires it to pass).
+   All three are now merged upstream, so this is a plain `main`-tracking git pin (the fork it used
+   to need is gone), still ahead of the 0.23 release.
    Because a git source will not unify with the crates.io `= "0.23"` release, downstream crates must
    also take `adbc_core` from this same git rev (see `README.md`).
 
