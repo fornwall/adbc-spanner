@@ -319,6 +319,13 @@ is cross-compiled, off the universal Apple toolchain) and installs NASM only on 
 `#[cfg(feature = "fuzzing")] pub mod fuzzing` wrapper in `src/lib.rs`. Run one with `cargo +nightly fuzz run <target>`; CI runs them nightly via
 `.github/workflows/fuzz.yml` (see the TEST-9 gaps in REVIEW.md for targets still worth adding).
 
+The workflow's matrix is **derived** from the `[[bin]]` targets in `fuzz/Cargo.toml` (its `discover`
+job parses them into a `fromJson` matrix) rather than hardcoded — a hardcoded list is how
+`staleness`, `directed_read` and `uri` stayed unfuzzed for several releases after being added, so
+declaring a `[[bin]]` is now the only step. `every_fuzz_target_is_wired_and_documented` (`src/lib.rs`,
+in the gating `test` job) pins the rest of the chain: harness file ↔ `[[bin]]` declaration, the
+workflow still deriving rather than listing, and every target named in `docs/testing.md` + this file.
+
 `fuzz/` is a **member of the root workspace** (its manifest has no `[workspace]` of its own — the
 `[workspace]` lives in the root `Cargo.toml`), so the whole repo resolves to **one** `Cargo.lock`.
 This is deliberate (TEST-13): cargo-fuzz's default layout makes `fuzz/` its *own* workspace with a

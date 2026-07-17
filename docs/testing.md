@@ -233,11 +233,17 @@ cargo +nightly fuzz run sql                 # run one target locally (needs nigh
 `cargo fuzz` builds into the root `target/`. `default-members = ["."]` keeps it out of the default
 build scope, so plain `cargo build`/`test`/`clippy` never touch it and never need nightly.
 
-[`fuzz.yml`](../.github/workflows/fuzz.yml) fuzzes targets nightly (and on demand), seeding from the
-committed [`fuzz/seeds/`](../fuzz/seeds) corpus and caching the generated corpus between runs so
-coverage accumulates. Note its matrix currently lists only the first seven targets — `staleness`,
-`directed_read` and `uri` are **not yet fuzzed in CI** and must be run by hand until the matrix
-catches up.
+[`fuzz.yml`](../.github/workflows/fuzz.yml) fuzzes **every** target nightly (and on demand), seeding
+from the committed [`fuzz/seeds/`](../fuzz/seeds) corpus and caching the generated corpus between
+runs so coverage accumulates. A target with no seed directory is simply fuzzed without one.
+
+Its matrix is **derived** from the `[[bin]]` targets in `fuzz/Cargo.toml` by the workflow's
+`discover` job, not hardcoded, so declaring a target is all it takes to have it fuzzed — there is no
+list to remember. This matters because a hardcoded matrix is exactly how `staleness`,
+`directed_read` and `uri` went unfuzzed for several releases after being added: declared, seeded and
+documented, but never run. `every_fuzz_target_is_wired_and_documented` (in `src/lib.rs`, run by the
+gating `test` job) fails the build if a harness file has no `[[bin]]`, if the workflow reverts to a
+literal list, or if a target is missing from this page.
 
 ## Benchmarks
 
