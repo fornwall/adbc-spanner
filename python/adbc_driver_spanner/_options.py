@@ -59,6 +59,9 @@ class DatabaseOptions(enum.Enum):
     IMPERSONATE_SCOPES = "spanner.auth.impersonate.scopes"
     #: Optional impersonated-token lifetime, in seconds (default ``3600``).
     IMPERSONATE_LIFETIME = "spanner.auth.impersonate.lifetime"
+    #: The GCP project charged for API quota (the ``x-goog-user-project`` header),
+    #: decoupled from the project owning the data. ``""`` unsets.
+    QUOTA_PROJECT = "spanner.auth.quota_project"
 
 
 class ConnectionOptions(enum.Enum):
@@ -101,6 +104,12 @@ class ConnectionOptions(enum.Enum):
     RETRY_MAX_ATTEMPTS = "spanner.retry.max_attempts"
     #: Cap (seconds) on total wall-clock time spent retrying a retryable RPC.
     RETRY_MAX_ELAPSED_SECONDS = "spanner.retry.max_elapsed_seconds"
+    #: Initial delay (seconds) of the exponential backoff between retry attempts.
+    RETRY_BACKOFF_INITIAL_SECONDS = "spanner.retry.backoff.initial_seconds"
+    #: Ceiling (seconds) the growing retry backoff delay is truncated at.
+    RETRY_BACKOFF_MAX_SECONDS = "spanner.retry.backoff.max_seconds"
+    #: Per-attempt growth factor for the retry backoff delay.
+    RETRY_BACKOFF_MULTIPLIER = "spanner.retry.backoff.multiplier"
 
 
 class StatementOptions(enum.Enum):
@@ -142,7 +151,17 @@ class StatementOptions(enum.Enum):
     RETRY_MAX_ATTEMPTS = "spanner.retry.max_attempts"
     #: Per-statement override of :attr:`ConnectionOptions.RETRY_MAX_ELAPSED_SECONDS`.
     RETRY_MAX_ELAPSED_SECONDS = "spanner.retry.max_elapsed_seconds"
+    #: Per-statement override of :attr:`ConnectionOptions.RETRY_BACKOFF_INITIAL_SECONDS`.
+    RETRY_BACKOFF_INITIAL_SECONDS = "spanner.retry.backoff.initial_seconds"
+    #: Per-statement override of :attr:`ConnectionOptions.RETRY_BACKOFF_MAX_SECONDS`.
+    RETRY_BACKOFF_MAX_SECONDS = "spanner.retry.backoff.max_seconds"
+    #: Per-statement override of :attr:`ConnectionOptions.RETRY_BACKOFF_MULTIPLIER`.
+    RETRY_BACKOFF_MULTIPLIER = "spanner.retry.backoff.multiplier"
     #: How bound Arrow columns pair with ``@name`` parameters (``"true"`` = by name).
     BIND_BY_NAME = "adbc.statement.bind_by_name"
     #: Primary key for the create/replace ingest modes (comma-separated columns).
     INGEST_PRIMARY_KEY = "spanner.ingest.primary_key"
+    #: ``"true"`` routes an autocommit bulk ingest's chunks through Spanner's
+    #: non-atomic **BatchWrite** RPC instead of a write-only transaction.
+    #: Ignored in manual-transaction mode.
+    INGEST_BATCH_WRITE = "spanner.ingest.batch_write"
