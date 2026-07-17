@@ -21,12 +21,43 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The matrix is DERIVED from the `[[bin]]` targets in fuzz/Cargo.toml, never hardcoded.
+  # A hardcoded list is what let `staleness`, `directed_read` and `uri` (added in #354) sit
+  # declared, seeded and documented while CI never fuzzed them — the list is the one place a
+  # new target has to be remembered, so it is the one place that silently rots. Deriving it
+  # means adding a `[[bin]]` is all it takes to get fuzzed the next night.
+  # `every_fuzz_target_is_wired_and_documented` (src/lib.rs) fails the PR-time `test` job if
+  # this job ever goes back to a literal list.
+  discover:
+    name: discover fuzz targets
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: list
+        # `[[bin]]` is always immediately followed by its `name = "..."`, so: on each [[bin]]
+        # line, read the next line and print the quoted name. jq -R/-sc turns the lines into
+        # the JSON array `fromJson` needs below.
+        run: |
+          set -euo pipefail
+          names="$(sed -n '/^\[\[bin\]\]/{n; s/^name *= *"\(.*\)"/\1/p}' fuzz/Cargo.toml)"
+          if [ -z "$names" ]; then
+            echo "!! no [[bin]] fuzz targets parsed out of fuzz/Cargo.toml" >&2
+            exit 1
+          fi
+          targets="$(printf '%s\n' "$names" | jq -R . | jq -sc .)"
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+          echo "fuzzing $(printf '%s\n' "$names" | wc -l) target(s): $targets"
+
   fuzz:
+    needs: discover
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target: [sql, values, like, options, keyword, params, partition]
+        target: ${{ fromJson(needs.discover.outputs.targets) }}
     steps:
       - uses: actions/checkout@v7
 
@@ -101,7 +132,9 @@ jobs:
   # comment on an already-open — tracking issue so a nightly regression stays visible in the repo.
   # Only fires on the nightly `schedule` trigger, never on manual `workflow_dispatch` runs.
   report-failure:
-    needs: fuzz
+    # Both jobs, so a `discover` failure (which skips `fuzz` entirely, fuzzing nothing) is
+    # reported rather than passing as a quiet no-op.
+    needs: [discover, fuzz]
     if: failure() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     # Least privilege: only this job needs to write issues.

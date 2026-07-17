@@ -403,6 +403,73 @@ pub mod fuzzing {
 
     #[cfg(test)]
     mod tests {
+        /// Every declared fuzz target must have a harness file, reach CI's matrix, and be
+        /// documented.
+        ///
+        /// `staleness`, `directed_read` and `uri` were declared, seeded and documented but never
+        /// fuzzed: `fuzz.yml` hardcoded its matrix, and the list was not updated when they were
+        /// added. Nothing failed — the gap was invisible until someone read the two lists side by
+        /// side. `fuzz.yml` now derives the matrix from `fuzz/Cargo.toml`, so CI cannot miss a
+        /// target; this test pins the links that derivation does not cover: harness file ↔
+        /// `[[bin]]` declaration, the workflow still deriving rather than hardcoding, and the
+        /// docs naming every target.
+        #[test]
+        fn every_fuzz_target_is_wired_and_documented() {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+            // `[[bin]]` is always immediately followed by its `name = "..."` — the same shape
+            // fuzz.yml's `discover` job parses.
+            let manifest = std::fs::read_to_string(root.join("fuzz/Cargo.toml")).unwrap();
+            let mut lines = manifest.lines();
+            let mut declared = std::collections::BTreeSet::new();
+            while let Some(line) = lines.next() {
+                if line.trim() != "[[bin]]" {
+                    continue;
+                }
+                let name = lines
+                    .next()
+                    .expect("a [[bin]] section is followed by its name")
+                    .trim()
+                    .strip_prefix("name = \"")
+                    .and_then(|rest| rest.strip_suffix('"'))
+                    .expect("a [[bin]] section starts with `name = \"...\"`");
+                declared.insert(name.to_string());
+            }
+
+            let harnesses: std::collections::BTreeSet<String> =
+                std::fs::read_dir(root.join("fuzz/fuzz_targets"))
+                    .expect("fuzz_targets directory exists")
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+                    .map(|path| path.file_stem().unwrap().to_str().unwrap().to_string())
+                    .collect();
+            assert_eq!(
+                declared, harnesses,
+                "every fuzz_targets/<name>.rs needs a [[bin]] in fuzz/Cargo.toml and vice versa \
+                 (cargo-fuzz only runs declared targets, and fuzz.yml's matrix derives from them)"
+            );
+
+            // The matrix must stay derived. A literal list here is exactly the regression that
+            // left three targets unfuzzed.
+            let workflow =
+                std::fs::read_to_string(root.join(".github/workflows/fuzz.yml")).unwrap();
+            assert!(
+                workflow.contains("fromJson(needs.discover.outputs.targets)"),
+                "fuzz.yml must derive its matrix from fuzz/Cargo.toml via the `discover` job; a \
+                 hardcoded target list silently skips new targets"
+            );
+
+            for doc in ["docs/testing.md", "CLAUDE.md"] {
+                let text = std::fs::read_to_string(root.join(doc)).unwrap();
+                for target in &declared {
+                    assert!(
+                        text.contains(&format!("`{target}`")),
+                        "fuzz target `{target}` is not named in {doc}"
+                    );
+                }
+            }
+        }
+
         /// Run the partition-descriptor oracle over the checked-in fuzz seed corpus
         /// (`fuzz/seeds/partition/`), so a corpus/oracle mismatch fails `cargo test
         /// --features fuzzing` locally instead of only surfacing in a fuzz run. Every seed is
