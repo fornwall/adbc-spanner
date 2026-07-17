@@ -405,8 +405,10 @@ pub mod fuzzing {
     mod tests {
         /// Run the partition-descriptor oracle over the checked-in fuzz seed corpus
         /// (`fuzz/seeds/partition/`), so a corpus/oracle mismatch fails `cargo test
-        /// --features fuzzing` locally instead of only surfacing in a fuzz run. The enveloped
-        /// seed must be accepted; the bad-version seed must be rejected — both verdicts include
+        /// --features fuzzing` locally instead of only surfacing in a fuzz run. Every seed is
+        /// listed with its expected verdict — the two enveloped descriptors must be accepted (and
+        /// their round-trip is byte-stable), while the bad-version and the bare huge-integer
+        /// artifact must be cleanly rejected by the versioned-envelope guard; every verdict runs
         /// the oracle's internal round-trip and clean-rejection assertions.
         #[test]
         fn partition_seed_corpus_satisfies_the_oracle() {
@@ -419,7 +421,9 @@ pub mod fuzzing {
                 verdicts.insert(name, super::decode_partition(&bytes));
             }
             let expected: std::collections::BTreeMap<String, bool> = [
+                ("bare-bignum-query-descriptor", false),
                 ("enveloped-bad-version", false),
+                ("enveloped-bignum-query-descriptor", true),
                 ("enveloped-query-descriptor", true),
             ]
             .into_iter()
