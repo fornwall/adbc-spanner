@@ -1341,6 +1341,30 @@ fn unavailable_mid_stream_surfaces_a_clean_error() {
     );
 }
 
+/// A server whose `ExecuteStreamingSql` delivers exactly one row and then goes silent: the stream's
+/// sender is parked in a Vec that lives as long as the server (never dropped, never sent to again),
+/// so from the client's side the server has simply gone silent mid-result — the stream never ends
+/// and never errors. This is the shared foundation for the two silent-stream reader tests, the
+/// cancel one below and its fetch-timeout twin: with one row per batch the first fetch settles the
+/// schema and every *later* chunk fetch blocks forever on this stream, which is exactly the
+/// in-flight `block_on` position both tests need to interrupt (by `cancel` and by a fetch deadline
+/// respectively), produced without Toxiproxy's bandwidth throttling.
+fn silent_after_first_row_server() -> MockServer {
+    MockServer::start(move |mock| {
+        // Owned by the `returning` closure, which the mock holds for the server's whole life, so
+        // every parked sender stays alive and its stream never closes.
+        let open_streams: Arc<Mutex<Vec<PartialResultSetSender>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        mock.expect_execute_streaming_sql().returning(move |_| {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(Ok(partial_result_set(true, &["v1"], b"rt-1", false)))
+                .expect("first message fits the channel");
+            open_streams.lock().unwrap().push(tx);
+            Ok(tonic::Response::new(rx))
+        });
+    })
+}
+
 /// (c) A server that accepts the RPC, sends one row, then goes silent (stream held open,
 /// nothing more ever arrives): `Statement::cancel` from another thread unblocks the reader
 /// promptly with `Status::Cancelled`. This is the foundation for future timeout tests — the
@@ -1354,20 +1378,7 @@ fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
         "cancel_unblocks_a_reader_hung_on_a_silent_stream",
     );
 
-    // Keep every scripted stream's sender alive so the streams never end and never error: from
-    // the client's side the server has simply gone silent mid-result.
-    let open_streams: Arc<Mutex<Vec<PartialResultSetSender>>> = Arc::new(Mutex::new(Vec::new()));
-    let streams_in_mock = open_streams.clone();
-    let server = MockServer::start(move |mock| {
-        mock.expect_execute_streaming_sql().returning(move |_| {
-            let (tx, rx) = tokio::sync::mpsc::channel(1);
-            tx.try_send(Ok(partial_result_set(true, &["v1"], b"rt-1", false)))
-                .expect("first message fits the channel");
-            streams_in_mock.lock().unwrap().push(tx);
-            Ok(tonic::Response::new(rx))
-        });
-    });
-
+    let server = silent_after_first_row_server();
     let mut connection = server.connect();
     let mut statement = connection.new_statement().expect("new statement");
     // One row per batch, so `execute` completes with the one delivered row and the *next* fetch
@@ -1426,7 +1437,96 @@ fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
     );
 }
 
-/// (c′) The timeout twin of the silent-stream cancel test above, on the **DDL** path:
+/// (c′) The **fetch-timeout** twin of the silent-stream cancel test above, on the query streaming
+/// path: the same server delivers one row and then goes silent, but instead of a `cancel` from
+/// another thread, `spanner.rpc.timeout_seconds.fetch` bounds the hung later-chunk fetch. The first
+/// `next()` yields the buffered row; the second — the fetch that blocks forever on the silent
+/// stream — must surface `Status::Timeout` naming the fetch option, the exact deadline
+/// `spawn_prefetch` wraps each `pull_chunk` in ([`crate::runtime::spawn_prefetch`] /
+/// `conversion.rs`'s `ResultSetChunks`).
+///
+/// This is the gating twin of resilience's Toxiproxy timeout assertion (`tests/resilience.rs`,
+/// which needs a proxy and self-skips without one): it runs offline in every `cargo test`.
+/// Non-vacuous by construction — the cancel twin above proves this same silent stream never ends on
+/// its own (its second `next()` blocks until the cancel lands), so without the fetch deadline the
+/// second fetch here would hang forever and the `Watchdog` would fire; only the driver's deadline
+/// can end it. The `>= 0.5s` floor (measured from before `execute`, since the prefetch's second
+/// fetch begins during `execute` and the deadline can only fire after it starts) rules out an
+/// unrelated transport failure racing it, which would come back in single-digit milliseconds.
+#[test]
+fn fetch_timeout_fires_on_a_reader_hung_on_a_silent_stream() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "fetch_timeout_fires_on_a_reader_hung_on_a_silent_stream",
+    );
+
+    let server = silent_after_first_row_server();
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().expect("new statement");
+    // One row per batch, so `execute` completes with the one delivered row and the *next* fetch is
+    // what blocks on the silent stream — the later chunk `spanner.rpc.timeout_seconds.fetch` bounds.
+    statement
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionValue::Int(1),
+        )
+        .expect("set rows_per_batch");
+    statement
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_RPC_TIMEOUT_FETCH.into()),
+            OptionValue::Double(0.5),
+        )
+        .expect("set the fetch deadline");
+    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+
+    // Time from before `execute`: the background prefetch's second-chunk fetch (whose 0.5s deadline
+    // this test observes) starts *during* `execute`, so the deadline cannot possibly fire before
+    // this point — the `>= 0.5s` floor below is robust against timer granularity.
+    let started = Instant::now();
+    let mut reader = statement.execute().expect("execute settles the schema");
+
+    // The first batch is the row delivered before the server went silent; it is already buffered.
+    let first = reader
+        .next()
+        .expect("first batch exists")
+        .expect("first batch is the row delivered before the server went silent");
+    assert_eq!(first.num_rows(), 1);
+
+    // The second fetch blocks on the silent stream until the fetch deadline expires; unlike the
+    // cancel twin, no worker thread is needed — the deadline ends the fetch on its own.
+    let error = reader
+        .next()
+        .expect("the timed-out fetch yields an item")
+        .expect_err("the fetch blocked on the silent stream must expire its deadline");
+    let elapsed = started.elapsed();
+
+    let ArrowError::ExternalError(source) = &error else {
+        panic!("expected the reader to surface the driver error, got: {error}");
+    };
+    let adbc_error = source
+        .downcast_ref::<adbc_core::error::Error>()
+        .expect("the reader error wraps the ADBC error");
+    assert_eq!(
+        adbc_error.status,
+        AdbcStatus::Timeout,
+        "got error: {adbc_error}"
+    );
+    assert!(
+        adbc_error
+            .message
+            .contains(adbc_spanner::OPTION_RPC_TIMEOUT_FETCH),
+        "the fetch timeout error must name the fetch option: {}",
+        adbc_error.message
+    );
+    // The deadline — not an unrelated transport failure racing it — ended the fetch.
+    assert!(
+        elapsed >= Duration::from_millis(500),
+        "returned in {elapsed:?}, before the 0.5s fetch deadline could fire — the fetch failed for \
+         some other reason"
+    );
+}
+
+/// (c″) The timeout twin of the silent-stream cancel test above, on the **DDL** path:
 /// `spanner.rpc.timeout_seconds.update` bounds `run_ddl` — the admin `UpdateDatabaseDdl` call and
 /// its long-running-operation poll loop, which sit inside the same `with_timeout`, so bounding the
 /// wrapper bounds the poll loop that used to run unbounded.
