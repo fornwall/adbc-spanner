@@ -1264,9 +1264,9 @@ impl Optionable for SpannerConnection {
             // schemas (addressed by qualified name, e.g. `sales.Orders`, and enumerated by
             // `get_objects`) — it exposes no settable session/current schema to point at one. So the
             // "current" catalog and schema are both fixed at `""`, which is what the `get_option` side
-            // always reports; setting either to `""` is a conformant no-op, and any other value is an
-            // `InvalidArguments` (there is no such switchable current catalog/schema), not
-            // `NotImplemented`.
+            // always reports; setting either to `""` is a conformant no-op, and setting a non-empty
+            // value is unsupported → `NotImplemented` (there is no such switchable current
+            // catalog/schema; matches the C++ PostgreSQL driver's treatment of this class).
             OptionConnection::CurrentCatalog => {
                 check_unnamed_catalog_or_schema(value, "current catalog")?;
             }
@@ -1691,9 +1691,10 @@ pub(crate) fn decode_partition(descriptor: &[u8]) -> Result<Partition> {
 /// catalog, and — although it supports named schemas (addressed by qualified name and enumerated by
 /// `get_objects`) — no settable session/current schema to select one. Both "current" values are
 /// therefore fixed at `""` (mirrored by the `get_option` side, which always reports `""`), so the
-/// only conformant value is the empty string, accepted as a no-op; any other value is rejected with
-/// `InvalidArguments` (there is no such switchable current catalog/schema), not `NotImplemented`.
-/// `what` names the option in the error.
+/// only conformant value is the empty string, accepted as a no-op; setting either to any other value
+/// is unsupported and rejected with `NotImplemented` (matching the C++ PostgreSQL driver's treatment
+/// of an unsupported `set` on this class). A non-string value is a malformed argument
+/// (`InvalidArguments`). `what` names the option in the error.
 fn check_unnamed_catalog_or_schema(value: OptionValue, what: &str) -> Result<()> {
     let OptionValue::String(s) = value else {
         return Err(invalid_argument(format!("expected a string {what} value")));
@@ -1701,8 +1702,8 @@ fn check_unnamed_catalog_or_schema(value: OptionValue, what: &str) -> Result<()>
     if s.is_empty() {
         Ok(())
     } else {
-        Err(invalid_argument(format!(
-            "Spanner has no settable {what}; only \"\" is valid, got {s:?}"
+        Err(not_implemented(&format!(
+            "setting the {what} to {s:?} (Spanner has no settable {what}; only \"\" is valid)"
         )))
     }
 }
@@ -1839,12 +1840,12 @@ mod tests {
         // The "current" catalog/schema is fixed at `""` (no settable session catalog/schema), so
         // setting it to `""` is a no-op success.
         assert!(set("").is_ok());
-        // Any other value has no switchable current catalog/schema to select → InvalidArguments (not
-        // NotImplemented, which is what the blanket fall-through arm would have produced).
+        // Any other value has no switchable current catalog/schema to select; setting it is
+        // unsupported → NotImplemented (aligned with the C++ PostgreSQL driver's `set` on this class).
         let err = set("foo").unwrap_err();
-        assert_eq!(err.status, Status::InvalidArguments);
+        assert_eq!(err.status, Status::NotImplemented);
         assert!(err.message.contains("\"foo\""), "{}", err.message);
-        // A non-string option value is likewise rejected as an invalid argument.
+        // A non-string option value is a malformed argument, rejected as InvalidArguments.
         assert_eq!(
             check_unnamed_catalog_or_schema(OptionValue::Int(1), "current schema")
                 .unwrap_err()

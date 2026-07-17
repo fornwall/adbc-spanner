@@ -2094,10 +2094,11 @@ fn undeclared_parameter_types(
 /// into thinking the transaction mode is the problem. Catch DDL and DML up front with a clear
 /// message instead. (This also covers `THEN RETURN` DML — it does produce rows, but Spanner cannot
 /// run it read-only.) `dml_rationale` completes "DML (INSERT/UPDATE/DELETE) cannot be …" with the
-/// entry point's read-only operation.
+/// entry point's read-only operation. Both DDL and DML are the same "not a query" class — the
+/// caller passed the wrong kind of statement — so both reject with `InvalidArguments` (SPEC-6).
 fn check_query_only(sql: &str, entry_point: &str, dml_rationale: &str) -> Result<()> {
     if crate::sql::is_ddl(sql) {
-        return Err(invalid_state(format!(
+        return Err(invalid_argument(format!(
             "{entry_point} is only valid for queries"
         )));
     }
@@ -2601,9 +2602,10 @@ mod tests {
         ] {
             check_schema_query(sql).unwrap_or_else(|e| panic!("query should pass: {sql}: {e}"));
         }
-        // DDL is rejected up front (unchanged behaviour).
+        // DDL is rejected up front with the same `InvalidArguments` as DML — both are the "not a
+        // query" class (SPEC-6).
         let error = check_schema_query("CREATE TABLE t (id INT64) PRIMARY KEY (id)").unwrap_err();
-        assert_eq!(error.status, Status::InvalidState);
+        assert_eq!(error.status, Status::InvalidArguments);
         // DML — in any spelling, hinted, or with THEN RETURN — gets a clear `InvalidArguments`
         // instead of Spanner's raw read-only-transaction error from the PLAN probe.
         for sql in [
@@ -2636,10 +2638,11 @@ mod tests {
         ] {
             check_partition_query(sql).unwrap_or_else(|e| panic!("query should pass: {sql}: {e}"));
         }
-        // DDL is rejected up front (unchanged behaviour).
+        // DDL is rejected up front with the same `InvalidArguments` as DML — both are the "not a
+        // query" class (SPEC-6).
         let error =
             check_partition_query("CREATE TABLE t (id INT64) PRIMARY KEY (id)").unwrap_err();
-        assert_eq!(error.status, Status::InvalidState);
+        assert_eq!(error.status, Status::InvalidArguments);
         assert!(
             error.message.contains("execute_partitions"),
             "unexpected message: {}",
