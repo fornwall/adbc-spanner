@@ -1790,6 +1790,56 @@ fn mutation_build_failure_on_a_later_chunk_notes_committed_rows() {
     );
 }
 
+/// (d⁗) **CON-5: a cancelled/timed-out chunk commit is ambiguous.** Cancel/timeout *drops* the
+/// in-flight `Commit` future, which may still land server-side, so the failing chunk's own outcome
+/// is unknown — the "rows already committed" annotation must flag that ambiguity (and the
+/// duplicate-row risk on a caller-driven retry) instead of implying exact accounting. The mock fails
+/// the single-chunk commit with `CANCELLED`; the append exists-probe can't run (its
+/// `ExecuteStreamingSql` is unscripted → `UNIMPLEMENTED`), so the remap leaves the annotated error
+/// intact for the assertion.
+#[test]
+fn cancelled_ingest_commit_reports_ambiguous_outcome() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "cancelled_ingest_commit_reports_ambiguous_outcome",
+    );
+
+    let server = MockServer::start(|mock| {
+        serve_begin_transaction(mock);
+        mock.expect_commit()
+            .returning(|_| Err(tonic::Status::cancelled("commit cancelled by peer")));
+    });
+
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("MockTable".into()),
+        )
+        .expect("set target table");
+    statement
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .expect("set ingest mode append");
+    // One row ⇒ a single, first chunk: nothing committed before it, so a naive annotation would say
+    // "0 rows already committed" — the ambiguity note is the only correct thing to report.
+    statement.bind(ingest_batch(1)).expect("bind ingest data");
+
+    let error = statement
+        .execute_update()
+        .expect_err("a cancelled commit must fail the ingest");
+
+    assert_eq!(error.status, AdbcStatus::Cancelled, "got error: {error}");
+    assert!(
+        error.message.contains("outcome is unknown") && error.message.contains("duplicate rows"),
+        "a cancelled chunk commit must flag its ambiguous outcome, not imply exact accounting: {}",
+        error.message
+    );
+}
+
 /// (d″) **A failed exists-probe must not mask the ingest error** (IDIO-9). When an `append` commit
 /// fails with anything other than `AlreadyExists`, the driver probes `INFORMATION_SCHEMA.TABLES` to
 /// choose between the contract's `NotFound` (table absent) and `AlreadyExists` (schema mismatch).
