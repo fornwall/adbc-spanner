@@ -47,11 +47,10 @@ if(SPANNER_VALIDATION_SANITIZE)
   add_link_options(-fsanitize=${SPANNER_VALIDATION_SANITIZE})
 endif()
 
-# TEMPORARILY pinned to a fornwall/arrow-adbc fork branch that carries one
-# unmerged upstream PR, apache/arrow-adbc#4534. As soon as that PR merges,
-# revert GIT_REPOSITORY (below) to apache/arrow-adbc.git and bump the tag onto a
-# `main` rev containing it — the fork is the *only* reason this points anywhere
-# but apache/arrow-adbc.
+# Pinned to an apache/arrow-adbc `main` revision. (This used to point at a
+# fornwall/arrow-adbc fork branch carrying the then-unmerged
+# apache/arrow-adbc#4534; that PR is merged, so the fork is gone and this is a
+# plain upstream `main` pin again.)
 #
 # This is the same *family* as the adbc_core / adbc_ffi git pin the driver
 # builds on (see Cargo.toml), but the two revisions are bumped independently
@@ -83,8 +82,8 @@ endif()
 # exists, so a stale `CMakeCache.txt` (e.g. one restored from a run on the old
 # rev) would silently keep the previous tag and rebuild against the wrong
 # arrow-adbc source. FORCE makes a rev bump here authoritative.
-set(ARROW_ADBC_TAG "4dc3be825cafb4357a91fae720c6de57594976fe"
-    CACHE STRING "arrow-adbc revision (TEMP: fornwall fork branch, see above)" FORCE)
+set(ARROW_ADBC_TAG "65957bbae31a70ad9ce07c2b9919c32d7ea62649"
+    CACHE STRING "arrow-adbc revision (apache/arrow-adbc main, see above)" FORCE)
 
 include(FetchContent)
 
@@ -108,9 +107,7 @@ set(ADBC_DRIVER_BIGQUERY OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
   arrow_adbc
-  # TEMPORARY: fornwall/arrow-adbc fork branch for unmerged apache/arrow-adbc#4534;
-  # revert to https://github.com/apache/arrow-adbc.git once #4534 merges (see above).
-  GIT_REPOSITORY https://github.com/fornwall/arrow-adbc.git
+  GIT_REPOSITORY https://github.com/apache/arrow-adbc.git
   GIT_TAG ${ARROW_ADBC_TAG}
   # NOT GIT_SHALLOW: ARROW_ADBC_TAG is a specific `main` commit, and a shallow clone
   # (`--depth 1`) fetches only upstream's current tip — so checking out the pinned SHA

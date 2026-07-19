@@ -33,7 +33,10 @@ GoogleTest — is fetched and built from source at a pinned arrow-adbc revision
 (`ARROW_ADBC_TAG` in `CMakeLists.txt` — an `apache/arrow-adbc` `main` revision
 carrying [apache/arrow-adbc#4514](https://github.com/apache/arrow-adbc/pull/4514),
 which routes the suite's hardcoded dialect-sensitive SQL through the
-`DriverQuirks::RewriteSql` hook). No system packages are required.
+`DriverQuirks::RewriteSql` hook, and
+[apache/arrow-adbc#4534](https://github.com/apache/arrow-adbc/pull/4534), which
+makes the `TestSqlPrepareUpdate` readbacks order-deterministic). No system
+packages are required.
 
 The **driver** (cdylib) links the `adbc_core` / `adbc_ffi` crates from a git pin
 (an `apache/arrow-adbc` `main` revision — see `Cargo.toml`) that carries three FFI
