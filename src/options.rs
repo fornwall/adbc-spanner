@@ -351,6 +351,10 @@ macro_rules! impl_shared_option_dispatch {
                     self.config.request.set_max_commit_delay(value)?
                 }
                 crate::OPTION_COMMIT_STATS => self.config.request.set_commit_stats(value)?,
+                crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS => self
+                    .config
+                    .request
+                    .set_exclude_txn_from_change_streams(value)?,
                 crate::OPTION_QUERY_OPTIMIZER_VERSION => {
                     self.config.query_options.set_optimizer_version(value)?
                 }
@@ -412,6 +416,14 @@ macro_rules! impl_shared_option_dispatch {
                 crate::OPTION_COMMIT_STATS => {
                     Some(self.config.request.commit_stats_string().to_string())
                 }
+                // A plain boolean; always reports the effective value ("true"/"false", default
+                // "false").
+                crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS => Some(
+                    self.config
+                        .request
+                        .exclude_txn_from_change_streams_string()
+                        .to_string(),
+                ),
                 // The captured mutation count from the most recent commit that requested commit
                 // stats; None → NotFound below.
                 crate::OPTION_COMMIT_STATS_MUTATION_COUNT => self

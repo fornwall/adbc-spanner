@@ -164,6 +164,7 @@ are handy from Python:
 | `DIRECTED_READ`                                 | `spanner.directed_read`    | conn/stmt  | Steer read-only queries to specific replicas, e.g. `"include:us-east1:read_only"` or `"exclude:us-central1"`. |
 | `MAX_COMMIT_DELAY`                              | `spanner.commit.max_delay` | conn/stmt  | Max delay Spanner may add to a read/write commit to batch it with others, e.g. `"100ms"` (a duration in `0..=500ms`) — trades a little latency for throughput. |
 | `COMMIT_STATS`                                  | `spanner.commit_stats`     | conn/stmt  | `"true"` requests commit statistics on read/write commits; read the mutation count of the most recent commit back with `get_option_int("spanner.commit_stats.mutation_count")` (on the statement for autocommit DML / bulk ingest, on the connection for a manual-mode commit). |
+| `EXCLUDE_TXN_FROM_CHANGE_STREAMS`               | `spanner.transaction.exclude_from_change_streams` | conn/stmt | `"true"` excludes the transaction's writes from change-stream capture (only for change streams created with `allow_txn_exclusion = true`); applies to DML/ingest write commits and the BatchWrite path. |
 | `QUERY_OPTIMIZER_VERSION`                       | `spanner.query.optimizer_version` | conn/stmt | Pin the query optimizer version, e.g. `"6"` or `"latest"` (also `QUERY_OPTIMIZER_STATISTICS_PACKAGE`). |
 | `StatementOptions.ROWS_PER_BATCH`               | `spanner.rows_per_batch`   | statement  | Rows per streamed Arrow batch (default `8192`); lower it to cap peak memory.                   |
 
