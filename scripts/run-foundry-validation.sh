@@ -32,7 +32,7 @@ cd "$REPO_ROOT"
 # rely on landed upstream (#249), and the create-mode synthetic-column quirk is handled
 # by a driver-side test override (see tests/test_connection.py, adbc-drivers/validation#250)
 # rather than a shared-suite feature — so no fork is needed.
-VALIDATION_REF="${ADBC_VALIDATION_REF:-61d34f9e47ef91e1f575b6d74b945a23eaf04804}"
+VALIDATION_REF="${ADBC_VALIDATION_REF:-dbc6857ff7ab7c43e98d7729a63ee8d9303ac1f9}"
 VALIDATION_REPO="${ADBC_VALIDATION_REPO:-adbc-drivers/validation}"
 PYTHON="${PYTHON:-python3}"
 EMULATOR_DATABASE="projects/test-project/instances/test-instance/databases/adbc-test"
