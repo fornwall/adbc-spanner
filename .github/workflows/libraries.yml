@@ -422,7 +422,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           # Only drives `setup.py bdist_wheel` to repackage the prebuilt libraries;
           # the wheel tag is forced to py3-none-<platform>, so this version does not
