@@ -32,6 +32,11 @@
 //!   builds (the same four sites as `max_commit_delay`). The returned mutation count is captured
 //!   into a [`CommitStats`] cell, readable back through `spanner.commit_stats.mutation_count`.
 //!   Connection and statement level.
+//! - [`OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS`](crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS)
+//!   (`spanner.transaction.exclude_from_change_streams`) — a boolean that, when `true`, excludes the
+//!   transaction's writes from change-stream capture. Applied at the same read/write commit sites as
+//!   `max_commit_delay`/`commit_stats` **and** on the `BatchWrite` ingest request (which carries the
+//!   flag directly). Connection and statement level.
 //!
 //! Like the read-staleness options, the connection's values become the default for statements it
 //! creates (which may override them), setting an empty string unsets a value, and every option
@@ -128,6 +133,9 @@ macro_rules! apply_to_commit_builder {
             if self.return_commit_stats {
                 builder = builder.set_return_commit_stats(true);
             }
+            if self.exclude_txn_from_change_streams {
+                builder = builder.set_exclude_txn_from_change_streams(true);
+            }
             builder
         }
     };
@@ -152,6 +160,9 @@ pub(crate) struct RequestConfig {
     /// `spanner.commit_stats`: whether to request Spanner return commit statistics on the read/write
     /// commits the driver builds. `false` (the default) leaves them off.
     return_commit_stats: bool,
+    /// `spanner.transaction.exclude_from_change_streams`: whether to exclude this transaction's
+    /// writes from change-stream capture. `false` (the default) records writes as normal.
+    exclude_txn_from_change_streams: bool,
 }
 
 impl RequestConfig {
@@ -211,6 +222,33 @@ impl RequestConfig {
     /// Always reported (the effective boolean), like the other plain-boolean statement options.
     pub(crate) fn commit_stats_string(&self) -> &'static str {
         if self.return_commit_stats {
+            "true"
+        } else {
+            "false"
+        }
+    }
+
+    /// Handle a `set_option` for `spanner.transaction.exclude_from_change_streams`. An empty string
+    /// unsets it (back to the default of *not* excluding); otherwise a boolean string (exactly
+    /// `true`/`false`).
+    pub(crate) fn set_exclude_txn_from_change_streams(&mut self, value: OptionValue) -> Result<()> {
+        if let OptionValue::String(s) = &value
+            && s.trim().is_empty()
+        {
+            self.exclude_txn_from_change_streams = false;
+            return Ok(());
+        }
+        self.exclude_txn_from_change_streams = crate::options::bool_option(
+            value,
+            "option spanner.transaction.exclude_from_change_streams",
+        )?;
+        Ok(())
+    }
+
+    /// The canonical `spanner.transaction.exclude_from_change_streams` value (`"true"`/`"false"`),
+    /// for `get_option` round-trip. Always reported (the effective boolean).
+    pub(crate) fn exclude_txn_from_change_streams_string(&self) -> &'static str {
+        if self.exclude_txn_from_change_streams {
             "true"
         } else {
             "false"
@@ -278,7 +316,9 @@ impl RequestConfig {
     /// The **request** tag is deliberately not applied: per-request tags apply only to queries and
     /// reads, and Spanner ignores them on `BatchWrite` (the client's builder exposes no setter for
     /// that reason). Nor is there a commit delay or commit-stats setter — BatchWrite carries no
-    /// per-request commit options — so this is not one of the `apply_to_commit_builder!` sites.
+    /// per-request commit options — so this is not one of the `apply_to_commit_builder!` sites. The
+    /// change-stream exclusion flag *is* applied, though: `BatchWriteTransactionBuilder` exposes
+    /// `set_exclude_txn_from_change_streams` (it rides the `BatchWriteRequest` directly).
     #[must_use]
     pub(crate) fn apply_to_batch_write(
         &self,
@@ -289,6 +329,9 @@ impl RequestConfig {
         }
         if let Some(tag) = &self.transaction_tag {
             builder = builder.set_transaction_tag(tag.as_str());
+        }
+        if self.exclude_txn_from_change_streams {
+            builder = builder.set_exclude_txn_from_change_streams(true);
         }
         builder
     }
@@ -537,6 +580,43 @@ mod tests {
     }
 
     #[test]
+    fn exclude_txn_from_change_streams_flag_round_trips_and_unsets() {
+        let mut config = RequestConfig::default();
+        // Default is off, always reported as an effective boolean.
+        assert_eq!(config.exclude_txn_from_change_streams_string(), "false");
+
+        // Accepts exactly the strings "true"/"false"; lenient spellings are rejected (COR-7).
+        config
+            .set_exclude_txn_from_change_streams(s("true"))
+            .unwrap();
+        assert_eq!(config.exclude_txn_from_change_streams_string(), "true");
+        // An int-typed set is rejected (COR-4) and leaves the stored value untouched.
+        let error = config
+            .set_exclude_txn_from_change_streams(OptionValue::Int(1))
+            .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert_eq!(config.exclude_txn_from_change_streams_string(), "true");
+        config
+            .set_exclude_txn_from_change_streams(s("false"))
+            .unwrap();
+        assert_eq!(config.exclude_txn_from_change_streams_string(), "false");
+        for lenient in ["1", "yes", "TRUE", "0", "no", "False"] {
+            let error = config
+                .set_exclude_txn_from_change_streams(s(lenient))
+                .unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "{lenient}");
+        }
+
+        // An empty string unsets (back to the default of not excluding).
+        config
+            .set_exclude_txn_from_change_streams(s("true"))
+            .unwrap();
+        assert_eq!(config.exclude_txn_from_change_streams_string(), "true");
+        config.set_exclude_txn_from_change_streams(s("")).unwrap();
+        assert_eq!(config.exclude_txn_from_change_streams_string(), "false");
+    }
+
+    #[test]
     fn commit_stats_sink_records_most_recent_and_ignores_none() {
         let sink = CommitStats::default();
         assert_eq!(sink.mutation_count(), None);
@@ -569,6 +649,9 @@ mod tests {
         connection.set_transaction_tag(s("txn-tag")).unwrap();
         connection.set_max_commit_delay(s("100ms")).unwrap();
         connection.set_commit_stats(s("true")).unwrap();
+        connection
+            .set_exclude_txn_from_change_streams(s("true"))
+            .unwrap();
 
         let mut statement = connection.clone();
         assert_eq!(statement.priority_string(), Some("low"));
@@ -576,19 +659,25 @@ mod tests {
         assert_eq!(statement.transaction_tag_string(), Some("txn-tag"));
         assert_eq!(statement.max_commit_delay_string(), Some("100ms"));
         assert_eq!(statement.commit_stats_string(), "true");
+        assert_eq!(statement.exclude_txn_from_change_streams_string(), "true");
 
         statement.set_priority(s("high")).unwrap();
         statement.set_request_tag(s("")).unwrap();
         statement.set_max_commit_delay(s("250ms")).unwrap();
         statement.set_commit_stats(s("false")).unwrap();
+        statement
+            .set_exclude_txn_from_change_streams(s("false"))
+            .unwrap();
         assert_eq!(statement.priority_string(), Some("high"));
         assert_eq!(statement.request_tag_string(), None);
         assert_eq!(statement.max_commit_delay_string(), Some("250ms"));
         assert_eq!(statement.commit_stats_string(), "false");
+        assert_eq!(statement.exclude_txn_from_change_streams_string(), "false");
         // The connection is unaffected by statement-level overrides.
         assert_eq!(connection.priority_string(), Some("low"));
         assert_eq!(connection.request_tag_string(), Some("conn-tag"));
         assert_eq!(connection.max_commit_delay_string(), Some("100ms"));
         assert_eq!(connection.commit_stats_string(), "true");
+        assert_eq!(connection.exclude_txn_from_change_streams_string(), "true");
     }
 }

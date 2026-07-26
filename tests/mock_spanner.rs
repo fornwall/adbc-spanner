@@ -3946,7 +3946,204 @@ fn batch_write_carries_the_priority_and_transaction_tag_but_not_the_request_tag(
     );
     assert!(
         !seen[0].exclude_txn_from_change_streams,
-        "no driver option exposes change-stream exclusion yet, so the default must go out"
+        "with spanner.transaction.exclude_from_change_streams unset, the default (false) must go \
+         out — the positive is asserted by \
+         exclude_from_change_streams_reaches_the_wire_on_batch_write"
+    );
+}
+
+/// SPAN-9 (wire): `spanner.transaction.exclude_from_change_streams=true` must set
+/// `exclude_txn_from_change_streams` on the write it produces. This exercises the `BatchWrite`
+/// firehose path (`RequestConfig::apply_to_batch_write`), where the flag rides the
+/// `BatchWriteRequest` **directly** — the cleanest wire assertion. Its negative half (unset ⇒
+/// `false` on the wire) is covered by
+/// `batch_write_carries_the_priority_and_transaction_tag_but_not_the_request_tag` above, so this
+/// asserts only the positive.
+///
+/// The runner-commit sites (`apply_to_runner`, autocommit DML) are covered by
+/// [`exclude_from_change_streams_reaches_the_wire_on_runner_commits`], which reads the inline-begin
+/// `TransactionOptions` off the `ExecuteBatchDml` request.
+#[test]
+fn exclude_from_change_streams_reaches_the_wire_on_batch_write() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "exclude_from_change_streams_reaches_the_wire_on_batch_write",
+    );
+
+    let requests: Arc<Mutex<Vec<v1::BatchWriteRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let record = requests.clone();
+    let server = MockServer::start(move |mock| {
+        mock.expect_batch_write().returning(move |request| {
+            record.lock().unwrap().push(request.into_inner());
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(Ok(v1::BatchWriteResponse {
+                indexes: vec![0],
+                status: Some(spanner_grpc_mock::google::rpc::Status {
+                    code: 0,
+                    message: "OK".into(),
+                    details: vec![],
+                }),
+                ..Default::default()
+            }))
+            .expect("scripted stream channel sized to fit");
+            Ok(tonic::Response::new(rx))
+        });
+    });
+
+    let mut connection = server.connect();
+    // Set the option on the connection; the statement inherits it (the inheritance is unit-tested
+    // in src/request.rs — here we only prove it reaches the wire).
+    connection
+        .set_option(
+            OptionConnection::Other(adbc_spanner::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS.into()),
+            OptionValue::String("true".into()),
+        )
+        .expect("exclude the transaction from change streams");
+
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("MockTable".into()),
+        )
+        .expect("set target table");
+    statement
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .expect("set ingest mode append");
+    statement
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_INGEST_BATCH_WRITE.into()),
+            OptionValue::String("true".into()),
+        )
+        .expect("route the ingest through BatchWrite");
+    statement.bind(ingest_batch(1)).expect("bind ingest data");
+    assert_eq!(
+        statement.execute_update().expect("BatchWrite ingest"),
+        Some(1)
+    );
+
+    let seen = requests.lock().unwrap();
+    assert_eq!(seen.len(), 1, "one chunk ⇒ one BatchWrite request");
+    assert!(
+        seen[0].exclude_txn_from_change_streams,
+        "spanner.transaction.exclude_from_change_streams=true must set \
+         exclude_txn_from_change_streams on the BatchWrite request"
+    );
+}
+
+/// SPAN-9 (wire, runner path): `spanner.transaction.exclude_from_change_streams=true` must set
+/// `exclude_txn_from_change_streams` on the **inline-begin** `TransactionOptions` the read/write
+/// runner sends — an autocommit DML begins its transaction inline on the `ExecuteBatchDml` request,
+/// so `RequestConfig::apply_to_runner`'s flag rides that request's `Begin` selector.
+///
+/// Two DML statements on one connection, in order:
+/// 1. **Unset** (the negative that makes the positive meaningful): before the option is set, the
+///    inline-begin options must carry `exclude_txn_from_change_streams == false`.
+/// 2. **Set**: with the connection-level option at `true`, a statement created afterwards inherits
+///    it and its inline-begin options carry `true`.
+#[test]
+fn exclude_from_change_streams_reaches_the_wire_on_runner_commits() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "exclude_from_change_streams_reaches_the_wire_on_runner_commits",
+    );
+
+    const DML_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
+
+    // The read/write TransactionOptions seen on each transaction begin, in order — recorded from
+    // whichever begin path the client takes: the inline `Begin` selector on `ExecuteBatchDml`, or
+    // an explicit `BeginTransaction` RPC. An autocommit DML does exactly one begin, one way or the
+    // other, and the two statements run sequentially, so the recorded order is deterministic.
+    let begins: Arc<Mutex<Vec<v1::TransactionOptions>>> = Arc::new(Mutex::new(Vec::new()));
+    let record_explicit = begins.clone();
+    let record_inline = begins.clone();
+    let server = MockServer::start(move |mock| {
+        // Explicit-begin path: record the options, then hand back a transaction id.
+        mock.expect_begin_transaction().returning(move |request| {
+            if let Some(options) = request.into_inner().options {
+                record_explicit.lock().unwrap().push(options);
+            }
+            Ok(tonic::Response::new(v1::Transaction {
+                id: b"dml-txn".to_vec(),
+                ..Default::default()
+            }))
+        });
+        mock.expect_execute_batch_dml().returning(move |request| {
+            let request = request.into_inner();
+            if let Some(v1::transaction_selector::Selector::Begin(options)) = request
+                .transaction
+                .as_ref()
+                .and_then(|t| t.selector.as_ref())
+            {
+                record_inline.lock().unwrap().push(options.clone());
+            }
+            Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
+                result_sets: vec![v1::ResultSet {
+                    metadata: Some(v1::ResultSetMetadata {
+                        transaction: Some(v1::Transaction {
+                            id: b"dml-txn".to_vec(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    stats: Some(v1::ResultSetStats {
+                        row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                status: Some(spanner_grpc_mock::google::rpc::Status {
+                    code: 0,
+                    message: "OK".into(),
+                    details: vec![],
+                }),
+                ..Default::default()
+            }))
+        });
+        mock.expect_commit().returning(|_| commit_ok());
+    });
+
+    let mut connection = server.connect();
+
+    let run_dml = |connection: &mut SpannerConnection| {
+        let mut statement = connection.new_statement().expect("new statement");
+        statement.set_sql_query(DML_SQL).unwrap();
+        assert_eq!(
+            statement.execute_update().expect("autocommit DML"),
+            Some(1),
+            "the scripted DML affects one row"
+        );
+    };
+
+    // 1. The negative: no exclusion configured yet.
+    run_dml(&mut connection);
+
+    // 2. Set on the connection; a statement created afterwards inherits it.
+    connection
+        .set_option(
+            OptionConnection::Other(adbc_spanner::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS.into()),
+            OptionValue::String("true".into()),
+        )
+        .expect("exclude the transaction from change streams");
+    run_dml(&mut connection);
+
+    let seen = begins.lock().unwrap();
+    assert_eq!(
+        seen.len(),
+        2,
+        "each autocommit DML begins its read/write transaction inline on ExecuteBatchDml"
+    );
+    assert!(
+        !seen[0].exclude_txn_from_change_streams,
+        "with the option unset, the inline-begin options must carry the default (false)"
+    );
+    assert!(
+        seen[1].exclude_txn_from_change_streams,
+        "spanner.transaction.exclude_from_change_streams=true must set \
+         exclude_txn_from_change_streams on the runner's inline-begin TransactionOptions"
     );
 }
 

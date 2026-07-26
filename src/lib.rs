@@ -968,6 +968,23 @@ pub const OPTION_COMMIT_STATS: &str = "spanner.commit_stats";
 /// most recent one's count.
 pub const OPTION_COMMIT_STATS_MUTATION_COUNT: &str = "spanner.commit_stats.mutation_count";
 
+/// Driver-specific connection **and** statement option: whether to **exclude a transaction's writes
+/// from change-stream capture** (see Spanner's
+/// [`TransactionOptions.exclude_txn_from_change_streams`](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions)).
+/// A boolean, `false` by default; accepted as exactly the string `true`/`false`, and an empty string
+/// unsets it (back to `false`). Round-trips through `get_option` (the effective boolean is always
+/// reported).
+///
+/// When `true` it is applied at every write the driver builds — the read/write transaction runner
+/// (autocommit DML, the `ExecuteBatchDml` batch runner, the manual-mode commit), the bulk-ingest
+/// write-only transaction, and the `spanner.ingest.batch_write` firehose `BatchWrite` request — so
+/// that transaction's modifications are not recorded in change streams. Per Spanner this only takes
+/// effect for change streams created with the DDL option `allow_txn_exclusion = true`; other change
+/// streams record the writes regardless. Set on a connection it becomes the default for statements
+/// it creates; a statement may override it.
+pub const OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS: &str =
+    "spanner.transaction.exclude_from_change_streams";
+
 /// Driver-specific connection **and** statement option: the maximum precision at which Spanner
 /// `TIMESTAMP` columns are read into Arrow. Two values:
 ///
@@ -1036,6 +1053,7 @@ mod options_doc_tests {
             crate::OPTION_MAX_COMMIT_DELAY,
             crate::OPTION_COMMIT_STATS,
             crate::OPTION_COMMIT_STATS_MUTATION_COUNT,
+            crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS,
             crate::OPTION_MAX_TIMESTAMP_PRECISION,
             crate::OPTION_RPC_TIMEOUT_QUERY,
             crate::OPTION_RPC_TIMEOUT_UPDATE,
