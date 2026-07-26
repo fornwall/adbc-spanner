@@ -52,7 +52,11 @@ Cases Spanner cannot round-trip are `skip`ped with a reason: narrower integers (
 `INT64`), `DECIMAL(p,s)` (Spanner `NUMERIC` is fixed 38,9), `TIME`-of-day / `float16` /
 `fixed_size_binary` (no Spanner type), the tz-naive `timestamp_*` variants (Spanner `TIMESTAMP` is
 UTC-aware), and the coarser-unit `timestamptz_s`/`_ms` (Spanner resolves to sub-second, so a
-second/millisecond read-back unit never matches).
+second/millisecond read-back unit never matches). The suite's `test_query_bind_dictionary`
+(adbc-drivers/validation#256) re-binds the `string` and `large_string` cases *dictionary-encoded* —
+the layout a pandas categorical produces — and both pass unchanged: dictionary encoding is an
+encoding of the same logical values, not a different logical type, and `bind::cell_value` decodes
+the key at each row back through the same mapping as the plain column.
 
 **`type/select/*` is done** (all pass or `skip`): each override supplies a Spanner `setup_query` —
 `idx` is the `PRIMARY KEY` and `res` the native-typed value column, with literals adjusted for

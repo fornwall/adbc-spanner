@@ -41,7 +41,8 @@ use adbc_spanner::{SpannerConnection, SpannerDatabase, SpannerDriver};
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int16Array, Int64Array, ListArray, RecordBatch, RecordBatchIterator, RecordBatchReader,
-    StringArray, StructArray, TimestampMicrosecondArray, TimestampNanosecondArray, UnionArray,
+    StringArray, StructArray, TimestampMicrosecondArray, TimestampNanosecondArray, UInt32Array,
+    UnionArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::{NaiveDate, SecondsFormat};
@@ -4732,6 +4733,38 @@ fn conformance_via_driver_manager() {
         .map(|b| b.num_rows())
         .sum();
     assert_eq!(subset_rows, 2, "one row per explicitly requested code");
+    // Unrecognized codes — an XDBC-range one ([500, 1000)) and a vendor-specific one (>= 10000) —
+    // must be *ignored* (their row omitted), not rejected, per `adbc.h`. This is only assertable
+    // through the C ABI since apache/arrow-adbc#4510: before it the exporter failed the whole call
+    // with "Unknown info code" before the driver was consulted, so a caller could never ask for a
+    // vendor code even though "fetch all" could return one. Mixed with a recognised code, exactly
+    // the recognised row comes back.
+    let unknown = connection
+        .get_info(Some(
+            [
+                InfoCode::Other(500),
+                InfoCode::Other(10_042),
+                InfoCode::DriverName,
+            ]
+            .into(),
+        ))
+        .expect("unrecognized info codes are ignored, not an error");
+    assert_eq!(unknown.schema(), GET_INFO_SCHEMA.clone());
+    let unknown_batches = unknown
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect unknown-code info");
+    let unknown_codes: Vec<u32> = unknown_batches
+        .iter()
+        .flat_map(|b| {
+            let col = b.column(0).as_any().downcast_ref::<UInt32Array>().unwrap();
+            (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        unknown_codes,
+        vec![u32::from(&InfoCode::DriverName)],
+        "only the recognised code is answered; the unrecognized ones are omitted"
+    );
 
     // --- get_table_types: canonical schema, BASE TABLE and VIEW present. ---
     let reader = connection.get_table_types().expect("get_table_types");

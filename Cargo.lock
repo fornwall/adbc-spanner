@@ -49,7 +49,7 @@ dependencies = [
 [[package]]
 name = "adbc_core"
 version = "0.24.0"
-source = "git+https://github.com/apache/arrow-adbc?rev=198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab#198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab"
+source = "git+https://github.com/apache/arrow-adbc?rev=3b3f123a74c767845e83e559bb889d1fa7d7616b#3b3f123a74c767845e83e559bb889d1fa7d7616b"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -58,7 +58,7 @@ dependencies = [
 [[package]]
 name = "adbc_driver_manager"
 version = "0.24.0"
-source = "git+https://github.com/apache/arrow-adbc?rev=198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab#198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab"
+source = "git+https://github.com/apache/arrow-adbc?rev=3b3f123a74c767845e83e559bb889d1fa7d7616b#3b3f123a74c767845e83e559bb889d1fa7d7616b"
 dependencies = [
  "adbc_core",
  "adbc_ffi",
@@ -75,7 +75,7 @@ dependencies = [
 [[package]]
 name = "adbc_ffi"
 version = "0.24.0"
-source = "git+https://github.com/apache/arrow-adbc?rev=198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab#198f39a9f0ec3e6965c8f50c0bbf85141e2cc4ab"
+source = "git+https://github.com/apache/arrow-adbc?rev=3b3f123a74c767845e83e559bb889d1fa7d7616b#3b3f123a74c767845e83e559bb889d1fa7d7616b"
 dependencies = [
  "adbc_core",
  "arrow-array",
@@ -772,7 +772,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2131,7 +2131,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2436,7 +2436,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2494,7 +2494,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2889,7 +2889,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3484,7 +3484,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
