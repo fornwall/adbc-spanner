@@ -31,8 +31,11 @@ cd "$REPO_ROOT"
 # upstream adbc-drivers/validation suite: the test_rows_affected DDL-override hook we
 # rely on landed upstream (#249), and the create-mode synthetic-column quirk is handled
 # by a driver-side test override (see tests/test_connection.py, adbc-drivers/validation#250)
-# rather than a shared-suite feature — so no fork is needed.
-VALIDATION_REF="${ADBC_VALIDATION_REF:-dbc6857ff7ab7c43e98d7729a63ee8d9303ac1f9}"
+# rather than a shared-suite feature — so no fork is needed. The current pin also carries
+# adbc-drivers/validation#256, whose `test_query_bind_dictionary` binds the `type/bind/string`
+# and `type/bind/large_string` cases dictionary-encoded (what a pandas categorical produces);
+# the driver decodes those in `bind::cell_value`, so both cases are gate-enforced.
+VALIDATION_REF="${ADBC_VALIDATION_REF:-1c20ca4bd11f6976f29fe45d15c501d3b75ad413}"
 VALIDATION_REPO="${ADBC_VALIDATION_REPO:-adbc-drivers/validation}"
 PYTHON="${PYTHON:-python3}"
 EMULATOR_DATABASE="projects/test-project/instances/test-instance/databases/adbc-test"

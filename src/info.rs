@@ -80,9 +80,9 @@ fn value_for(code: InfoCode) -> InfoValue {
         // Spanner exposes no user-visible server version, so reporting anything here — least of all
         // this driver's own version — would be misleading. Likewise `VendorArrowVersion` (the server
         // runs no Arrow library) and the Substrait version bounds (null is `adbc.h`'s defined value
-        // when Substrait is unsupported). A future `#[non_exhaustive]` variant also lands here, but
-        // never reaches this function: it is absent from [`REPORTED`], so [`build`] omits it as
-        // unrecognized first.
+        // when Substrait is unsupported). [`InfoCode::Other`] — any XDBC-range or vendor-specific
+        // code — also lands here, but never reaches this function: it is absent from [`REPORTED`],
+        // so [`build`] omits it as unrecognized first.
         _ => InfoValue::Null,
     }
 }
@@ -330,6 +330,44 @@ mod tests {
         let driver_str = driver_value.as_any().downcast_ref::<StringArray>().unwrap();
         assert!(!driver_str.is_null(0));
         assert_eq!(driver_str.value(0), DRIVER_VERSION);
+    }
+
+    #[test]
+    fn unrecognized_codes_are_omitted_rather_than_rejected() {
+        // `adbc.h`: "Drivers/vendors will ignore requests for unrecognized codes (the row will be
+        // omitted from the result)" — so an XDBC-range ([500, 1000)) or vendor-specific (>= 10000)
+        // code is silently dropped, never an error, and never a row with a fabricated value. These
+        // reach the driver as `InfoCode::Other` (apache/arrow-adbc#4510); before it the C FFI
+        // exporter rejected the whole call with "Unknown info code" before this function ran, so
+        // this contract was only observable at the Rust-trait level.
+        let batch = build(Some(
+            [InfoCode::Other(500), InfoCode::Other(10_042)]
+                .into_iter()
+                .collect(),
+        ))
+        .unwrap();
+        assert_eq!(batch.schema(), GET_INFO_SCHEMA.clone());
+        assert_eq!(batch.num_rows(), 0, "unrecognized codes yield no rows");
+
+        // Mixed with a recognised code, only the recognised one is answered — the unrecognized
+        // ones drop out instead of failing the whole request.
+        let batch = build(Some(
+            [
+                InfoCode::Other(10_042),
+                InfoCode::DriverName,
+                InfoCode::Other(999),
+            ]
+            .into_iter()
+            .collect(),
+        ))
+        .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(names.value(0), u32::from(&InfoCode::DriverName));
     }
 
     #[test]

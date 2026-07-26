@@ -338,7 +338,7 @@ course — an Arrow result:
 
 | ADBC call | Question it answers | How this driver implements it |
 | --- | --- | --- |
-| `get_info` | "What driver/vendor is this, what version?" | Static metadata ([`src/info.rs`](../src/info.rs)). |
+| `get_info` | "What driver/vendor is this, what version?" | Static metadata ([`src/info.rs`](../src/info.rs)). A code the driver does not recognise (an XDBC-range or vendor-specific one) is *omitted* from the result rather than erroring, as `adbc.h` requires. |
 | `get_objects` | "What catalogs / schemas / tables / columns / constraints exist?" | Queries Spanner's `INFORMATION_SCHEMA` ([`src/objects.rs`](../src/objects.rs)). |
 | `get_table_schema` | "What is the Arrow schema of table X?" | Reads the table's columns and maps them to an Arrow schema. |
 | `get_table_types` | "What kinds of table exist?" | A fixed, typed result set: `BASE TABLE` and `VIEW`. |
