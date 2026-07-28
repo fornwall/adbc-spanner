@@ -4498,20 +4498,21 @@ fn exec_incremental_spec_default_is_a_no_op() {
 // Retry-limit accounting per RPC path (UP-14)
 // ---------------------------------------------------------------------------
 
-// The pinned client runs two *different* retry loops, and they account for attempts differently —
-// so `spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds` do not mean the same thing
-// on every path. These tests pin the exact, observed numbers on one path of each kind, so the
-// asymmetry is a checked fact rather than a claim in a comment, and so a `google-cloud-rust` rev
-// bump that fixes it upstream (UP-14) fails here loudly instead of silently changing what a
-// caller's option means. See `src/retry.rs`'s module doc for the user-facing statement of this.
+// The pinned client runs two *different* retry loops, and they account for elapsed time
+// differently — so `spanner.retry.max_elapsed_seconds` does not mean the same thing on every path.
+// These tests pin the exact, observed numbers on one path of each kind, so the asymmetry is a
+// checked fact rather than a claim in a comment, and so a `google-cloud-rust` rev bump that changes
+// them fails here loudly instead of silently changing what a caller's option means. See
+// `src/retry.rs`'s module doc for the user-facing statement of this.
 //
 // - **Unary** RPCs (`ExecuteBatchDml`, `ExecuteSql`, `BeginTransaction`, `Commit`) go through gax's
 //   `retry_loop`, which increments `RetryState::attempt_count` *before* each attempt and pins
 //   `RetryState::start` to the real loop start. Both limits are then exact.
 // - **Server-streaming** `ExecuteStreamingSql` is dispatched outside `retry_loop`; the client
-//   hand-rolls stream resumption in `ResultSet::check_retry`, seeding `RetryState` with its own
-//   `retry_count` (retries *so far* — 0 on the first failure) and a fresh `Instant::now()` start.
-//   So the attempt limit permits one attempt too many, and the elapsed-time limit never fires.
+//   hand-rolls stream resumption in `ResultSet::check_retry`, seeding a fresh `RetryState` per
+//   resume decision. That state carries the real 1-based attempt count (`1 + retry_count`), so the
+//   **attempt** limit is exact here too; but `start` is re-taken as `Instant::now()` every time, so
+//   the elapsed-time limit never fires (UP-14).
 
 /// How many attempts each probe's mock serves before giving up with a permanent error. A retry
 /// limit that never fires stops here rather than hanging the test.
@@ -4630,17 +4631,16 @@ fn retry_max_attempts_is_exact_on_unary_rpcs() {
     }
 }
 
-/// On the **streaming** query path the same option permits `N + 1` attempts — one too many — because
-/// the client seeds the retry policy with its own `retry_count` (retries so far, `0` on the first
-/// failure) where gax's own loop would pass the 1-based attempt count. `1` therefore does *not*
-/// disable retrying here. Upstream bug (UP-14), pinned here as observed behaviour; `src/retry.rs`
-/// documents it. The `N + 1` shape (not a constant) is what proves the option reaches the streaming
-/// retry loop at all rather than being ignored.
+/// The **streaming** query path counts attempts exactly too: `ResultSet::check_retry` seeds the
+/// retry policy with the real 1-based attempt count (`1 + retry_count`), so `N` permits `N` attempts
+/// and `1` disables retrying, matching the unary paths. That the count *tracks* `N` (rather than
+/// being a constant) is what proves the option reaches the hand-rolled streaming retry loop at all
+/// rather than being ignored.
 #[test]
-fn retry_max_attempts_permits_one_extra_attempt_on_the_streaming_path() {
+fn retry_max_attempts_is_exact_on_the_streaming_path() {
     let _watchdog = Watchdog::arm(
         Duration::from_secs(120),
-        "retry_max_attempts_permits_one_extra_attempt_on_the_streaming_path",
+        "retry_max_attempts_is_exact_on_the_streaming_path",
     );
 
     for max_attempts in [1_i64, 2, 3] {
@@ -4649,12 +4649,10 @@ fn retry_max_attempts_permits_one_extra_attempt_on_the_streaming_path() {
             OptionValue::Int(max_attempts),
         );
         assert_eq!(
-            attempts,
-            max_attempts as usize + 1,
-            "max_attempts={max_attempts} currently permits {} ExecuteStreamingSql attempts \
-             (UP-14); a change here means the pinned client's stream-resume accounting moved — \
-             update src/retry.rs, docs/options.md and REVIEW.md's UP-14 to match",
-            max_attempts + 1
+            attempts, max_attempts as usize,
+            "max_attempts={max_attempts} must permit exactly {max_attempts} ExecuteStreamingSql \
+             attempts; a change here means the pinned client's stream-resume accounting moved — \
+             update src/retry.rs, docs/options.md and REVIEW.md's UP-14 to match"
         );
     }
 }
@@ -4662,8 +4660,8 @@ fn retry_max_attempts_permits_one_extra_attempt_on_the_streaming_path() {
 /// `spanner.retry.max_elapsed_seconds` bounds the unary paths, but is **inert** on the streaming
 /// query path: the client builds a fresh `RetryState` (hence `start = Instant::now()`) for every
 /// resume decision, so the gax elapsed-time decorator always compares now against a deadline one
-/// budget in the future and never exhausts. Same upstream root cause as the attempt off-by-one
-/// (UP-14). A streaming caller who wants a wall-clock bound has a working one in the separate
+/// budget in the future and never exhausts (UP-14). A streaming caller who wants a wall-clock bound
+/// has a working one in the separate
 /// `spanner.rpc.timeout_seconds.{query,fetch}` family.
 #[test]
 fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_path() {

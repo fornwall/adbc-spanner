@@ -839,7 +839,7 @@ pub const OPTION_RPC_TIMEOUT_FETCH: &str = "spanner.rpc.timeout_seconds.fetch";
 /// Driver-specific connection **and** statement option: the **maximum number of attempts** the
 /// Spanner client makes for a retryable RPC — the first try plus retries — as a positive integer.
 /// `1` disables retrying; unset (the default) leaves the client's own policy, which is uncapped on
-/// the unary RPC paths and capped at 10 retries on the streaming query path.
+/// the unary RPC paths and capped at 10 attempts on the streaming query path.
 ///
 /// The value is accepted as an integer, a whole-valued double, or a numeric string, and round-trips
 /// through `get_option` and `get_option_int`. An empty string unsets it. Setting it (or
@@ -849,11 +849,11 @@ pub const OPTION_RPC_TIMEOUT_FETCH: &str = "spanner.rpc.timeout_seconds.fetch";
 /// it creates; a statement may override it. This tunes the *per-attempt* retry loop; the separate
 /// [`OPTION_RPC_TIMEOUT_QUERY`] family bounds the *overall* per-operation wall time.
 ///
-/// **Exact on unary RPCs, one too many on queries.** The pinned client accounts for attempts
-/// differently in its two retry loops: on the unary paths (DML, `ExecuteBatchDml`, begin, commit)
-/// `N` permits exactly `N` attempts, but on the streaming query path it permits **`N + 1`** — so `1`
-/// does not disable retrying there. This is an upstream defect the driver cannot correct; see
-/// `src/retry.rs`'s module docs for the mechanism and REVIEW.md's UP-14.
+/// **Exact on every path.** The pinned client runs two different retry loops, but both count
+/// attempts the same way: on the unary paths (DML, `ExecuteBatchDml`, begin, commit) *and* on the
+/// streaming query path, `N` permits exactly `N` attempts and `1` disables retrying. The companion
+/// [`OPTION_RETRY_MAX_ELAPSED_SECONDS`] is *not* exact on the streaming path — see `src/retry.rs`'s
+/// module docs and REVIEW.md's UP-14.
 ///
 /// Mirrors the gax `RetryPolicyExt::with_attempt_limit` knob.
 pub const OPTION_RETRY_MAX_ATTEMPTS: &str = "spanner.retry.max_attempts";

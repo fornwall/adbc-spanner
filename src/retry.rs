@@ -19,19 +19,19 @@
 //! first). When neither is set the client keeps its own default policy — so this feature is purely
 //! opt-in and, by default, changes nothing.
 //!
-//! Those are the gax knobs' meanings, and what the driver asks for. What the pinned client then
-//! *delivers* differs per RPC path — the next section is the authoritative statement, and the two
-//! bullets above hold exactly on the unary paths.
+//! Those are the gax knobs' meanings, and what the driver asks for. The attempt limit delivers them
+//! on every path; the *elapsed-time* limit does not reach the streaming query path — the next
+//! section is the authoritative statement.
 //!
 //! # What the limits actually deliver, per RPC path
 //!
-//! The pinned client runs **two different retry loops**, and they account for attempts differently,
-//! so both limits above land differently depending on which RPC carries the work. This is an
-//! upstream defect (REVIEW.md **UP-14**), not something the driver can correct: the same
-//! [`RetryPolicyArg`] is handed to both kinds of loop, and the two need *different* limits to
-//! deliver the same guarantee — so no single compensation is right for both. The exact numbers below
-//! are pinned by `retry_max_attempts_*` / `retry_max_elapsed_seconds_*` in `tests/mock_spanner.rs`,
-//! which fail loudly if a `google-cloud-rust` rev bump changes them.
+//! The pinned client runs **two different retry loops**, and they do not account for elapsed time
+//! the same way, so `max_elapsed_seconds` lands differently depending on which RPC carries the work.
+//! This is an upstream defect (REVIEW.md **UP-14**), not something the driver can correct: the same
+//! [`RetryPolicyArg`] is handed to both kinds of loop, and no policy decoration can recover a loop
+//! start the caller re-takes on every call. The exact numbers below are pinned by
+//! `retry_max_attempts_*` / `retry_max_elapsed_seconds_*` in `tests/mock_spanner.rs`, which fail
+//! loudly if a `google-cloud-rust` rev bump changes them.
 //!
 //! - **Unary RPCs** — `ExecuteSql` (DML), `ExecuteBatchDml`, `BeginTransaction`, `Commit` — run
 //!   through gax's `retry_loop`, which increments `RetryState::attempt_count` *before* each attempt
@@ -42,10 +42,9 @@
 //!   dispatched *outside* `retry_loop` (`server_streaming/builder.rs`'s `send()` has no retry loop
 //!   of its own, so an error returned as the RPC's *initial* status is never retried at all). Stream
 //!   resumption is hand-rolled in `ResultSet::check_retry` (`.../src/spanner/src/result_set.rs`),
-//!   which builds a fresh [`RetryState`] per resume decision, seeded with the client's own
-//!   `retry_count` — *retries so far*, hence `0` on the first failure — rather than the 1-based
-//!   attempt count gax's own loop passes. Two consequences:
-//!   - `max_attempts = N` permits **`N + 1`** attempts; `1` does **not** disable retrying here.
+//!   which builds a fresh [`RetryState`] per resume decision. That state carries the real 1-based
+//!   attempt count (`1 + retry_count`), so **`max_attempts` is exact here too** — `N` permits `N`
+//!   attempts and `1` disables retrying, as on the unary paths. The elapsed-time half is not:
 //!   - `max_elapsed_seconds` is **inert**: the fresh state also resets `start` to `Instant::now()`,
 //!     so the gax elapsed-time decorator forever compares now against a deadline one whole budget in
 //!     the future and never exhausts. A streaming caller who needs a wall-clock bound has a working
@@ -53,9 +52,9 @@
 //!     (`spanner.rpc.timeout_seconds.{query,fetch}`), which does bound this path.
 //!
 //!   The client's default policy on this path is *not* uncapped either — it is
-//!   `SpannerRetryPolicy::new().with_attempt_limit(10)` (`result_set.rs`'s `apply_defaults`), i.e. 11
-//!   attempts under the same off-by-one — so setting `max_attempts` here replaces a cap rather than
-//!   introducing one.
+//!   `SpannerRetryPolicy::new().with_attempt_limit(DEFAULT_ATTEMPT_LIMIT)` with
+//!   `DEFAULT_ATTEMPT_LIMIT = 10` (`result_set.rs`'s `apply_defaults`), i.e. 10 attempts — so
+//!   setting `max_attempts` here replaces a cap rather than introducing one.
 //!
 //! Independently, three options tune the *delay between* attempts (the client's truncated
 //! exponential backoff with jitter), each opt-in and applied at the same builder sites:

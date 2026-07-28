@@ -228,7 +228,7 @@ and **each is independently a crates.io publish blocker** — the crate cannot b
 lines plus `deny.toml` plus the docs; this list is the one place that enumerates every edit needed to
 revert a family to versioned crates.io releases. Current pinned revs:
 
-- `google-cloud-rust`: `5c1fe1315be4a85e66c6637a20fc8f626faa56a3` (upstream `googleapis/google-cloud-rust` `main`)
+- `google-cloud-rust`: `ba2876c2e939336eb9017f00d695af2bf84655d3` (upstream `googleapis/google-cloud-rust` `main`)
 - `apache/arrow-adbc`: `3b3f123a74c767845e83e559bb889d1fa7d7616b`
 
 **Invariant:** the three arrow-adbc crates (`adbc_core`, `adbc_ffi`, `adbc_driver_manager`) must
@@ -590,22 +590,22 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   recommended ranges so it never fails to build) and applies it via `with_backoff_policy` /
   `with_begin_backoff_policy` / `with_commit_backoff_policy` at the same four sites; independent of
   the attempt/elapsed caps (either family may be set alone). The transaction-level abort retry
-  stays at the client default. **Both caps mean different things per RPC path, and the driver
-  cannot fix it** (COR-13 / UP-14): the pinned client runs two retry loops. Unary RPCs (DML,
+  stays at the client default. **`max_elapsed_seconds` means different things per RPC path, and the
+  driver cannot fix it** (COR-13 / UP-14): the pinned client runs two retry loops. Unary RPCs (DML,
   `ExecuteBatchDml`, begin, commit) go through gax's `retry_loop`, which increments
   `RetryState::attempt_count` before each attempt and pins `start` to the real loop start — both
   caps are exact there, and the default policy is uncapped. Server-streaming `ExecuteStreamingSql`
   (every query) is dispatched *outside* `retry_loop` (`server_streaming/builder.rs`'s `send()` has
   none — so an error returned as the *initial* RPC status is never retried at all, the vacuity trap
   for any retry test here) and hand-rolls resumption in `ResultSet::check_retry`, which seeds a
-  fresh `RetryState` with its own `retry_count` (retries *so far*, 0 on the first failure) and
-  `Instant::now()`. So on queries `max_attempts=N` permits **N+1** attempts (`1` does not disable
-  retrying), `max_elapsed_seconds` is **inert**, and the default is `with_attempt_limit(10)` rather
-  than uncapped. No driver-side compensation is correct — the same `RetryPolicyArg` feeds both
-  loops, which would need *different* limits — so this is documented (`src/retry.rs` module doc,
-  both `src/lib.rs` constants, `docs/options.md`) and pinned by three `retry_max_*` tests in
-  `tests/mock_spanner.rs` that fault *inside* the stream; streaming callers get a working
-  wall-clock bound from `spanner.rpc.timeout_seconds.{query,fetch}` instead).
+  fresh `RetryState` with the real 1-based attempt count (`1 + retry_count`) but a freshly-taken
+  `Instant::now()` start. So on queries `max_attempts=N` is exact (`1` disables retrying, as on the
+  unary paths) but `max_elapsed_seconds` is **inert**, and the default is `with_attempt_limit(10)`
+  rather than uncapped. No driver-side compensation is correct for the elapsed-time half — no policy
+  decoration can recover a loop start the caller re-takes on every call — so this is documented
+  (`src/retry.rs` module doc, both `src/lib.rs` constants, `docs/options.md`) and pinned by three
+  `retry_max_*` tests in `tests/mock_spanner.rs` that fault *inside* the stream; streaming callers
+  get a working wall-clock bound from `spanner.rpc.timeout_seconds.{query,fetch}` instead).
   (`get_statistics` computes exact `ROW_COUNT`/`NULL_COUNT`/`DISTINCT_COUNT` via one aggregate scan
   per table — see `src/statistics.rs`; `approximate=true` serves the same exact stats (exact values
   always satisfy an approximate request; Spanner has no cheaper source), with

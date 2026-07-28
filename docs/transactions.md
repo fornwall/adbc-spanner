@@ -383,15 +383,15 @@ behalf. Each is covered below.
     which pins its discovery fetch and per-table aggregate scans to one snapshot — SPAN-5).
 - **Retry caveat.** This RPC is dispatched **outside** gax's `retry_loop` — `send()` calls the
   transport directly (`<client>/src/server_streaming/builder.rs:62-75`) — and hand-rolls resumption
-  in `ResultSet::check_retry` (`<client>/src/result_set.rs:674-685`), which seeds a fresh
-  `RetryState` each time. That is why `spanner.retry.max_attempts` is off-by-one and
+  in `ResultSet::check_retry` (`<client>/src/result_set.rs:681-693`), which seeds a fresh
+  `RetryState` each time — with a freshly-taken `start`. That is why
   `spanner.retry.max_elapsed_seconds` is inert on queries, and why an error returned as the
   *initial* RPC status is never retried at all. See
   [docs/options.md § What the two limits actually deliver](options.md#what-the-two-limits-actually-deliver-per-rpc-path).
 - **Resumption caveat.** Resumption replays the request with the last `resume_token`. Token-less
   messages are buffered up to `MAX_BUFFERED_PARTIAL_RESULT_SETS = 10`
   (`<client>/src/result_set.rs:103-106`); on overflow the client marks the stream **not safe to
-  retry** (`:416-423`), after which a transient error propagates to the caller instead of resuming.
+  retry** (`:421-424`), after which a transient error propagates to the caller instead of resuming.
   So a long token-less run mid-result silently forfeits resumability.
 
 ### `ExecuteBatchDml`

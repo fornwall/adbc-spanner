@@ -437,24 +437,24 @@ policy and stays at the client default.
 
 ### What the two limits actually deliver, per RPC path
 
-The Spanner client runs **two different retry loops**, and they count attempts differently — so both
-limits land differently depending on which RPC carries the work. This is an upstream defect that the
-driver cannot correct (the same policy object feeds both loops, and they would need *different*
-limits to deliver the same guarantee), so it is documented rather than compensated:
+The Spanner client runs **two different retry loops**. They now count *attempts* the same way, but
+they do not measure *elapsed time* the same way — so the second limit lands differently depending on
+which RPC carries the work. That is an upstream defect the driver cannot correct (the same policy
+object feeds both loops, and no policy decoration can recover a loop start the caller re-takes on
+every call), so it is documented rather than compensated:
 
 | | Unary RPCs — DML, `ExecuteBatchDml`, begin, commit | Streaming queries — `ExecuteStreamingSql` |
 | --- | --- | --- |
-| `spanner.retry.max_attempts = N` | exactly `N` attempts; `1` disables retrying | **`N + 1`** attempts; `1` does **not** disable retrying |
+| `spanner.retry.max_attempts = N` | exactly `N` attempts; `1` disables retrying | exactly `N` attempts; `1` disables retrying |
 | `spanner.retry.max_elapsed_seconds` | bounds the loop as documented | **inert** — never fires |
-| client default when unset | uncapped | capped at 10 retries (11 attempts, per the row above) |
+| client default when unset | uncapped | capped at 10 attempts |
 
 The cause is that the streaming query path is dispatched outside gax's retry loop and hand-rolls its
-stream resumption, seeding the retry policy with the count of *retries so far* (`0` on the first
-failure, hence the off-by-one) and a freshly-taken start instant (hence the never-firing elapsed
-budget). If you need a wall-clock bound on a **query**, use the [RPC timeout](#rpc-timeouts) family
-(`spanner.rpc.timeout_seconds.query` / `…fetch`) — it does bound that path. The exact numbers above
-are pinned by tests (`retry_max_attempts_*` / `retry_max_elapsed_seconds_*` in
-`tests/mock_spanner.rs`).
+stream resumption, building a fresh retry state per resume decision with a freshly-taken start
+instant — hence the never-firing elapsed budget. If you need a wall-clock bound on a **query**, use
+the [RPC timeout](#rpc-timeouts) family (`spanner.rpc.timeout_seconds.query` / `…fetch`) — it does
+bound that path. The exact numbers above are pinned by tests (`retry_max_attempts_*` /
+`retry_max_elapsed_seconds_*` in `tests/mock_spanner.rs`).
 
 ## Environment
 
