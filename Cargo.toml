@@ -153,7 +153,7 @@ futures-util = "0.3"
 # `decode → encode` fixed point the partition round-trip relies on never settles. See the
 # `partition_descriptor_round_trips_large_floats` regression test in `connection.rs`.
 serde_json = { version = "1", features = ["float_roundtrip"] }
-base64 = "0.22"
+base64 = "0.23"
 # Build the `Authorization: Bearer <token>` header for the static-token credential backing the
 # `spanner.auth.access_token` option (a minimal `google-cloud-auth` `CredentialsProvider`). Same `http`
 # major version the google-cloud-auth family uses, so `HeaderMap` / `Extensions` unify across crates.
