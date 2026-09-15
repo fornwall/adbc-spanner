@@ -251,8 +251,7 @@ type ScalarBinder = fn(&str, &DataType, &dyn Array, usize) -> Result<Value>;
 /// Returns the [`ScalarBinder`] for a scalar Arrow `data_type` (reading element `i` of an array of
 /// that type into a Spanner scalar [`Value`], nulls preserved), or `None` if the type has no
 /// Spanner mapping. Both binding paths funnel through it — [`cell_value`] for a scalar `@param`,
-/// and [`list_cell_value`] for every element of an `ARRAY<...>` — so the two can no longer drift,
-/// and a scalar type is accepted as parameter *and* array element in one stroke.
+/// and [`list_cell_value`] for every `ARRAY<...>` element — so the two cannot drift.
 ///
 /// **Adding a new Arrow scalar type touches these sites** (keep them in lockstep):
 ///   1. **here** (`scalar_binder`) — the Arrow→Spanner *value* mapping, shared by the scalar and
@@ -450,12 +449,9 @@ fn try_scalar_value<T: Into<Value>>(
 /// `item` is the list's element field: its data type selects the [`scalar_binder`] mapping (an
 /// `arrow.json` tag on a string element types the whole array as `ARRAY<JSON>`), and `elem` is the
 /// child slice for this row, or `None` when the whole cell is null (→ a typed null array). Every
-/// element runs through the same `scalar_binder` as a scalar bind, so the element mapping cannot
-/// drift from the scalar one (narrower ints widen to `INT64`, floats to `FLOAT64`,
-/// `DATE`/`TIMESTAMP`/`NUMERIC` format to their Spanner string forms), and each element keeps its
-/// own null. The element type is validated up front, so an unsupported element — including a
-/// nested `ARRAY<ARRAY<…>>` or `ARRAY<STRUCT>` (both out of scope for Spanner) — is rejected even
-/// for an empty or null array.
+/// element runs through the same `scalar_binder` as a scalar bind, keeping its own null. The
+/// element type is validated up front, so an unsupported element — including a nested
+/// `ARRAY<ARRAY<…>>` or `ARRAY<STRUCT>` — is rejected even for an empty or null array.
 fn list_cell_value(
     name: &str,
     item: &Field,
@@ -649,9 +645,7 @@ fn spanner_field_type(field: &Field) -> Result<String> {
 /// which no `SELECT *` returns — so the created table reads back as exactly the Arrow schema that
 /// built it. Arrow ingest data carries no key, and inventing one is not the driver's call: a
 /// primary key fixes Spanner's physical row layout, so choosing it belongs in the `CREATE TABLE`
-/// the user writes, followed by an `append` ingest. (Up to 0.7 this appended a synthetic
-/// `adbc_ingest_key` UUID key column, and `spanner.ingest.primary_key` existed to opt out of it;
-/// both are gone.)
+/// the user writes, followed by an `append` ingest.
 ///
 /// Pass `if_not_exists` for `create_append` mode. `db_schema` (the `adbc.ingest.target_db_schema`
 /// option) optionally qualifies the created table with a named schema.

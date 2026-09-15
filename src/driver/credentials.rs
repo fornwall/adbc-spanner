@@ -82,12 +82,10 @@ impl SpannerDatabase {
 
     /// The name of the first explicitly-configured credential option, if any.
     ///
-    /// Only *driver-level* credential configuration counts: a keyfile (path or inline JSON), an
-    /// impersonation target, or an explicit access token. Ambient Application Default Credentials
+    /// Only *driver-level* credential configuration counts. Ambient Application Default Credentials
     /// are deliberately *not* reported — they are the environment's business, not an explicit
-    /// driver option, and must not prevent emulator use.
-    ///
-    /// The ladder's order is load-bearing: [`OPTION_ACCESS_TOKEN`] comes last so that
+    /// option, and must not prevent emulator use. The ladder's order is load-bearing:
+    /// [`OPTION_ACCESS_TOKEN`] comes last so that
     /// [`conflicting_credential_with_access_token`](Self::conflicting_credential_with_access_token)
     /// is this same ladder with the token filtered out.
     pub(super) fn explicit_credential_option(&self) -> Option<&'static str> {

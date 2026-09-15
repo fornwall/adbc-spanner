@@ -87,12 +87,10 @@ pub(crate) fn table_exists(
 /// [`SpannerConnection::get_table_schema`].
 ///
 /// These are the heaviest queries the driver issues on its own, so they honour the connection's
-/// retry bounds (`spanner.retry.*` — an unbounded retry of a `COUNT(*)` over every table is a real
-/// hazard), its directed-read replica selection (`spanner.directed_read`; legal here because every
-/// one of them runs in a read-only transaction) and its request **priority**. They stay untagged —
-/// see [`apply_priority_to_statement`](crate::request::RequestConfig::apply_priority_to_statement).
-/// The commit-side knobs (`spanner.commit.max_delay`, `spanner.commit_stats`) do not apply: these
-/// paths never commit.
+/// retry bounds (an unbounded retry of a `COUNT(*)` over every table is a real hazard), its
+/// directed-read replica selection (legal here because they all run read-only) and its request
+/// **priority**. They stay untagged — see
+/// [`apply_priority_to_statement`](crate::request::RequestConfig::apply_priority_to_statement).
 #[must_use]
 pub(crate) fn metadata_sql_builder(
     config: &SharedConfig,
@@ -110,12 +108,10 @@ pub(crate) fn metadata_sql_builder(
 /// Run one metadata statement on a shared multi-use read-only transaction and materialise its
 /// result batch.
 ///
-/// Every driver-internal read of [`get_objects`](crate::objects::collect_objects) and
-/// [`get_statistics`](crate::statistics::collect_statistics) — `INFORMATION_SCHEMA` discovery and
-/// per-table aggregate scan alike — goes through one transaction, so they all observe a single
-/// consistent snapshot, and each statement comes from [`metadata_sql_builder`] so it carries the
-/// connection's retry bounds, replica selection and request priority. The results are string
-/// metadata or INT64 counts, never a TIMESTAMP, so the default timestamp precision is fine.
+/// Every driver-internal read of `get_objects` and `get_statistics` — `INFORMATION_SCHEMA`
+/// discovery and per-table aggregate scan alike — goes through one transaction, so they all observe
+/// a single consistent snapshot. The results are string metadata or INT64 counts, never a
+/// TIMESTAMP, so the default timestamp precision is fine.
 pub(crate) async fn query_txn(
     txn: &MultiUseReadOnlyTransaction,
     statement: impl Into<SpannerSql>,
@@ -157,12 +153,9 @@ pub(crate) fn str_col(batch: &RecordBatch, index: usize) -> Result<&StringArray>
 /// A compiled ADBC `LIKE` pattern (`%` = any run, `_` = one char), matched case-sensitively.
 ///
 /// The pattern chars are collected once so a collector can reuse one matcher across every candidate
-/// row (the pattern is loop-invariant) instead of re-collecting it on each call; the free
-/// [`like_match`] helper wraps it for one-off matches.
-///
+/// row; the free [`like_match`] helper wraps it for one-off matches.
 /// [`matches`](LikeMatcher::matches) is iterative with backtrack pointers (O(pattern × value), no
-/// recursion) so adversarial patterns like `%a%a%a…` cannot cause exponential blowup or stack
-/// overflow.
+/// recursion) so adversarial patterns like `%a%a%a…` cannot blow up or overflow the stack.
 pub(crate) struct LikeMatcher {
     pattern: Vec<char>,
 }

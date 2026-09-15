@@ -675,11 +675,10 @@ fn arrow_type(ty: &Type, precision: TimestampPrecision, depth: usize) -> Result<
         TypeCode::Numeric => DataType::Decimal128(NUMERIC_PRECISION, NUMERIC_SCALE),
         TypeCode::Struct => struct_arrow_type(ty, precision, depth)?,
         TypeCode::Array => match ty.array_element_type() {
-            // ARRAY<T> → Arrow List<T> (recursively; T may itself be a STRUCT). The element field is
-            // built via `arrow_field`, so an `ARRAY<JSON>` carries the `arrow.json` extension on the
-            // list's child (`item`) field, not the top-level List. Element types recurse the same as
-            // scalars: `ARRAY<ENUM>` → `List<Int64>`, `ARRAY<PROTO>` → `List<Binary>`. Spanner does
-            // not allow arrays of arrays; fall back to JSON text for anything else.
+            // ARRAY<T> → Arrow List<T> (recursively; T may itself be a STRUCT). The element field
+            // is built via `arrow_field`, so an `ARRAY<JSON>` carries the `arrow.json` extension on
+            // the list's child (`item`) field, not the top-level List. Spanner does not allow
+            // arrays of arrays; fall back to JSON text for anything else.
             Some(element) if !matches!(element.code(), TypeCode::Array | TypeCode::Unspecified) => {
                 DataType::List(Arc::new(arrow_field_at(
                     LIST_ITEM,
@@ -692,10 +691,9 @@ fn arrow_type(ty: &Type, precision: TimestampPrecision, depth: usize) -> Result<
             _ => DataType::Utf8,
         },
         // ENUM's wire value is a bare ordinal (a decimal string, like INT64); PROTO's is the raw
-        // serialized message base64-encoded (exactly like BYTES). Both mappings are lossless. Their
-        // *structure* (enum member names / proto field layout) travels only in the database's proto
-        // descriptor bundle (admin `GetDatabaseDdl`), not the query metadata, so a label
-        // `Dictionary` / decoded `Struct` is not reachable here — see the module doc.
+        // serialized message base64-encoded (like BYTES). Both mappings are lossless; their
+        // *structure* travels only in the database's proto descriptor bundle, not the query
+        // metadata — see the module doc.
         TypeCode::Enum => DataType::Int64,
         TypeCode::Proto => DataType::Binary,
         // Unlike JSON (whose `arrow.json` tag also drives the bind path), ENUM/PROTO/INTERVAL/UUID
@@ -739,9 +737,9 @@ fn struct_fields(
 
 fn build_batch(schema: SchemaRef, rows: &[Row]) -> Result<RecordBatch> {
     // Build each top-level column by iterating rows directly, reusing one scratch buffer of
-    // `rows.len()` value pointers rather than materializing the whole O(rows × cols) column
-    // matrix up front. Nested List/Struct columns still gather their own child slices when
-    // `build_array` recurses, but the flat/top-level path allocates only this single buffer.
+    // `rows.len()` value pointers rather than materializing the whole O(rows × cols) column matrix
+    // up front. Nested List/Struct columns still gather their own child slices when `build_array`
+    // recurses.
     let mut scratch: Vec<Option<&Value>> = Vec::with_capacity(rows.len());
     let arrays: Vec<ArrayRef> = schema
         .fields()
@@ -921,9 +919,8 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
         }
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
             // The `microseconds` mode of `spanner.max_timestamp_precision`. Every instant Spanner
-            // can store (0001-01-01 to 9999-12-31) fits an i64 of epoch microseconds, so this arm
-            // has no out-of-range case; sub-microsecond wire digits are truncated toward negative
-            // infinity (see `parse_timestamp_micros`). Undecodable strings still error loudly.
+            // can store fits an i64 of epoch microseconds, so this arm has no out-of-range case;
+            // sub-microsecond digits truncate toward negative infinity. Undecodable strings error.
             let array = build_primitive::<TimestampMicrosecondType>(values, "TIMESTAMP", |v| {
                 v.try_as_string().and_then(parse_timestamp_micros)
             })?;
