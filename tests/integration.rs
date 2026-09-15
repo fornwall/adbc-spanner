@@ -555,6 +555,45 @@ fn manual_transaction_kinds_round_trip() {
     cleanup.execute_update().expect("drop scratch tables");
 }
 
+/// The two-column `Id` / `Label` batch the create-mode bulk-ingest tests bind.
+fn ingest_label_rows() -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("Id", DataType::Int64, false),
+            Field::new("Label", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![10, 20])),
+            Arc::new(StringArray::from(vec!["x", "y"])),
+        ],
+    )
+    .unwrap()
+}
+
+/// Bind [`ingest_label_rows`] into `table` with the given ingest `mode`, returning the raw result
+/// so callers can assert either the affected count or an error status.
+fn ingest_labels(
+    connection: &mut SpannerConnection,
+    table: &str,
+    mode: &str,
+) -> adbc_core::error::Result<Option<i64>> {
+    let mut statement = ingest_stmt(connection, table, mode);
+    statement
+        .bind(ingest_label_rows())
+        .expect("bind ingest rows");
+    statement.execute_update()
+}
+
+/// The core query / DML round trip against a live Spanner: `get_table_types`, an `INSERT`, a
+/// typed `SELECT` whose Arrow schema and values must match the Spanner column types exactly, and
+/// an autocommit `UPDATE`.
+///
+/// The `UPDATE` also covers the **`last_statement` optimization**: an autocommit UPDATE is the
+/// whole read/write transaction, so the driver flags its `ExecuteBatchDml` batch as the
+/// transaction's last request (`last_statements=true`, set for every autocommit batch, single- or
+/// multi-statement), letting Spanner release the transaction in the same round-trip. The flag must
+/// not change the observable result: the exact affected-row count is still reported and the write
+/// is durably committed.
 #[test]
 fn query_and_dml_round_trip() {
     let Some(mut fx) = fixture() else {
@@ -659,6 +698,17 @@ fn query_and_dml_round_trip() {
         9.5,
         "the last_statement-optimized UPDATE must be durably committed"
     );
+}
+
+/// `get_table_schema` reflects a table's real column types, honours the catalog argument (Spanner's
+/// single catalog is the empty string, so `Some("")` behaves like `None` and any other catalog is
+/// `NotFound`), and escapes a hostile table name rather than interpolating it into the probe SQL.
+#[test]
+fn get_table_schema_reports_column_types() {
+    let Some(mut fx) = fixture_unguarded() else {
+        return;
+    };
+    let connection = &mut fx.connection;
 
     // --- get_table_schema reflects the table's column types ---
 
@@ -689,6 +739,18 @@ fn query_and_dml_round_trip() {
         .get_table_schema(Some("nosuchcatalog"), None, "Singers")
         .expect_err("a named catalog does not exist in Spanner");
     assert_eq!(bogus_catalog.status, adbc_core::error::Status::NotFound);
+}
+
+/// DDL through the driver, routed to the admin `UpdateDatabaseDdl` API: a `;`-separated batch of
+/// two statements applies as one near-atomic schema change, reports no affected-row count, and the
+/// freshly-created table is immediately usable through the data plane — with the stored value
+/// round-tripping exactly, not merely a row existing.
+#[test]
+fn ddl_batch_creates_an_immediately_usable_table() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
 
     // --- DDL through the driver (routed to the admin UpdateDatabaseDdl API) ---
 
@@ -728,6 +790,20 @@ fn query_and_dml_round_trip() {
     // Drop the scratch table like every other section, so re-runs against a persistent
     // `SPANNER_GCP_DATABASE` don't accumulate leftovers.
     drop_tables(connection, &["AdbcDdl"]);
+}
+
+/// Manual (non-autocommit) transactions, the happy paths: plain and **parameterized** DML buffers
+/// (returning `None`, since the count is unknown until commit) and is invisible until `commit`,
+/// which applies the whole batch atomically; `rollback` leaves no trace; a query while writes are
+/// buffered is rejected up front rather than silently returning the pre-insert snapshot; and
+/// **re-enabling autocommit commits the pending work rather than discarding it** — the data-loss
+/// path. The toggle is idempotent, and afterwards per-statement commit is back.
+#[test]
+fn manual_transaction_buffers_commits_and_rolls_back() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
 
     // --- Manual multi-statement transactions ---
 
@@ -863,6 +939,39 @@ fn query_and_dml_round_trip() {
         "commit without an active manual transaction must fail"
     );
 
+    drop_tables(connection, &["AdbcTxn"]);
+}
+
+/// A **failed** commit must keep the buffered DML: the transaction stays open so the caller can
+/// retry (a genuine replay) or roll back.
+///
+/// Regression test — taking the buffer *before* the apply lost the DML on error, so a retried
+/// commit saw an empty batch and reported success having written nothing. The failure is forced
+/// with DML that buffers fine (buffering never talks to Spanner) but cannot execute: an unknown
+/// table. Enabling autocommit is an implicit commit, so it must fail too and leave the connection
+/// in manual mode with the buffer intact; only `rollback` discards it.
+#[test]
+fn failed_commit_keeps_the_transaction_replayable() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
+
+    let mut txn_ddl = connection.new_statement().expect("new statement");
+    txn_ddl
+        .set_sql_query(
+            "DROP TABLE IF EXISTS AdbcTxn; CREATE TABLE AdbcTxn (Id INT64) PRIMARY KEY (Id)",
+        )
+        .unwrap();
+    txn_ddl.execute_update().expect("create txn table");
+    let mut seed = connection.new_statement().expect("new statement");
+    seed.set_sql_query("INSERT INTO AdbcTxn (Id) VALUES (1), (2), (3), (5), (6)")
+        .unwrap();
+    assert_eq!(
+        seed.execute_update().expect("seed the transaction table"),
+        Some(5)
+    );
+
     // A FAILED commit must keep the buffered DML: the transaction stays open so the caller can
     // retry (a genuine replay) or roll back. Regression: taking the buffer *before* the apply lost
     // the DML on error, so a retried commit saw an empty batch and reported success having written
@@ -929,6 +1038,40 @@ fn query_and_dml_round_trip() {
         )
         .expect("re-enable autocommit");
 
+    drop_tables(connection, &["AdbcTxn"]);
+}
+
+/// Bulk ingest inside a manual transaction: the rows' insert mutations must buffer (returning
+/// `None`, invisible before commit) and commit atomically in the SAME transaction as buffered DML,
+/// and `rollback` must discard them. Buffered ingest mutations count as pending writes, so a query
+/// is guarded while they are outstanding.
+#[test]
+fn manual_transaction_commits_buffered_ingest_with_dml() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
+
+    let mut txn_ddl = connection.new_statement().expect("new statement");
+    txn_ddl
+        .set_sql_query(
+            "DROP TABLE IF EXISTS AdbcTxn; CREATE TABLE AdbcTxn (Id INT64) PRIMARY KEY (Id)",
+        )
+        .unwrap();
+    txn_ddl.execute_update().expect("create txn table");
+    let mut seed = connection.new_statement().expect("new statement");
+    seed.set_sql_query("INSERT INTO AdbcTxn (Id) VALUES (1), (2), (3), (5), (6), (7)")
+        .unwrap();
+    assert_eq!(
+        seed.execute_update().expect("seed the transaction table"),
+        Some(6)
+    );
+    let buffer_sql = |connection: &mut SpannerConnection, sql: &str| {
+        let mut s = connection.new_statement().expect("new statement");
+        s.set_sql_query(sql).unwrap();
+        assert_eq!(s.execute_update().expect("buffer DML"), None);
+    };
+
     // Bulk ingest inside a manual transaction: the rows' insert mutations must buffer (returning
     // None, invisible before commit) and commit atomically in the SAME transaction as buffered
     // DML; rollback must discard them.
@@ -989,6 +1132,17 @@ fn query_and_dml_round_trip() {
         .expect("re-enable autocommit after ingest");
 
     drop_tables(connection, &["AdbcTxn"]);
+}
+
+/// `DATE` / `TIMESTAMP` / `NUMERIC` columns map to native Arrow `Date32` /
+/// `Timestamp(Nanosecond, "UTC")` / `Decimal128(38, 9)`, and their values round-trip to the exact
+/// Arrow encoding (epoch days, epoch nanos, unscaled scale-9 `i128`).
+#[test]
+fn native_date_timestamp_numeric_round_trip() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
 
     // --- Native Arrow types for DATE / TIMESTAMP / NUMERIC ---
 
@@ -1038,6 +1192,17 @@ fn query_and_dml_round_trip() {
     assert_eq!(num.value(0), 1_500_000_000); // 1.5 unscaled at scale 9
 
     drop_tables(connection, &["AdbcTypes"]);
+}
+
+/// The bulk-ingest statement options round-trip through `get_option` (the mode in its canonical
+/// `adbc.ingest.mode.*` form), `adbc.ingest.temporary=false` is accepted as a spec no-op while
+/// `true` is rejected (Spanner has no temporary tables), and an `append` ingest lands its rows.
+#[test]
+fn bulk_ingest_options_round_trip_and_append() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
 
     // --- Parameter binding and bulk ingest ---
 
@@ -1103,6 +1268,20 @@ fn query_and_dml_round_trip() {
     assert_eq!(ingest.execute_update().expect("ingest"), Some(2));
     assert_eq!(count_rows(connection, "AdbcBind"), 2);
 
+    drop_tables(connection, &["AdbcBind"]);
+}
+
+/// With no ingest mode set the driver defaults to `create` (the ADBC spec default), building the
+/// table from the bound data rather than appending into a pre-existing one. The unset option
+/// reports that effective default, and a second unset-mode ingest into the now-existing table
+/// fails with `AlreadyExists` — which is what proves the default is `create` and not `append`.
+#[test]
+fn bulk_ingest_defaults_to_create_mode() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
+
     // With no ingest mode set, the driver defaults to `create` (the ADBC spec default), building
     // the table from the bound data — not `append` into a pre-existing one.
     let default_mode_rows = RecordBatch::try_new(
@@ -1160,6 +1339,35 @@ fn query_and_dml_round_trip() {
         "default (create) ingest onto an existing table must be AlreadyExists, got: {dup_err:?}"
     );
     drop_tables(connection, &["AdbcDefaultMode"]);
+}
+
+/// The ADBC-mandated error mapping on the `append` failure path, which the driver derives by
+/// probing `INFORMATION_SCHEMA`: a missing target table is `NotFound` (not a generic mapped Spanner
+/// `INVALID_ARGUMENT`), and a bound schema the existing table cannot accept is `AlreadyExists`.
+/// Neither rejected append may change anything.
+#[test]
+fn bulk_ingest_append_failures_remap_to_the_adbc_contract() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
+
+    let mut bind_ddl = connection.new_statement().expect("new statement");
+    bind_ddl
+        .set_sql_query(
+            "DROP TABLE IF EXISTS AdbcBind; \
+             CREATE TABLE AdbcBind (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
+        )
+        .unwrap();
+    bind_ddl.execute_update().expect("create bind table");
+    let mut bind_seed = connection.new_statement().expect("new statement");
+    bind_seed
+        .set_sql_query("INSERT INTO AdbcBind (Id, Name) VALUES (1, 'Alice'), (2, 'Bob')")
+        .unwrap();
+    assert_eq!(
+        bind_seed.execute_update().expect("seed the bind table"),
+        Some(2)
+    );
 
     // Append onto a missing target table must surface as the ADBC-mandated NotFound (not a generic
     // mapped Spanner INVALID_ARGUMENT). The driver probes INFORMATION_SCHEMA on the failure path and
@@ -1208,6 +1416,46 @@ fn query_and_dml_round_trip() {
     );
     // The rejected appends changed nothing.
     assert_eq!(count_rows(connection, "AdbcBind"), 2);
+
+    drop_tables(connection, &["AdbcBind"]);
+}
+
+/// The `execute()` entry point and statement-handle reuse — the shapes every ADBC language binding
+/// produces, since the C ABI exposes only `ExecuteQuery`:
+///
+/// - **DML through `execute()`** (not the Rust-only `execute_update`) must run on the read/write
+///   path and yield an empty result set. Regression test for routing it to a read-only single-use
+///   transaction, which Spanner rejects.
+/// - **Bound data is consumed** by the execute that uses it: a handle reused for a follow-up query
+///   (the Python DBAPI's `adbc_ingest` then `cursor.execute`) must not replay the stale rows and
+///   run the query once per bound row.
+/// - **Bulk ingest through `execute()`** must perform the ingest and hand back an empty stream, not
+///   `InvalidState` ("no SQL query set").
+/// - **Setting an ingest target wins over a stale query** on a reused handle (the Python DBAPI
+///   `Cursor` pattern), so the bound rows are ingested rather than the query re-run.
+#[test]
+fn execute_entry_point_and_statement_handle_reuse() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
+
+    let mut bind_ddl = connection.new_statement().expect("new statement");
+    bind_ddl
+        .set_sql_query(
+            "DROP TABLE IF EXISTS AdbcBind; \
+             CREATE TABLE AdbcBind (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
+        )
+        .unwrap();
+    bind_ddl.execute_update().expect("create bind table");
+    let mut bind_seed = connection.new_statement().expect("new statement");
+    bind_seed
+        .set_sql_query("INSERT INTO AdbcBind (Id, Name) VALUES (1, 'Alice'), (2, 'Bob')")
+        .unwrap();
+    assert_eq!(
+        bind_seed.execute_update().expect("seed the bind table"),
+        Some(2)
+    );
 
     // DML issued through the query entry point (`execute`, not the Rust-only `execute_update`) must
     // run on the read/write path and succeed. Every ADBC client — the Python DBAPI, R, etc. — issues
@@ -1335,6 +1583,29 @@ fn query_and_dml_round_trip() {
         .expect("ingest after a prior query on a reused statement");
     assert_eq!(count_rows(connection, "AdbcBind"), 5);
 
+    drop_tables(connection, &["AdbcBind"]);
+}
+
+/// Create-mode bulk ingest: the driver builds the table from the bound Arrow schema, so no
+/// `CREATE TABLE` is needed first — exercising `create`, `append` and `replace` in turn.
+///
+/// The created table has **no `PRIMARY KEY` clause**, so Spanner keys it on an implicit hidden
+/// `rowid`. That key must be invisible on every surface: `SELECT *` returns exactly the ingested
+/// columns, and so do `get_table_schema` and `get_objects` — which must also hide the
+/// `PK_`/`CK_IS_NOT_NULL_` constraints Spanner attaches to it
+/// (`objects::HIDE_HIDDEN_COLUMN_CONSTRAINTS`). Earlier driver versions exposed a synthetic
+/// `adbc_ingest_key` column here instead.
+///
+/// `create` onto an already-existing table is the ADBC-contractual error path: the driver's
+/// `CREATE TABLE` (no `IF NOT EXISTS`) is rejected and remapped onto `AlreadyExists` naming the
+/// table, and nothing may be inserted.
+#[test]
+fn ingest_create_modes_and_the_implicit_hidden_key() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
+
     // Create-mode bulk ingest: the driver builds the table from the bound Arrow schema (with a
     // synthetic UUID primary key), so no CREATE TABLE is needed first. Exercises create/append/replace.
     let mut drop_create = connection.new_statement().expect("new statement");
@@ -1342,51 +1613,18 @@ fn query_and_dml_round_trip() {
         .set_sql_query("DROP TABLE IF EXISTS AdbcCreate")
         .unwrap();
     drop_create.execute_update().expect("pre-drop create table");
-    let create_rows = || {
-        RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("Id", DataType::Int64, false),
-                Field::new("Label", DataType::Utf8, false),
-            ])),
-            vec![
-                Arc::new(Int64Array::from(vec![10, 20])),
-                Arc::new(StringArray::from(vec!["x", "y"])),
-            ],
-        )
-        .unwrap()
-    };
-    // Bind `create_rows()` into `table` with the given ingest mode, returning the raw result so
-    // callers can assert either the affected count or an error status.
-    let ingest_into = |connection: &mut SpannerConnection, table: &str, mode: &str| {
-        let mut s = connection.new_statement().expect("new statement");
-        s.set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String(table.into()),
-        )
-        .unwrap();
-        s.set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String(mode.into()),
-        )
-        .unwrap();
-        s.bind(create_rows()).expect("bind ingest rows");
-        s.execute_update()
-    };
-    let ingest_create = |connection: &mut SpannerConnection, mode: &str| {
-        ingest_into(connection, "AdbcCreate", mode)
-    };
     assert_eq!(
-        ingest_create(connection, "create").expect("create"),
+        ingest_labels(connection, "AdbcCreate", "create").expect("create"),
         Some(2)
     ); // creates table + 2 rows
     assert_eq!(count_rows(connection, "AdbcCreate"), 2);
     assert_eq!(
-        ingest_create(connection, "append").expect("append"),
+        ingest_labels(connection, "AdbcCreate", "append").expect("append"),
         Some(2)
     ); // appends
     assert_eq!(count_rows(connection, "AdbcCreate"), 4);
     assert_eq!(
-        ingest_create(connection, "replace").expect("replace"),
+        ingest_labels(connection, "AdbcCreate", "replace").expect("replace"),
         Some(2)
     ); // drops + recreates
     assert_eq!(count_rows(connection, "AdbcCreate"), 2);
@@ -1437,7 +1675,7 @@ fn query_and_dml_round_trip() {
         "get_objects must not list the implicit key's own constraints: {objects_constraints:?}"
     );
     // Assert the replaced values, not just the count: `replace` drops + recreates, so the table
-    // holds exactly one copy of `create_rows()`, not the four rows an `append` would leave.
+    // holds exactly one copy of `ingest_label_rows()`, not the four rows an `append` would leave.
     let created_ids = col::<Int64Array>(created[0].column(0));
     let created_labels = col::<StringArray>(created[0].column(1));
     assert_eq!(
@@ -1451,7 +1689,7 @@ fn query_and_dml_round_trip() {
     // emits a `CREATE TABLE` (no `IF NOT EXISTS`), Spanner rejects it because `AdbcCreate` still
     // exists, and the driver remaps the DDL failure onto `AlreadyExists` — naming the table — so
     // consumers can branch on the status (e.g. to fall back to append). Nothing may be inserted.
-    let create_on_existing = ingest_into(connection, "AdbcCreate", "create")
+    let create_on_existing = ingest_labels(connection, "AdbcCreate", "create")
         .expect_err("create-mode ingest onto an existing table must fail");
     assert_eq!(
         create_on_existing.status,
@@ -1468,6 +1706,20 @@ fn query_and_dml_round_trip() {
         "a failed create-mode ingest must leave the table unchanged (got error: {create_on_existing:?})"
     );
     drop_tables(connection, &["AdbcCreate"]);
+}
+
+/// `create_append` end-to-end: it creates the table from the bound Arrow schema when absent (like
+/// `create`) but — unlike `create` — is a no-op-on-conflict for the table itself, so a second
+/// ingest into the now-existing table simply appends. When the table exists and the bound schema
+/// does not match, the ADBC contract requires `AlreadyExists` (the `CREATE TABLE IF NOT EXISTS` is
+/// a no-op, the insert then fails on the unknown column and the driver remaps it through the same
+/// probe path as `append`).
+#[test]
+fn ingest_create_append_mode_creates_then_appends() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
 
     // `create_append` mode end-to-end: it creates the table from the bound Arrow schema when absent
     // (like `create`), but — unlike `create` — is a no-op-on-conflict for the table itself, so a
@@ -1481,13 +1733,13 @@ fn query_and_dml_round_trip() {
         .expect("pre-drop create_append table");
     // First ingest: table absent → created + 2 rows.
     assert_eq!(
-        ingest_into(connection, "AdbcCreateAppend", "create_append").expect("create_append"),
+        ingest_labels(connection, "AdbcCreateAppend", "create_append").expect("create_append"),
         Some(2)
     );
     assert_eq!(count_rows(connection, "AdbcCreateAppend"), 2);
     // Second ingest: table now present → append (no error, unlike `create`).
     assert_eq!(
-        ingest_into(connection, "AdbcCreateAppend", "create_append")
+        ingest_labels(connection, "AdbcCreateAppend", "create_append")
             .expect("create_append onto an existing table appends"),
         Some(2)
     );
@@ -1533,6 +1785,19 @@ fn query_and_dml_round_trip() {
         4
     );
     drop_tables(connection, &["AdbcCreateAppend"]);
+}
+
+/// A user-keyed table is the `append` story: create it with your own DDL — a primary key fixes
+/// Spanner's physical row layout, so it is the user's choice, not the driver's, and there is
+/// deliberately no ingest option for it — then append into it. The declared key really is enforced:
+/// re-appending a duplicate is an insert-mutation conflict, surfaced as `AlreadyExists`. The
+/// removed `spanner.ingest.primary_key` option is now just an unknown statement option.
+#[test]
+fn ingest_appends_into_a_user_keyed_table() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
 
     // A user-keyed table is the `append` story: create it with your own DDL (the primary key fixes
     // Spanner's physical row layout, so it is the user's choice, not the driver's — there is
@@ -1548,21 +1813,8 @@ fn query_and_dml_round_trip() {
     keyed_ddl
         .execute_update()
         .expect("create the user-keyed ingest table");
-    let keyed_ingest = |connection: &mut SpannerConnection| {
-        let mut s = connection.new_statement().expect("new statement");
-        s.set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcIngestPk".into()),
-        )
-        .unwrap();
-        s.set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .unwrap();
-        s.bind(create_rows()).expect("bind keyed ingest rows");
-        s.execute_update()
-    };
+    let keyed_ingest =
+        |connection: &mut SpannerConnection| ingest_labels(connection, "AdbcIngestPk", "append");
     assert_eq!(
         keyed_ingest(connection).expect("append into the keyed table"),
         Some(2)
@@ -1587,6 +1839,44 @@ fn query_and_dml_round_trip() {
         gone_err.status,
         adbc_core::error::Status::NotImplemented,
         "a removed option must report NotImplemented like any unknown one, got: {gone_err:?}"
+    );
+}
+
+/// Parameter binding across the query and DML paths:
+///
+/// - a **parameterized query** binds `@Id` and reads the matching row back, with
+///   `get_parameter_schema` deriving the parameter types from the SQL (a PLAN probe for the
+///   statement's undeclared parameters) before binding and from the bound data afterwards;
+/// - **positional binding** pairs the sole bound column with the sole `@parameter` even though the
+///   names differ — the ADBC ordinal contract positional clients rely on;
+/// - **parameterized DML** under `adbc.statement.bind_by_name=true`, whose parameter schema comes
+///   back in SQL appearance order (planning DML needs a read/write transaction; the probe's plan
+///   executes nothing and commits empty);
+/// - a **`Null`-typed bind column** binds NULL per row — the shape ADBC's own contract produces,
+///   so a driver advertising bind support must accept it rather than contradict its own reported
+///   schema.
+#[test]
+fn parameter_binding_round_trip() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
+
+    let mut bind_ddl = connection.new_statement().expect("new statement");
+    bind_ddl
+        .set_sql_query(
+            "DROP TABLE IF EXISTS AdbcBind; \
+             CREATE TABLE AdbcBind (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
+        )
+        .unwrap();
+    bind_ddl.execute_update().expect("create bind table");
+    let mut bind_seed = connection.new_statement().expect("new statement");
+    bind_seed
+        .set_sql_query("INSERT INTO AdbcBind (Id, Name) VALUES (1, 'Alice'), (2, 'Bob')")
+        .unwrap();
+    assert_eq!(
+        bind_seed.execute_update().expect("seed the bind table"),
+        Some(2)
     );
 
     // Parameterized query: bind @Id and read the matching row back.
@@ -1720,6 +2010,17 @@ fn query_and_dml_round_trip() {
     );
 
     drop_tables(connection, &["AdbcBind"]);
+}
+
+/// `prepare()` preconditions: preparing a statement before its query is set is an `InvalidState`
+/// error (the ADBC precondition), while a bulk-ingest statement needs no SQL query at all, so
+/// preparing one with only a target set is fine — even when that target table does not exist.
+#[test]
+fn prepare_requires_a_query_or_an_ingest_target() {
+    let Some(mut fx) = fixture_unguarded() else {
+        return;
+    };
+    let connection = &mut fx.connection;
 
     // Preparing a statement before its query is set is an InvalidState error (ADBC precondition).
     let mut unprepared = connection.new_statement().expect("new statement");
@@ -1736,6 +2037,18 @@ fn query_and_dml_round_trip() {
         )
         .unwrap();
     ingest_prepare.prepare().expect("prepare ingest statement");
+}
+
+/// Bulk ingest must quote identifiers, so reserved words survive as table and column names — the
+/// value of the ADBC suite's ingest-escaping tests. Table `create` and column `index` are both
+/// reserved words, and `create`-mode ingest exercises the quoting on both sides: the generated
+/// `CREATE TABLE` (`bind::create_table_sql`) and the insert mutations.
+#[test]
+fn bulk_ingest_quotes_reserved_word_identifiers() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
 
     // Bulk ingest must quote identifiers, so reserved words survive as table/column names — the
     // value of the ADBC suite's ingest-escaping tests. Table `create` and column `index` are both
@@ -1765,6 +2078,16 @@ fn query_and_dml_round_trip() {
     );
     assert_eq!(count_rows(connection, "`create`"), 2);
     drop_tables(connection, &["`create`"]);
+}
+
+/// `ARRAY<scalar>` columns map to a native Arrow `List` of the element type, and their values
+/// round-trip element for element.
+#[test]
+fn array_columns_map_to_native_arrow_lists() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
 
     // --- ARRAY<scalar> maps to a native Arrow List ---
 
@@ -1812,6 +2135,21 @@ fn query_and_dml_round_trip() {
     assert_eq!((tags0.value(0), tags0.value(1)), ("a", "b"));
 
     drop_tables(connection, &["AdbcArr"]);
+}
+
+/// `STRUCT` maps to a native Arrow `Struct`. Spanner only returns structs inside an `ARRAY`, so the
+/// value is built with `ARRAY(SELECT AS STRUCT ...)`; the element type carries the field names from
+/// the result metadata.
+///
+/// A `STRUCT` may repeat a field name and leave a field unnamed — both legal in Spanner, since a
+/// `STRUCT` is positional, not a map. Every field must keep its own value: decoding by name would
+/// collapse the two `x`es onto one value (CONV-6).
+#[test]
+fn struct_values_map_to_native_arrow_structs() {
+    let Some(mut fx) = fixture_unguarded() else {
+        return;
+    };
+    let connection = &mut fx.connection;
 
     // --- STRUCT → native Arrow Struct (Spanner only returns structs inside an ARRAY) ---
 
@@ -1891,6 +2229,17 @@ fn query_and_dml_round_trip() {
     let dup_inner = col::<StructArray>(&dup_inner);
     let dup_col = |i: usize| col::<Int64Array>(dup_inner.column(i)).value(0);
     assert_eq!((dup_col(0), dup_col(1), dup_col(2)), (1, 2, 3));
+}
+
+/// A `;`-separated multi-statement DML string in one `execute_update` runs as a single
+/// `ExecuteBatchDml`: the `DELETE` and the `INSERT` commit together and the affected count is their
+/// sum.
+#[test]
+fn batched_multi_statement_dml_commits_together() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
 
     // --- Batched multi-statement DML in one execute_update (atomic DELETE; INSERT) ---
 
@@ -1919,6 +2268,17 @@ fn query_and_dml_round_trip() {
     assert_eq!(count_rows(connection, "AdbcBatch"), 2);
 
     drop_tables(connection, &["AdbcBatch"]);
+}
+
+/// `execute_schema` returns a query's schema without executing it, including for a top-level
+/// `WITH`. DML is rejected up front with a clear `InvalidArguments` error rather than surfacing
+/// Spanner's raw read-only-transaction error from the PLAN probe.
+#[test]
+fn execute_schema_returns_a_query_schema_without_running_it() {
+    let Some(mut fx) = fixture_unguarded() else {
+        return;
+    };
+    let connection = &mut fx.connection;
 
     // --- execute_schema returns a query's schema without running it (incl. a top-level WITH) ---
 
@@ -1948,6 +2308,17 @@ fn query_and_dml_round_trip() {
         "unexpected message: {}",
         error.message
     );
+}
+
+/// `get_objects` at `All` depth walks catalog → schema → table → columns out of
+/// `INFORMATION_SCHEMA`, and `xdbc_type_name` carries the Spanner-native type
+/// (`INFORMATION_SCHEMA.COLUMNS.SPANNER_TYPE`).
+#[test]
+fn get_objects_reports_catalog_schema_table_columns() {
+    let Some(mut fx) = fixture_unguarded() else {
+        return;
+    };
+    let connection = &mut fx.connection;
 
     // --- get_objects: catalog → schema → table → columns from INFORMATION_SCHEMA ---
 
@@ -1997,6 +2368,28 @@ fn query_and_dml_round_trip() {
     );
     let type_names: Vec<&str> = (0..type_name.len()).map(|i| type_name.value(i)).collect();
     assert_eq!(type_names, ["INT64", "STRING(MAX)", "BOOL", "FLOAT64"]);
+}
+
+/// The `get_objects` depth and filter contract, which is where peer drivers have shipped bugs:
+///
+/// - **`Catalogs` depth** reports Spanner's single unnamed catalog with a NULL `db_schemas` list
+///   (this depth needs no `INFORMATION_SCHEMA` data and issues no queries at all), and a catalog
+///   filter that excludes `""` yields zero rows.
+/// - **`Schemas` depth** populates the schemas (the default `""` schema is present) but leaves each
+///   schema's table list NULL.
+/// - **Round trip**: every value `get_table_types` reports works as a `get_objects` `table_type`
+///   filter — the spec says valid filter values come from `get_table_types`, so the two
+///   vocabularies must agree.
+/// - **Depth boundary**: a `table_type` filter matching nothing must still return the catalog +
+///   db_schema skeleton with each schema's `db_schema_tables` an EMPTY list — never NULL, which is
+///   reserved for levels strictly below the requested depth. (The adbc-drivers validation suite
+///   caught DuckDB shipping NULL here; see duckdb/duckdb PR #21018.)
+#[test]
+fn get_objects_depth_and_filter_boundaries() {
+    let Some(mut fx) = fixture_unguarded() else {
+        return;
+    };
+    let connection = &mut fx.connection;
 
     // --- get_objects at Catalogs depth: the single unnamed catalog with a NULL db_schemas
     // list (this depth needs no INFORMATION_SCHEMA data and issues no queries at all).
