@@ -44,13 +44,14 @@ Early, tested end-to-end against the Spanner emulator.
     - table first, failing if it exists),
       `append` (insert into an existing table), `create_append` (create if absent, then insert) and
       `replace` (drop and recreate).
-      The three create modes build the table from the ingest data's Arrow schema, adding a synthetic
-      `adbc_ingest_key` `STRING` primary key populated with a UUID per row, because Spanner requires
-      every table to have a primary key and the ingest data carries none. That column is a real column,
-      so it shows up in a later `SELECT *` from the table. To key on your own data instead, set
+      The three create modes build the table from the ingest data's Arrow schema and declare **no
+      primary key**: the ingest data carries none, and Spanner keys a keyless table on a
+      [hidden `rowid` column](https://cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys)
+      of its own that no `SELECT *` (and neither `get_table_schema` nor `get_objects`) returns — so the
+      created table holds exactly the columns you ingested. To key on your own data instead, set
       `spanner.ingest.primary_key` to one or more existing ingest columns (comma-separated for a
-      composite key, in key order) — those become the primary key and no synthetic column is added; a
-      named column absent from the data fails with `InvalidArguments`. For non-atomic,
+      composite key, in key order) — those become the primary key, and only then do duplicate rows
+      conflict; a named column absent from the data fails with `InvalidArguments`. For non-atomic,
       high-throughput ("firehose") loads, set `spanner.ingest.batch_write=true` to route an autocommit
       ingest's per-chunk mutations through Spanner's **BatchWrite** RPC instead of a write-only
       transaction (insert/count/error semantics and chunking preserved; BatchWrite applies its mutation

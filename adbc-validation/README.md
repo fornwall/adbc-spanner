@@ -54,14 +54,13 @@ they interoperate with the driver over the C ABI.
 
 `SpannerQuirks` (in `spanner_validation.cc`) describes Spanner's capabilities to
 the suite — named `@p` parameters, backtick identifier quoting, DDL via the admin
-API, all four ingest modes, mandatory (NULL-permitting) primary keys, the Arrow
+API, all four ingest modes, the Arrow
 types Spanner widens on readback (`IngestSelectRoundTripType`) — so tests that do
 not apply to Spanner's model self-skip rather than fail. Its `RewriteSql`
 override substitutes GoogleSQL for the suite's dialect-sensitive default SQL per
-stable query id: Spanner-valid `CREATE TABLE`s (INT64/STRING(MAX) + PRIMARY
-KEY), `INSERT`s with the column list Spanner requires, ingest readbacks that
-select the ingested columns explicitly (dodging the synthetic `adbc_ingest_key`
-column) and drop the `NULLS FIRST`/`NULLS LAST` the emulator rejects (GoogleSQL's
+stable query id: Spanner-valid `CREATE TABLE`s (INT64/STRING(MAX)),
+`INSERT`s with the column list Spanner requires, readbacks that
+drop the `NULLS FIRST`/`NULLS LAST` the emulator rejects (GoogleSQL's
 defaults match them anyway), and CASTs that give Spanner's parameter-type
 inference the context a bare `SELECT @p0, @p1` lacks. Every rewrite pins the
 upstream default SQL, so an `ARROW_ADBC_TAG` bump that changes a query fails
@@ -167,13 +166,13 @@ silently-disarmed `rust-asan` leg goes red instead of green.
   create over an existing table → error, incompatible-schema append → error).
 
 The gate runs **every case except the documented `EXCLUDED` expected-failures**
-(see the next section), and they all pass or self-skip — today **89 cases: 82
-pass, 7 self-skip**. `DatabaseTest` and `ConnectionTest` pass in full; from `StatementTest`
+(see the next section), and they all pass or self-skip — today **96 cases: 90
+pass, 6 self-skip**. `DatabaseTest` and `ConnectionTest` pass in full; from `StatementTest`
 everything but the `EXCLUDED` list in `scripts/run-adbc-validation.sh` runs here.
 `SpannerQuirks::supports_bulk_ingest` declares
 all four ingest modes (append, create, create_append, replace — the create
-modes build the table from the ingest data's Arrow schema with a synthetic
-`adbc_ingest_key` UUID primary key satisfying Spanner's mandatory-key rule),
+modes build the table from the ingest data's Arrow schema, declaring no primary
+key, so its columns are exactly the ingested ones),
 which un-skipped the last two `ConnectionTest` cases, `MetadataGetTableSchema`
 and `MetadataGetTableSchemaEscaping` (both gated upstream on
 `supports_bulk_ingest(CREATE)`, though their fixtures only use plain DDL).
@@ -294,7 +293,8 @@ every `f16` is exactly representable in `f32`, so the driver widens it into a
 
 **Insertion-order readbacks** (`SqlPrepareUpdate` / `SqlPrepareUpdateStream`) were
 another former bucket: no SQL can recover insertion order from a Spanner table,
-whose rows come back in primary-key order behind a random-UUID synthetic key.
+whose rows come back in primary-key order — and an ingest-created table's key is
+the implicit `rowid`, a bit-reversed identity.
 [apache/arrow-adbc#4534](https://github.com/apache/arrow-adbc/pull/4534) gave both
 readbacks a deterministic `ORDER BY <col> ASC NULLS FIRST` and sorted the expected
 vectors, so with the `RewriteSql` overrides both now pass and are gate-enforced.
@@ -327,16 +327,18 @@ ids, and the `SpannerQuirks` override substitutes GoogleSQL per id
 - The **"suite-internal non-Spanner DDL"** bucket (`SqlBind`, `SqlQueryEmpty`,
   `SqlQueryInsertRollback`, `SqlQueryRowsAffectedDelete{,Stream}`,
   `SqlPrepareSelectParams`) — Spanner-valid `CREATE TABLE`s (`INT64` /
-  `STRING(MAX)` + `PRIMARY KEY`), `INSERT`s with the column list GoogleSQL
+  `STRING(MAX)`; a keyless `CREATE TABLE` is legal Spanner, so the portable DDL
+  needs no `PRIMARY KEY` bolted on), `INSERT`s with the column list GoogleSQL
   requires, and CASTs that give the parameter-type inference the context a bare
   `SELECT @p0, @p1` lacks. All six now pass, gate-enforced.
 - The **"ingest readback"** bucket (the whole `SqlIngest*` type family plus
   `Append`/`Replace`/`CreateAppend`/`MultipleConnections`/`Sample`) — the
-  `SELECT * FROM bulk_ingest … NULLS FIRST` readbacks used to trip over the
-  emulator's `NULLS FIRST`/`NULLS LAST` rejection first and the synthetic
-  `adbc_ingest_key` column second. The rewrites select the ingested column(s)
-  explicitly and drop the NULLS clause (GoogleSQL's ASC/DESC defaults are
-  exactly NULLS FIRST/NULLS LAST, so the semantics are unchanged); the
+  `SELECT * FROM bulk_ingest … NULLS FIRST` readbacks trip over the
+  emulator's `NULLS FIRST`/`NULLS LAST` rejection. The rewrites drop the NULLS
+  clause (GoogleSQL's ASC/DESC defaults are exactly NULLS FIRST/NULLS LAST, so
+  the semantics are unchanged) and add an `ORDER BY` to the one readback whose
+  expected values are order-sensitive without one (`Append` — an ingest-created
+  table is ordered by the implicit `rowid`, not insertion order); the
   `TestSqlIngestType` query id carries the ingested Arrow type as a suffix, which
   lets the two `List` cases order by `` `col`[SAFE_OFFSET(0)] `` instead (GoogleSQL
   cannot `ORDER BY` an ARRAY column). Alongside, `IngestSelectRoundTripType`

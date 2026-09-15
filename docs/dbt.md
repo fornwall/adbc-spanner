@@ -216,8 +216,8 @@ WHERE s.`dbt_scd_id` NOT IN (SELECT `dbt_scd_id` FROM `my_snapshot`);
 ```
 
 - `dbt_scd_id` — a stable hash over the source key plus the tracked columns (`check` strategy) or an
-  updated-at column (`timestamp` strategy) — is the natural **`PRIMARY KEY`**, which Spanner requires
-  anyway. A changed row hashes to a *new* `dbt_scd_id`, so step 1 closes the old version and step 2
+  updated-at column (`timestamp` strategy) — is the natural **`PRIMARY KEY`** for the snapshot
+  table. A changed row hashes to a *new* `dbt_scd_id`, so step 1 closes the old version and step 2
   inserts the new one.
 - Ordering matters (close out before insert). Because each step commits, a failure between them
   leaves a well-defined, inspectable intermediate state rather than a torn transaction, and re-running
@@ -233,9 +233,9 @@ per row. Relevant knobs (full list in [docs/options.md](options.md#statement-opt
 
 - **`adbc.ingest.mode`** — `create` / `create_append` / `replace` build the table from the seed's
   Arrow schema; `append` requires it to exist.
-- **Primary key.** A create mode adds a synthetic `adbc_ingest_key` `STRING(36)` UUID primary key
-  unless **`spanner.ingest.primary_key`** names existing seed columns to key on, in key order — what
-  a seed config declaring a primary key would set, so no synthetic column appears.
+- **Primary key.** A create mode declares none, leaving Spanner to key the table on a hidden
+  `rowid`, unless **`spanner.ingest.primary_key`** names existing seed columns to key on, in key
+  order — what a seed config declaring a primary key would set.
 - **`spanner.ingest.batch_write`** — routes each autocommit chunk through Spanner's BatchWrite RPC
   (non-atomic per row group, higher throughput) for large seeds. Chunking, insert semantics and the
   row count are preserved.

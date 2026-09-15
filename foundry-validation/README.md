@@ -39,10 +39,9 @@ corpus assumes a portable SQL dialect that Spanner diverges from**, so per-categ
 
 **`type/bind/*` is done** (all pass or `skip`): the driver binds parameters positionally when the
 bound column names don't match the query's `@names`, so no per-case column renaming is needed — each
-override just supplies a Spanner `setup_query` (mandatory `PRIMARY KEY`, native type names) and an
+override just supplies a Spanner `setup_query` (an explicit `PRIMARY KEY`, native type names) and an
 explicit `INSERT` column list. `FLOAT32`/`FLOAT64` — which Spanner forbids as a primary key —
-round-trip by adding a synthetic UUID key column (defaulted, so the bind `INSERT` still supplies
-only `res`), and `BinaryView`/`Utf8View` params round-trip too (the driver binds the Arrow view
+round-trip in a table that declares no key at all (Spanner keys it on a hidden `rowid`), and `BinaryView`/`Utf8View` params round-trip too (the driver binds the Arrow view
 layouts like their offset kin, `src/bind.rs`). `timestamptz_ns` round-trips in the default
 (nanosecond) mode — its values sit at the i64 nanosecond boundaries (~1677 / ~2262), which *are*
 in range — and `timestamptz_us` (whose values reach `9999-12-31`) round-trips by setting
@@ -96,8 +95,8 @@ pins the literal to `+00` and expects UTC nanoseconds. `skip`ped: narrower integ
 
 **`ingest/*` is done** (all pass or `skip`): this one needed a *driver* change, not fixtures — the
 suite ingests with `mode="create"`, so the driver now builds the table from the ingest data's Arrow
-schema, adding a synthetic `adbc_ingest_key` UUID primary key (Spanner requires one; the ingest
-`INSERT`s omit it so the `DEFAULT (GENERATE_UUID())` fills it). `append`/`create`/`create_append`/
+schema, declaring no primary key (Spanner keys such a table on a hidden `rowid` of its own, so the
+created table's columns are exactly the ingested ones). `append`/`create`/`create_append`/
 `replace` are all supported. `skip`ped: narrower integers (→ `INT64`), all `DECIMAL` variants (fixed
 38,9), `TIME`/fixed-size-binary (no type), tz-naive `timestamp` (Spanner `TIMESTAMP` is UTC-aware),
 and `timestamptz` at non-nanosecond units (Spanner returns nanosecond).
@@ -131,35 +130,35 @@ Spanner. Neither requires a fork any more — `VALIDATION_REF` pins the plain up
 `adbc-drivers/validation` suite (`scripts/run-foundry-validation.sh`) — and both now **pass**, so
 there are no strict xfails left:
 
-- `test_get_objects_column_filter_table` / `_table_name` — tables created by `mode="create"` ingest
-  carry the synthetic `adbc_ingest_key` primary-key column, which `get_objects` faithfully lists; the
-  cases' strict column-list assertions expected only the data columns.
-  Handled **in this repo**, not the shared suite: `tests/test_connection.py` subclasses the suite's
-  `TestConnection` and overrides just these two tests to drop `adbc_ingest_key` before the strict
-  assertions (`SYNTHETIC_INGEST_COLUMN`). The membership-based filter tests already pass and are
-  inherited unchanged. This is the driver-side alternative to a shared
+- `test_get_objects_column_filter_table` / `_table_name` — **no adaptation left**: these assert the
+  exact ingested column list, which tables created by `mode="create"` ingest used to exceed by the
+  synthetic `adbc_ingest_key` primary-key column. The create modes now declare no key at all, so
+  `tests/test_connection.py` re-exports the suite's `TestConnection` unchanged. (The overrides that
+  used to filter that column out were the driver-side alternative to a shared
   `bulk_ingest_synthetic_column` feature flag — see the discussion on
-  [adbc-drivers/validation#250](https://github.com/adbc-drivers/validation/pull/250). If the suite
-  ever renames these two methods or reshapes their assertions, the overrides silently go stale — keep
-  them in lockstep with the pin.
-- `test_rows_affected` — the suite hardcoded portable `CREATE TABLE (id INT)`; Spanner needs a
-  `PRIMARY KEY` and `INT64`. The suite now routes that DDL through
+  [adbc-drivers/validation#250](https://github.com/adbc-drivers/validation/pull/250).)
+- `test_rows_affected` — the suite hardcoded portable `CREATE TABLE (id INT)`; Spanner needs
+  `INT64`. The suite now routes that DDL through
   `query_override("TestStatement.test_rows_affected.create_table", …)`
   ([#249](https://github.com/adbc-drivers/validation/pull/249), merged upstream); quirks hookup: that
-  override rewrites `(id INT)` → `(id INT64, adbc_pk STRING(36) DEFAULT (GENERATE_UUID())) PRIMARY KEY (adbc_pk)`.
+  override rewrites `(id INT)` → `(id INT64)`. It deliberately declares no key: the test runs
+  `UPDATE … SET id = id + 1`, which Spanner rejects on a key column.
 
-Known remaining gaps (documented, not yet addressed):
+**`get_objects` constraints.** `test_get_objects_constraints_{primary,foreign}` both **pass**.
+`SpannerQuirks` implements the suite's `sample_ddl_constraints` hook (Spanner DDL: `INT64`, trailing
+`PRIMARY KEY`, table-level `FOREIGN KEY`), and the driver reports the constraints faithfully — the
+FK shapes are exact, and declared key order is preserved (`PRIMARY KEY (b, a)` reports
+`["b", "a"]`), matching the suite's non-normalized defaults. `_primary` passes because the driver
+reports `constraint_column_usage` as NULL, not `[]`, for non-FK constraints. `_foreign` asserts
+*exactly one* constraint per FK table, which used to be impossible (every Spanner table needed a
+primary key, so each reported PK + FK); the two FK children are now created **keyless**, and
+`get_objects` omits the implicit `rowid`'s own `PK_<table>` / `CK_IS_NOT_NULL_<table>_rowid`
+constraints along with the hidden column itself.
 
-- `test_get_objects_constraints_foreign` — `SpannerQuirks` implements the suite's
-  `sample_ddl_constraints` hook (Spanner DDL: `INT64`, trailing `PRIMARY KEY`, table-level
-  `FOREIGN KEY`), so the fixture no longer errors, and the driver reports the constraints
-  faithfully — the FK shapes are exact, and declared key order is preserved (`PRIMARY KEY (b, a)`
-  reports `["b", "a"]`), matching the suite's non-normalized defaults. `_primary` now **passes**
-  (the driver reports `constraint_column_usage` as NULL, not `[]`, for non-FK constraints). Only
-  `_foreign` stays skipped (feature gated off): it is upstream-unpassable for Spanner — every
-  Spanner table has a mandatory primary key, and even the empty `PRIMARY KEY ()` singleton form
-  still produces a `PK_<table>` row in `INFORMATION_SCHEMA.TABLE_CONSTRAINTS` (verified on the
-  emulator), so the FK tables report two constraints (PK + FK) where the suite asserts exactly one.
+The remaining two constraint cases stay feature-gated off, and are genuine Spanner gaps rather than
+driver ones: `_unique` (Spanner has no `UNIQUE` table constraint, only unique indexes) and `_check`
+(not wired up — Spanner's own `CK_IS_NOT_NULL_*` constraints make the suite's exact-count
+assertions ambiguous).
 
 ## Skip-inventory baseline guard
 

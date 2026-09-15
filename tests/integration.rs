@@ -1537,17 +1537,52 @@ fn query_and_dml_round_trip() {
         Some(2)
     ); // drops + recreates
     assert_eq!(count_rows(&mut connection, "AdbcCreate"), 2);
-    // The data columns read back even though the table also has the synthetic key column.
+    // A `SELECT *` reads back exactly the ingested columns: the created table has no `PRIMARY KEY`
+    // clause, so Spanner keys it on an implicit `rowid` that no `SELECT *` returns (earlier driver
+    // versions appended a visible synthetic `adbc_ingest_key` column here instead).
     let mut read_create = connection.new_statement().expect("new statement");
     read_create
-        .set_sql_query("SELECT Id, Label FROM AdbcCreate ORDER BY Id")
+        .set_sql_query("SELECT * FROM AdbcCreate ORDER BY Id")
         .unwrap();
-    let created = read_create
-        .execute()
-        .expect("read created")
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let created_reader = read_create.execute().expect("read created");
+    let created_cols: Vec<String> = created_reader
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    assert_eq!(
+        created_cols,
+        vec!["Id", "Label"],
+        "an ingest-created table must expose exactly the ingested columns: {created_cols:?}"
+    );
+    let created = created_reader.collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(created.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    // The same holds for the metadata surfaces: `get_table_schema` and `get_objects` must not
+    // leak the implicit key either — nor the `PK_`/`CK_IS_NOT_NULL_` constraints Spanner attaches
+    // to it (`objects::HIDE_HIDDEN_COLUMN_CONSTRAINTS`).
+    let created_schema = connection
+        .get_table_schema(None, None, "AdbcCreate")
+        .expect("get_table_schema for the ingest-created table");
+    assert_eq!(
+        created_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>(),
+        vec!["Id", "Label"]
+    );
+    let (objects_columns, objects_constraints) =
+        table_columns_and_constraints(&mut connection, "AdbcCreate");
+    assert_eq!(
+        objects_columns,
+        vec!["Id", "Label"],
+        "get_objects must not list the implicit hidden key column"
+    );
+    assert!(
+        objects_constraints.is_empty(),
+        "get_objects must not list the implicit key's own constraints: {objects_constraints:?}"
+    );
     // Assert the replaced values, not just the count: `replace` drops + recreates, so the table
     // holds exactly one copy of `create_rows()`, not the four rows an `append` would leave.
     let created_ids = created[0]
@@ -1653,7 +1688,6 @@ fn query_and_dml_round_trip() {
     );
     // The rejected ingest changed nothing.
     assert_eq!(count_rows(&mut connection, "AdbcCreateAppend"), 4);
-    // The data columns read back even though the table also carries the synthetic key column.
     let mut read_create_append = connection.new_statement().expect("new statement");
     read_create_append
         .set_sql_query("SELECT Id, Label FROM AdbcCreateAppend ORDER BY Id")
@@ -1676,7 +1710,7 @@ fn query_and_dml_round_trip() {
         .expect("drop create_append table");
 
     // Create-mode ingest keyed on an existing column (`spanner.ingest.primary_key`): the table is
-    // built with that column as the primary key and NO synthetic `adbc_ingest_key` is added.
+    // built with that column as its declared primary key, rather than left keyless.
     let mut drop_pk = connection.new_statement().expect("new statement");
     drop_pk
         .set_sql_query("DROP TABLE IF EXISTS AdbcIngestPk")
@@ -1717,7 +1751,8 @@ fn query_and_dml_round_trip() {
         Some(2)
     );
     assert_eq!(count_rows(&mut connection, "AdbcIngestPk"), 2);
-    // The created table's columns are exactly the data columns — no synthetic key was appended.
+    // Keying on an existing column is the other half: the table's columns are still exactly the
+    // data columns, but now `Id` is the real primary key (asserted by the duplicate append below).
     let pk_schema = connection
         .get_table_schema(None, None, "AdbcIngestPk")
         .expect("get_table_schema for the keyed ingest table");
@@ -1946,20 +1981,17 @@ fn query_and_dml_round_trip() {
         .unwrap();
     ingest_prepare.prepare().expect("prepare ingest statement");
 
-    // Bulk ingest must quote identifiers, so reserved words survive as table/column names. This is
-    // the value of the ADBC suite's ingest-escaping tests, which we can only run in append mode
-    // (Spanner requires a primary key, so it has no create-mode ingest). Table `create` and column
-    // `index` are both reserved words.
+    // Bulk ingest must quote identifiers, so reserved words survive as table/column names — the
+    // value of the ADBC suite's ingest-escaping tests. Table `create` and column `index` are both
+    // reserved words, and `create`-mode ingest exercises the quoting on both sides: the generated
+    // `CREATE TABLE` (`bind::create_table_sql`) and the insert mutations.
     let mut esc_ddl = connection.new_statement().expect("new statement");
     esc_ddl
-        .set_sql_query(
-            "DROP TABLE IF EXISTS `create`; \
-             CREATE TABLE `create` (`index` INT64) PRIMARY KEY (`index`)",
-        )
+        .set_sql_query("DROP TABLE IF EXISTS `create`")
         .unwrap();
     esc_ddl
         .execute_update()
-        .expect("create reserved-word table");
+        .expect("drop any leftover reserved-word table");
     let esc_rows = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new(
             "index",
@@ -1979,7 +2011,7 @@ fn query_and_dml_round_trip() {
     esc_ingest
         .set_option(
             OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
+            OptionValue::String("create".into()),
         )
         .unwrap();
     esc_ingest.bind(esc_rows).expect("bind reserved-word rows");
@@ -5939,6 +5971,39 @@ fn connect_with_retry(database: &SpannerDatabase) -> SpannerConnection {
         }
     }
     panic!("create connection failed after retries: {last_err:?}");
+}
+
+/// The `column_name`s and `constraint_name`s `get_objects` reports for a single table, in the
+/// order it reports them.
+fn table_columns_and_constraints(
+    connection: &mut SpannerConnection,
+    table: &str,
+) -> (Vec<String>, Vec<String>) {
+    let batches = connection
+        .get_objects(ObjectDepth::All, None, Some(""), Some(table), None, None)
+        .expect("get_objects")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect objects");
+    // catalog -> catalog_db_schemas -> db_schema_tables: one row each, the table we filtered to.
+    let list_struct = |array: &dyn Array| {
+        let list = array.as_any().downcast_ref::<ListArray>().unwrap().value(0);
+        list.as_any().downcast_ref::<StructArray>().unwrap().clone()
+    };
+    let schemas = list_struct(batches[0].column(1));
+    let tables = list_struct(schemas.column(1));
+    assert_eq!(tables.len(), 1, "expected exactly one {table} row");
+    let names = |strukt: &StructArray, field: &str| {
+        let array = strukt.column_by_name(field).unwrap();
+        let array = array.as_any().downcast_ref::<StringArray>().unwrap();
+        (0..array.len())
+            .map(|i| array.value(i).to_string())
+            .collect()
+    };
+    let columns: Vec<String> = names(&list_struct(tables.column(2)), "column_name");
+    // `table_constraints` (field 3) is an empty — not null — list when a table has none, so the
+    // downcast below is always valid.
+    let constraints: Vec<String> = names(&list_struct(tables.column(3)), "constraint_name");
+    (columns, constraints)
 }
 
 /// Count the rows in `table` through a driver query.

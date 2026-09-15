@@ -596,12 +596,6 @@ fn numeric_string(unscaled: i128, scale: u32) -> String {
     )
 }
 
-/// Synthetic primary-key column added to tables created by bulk ingest (see [`create_table_sql`]).
-/// Spanner requires a primary key, but Arrow ingest data carries none, so we add a hidden
-/// UUID-defaulted key. Spanner forbids leading-underscore identifiers, hence the `adbc_`-prefixed
-/// (rather than `_adbc_`) name. Ingest `INSERT`s omit it, so the `DEFAULT` fills it per row.
-pub(crate) const INGEST_KEY_COLUMN: &str = "adbc_ingest_key";
-
 /// Map an Arrow parameter/ingest type to the Spanner column type used when creating a table.
 ///
 /// This mirrors the read path's Spanner→Arrow mapping. Narrower integers collapse to `INT64`
@@ -658,13 +652,18 @@ fn spanner_field_type(field: &Field) -> Result<String> {
 
 /// Build a `CREATE TABLE` statement for bulk ingest from the data's Arrow `schema`.
 ///
-/// Every data column maps to its Spanner type via [`spanner_field_type`]. Spanner requires a primary
-/// key; `primary_key` chooses it:
-/// - `None` (the default): a hidden [`INGEST_KEY_COLUMN`] UUID column is appended and keyed on.
+/// Every data column maps to its Spanner type via [`spanner_field_type`]; the created table's
+/// columns are exactly the ingest data's, never more. `primary_key` chooses the key:
+/// - `None` (the default): **no `PRIMARY KEY` clause at all**. Spanner creates such a table with an
+///   implicit hidden `rowid` key of its own
+///   (<https://cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys>),
+///   which no `SELECT *` returns — so the ingested table reads back as exactly the Arrow schema
+///   that built it. (Arrow ingest data carries no key, and inventing one is not the driver's call;
+///   earlier versions appended a synthetic `adbc_ingest_key` UUID column, which leaked into every
+///   `SELECT *` and `get_objects` listing.)
 /// - `Some(cols)` (the `spanner.ingest.primary_key` option): those **existing** data columns become
-///   the key, in the given order, and no synthetic column is added. Every name must appear in
-///   `schema`, else this fails with `InvalidArguments`. (Spanner separately rejects key columns of
-///   unsupported types at DDL time.)
+///   the key, in the given order. Every name must appear in `schema`, else this fails with
+///   `InvalidArguments`. (Spanner separately rejects key columns of unsupported types at DDL time.)
 ///
 /// Pass `if_not_exists` for `create_append` mode. `db_schema` (the `adbc.ingest.target_db_schema`
 /// option) optionally qualifies the created table with a named schema.
@@ -675,7 +674,7 @@ pub(crate) fn create_table_sql(
     if_not_exists: bool,
     primary_key: Option<&[String]>,
 ) -> Result<String> {
-    let mut columns: Vec<String> = Vec::with_capacity(schema.fields().len() + 1);
+    let mut columns: Vec<String> = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
         columns.push(format!(
             "{} {}",
@@ -683,6 +682,8 @@ pub(crate) fn create_table_sql(
             spanner_field_type(field)?
         ));
     }
+    // No `spanner.ingest.primary_key` means no `PRIMARY KEY` clause: Spanner supplies its own
+    // hidden `rowid` key, so the table keeps exactly the ingested columns.
     let key = match primary_key {
         Some(cols) => {
             for col in cols {
@@ -693,22 +694,21 @@ pub(crate) fn create_table_sql(
                     )));
                 }
             }
-            cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>()
+            format!(
+                " PRIMARY KEY ({})",
+                cols.iter()
+                    .map(|c| quote_ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         }
-        None => {
-            columns.push(format!(
-                "{} STRING(36) DEFAULT (GENERATE_UUID())",
-                quote_ident(INGEST_KEY_COLUMN)
-            ));
-            vec![quote_ident(INGEST_KEY_COLUMN)]
-        }
+        None => String::new(),
     };
     let guard = if if_not_exists { "IF NOT EXISTS " } else { "" };
     Ok(format!(
-        "CREATE TABLE {guard}{} ({}) PRIMARY KEY ({})",
+        "CREATE TABLE {guard}{} ({}){key}",
         qualified_table(db_schema, table),
         columns.join(", "),
-        key.join(", "),
     ))
 }
 
@@ -988,11 +988,11 @@ mod tests {
             Field::new("idx", DataType::Int64, true),
             Field::new("name", DataType::Utf8, true),
         ]);
+        // No `spanner.ingest.primary_key`: no PRIMARY KEY clause and no extra column — Spanner
+        // adds its own hidden `rowid` key, so the table is exactly the ingest schema.
         assert_eq!(
             create_table_sql("my_table", None, &schema, false, None).unwrap(),
-            "CREATE TABLE `my_table` (`idx` INT64, `name` STRING(MAX), \
-             `adbc_ingest_key` STRING(36) DEFAULT (GENERATE_UUID())) \
-             PRIMARY KEY (`adbc_ingest_key`)"
+            "CREATE TABLE `my_table` (`idx` INT64, `name` STRING(MAX))"
         );
         assert!(
             create_table_sql("t", None, &schema, true, None)
@@ -1013,7 +1013,7 @@ mod tests {
             Field::new("idx", DataType::Int64, true),
             Field::new("name", DataType::Utf8, true),
         ]);
-        // A single existing column becomes the key; no synthetic column is added.
+        // A single existing column becomes the key.
         assert_eq!(
             create_table_sql("t", None, &schema, false, Some(&["idx".to_string()])).unwrap(),
             "CREATE TABLE `t` (`idx` INT64, `name` STRING(MAX)) PRIMARY KEY (`idx`)"

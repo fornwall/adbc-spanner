@@ -125,10 +125,16 @@ pub(crate) fn collect_statistics(
                      WHERE TABLE_TYPE = 'BASE TABLE'",
                 )
                 .await?;
+                // Hidden columns are skipped for the same reason `get_objects` omits them
+                // (`objects::HIDE_HIDDEN_COLUMNS`): no `SELECT *` returns them, so statistics
+                // about them describe nothing the caller can see — most concretely the implicit
+                // `rowid` key of a table created without a `PRIMARY KEY`, whose distinct count is
+                // just the row count.
                 let columns = query_txn(
                     &txn,
                     "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, SPANNER_TYPE \
                      FROM INFORMATION_SCHEMA.COLUMNS \
+                     WHERE NOT CAST(IS_HIDDEN AS BOOL) \
                      ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION",
                 )
                 .await?;

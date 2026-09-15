@@ -1,4 +1,4 @@
-// Spanner override: mandatory PRIMARY KEY, native type name, and an explicit INSERT column list.
+// Spanner override: explicit PRIMARY KEY, native type name, and an explicit INSERT column list.
 
 // part: setup_query
 

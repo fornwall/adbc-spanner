@@ -190,12 +190,14 @@ pub(crate) fn collect_objects(
     // result (see [`sql_like_pattern`] for the one known divergence, the escape character).
     let schemata_stmt = filtered_query(
         "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA",
+        None,
         &[("SCHEMA_NAME", db_schema)],
         None,
     );
     let tables_stmt = populate_tables.then(|| {
         filtered_query(
             "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES",
+            None,
             &[("TABLE_SCHEMA", db_schema), ("TABLE_NAME", table_name)],
             None,
         )
@@ -205,6 +207,7 @@ pub(crate) fn collect_objects(
             "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, \
              IS_NULLABLE, SPANNER_TYPE \
              FROM INFORMATION_SCHEMA.COLUMNS",
+            Some(HIDE_HIDDEN_COLUMNS),
             &[
                 ("TABLE_SCHEMA", db_schema),
                 ("TABLE_NAME", table_name),
@@ -222,7 +225,8 @@ pub(crate) fn collect_objects(
     let constraints_stmt = populate_columns.then(|| {
         filtered_query(
             "SELECT TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE \
-             FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS",
+             FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc",
+            Some(HIDE_HIDDEN_COLUMN_CONSTRAINTS),
             &[("TABLE_SCHEMA", db_schema), ("TABLE_NAME", table_name)],
             None,
         )
@@ -378,6 +382,38 @@ fn assemble_objects(batches: &ObjectBatches, filters: &ObjectFilters<'_>) -> Res
     Ok(result)
 }
 
+/// `WHERE` predicate keeping only the columns a `SELECT *` would return.
+///
+/// Spanner marks a column `HIDDEN` when it is excluded from `SELECT *` — most importantly the
+/// implicit `rowid` key it adds to a table created without a `PRIMARY KEY` clause, which is what
+/// bulk ingest now creates (see [`bind::create_table_sql`](crate::bind::create_table_sql)). Such a
+/// column is invisible to every other schema surface the driver exposes — query results and
+/// `get_table_schema`, which reads `SELECT * LIMIT 0` — so listing it here would make `get_objects`
+/// alone describe columns no query ever returns.
+///
+/// `IS_HIDDEN` is documented as the `STRING` `"TRUE"`/`"FALSE"` (like `IS_NULLABLE`'s `"YES"`/
+/// `"NO"`), but the emulator types it as a `BOOL`; the `CAST` accepts both (GoogleSQL parses
+/// `"TRUE"` case-insensitively into `TRUE`) rather than betting on one.
+const HIDE_HIDDEN_COLUMNS: &str = "NOT CAST(IS_HIDDEN AS BOOL)";
+
+/// `WHERE` predicate dropping the constraints that exist only to describe a hidden column — the
+/// companion to [`HIDE_HIDDEN_COLUMNS`], keeping the constraint list consistent with the column
+/// list rather than pointing at columns `get_objects` does not report.
+///
+/// A table created without a `PRIMARY KEY` gets two such constraints on its implicit `rowid`: the
+/// `PK_<table>` primary key and a `CK_IS_NOT_NULL_<table>_rowid` check. `CONSTRAINT_COLUMN_USAGE`
+/// covers both shapes (key columns *and* the columns a check constraint reads), where
+/// `KEY_COLUMN_USAGE` would miss the check. A foreign key's usage rows name the *parent* columns,
+/// which are never hidden, so real constraints are untouched.
+const HIDE_HIDDEN_COLUMN_CONSTRAINTS: &str = "NOT EXISTS ( \
+     SELECT 1 FROM INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE AS u \
+     JOIN INFORMATION_SCHEMA.COLUMNS AS c \
+       ON c.TABLE_SCHEMA = u.TABLE_SCHEMA AND c.TABLE_NAME = u.TABLE_NAME \
+      AND c.COLUMN_NAME = u.COLUMN_NAME \
+     WHERE u.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA \
+       AND u.CONSTRAINT_NAME = tc.CONSTRAINT_NAME \
+       AND CAST(c.IS_HIDDEN AS BOOL))";
+
 /// Escape an ADBC `LIKE` pattern for GoogleSQL `LIKE`.
 ///
 /// The ADBC pattern contract (implemented client-side by [`like_match`](crate::connection::like_match)) has no escape syntax:
@@ -390,21 +426,29 @@ fn sql_like_pattern(pattern: &str) -> String {
     pattern.replace('\\', "\\\\")
 }
 
-/// Build the SQL text and bound parameters for an `INFORMATION_SCHEMA` query, appending one
+/// Build the SQL text and bound parameters for an `INFORMATION_SCHEMA` query: a fixed
+/// `base_predicate` (driver-authored SQL, not user data — see [`HIDE_HIDDEN_COLUMNS`]) plus one
 /// `column LIKE @pN` predicate per present ADBC pattern filter. Split from [`filtered_query`] so
 /// the generated SQL is unit-testable offline.
 fn filtered_sql(
     base: &str,
+    base_predicate: Option<&str>,
     filters: &[(&str, Option<&str>)],
     order_by: Option<&str>,
 ) -> (String, Vec<(String, String)>) {
     let mut sql = base.to_string();
+    let mut predicates = 0;
     let mut params = Vec::new();
+    if let Some(predicate) = base_predicate {
+        sql = format!("{sql} WHERE {predicate}");
+        predicates += 1;
+    }
     for (column, pattern) in filters {
         let Some(pattern) = pattern else { continue };
         let name = format!("p{}", params.len());
-        let keyword = if params.is_empty() { "WHERE" } else { "AND" };
+        let keyword = if predicates == 0 { "WHERE" } else { "AND" };
         sql = format!("{sql} {keyword} {column} LIKE @{name}");
+        predicates += 1;
         params.push((name, sql_like_pattern(pattern)));
     }
     if let Some(order_by) = order_by {
@@ -419,10 +463,11 @@ fn filtered_sql(
 /// apache/arrow-adbc#1338, by string-formatting these very patterns).
 fn filtered_query(
     base: &str,
+    base_predicate: Option<&str>,
     filters: &[(&str, Option<&str>)],
     order_by: Option<&str>,
 ) -> SpannerSql {
-    let (sql, params) = filtered_sql(base, filters, order_by);
+    let (sql, params) = filtered_sql(base, base_predicate, filters, order_by);
     let mut builder = SpannerSql::builder(sql);
     for (name, value) in &params {
         builder = builder.add_param(name.as_str(), value);
@@ -1224,6 +1269,7 @@ mod tests {
         // No filters: the base SQL is unchanged.
         let (sql, params) = filtered_sql(
             "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA",
+            None,
             &[("SCHEMA_NAME", None)],
             None,
         );
@@ -1235,6 +1281,7 @@ mod tests {
         // apache/arrow-adbc#1338, came from string-formatting the pattern into the SQL).
         let (sql, params) = filtered_sql(
             "SELECT C FROM T",
+            None,
             &[
                 ("TABLE_SCHEMA", None),
                 ("TABLE_NAME", Some("Sing%")),
@@ -1253,6 +1300,28 @@ mod tests {
                 ("p1".to_string(), r"evil'\\--%".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn filtered_sql_chains_the_base_predicate_before_the_filters() {
+        // Alone, the base predicate is the whole `WHERE`...
+        let (sql, params) = filtered_sql("SELECT C FROM T", Some("X"), &[("A", None)], None);
+        assert_eq!(sql, "SELECT C FROM T WHERE X");
+        assert!(params.is_empty());
+
+        // ...and with filters present it stays first, each filter chaining on with `AND` (a
+        // second `WHERE` would not parse).
+        let (sql, params) = filtered_sql(
+            "SELECT C FROM T",
+            Some("X"),
+            &[("A", Some("a%")), ("B", Some("b%"))],
+            Some("A"),
+        );
+        assert_eq!(
+            sql,
+            "SELECT C FROM T WHERE X AND A LIKE @p0 AND B LIKE @p1 ORDER BY A"
+        );
+        assert_eq!(params.len(), 2);
     }
 
     #[test]

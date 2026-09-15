@@ -1,4 +1,4 @@
-// Spanner override: mandatory PRIMARY KEY, native type name, and an explicit INSERT
+// Spanner override: explicit PRIMARY KEY, native type name, and an explicit INSERT
 // column list. The driver binds Arrow BinaryView params (src/bind.rs) like Binary.
 
 // part: setup_query

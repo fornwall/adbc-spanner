@@ -363,9 +363,9 @@ parameter values to a statement before executing it. Two uses:
   Crucially it ships them as native Spanner **insert mutations**, not one `INSERT` statement per
   row, so nothing is SQL-parsed per row. The standard `adbc.ingest.mode` option picks the
   behaviour: `append` to an existing table, or `create` / `create_append` / `replace`, which build
-  the table via DDL from the incoming Arrow schema. Spanner requires every table to have a primary
-  key and Arrow data carries none, so the create modes add a hidden `adbc_ingest_key` UUID key
-  column — unless `spanner.ingest.primary_key` names existing columns to key on instead. Because
+  the table via DDL from the incoming Arrow schema. Arrow data carries no primary key, so the
+  create modes declare none and let Spanner key the table on its own hidden `rowid` column — unless
+  `spanner.ingest.primary_key` names existing columns to key on instead. Because
   Spanner caps how much a single commit may write, a large ingest is committed **chunk by chunk**
   (so it is not atomic as a whole; a failure reports how many rows earlier chunks already
   committed).

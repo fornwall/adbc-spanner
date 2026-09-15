@@ -21,9 +21,8 @@
 #   FOUNDRY_UPDATE_SKIP_BASELINE=1 scripts/run-foundry-validation.sh
 
 tests/test_connection.py::TestConnection::test_get_objects_constraints_check[spanner:emulator]  # not implemented
-tests/test_connection.py::TestConnection::test_get_objects_constraints_foreign[spanner:emulator]  # not implemented
 tests/test_connection.py::TestConnection::test_get_objects_constraints_unique[spanner:emulator]  # not implemented
-tests/test_connection.py::TestConnection::test_get_table_schema_catalog[spanner:emulator]  # secondary_catalog_schema not supported
+tests/test_connection.py::TestConnection::test_get_table_schema_catalog[spanner:emulator]  # secondary_catalog not supported
 tests/test_connection.py::TestConnection::test_get_table_schema_schema[spanner:emulator]  # secondary_schema not supported
 tests/test_connection.py::TestConnection::test_set_current_catalog[spanner:emulator]  # not implemented
 tests/test_connection.py::TestConnection::test_set_current_schema[spanner:emulator]  # not implemented

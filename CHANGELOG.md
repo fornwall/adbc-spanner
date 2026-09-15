@@ -12,6 +12,22 @@ Releases are cut with [`cargo-release`](https://github.com/crate-ci/cargo-releas
 
 ### Changed
 
+- **Breaking:** the `create` / `create_append` / `replace` bulk-ingest modes no longer add a
+  synthetic `adbc_ingest_key` `STRING(36)` UUID primary-key column. Spanner now supports
+  [tables without a primary key](https://cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys),
+  keying them on an implicit **hidden** `rowid`, so the driver emits no `PRIMARY KEY` clause and an
+  ingest-created table's columns are exactly the ingested ones — no extra column in `SELECT *`,
+  `get_table_schema` or `get_objects`. The synthetic key existed only because every Spanner table
+  used to need one. Set `spanner.ingest.primary_key` to key on your own columns, as before; note
+  that without it an ingested table has no user-visible key, so re-ingesting identical rows now
+  appends duplicates instead of failing with `AlreadyExists`. Tables created by earlier versions
+  keep their `adbc_ingest_key` column (a key cannot be added to or removed from an existing Spanner
+  table); `append` into them is unaffected.
+- `get_objects` and `get_statistics` now omit Spanner's **hidden** columns — those a `SELECT *`
+  does not return — and `get_objects` also omits constraints that reference only hidden columns.
+  This matches `get_table_schema` (which reads `SELECT * LIMIT 0`) and keeps the implicit `rowid`
+  of a keyless table, plus its auto-generated `PK_<table>` / `CK_IS_NOT_NULL_<table>_rowid`
+  constraints, out of the reported metadata.
 - MSRV raised to 1.98.1; the pinned dev/CI toolchain (`rust-toolchain.toml`) moves with it.
 - The `adbc-driver-spanner` wheel's `dbapi` extra now delegates to `adbc-driver-manager[dbapi]`
   instead of declaring a standalone `pyarrow>=8`. That floor sat below the `pyarrow>=14.0.1` the

@@ -393,9 +393,13 @@ The `mode` selects how the target table is handled:
 - `create_append` — create the table only if it is absent, then insert.
 - `replace` — drop any existing table, recreate it from the schema, then insert.
 
-Spanner requires a primary key on every table, but an ingested Arrow batch has none, so the three
-create modes add a synthetic `adbc_ingest_key` column (a UUID string) as the primary key. It is not
-part of your data, but it is a real column and will show up in `SELECT *`.
+An ingested Arrow batch carries no primary key, so the three create modes declare none: Spanner
+keys such a table on a [hidden `rowid` column][no-pk] of its own, which no `SELECT *` returns. The
+created table therefore holds exactly the columns you ingested. To give it a real key, set the
+`spanner.ingest.primary_key` statement option to one or more existing ingest columns (comma-separated
+for a composite key, in key order).
+
+[no-pk]: https://cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys
 
 ## Partitioned reads and Data Boost
 

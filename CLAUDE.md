@@ -451,16 +451,23 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   column binds as a `JSON`-typed param — Spanner won't coerce STRING params into JSON columns — and
   ingest create modes map it to a `JSON` column) + bulk ingest (append and
   create/create_append/replace — the create modes build the table via admin DDL from the ingest
-  data's Arrow schema with a synthetic `adbc_ingest_key` UUID primary key, since Spanner requires
-  one — or, when `spanner.ingest.primary_key` [statement option; comma-separated existing columns,
+  data's Arrow schema with **no `PRIMARY KEY` clause**: Spanner keys such a table on an implicit
+  `HIDDEN rowid` column of its own
+  (<https://cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys>),
+  so the created table's columns are exactly the ingested ones — no `SELECT *`, `get_table_schema`
+  or `get_objects` shows the key. [Up to 0.7 the driver instead appended a visible synthetic
+  `adbc_ingest_key STRING(36) DEFAULT (GENERATE_UUID())` key, because a Spanner table used to
+  require one; that column, and every workaround for it across the two validation harnesses, is
+  gone.] Or, when `spanner.ingest.primary_key` [statement option; comma-separated existing columns,
   `""` unsets, round-trips via `get_option`] is set, key on those existing columns in the given
-  order and add no synthetic column [`bind::create_table_sql`; a named column absent from the ingest
+  order [`bind::create_table_sql`; a named column absent from the ingest
   schema → `InvalidArguments`, and it is ignored by `append`]; the rows themselves ship as native
   **insert mutations** — `bind::insert_mutation`, reusing
   the same `cell_value` Arrow→Spanner mapping as parameter binding — not per-row `INSERT` DML, so
   nothing is SQL-parsed/planned per row but `INSERT` semantics are kept (duplicate PK →
-  `AlreadyExists` naming the target table; `create` mode onto an existing table likewise remaps to
-  `AlreadyExists`); autocommit ingests are built and committed chunk by chunk via
+  `AlreadyExists` naming the target table — reachable only once the table *has* a declared key, i.e.
+  `append` into a user table or `spanner.ingest.primary_key`; `create` mode onto an existing table
+  likewise remaps to `AlreadyExists`); autocommit ingests are built and committed chunk by chunk via
   `DatabaseClient::write_only_transaction` under Spanner's per-commit limits — `IngestChunkBudget`
   in `src/statement.rs`, ~rows × columns mutations + an approximate byte budget — so a multi-chunk
   ingest commits per chunk and is not atomic as a whole (a mid-ingest chunk failure reports the
@@ -494,7 +501,15 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   BatchWrite, so the client's builder exposes no setter] nor `max_commit_delay`/`commit_stats` [BatchWrite
   takes no per-request commit options]), `get_info` (static
   driver/vendor metadata),
-  `get_objects` (incl. foreign-key `constraint_column_usage`), `get_table_types`/`get_table_schema`,
+  `get_objects` (incl. foreign-key `constraint_column_usage`; it omits Spanner's **hidden**
+  columns — `objects::HIDE_HIDDEN_COLUMNS`, a `NOT CAST(IS_HIDDEN AS BOOL)` predicate on
+  `INFORMATION_SCHEMA.COLUMNS` — and, via `HIDE_HIDDEN_COLUMN_CONSTRAINTS`, the constraints that
+  reference only such a column, so the constraint list stays consistent with the column list. That
+  is what keeps a keyless ingest-created table's implicit `rowid` and its auto-generated
+  `PK_<table>` / `CK_IS_NOT_NULL_<table>_rowid` constraints out of every schema surface, matching
+  `get_table_schema`'s `SELECT * LIMIT 0`; `get_statistics` skips hidden columns for the same
+  reason. Note `IS_HIDDEN` is documented as a `"TRUE"`/`"FALSE"` STRING but typed BOOL by the
+  emulator, hence the CAST), `get_table_types`/`get_table_schema`,
   `get_parameter_schema`, `Connection`/`Statement::get_cancel_handle` (the `adbc_core` 0.25
   replacement for the now-deprecated `cancel()`, whose default impl delegates to it: the handle is a
   `SlotCancelHandle` over the object's `Arc<CancelSlot>`, so it always targets the *current*

@@ -69,9 +69,11 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
                              error);
   }
 
-  // The suite's fixed two-column sample table (int64s INT64, strings STRING).
-  // Spanner requires a primary key (and permits NULL key values), so key on
-  // int64s and seed the canonical {42, -42, NULL} / {"foo", NULL, ""} rows.
+  // The suite's fixed two-column sample table (int64s INT64, strings STRING),
+  // seeded with the canonical {42, -42, NULL} / {"foo", NULL, ""} rows. No
+  // `PRIMARY KEY` clause: Spanner keys a keyless table on a hidden `rowid` of
+  // its own, so the table's visible columns are exactly the two the suite
+  // expects.
   AdbcStatusCode CreateSampleTable(struct AdbcConnection* connection,
                                    const std::string& name,
                                    struct AdbcError* error) const override {
@@ -84,8 +86,7 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
     const std::string table = Qualified(name, schema);
     RAISE_ADBC(
         RunIgnoringResult(connection,
-                          "CREATE TABLE " + table +
-                              " (int64s INT64, strings STRING(MAX)) PRIMARY KEY (int64s)",
+                          "CREATE TABLE " + table + " (int64s INT64, strings STRING(MAX))",
                           error));
     return RunIgnoringResult(
         connection,
@@ -152,15 +153,20 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   // generic per-query override hook from apache/arrow-adbc#4496; the routing of
   // all the statement-test SQL below it is apache/arrow-adbc#4514 — see
   // ARROW_ADBC_TAG in CMakeLists.txt). Three Spanner-isms drive the rewrites:
-  //   - DDL: Spanner requires a PRIMARY KEY and has INT64/STRING(MAX), not
-  //     INT/INTEGER/TEXT; DML INSERT requires an explicit column list.
+  //   - DDL: Spanner has INT64/STRING(MAX), not INT/INTEGER/TEXT; DML INSERT
+  //     requires an explicit column list.
   //   - `NULLS FIRST`/`NULLS LAST` are rejected (by the emulator's GoogleSQL);
   //     dropping them is semantics-preserving — GoogleSQL's defaults are
   //     exactly NULLS FIRST for ASC and NULLS LAST for DESC.
-  //   - Create-mode ingest adds the synthetic `adbc_ingest_key` UUID primary
-  //     key, so a `SELECT *` readback has one column too many (and no ORDER BY
-  //     readback has a deterministic order — the UUID key order is random):
-  //     select the ingested column(s) explicitly and order by them.
+  //   - An ingest-created table has no declared key (see CreateSampleTable), so
+  //     Spanner orders its rows by the implicit `rowid` it assigns — a
+  //     bit-reversed identity, i.e. not insertion order. A readback whose
+  //     expected values are order-sensitive therefore needs an explicit
+  //     ORDER BY even where upstream relies on the natural order.
+  // `SELECT *` itself needs no rewriting: the implicit key is HIDDEN, so an
+  // ingest-created table reads back as exactly the ingested columns (driver
+  // versions up to 0.7 appended a visible `adbc_ingest_key` column here and had
+  // to project past it in every readback).
   // Every entry pins the upstream default so a future ARROW_ADBC_TAG bump that
   // changes a query out from under us fails the test loudly, rather than
   // silently rewriting a query the substitution no longer matches.
@@ -176,34 +182,31 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
          {"SELECT CAST(1.5 AS FLOAT)", "SELECT CAST(1.5 AS FLOAT64)"}},
         {"StatementTest::TestSqlSchemaFloats::cast-1.5-as-float",
          {"SELECT CAST(1.5 AS FLOAT)", "SELECT CAST(1.5 AS FLOAT64)"}},
-        // Ingest readbacks: dodge the synthetic key column; the expected row
-        // order NULL-first ascending is GoogleSQL's ASC default.
+        // Ingest readbacks: only the NULLS FIRST/LAST has to go — the expected
+        // NULL-first ascending / NULL-last descending order is GoogleSQL's own
+        // default for ASC / DESC.
         {"StatementTest::TestSqlIngestTemporalType::select-bulk-ingest",
          {"SELECT * FROM `bulk_ingest` ORDER BY `col` ASC NULLS FIRST",
-          "SELECT `col` FROM `bulk_ingest` ORDER BY `col` ASC"}},
+          "SELECT * FROM `bulk_ingest` ORDER BY `col` ASC"}},
         {"StatementTest::TestSqlIngestInterval::select-bulk-ingest",
          {"SELECT * FROM `bulk_ingest` ORDER BY `col` ASC NULLS FIRST",
-          "SELECT `col` FROM `bulk_ingest` ORDER BY `col` ASC"}},
-        {"StatementTest::TestSqlIngestStreamZeroArrays::select-bulk-ingest",
-         {"SELECT * FROM `bulk_ingest`", "SELECT `col` FROM `bulk_ingest`"}},
-        // Append expects {42, -42, NULL} — its insertion order, which `ORDER BY
-        // int64s DESC` happens to reproduce exactly (GoogleSQL DESC puts NULLs
-        // last by default).
-        {"StatementTest::TestSqlIngestAppend::select-bulk-ingest",
-         {"SELECT * FROM `bulk_ingest`",
-          "SELECT `int64s` FROM `bulk_ingest` ORDER BY `int64s` DESC"}},
-        {"StatementTest::TestSqlIngestReplace::select-bulk-ingest",
-         {"SELECT * FROM `bulk_ingest`", "SELECT `int64s` FROM `bulk_ingest`"}},
-        {"StatementTest::TestSqlIngestCreateAppend::select-bulk-ingest",
-         {"SELECT * FROM `bulk_ingest`", "SELECT `int64s` FROM `bulk_ingest`"}},
+          "SELECT * FROM `bulk_ingest` ORDER BY `col` ASC"}},
         {"StatementTest::TestSqlIngestMultipleConnections::select-bulk-ingest",
          {"SELECT * FROM `bulk_ingest` ORDER BY `int64s` DESC NULLS LAST",
-          "SELECT `int64s` FROM `bulk_ingest` ORDER BY `int64s` DESC"}},
-        // The sample table is CreateSampleTable's own DDL (no synthetic key),
-        // so only the NULLS FIRST needs to go.
+          "SELECT * FROM `bulk_ingest` ORDER BY `int64s` DESC"}},
         {"StatementTest::TestSqlIngestSample::select-bulk-ingest",
          {"SELECT * FROM `bulk_ingest` ORDER BY int64s ASC NULLS FIRST",
-          "SELECT `int64s`, `strings` FROM `bulk_ingest` ORDER BY `int64s` ASC"}},
+          "SELECT * FROM `bulk_ingest` ORDER BY `int64s` ASC"}},
+        // Append is the one ORDER BY-less readback whose expected values are
+        // order-sensitive: it wants {42, -42, NULL}, its insertion order, which
+        // Spanner's implicit-key order does not reproduce. `ORDER BY int64s
+        // DESC` does, exactly (GoogleSQL DESC puts NULLs last by default).
+        // Replace ({42}, then {-42, -42}), CreateAppend ({42, 42, 42}) and
+        // StreamZeroArrays (no rows) compare order-insensitively, so their
+        // upstream `SELECT *` runs unrewritten.
+        {"StatementTest::TestSqlIngestAppend::select-bulk-ingest",
+         {"SELECT * FROM `bulk_ingest`",
+          "SELECT * FROM `bulk_ingest` ORDER BY `int64s` DESC"}},
         // Spanner cannot infer the types of undeclared parameters selected
         // bare; the CASTs give the inference the context it needs (the driver
         // then binds the Arrow int64/string columns to matching param types).
@@ -211,27 +214,26 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
          {"SELECT @p0, @p1", "SELECT CAST(@p0 AS INT64), CAST(@p1 AS STRING)"}},
         // Now passing (apache/arrow-adbc#4534 gave the readback a deterministic
         // `ORDER BY <col> ASC NULLS FIRST` and sorted the expected vectors — see
-        // ARROW_ADBC_TAG in CMakeLists.txt). INSERT needs a column list, and
-        // omitting `adbc_ingest_key` lets its DEFAULT (GENERATE_UUID()) fill the
-        // synthetic key; the readback drops NULLS FIRST (implicit for GoogleSQL
-        // ASC) and projects past that key, so it returns the ingested column in
-        // the NULL-first ascending order the suite now expects.
+        // ARROW_ADBC_TAG in CMakeLists.txt). Only the INSERT column list and the
+        // NULLS FIRST (implicit for GoogleSQL ASC) need rewriting.
         {"StatementTest::TestSqlPrepareUpdate::insert-bulk-ingest",
          {"INSERT INTO `bulk_ingest` VALUES (@p0)",
           "INSERT INTO `bulk_ingest` (`int64s`) VALUES (@p0)"}},
         {"StatementTest::TestSqlPrepareUpdate::select-bulk-ingest",
          {"SELECT * FROM `bulk_ingest` ORDER BY `int64s` ASC NULLS FIRST",
-          "SELECT `int64s` FROM `bulk_ingest` ORDER BY `int64s` ASC"}},
+          "SELECT * FROM `bulk_ingest` ORDER BY `int64s` ASC"}},
         {"StatementTest::TestSqlPrepareUpdateStream::insert-bulk-ingest",
          {"INSERT INTO `bulk_ingest` VALUES (@p0)",
           "INSERT INTO `bulk_ingest` (`ints`) VALUES (@p0)"}},
         {"StatementTest::TestSqlPrepareUpdateStream::select-bulk-ingest",
          {"SELECT * FROM `bulk_ingest` ORDER BY `ints` ASC NULLS FIRST",
-          "SELECT `ints` FROM `bulk_ingest` ORDER BY `ints` ASC"}},
-        // Suite-internal DDL/DML in Spanner-valid form.
+          "SELECT * FROM `bulk_ingest` ORDER BY `ints` ASC"}},
+        // Suite-internal DDL/DML in Spanner-valid form. The DDL needs only the
+        // native type names: a `CREATE TABLE` with no `PRIMARY KEY` clause is
+        // legal Spanner, keyed on the implicit hidden `rowid`.
         {"StatementTest::TestSqlBind::create-table-bindtest",
          {"CREATE TABLE bindtest (col1 INTEGER, col2 TEXT)",
-          "CREATE TABLE bindtest (col1 INT64, col2 STRING(MAX)) PRIMARY KEY (col1)"}},
+          "CREATE TABLE bindtest (col1 INT64, col2 STRING(MAX))"}},
         {"StatementTest::TestSqlBind::insert-bindtest",
          {"INSERT INTO bindtest VALUES (@p0, @p1)",
           "INSERT INTO bindtest (col1, col2) VALUES (@p0, @p1)"}},
@@ -239,17 +241,15 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
          {"SELECT * FROM bindtest ORDER BY col1 ASC NULLS FIRST",
           "SELECT * FROM bindtest ORDER BY col1 ASC"}},
         {"StatementTest::TestSqlQueryEmpty::create-table-queryempty",
-         {"CREATE TABLE queryempty (FOO INT)",
-          "CREATE TABLE queryempty (FOO INT64) PRIMARY KEY (FOO)"}},
+         {"CREATE TABLE queryempty (FOO INT)", "CREATE TABLE queryempty (FOO INT64)"}},
         {"StatementTest::TestSqlQueryInsertRollback::create-table-rollbacktest",
-         {"CREATE TABLE `rollbacktest` (a INT)",
-          "CREATE TABLE `rollbacktest` (a INT64) PRIMARY KEY (a)"}},
+         {"CREATE TABLE `rollbacktest` (a INT)", "CREATE TABLE `rollbacktest` (a INT64)"}},
         {"StatementTest::TestSqlQueryRowsAffectedDelete::create-table-delete-test",
          {"CREATE TABLE `delete_test` (foo INT)",
-          "CREATE TABLE `delete_test` (foo INT64) PRIMARY KEY (foo)"}},
+          "CREATE TABLE `delete_test` (foo INT64)"}},
         {"StatementTest::TestSqlQueryRowsAffectedDeleteStream::create-table-delete-test",
          {"CREATE TABLE `delete_test` (foo INT)",
-          "CREATE TABLE `delete_test` (foo INT64) PRIMARY KEY (foo)"}},
+          "CREATE TABLE `delete_test` (foo INT64)"}},
     };
 
     // The whole TestSqlIngestType family shares one call site whose query id is
@@ -263,9 +263,9 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
       EXPECT_EQ(default_sql, "SELECT * FROM `bulk_ingest` ORDER BY `col` ASC NULLS FIRST")
           << "upstream default SQL for " << query_id << " changed; revisit the rewrite";
       if (query_id.substr(kIngestTypePrefix.size()) == "list") {
-        return "SELECT `col` FROM `bulk_ingest` ORDER BY `col`[SAFE_OFFSET(0)] ASC";
+        return "SELECT * FROM `bulk_ingest` ORDER BY `col`[SAFE_OFFSET(0)] ASC";
       }
-      return "SELECT `col` FROM `bulk_ingest` ORDER BY `col` ASC";
+      return "SELECT * FROM `bulk_ingest` ORDER BY `col` ASC";
     }
 
     auto it = kRewrites.find(query_id);
@@ -307,8 +307,9 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   }
 
   // The driver supports all four ingest modes; for the create modes it builds
-  // the table from the ingest data's Arrow schema with a synthetic
-  // `adbc_ingest_key` UUID primary key (Spanner mandates a primary key).
+  // the table from the ingest data's Arrow schema, with no `PRIMARY KEY` clause
+  // (Spanner keys such a table on a hidden `rowid` of its own), so the created
+  // table's columns are exactly the ingested ones.
   bool supports_bulk_ingest(const char* mode) const override {
     return std::strcmp(mode, "adbc.ingest.mode.append") == 0 ||
            std::strcmp(mode, "adbc.ingest.mode.create") == 0 ||
@@ -347,14 +348,7 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   // View-typed columns, a target catalog, and a target db-schema are all real
   // driver capabilities (the driver binds Arrow view layouts, accepts the single
   // unnamed catalog "", and has named-schema support), so declare them rather than
-  // hiding the cases behind a false quirk. The two families then diverge:
-  //   - SqlIngest{BinaryView,StringView} *run* and fail with the rest of the
-  //     ingest-readback family (the suite's `SELECT *` readback also surfaces
-  //     the driver's synthetic `adbc_ingest_key` column, breaking the
-  //     single-column assertions) — an excluded expected-failure that flips to
-  //     passing once that readback is fixed.
-  //   - SqlIngest{TargetCatalog,TargetSchema,TargetCatalogSchema} only ingest and
-  //     never read back, so they pass cleanly and are gate-enforced (not excluded).
+  // hiding the cases behind a false quirk. All five cases are gate-enforced.
   bool supports_ingest_view_types() const override { return true; }
   bool supports_bulk_ingest_catalog() const override { return true; }
   bool supports_bulk_ingest_db_schema() const override { return true; }
