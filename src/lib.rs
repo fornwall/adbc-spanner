@@ -185,7 +185,7 @@ pub mod fuzzing {
     }
     /// Match an ADBC `LIKE` pattern against a value.
     pub fn like_match(pattern: &str, value: &str) -> bool {
-        crate::connection::like_match(pattern, value)
+        crate::metadata::like_match(pattern, value)
     }
     /// The first SQL keyword, uppercased — skipping whitespace, comments, and `@{…}` statement
     /// hints. (The driver-internal function returns the keyword borrowed from the input in its

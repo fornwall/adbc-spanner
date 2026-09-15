@@ -30,7 +30,7 @@ use crate::timeout::with_timeout;
 /// does not accept an isolation level on a read-only or partitioned-DML transaction — and the
 /// mutations-only ingest commit uses the write-only builder, which has no isolation setter.
 #[must_use]
-pub(crate) fn apply_isolation(
+pub(super) fn apply_isolation(
     builder: TransactionRunnerBuilder,
     isolation: IsolationLevel,
 ) -> TransactionRunnerBuilder {

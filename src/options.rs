@@ -302,7 +302,7 @@ pub(crate) struct SharedConfig {
     /// Isolation level applied to read/write transactions (autocommit DML and the manual-mode
     /// commit), set via the standard `adbc.connection.transaction.isolation_level` option. It
     /// reaches only the DML paths — queries take a timestamp bound instead (see
-    /// [`apply_isolation`](crate::connection::apply_isolation)) — and
+    /// [`apply_isolation`](crate::connection::exec::apply_isolation)) — and
     /// [`IsolationLevel::Unspecified`] (the default) sends no level, which Spanner reads as
     /// `SERIALIZABLE`. Connection-set only: a statement inherits it but exposes no setter of its
     /// own.
@@ -555,7 +555,7 @@ macro_rules! impl_shared_option_dispatch {
                 }
                 _ => None,
             };
-            value.ok_or_else(|| err(format!("option {key} is not set"), Status::NotFound))
+            value.ok_or_else(|| crate::error::option_not_set(key))
         }
     };
 }
@@ -564,7 +564,6 @@ pub(crate) use impl_shared_option_dispatch;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::err;
     use adbc_core::error::Status;
 
     #[test]
@@ -625,13 +624,14 @@ mod tests {
     #[test]
     fn typed_getters_propagate_the_string_lookup_error_unchanged() {
         // Unset (NotFound) and unknown-key errors from get_option_string pass through as-is.
-        let unset = || err("option o is not set", Status::NotFound);
+        let unset = || crate::error::option_not_set("o");
+        let expected = unset().message;
         let error = int_from_stored_string(Err(unset()), "option o").unwrap_err();
         assert_eq!(error.status, Status::NotFound);
-        assert_eq!(error.message, "option o is not set");
+        assert_eq!(error.message, expected);
         let error = double_from_stored_string(Err(unset()), "option o").unwrap_err();
         assert_eq!(error.status, Status::NotFound);
-        assert_eq!(error.message, "option o is not set");
+        assert_eq!(error.message, expected);
     }
 
     #[test]
