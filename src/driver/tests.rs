@@ -260,3 +260,30 @@ fn unknown_database_option_is_not_implemented() {
         .unwrap_err();
     assert_eq!(error.status, Status::NotImplemented);
 }
+
+/// The driver owns the one Tokio runtime and hands it to everything it creates, so every database
+/// a driver produces drives its async Spanner client on that same runtime — never one of its own.
+/// (The other half of the guarantee, that a process only ever has one driver, is
+/// `every_database_is_initialized_through_one_shared_driver` in `src/ffi/database/tests.rs`.)
+#[test]
+fn every_database_a_driver_creates_shares_the_drivers_runtime() {
+    let mut driver = SpannerDriver::try_new().unwrap();
+    let first = driver.new_database().unwrap();
+    let second = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String("spanner:///projects/p/instances/i/databases/d".into()),
+        )])
+        .unwrap();
+
+    assert!(
+        Arc::ptr_eq(&first.runtime, &second.runtime),
+        "two databases from one driver must share its runtime"
+    );
+    assert!(Arc::ptr_eq(&driver.runtime, &first.runtime));
+
+    // A second driver really does bring its own runtime, so the identity above is a genuine
+    // check rather than one every `Arc<Runtime>` would pass.
+    let other = SpannerDriver::try_new().unwrap();
+    assert!(!Arc::ptr_eq(&driver.runtime, &other.runtime));
+}
