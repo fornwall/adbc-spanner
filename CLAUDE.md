@@ -228,8 +228,8 @@ and **each is independently a crates.io publish blocker** — the crate cannot b
 lines plus `deny.toml` plus the docs; this list is the one place that enumerates every edit needed to
 revert a family to versioned crates.io releases. Current pinned revs:
 
-- `google-cloud-rust`: `5c1fe1315be4a85e66c6637a20fc8f626faa56a3` (upstream `googleapis/google-cloud-rust` `main`)
-- `apache/arrow-adbc`: `3b3f123a74c767845e83e559bb889d1fa7d7616b`
+- `google-cloud-rust`: `ec54ef0ad69ecd24487c1d3b93a2e4082d820b58` (upstream `googleapis/google-cloud-rust` `main`)
+- `apache/arrow-adbc`: `32c67b092c0f7cabf2be75062f001a9e17a48cc1`
 
 **Invariant:** the three arrow-adbc crates (`adbc_core`, `adbc_ffi`, `adbc_driver_manager`) must
 always share ONE rev; the eight `google-cloud-rust` crates likewise share ONE rev. When reverting,
@@ -249,7 +249,7 @@ touch *every* location for that family in lockstep:
   section.)
 - `deny.toml` `allow-git` — drop the repo URL for each family once it no longer has any git dep.
 - `README.md` — the **Note** callout at the end of the *Type mapping* section that explains the
-  crate is "not on crates.io" and names both git pins narratively (no literal `rev = "3b3f123a…"`
+  crate is "not on crates.io" and names both git pins narratively (no literal `rev = "32c67b09…"`
   string to update there — the revs live only in `Cargo.toml`).
 - `CLAUDE.md` — this section (both the "Temporary git pins" note and this checklist); once *both*
   families are versioned, also re-enable `publish` (below) and revisit the `arrow-array`/`-schema`/
@@ -491,9 +491,13 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   takes no per-request commit options]), `get_info` (static
   driver/vendor metadata),
   `get_objects` (incl. foreign-key `constraint_column_usage`), `get_table_types`/`get_table_schema`,
-  `get_parameter_schema`, `Connection`/`Statement::cancel` (a shared, sticky `CancelSignal`
-  interrupts an in-flight `block_on` op and stays latched — so a cancel between the chunk fetches of
-  a streamed result still cancels the next fetch — until the object's next operation resets it),
+  `get_parameter_schema`, `Connection`/`Statement::get_cancel_handle` (the `adbc_core` 0.25
+  replacement for the now-deprecated `cancel()`, whose default impl delegates to it: the handle is a
+  `SlotCancelHandle` over the object's `Arc<CancelSlot>`, so it always targets the *current*
+  operation even though the FFI exporter takes one handle per object at creation time. Signalling it
+  latches a shared, sticky `CancelSignal` that interrupts an in-flight `block_on` op and stays
+  latched — so a cancel between the chunk fetches of a streamed result still cancels the next
+  fetch — until the object's next operation resets it),
   keyfile/keyfile_json auth (credential-type auto-detected
   from the JSON `"type"`), OAuth access-token auth
   (`spanner.auth.access_token` — a caller-supplied bearer token sent verbatim with no refresh via a
@@ -590,20 +594,22 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   recommended ranges so it never fails to build) and applies it via `with_backoff_policy` /
   `with_begin_backoff_policy` / `with_commit_backoff_policy` at the same four sites; independent of
   the attempt/elapsed caps (either family may be set alone). The transaction-level abort retry
-  stays at the client default. **Both caps mean different things per RPC path, and the driver
+  stays at the client default. **The elapsed cap means different things per RPC path, and the driver
   cannot fix it** (COR-13 / UP-14): the pinned client runs two retry loops. Unary RPCs (DML,
   `ExecuteBatchDml`, begin, commit) go through gax's `retry_loop`, which increments
   `RetryState::attempt_count` before each attempt and pins `start` to the real loop start — both
   caps are exact there, and the default policy is uncapped. Server-streaming `ExecuteStreamingSql`
   (every query) is dispatched *outside* `retry_loop` (`server_streaming/builder.rs`'s `send()` has
   none — so an error returned as the *initial* RPC status is never retried at all, the vacuity trap
-  for any retry test here) and hand-rolls resumption in `ResultSet::check_retry`, which seeds a
-  fresh `RetryState` with its own `retry_count` (retries *so far*, 0 on the first failure) and
-  `Instant::now()`. So on queries `max_attempts=N` permits **N+1** attempts (`1` does not disable
-  retrying), `max_elapsed_seconds` is **inert**, and the default is `with_attempt_limit(10)` rather
-  than uncapped. No driver-side compensation is correct — the same `RetryPolicyArg` feeds both
-  loops, which would need *different* limits — so this is documented (`src/retry.rs` module doc,
-  both `src/lib.rs` constants, `docs/options.md`) and pinned by three `retry_max_*` tests in
+  for any retry test here) and hand-rolls resumption in `ResultSet::check_retry`, which builds a
+  fresh `RetryState` per resume decision. It seeds the attempt count with `1 + retry_count`, so
+  `max_attempts=N` is **exact** on queries too (it permitted **N+1** until the `ec54ef0a` pin fixed
+  the seed — the attempt half of UP-14); but `start` is still re-taken as `Instant::now()` on every
+  decision, so `max_elapsed_seconds` remains **inert** there, and the streaming default is
+  `with_attempt_limit(10)` rather than uncapped. No driver-side compensation is correct — the same
+  `RetryPolicyArg` feeds both loops, which would need *different* limits, and no policy can recover
+  a loop start the caller re-takes — so this is documented (`src/retry.rs` module doc, both
+  `src/lib.rs` constants, `docs/options.md`) and pinned by three `retry_max_*` tests in
   `tests/mock_spanner.rs` that fault *inside* the stream; streaming callers get a working
   wall-clock bound from `spanner.rpc.timeout_seconds.{query,fetch}` instead).
   (`get_statistics` computes exact `ROW_COUNT`/`NULL_COUNT`/`DISTINCT_COUNT` via one aggregate scan

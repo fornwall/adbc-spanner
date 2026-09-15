@@ -78,7 +78,7 @@ use std::time::Duration;
 
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection, OptionValue};
-use adbc_core::{Connection, Optionable};
+use adbc_core::{CancelHandle, Connection, Optionable};
 use arrow_array::{
     Array, ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
 };
@@ -95,7 +95,9 @@ use crate::conversion::{TimestampPrecision, result_set_to_batch, stream_query};
 use crate::driver::{Connected, SharedDatabaseAdmin};
 use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
 use crate::options::{SharedConfig, impl_shared_option_dispatch, impl_typed_option_getters};
-use crate::runtime::{CancelSignal, CancelSlot, SharedRuntime, block_on_cancellable};
+use crate::runtime::{
+    CancelSignal, CancelSlot, SharedRuntime, SlotCancelHandle, block_on_cancellable,
+};
 use crate::sql::qualified_table;
 use crate::statement::{DEFAULT_ROWS_PER_BATCH, SpannerStatement};
 use crate::timeout::with_timeout;
@@ -394,7 +396,7 @@ mod txn_state_tests {
     }
 
     fn mutation(id: i64) -> Mutation {
-        Mutation::new_insert_builder("t").set("Id").to(&id).build()
+        Mutation::new_insert_builder("t").set("Id").to(id).build()
     }
 
     fn manual() -> TxnState {
@@ -669,10 +671,12 @@ pub struct SpannerConnection {
     config: SharedConfig,
     txn: SharedTxn,
     /// Per-operation cancellation for this connection's metadata/commit operations (see
-    /// [`Connection::cancel`]): each entry point mints a fresh [`CancelSignal`] here, and
-    /// `cancel()` latches the current one — forever, so a cancelled `read_partition` stream stays
-    /// cancelled even after this connection starts a new operation.
-    cancel: CancelSlot,
+    /// [`Connection::get_cancel_handle`]): each entry point mints a fresh [`CancelSignal`] here,
+    /// and a cancel latches the current one — forever, so a cancelled `read_partition` stream stays
+    /// cancelled even after this connection starts a new operation. Shared through an [`Arc`] so
+    /// the [`SlotCancelHandle`]s handed out by `get_cancel_handle` keep targeting the *current*
+    /// operation for this connection's whole life.
+    cancel: Arc<CancelSlot>,
 }
 
 impl SpannerConnection {
@@ -690,7 +694,7 @@ impl SpannerConnection {
             admin: connected.admin,
             config: SharedConfig::default(),
             txn: Arc::new(Mutex::new(TxnState::new())),
-            cancel: CancelSlot::new(),
+            cancel: Arc::new(CancelSlot::new()),
         }
     }
 
@@ -1370,16 +1374,15 @@ impl Connection for SpannerConnection {
         ))
     }
 
-    fn cancel(&mut self) -> Result<()> {
-        // Latch the current operation's (sticky) signal: an in-flight metadata/commit operation
-        // wakes and returns Cancelled, and a cancel landing between two chunk fetches of a
-        // `read_partition` stream still cancels the next fetch — permanently, since the latch is
+    fn get_cancel_handle(&self) -> Box<dyn CancelHandle> {
+        // The handle latches the current operation's (sticky) signal: an in-flight metadata/commit
+        // operation wakes and returns Cancelled, and a cancel landing between two chunk fetches of
+        // a `read_partition` stream still cancels the next fetch — permanently, since the latch is
         // never cleared. The connection's next operation mints a fresh signal instead, so a cancel
         // with nothing running does not affect later operations, and later operations cannot
         // revive a cancelled reader. Statements have their own signal, so this does not affect a
         // query running on a statement from this connection.
-        self.cancel.signal();
-        Ok(())
+        Box::new(SlotCancelHandle::new(self.cancel.clone()))
     }
 
     /// Driver / vendor metadata, sourced entirely from static driver constants (no Spanner RPC).

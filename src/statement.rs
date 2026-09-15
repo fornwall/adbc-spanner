@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{IngestMode, OptionStatement, OptionValue};
-use adbc_core::{Optionable, PartitionedResult, Statement};
+use adbc_core::{CancelHandle, Optionable, PartitionedResult, Statement};
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use google_cloud_lro::Poller as _;
@@ -45,7 +45,7 @@ use crate::error::{
 use crate::options::{
     SharedConfig, bool_option, impl_shared_option_dispatch, impl_typed_option_getters,
 };
-use crate::runtime::{CancelSlot, SharedRuntime, block_on_cancellable};
+use crate::runtime::{CancelSlot, SharedRuntime, SlotCancelHandle, block_on_cancellable};
 use crate::timeout::with_timeout;
 
 /// Default number of rows converted into each streamed Arrow batch (see
@@ -169,11 +169,13 @@ pub struct SpannerStatement {
     rows_per_batch: usize,
     /// Enable Data Boost for partitioned execution (`spanner.data_boost`).
     data_boost: bool,
-    /// Per-operation cancellation for this statement (see [`Statement::cancel`]): each execution
-    /// entry point mints a fresh [`crate::runtime::CancelSignal`] here, and `cancel()` latches the
-    /// current one — forever, so a cancelled streamed reader stays cancelled even after this
-    /// statement starts a new operation.
-    cancel: CancelSlot,
+    /// Per-operation cancellation for this statement (see [`Statement::get_cancel_handle`]): each
+    /// execution entry point mints a fresh [`crate::runtime::CancelSignal`] here, and a cancel
+    /// latches the current one — forever, so a cancelled streamed reader stays cancelled even after
+    /// this statement starts a new operation. Shared through an [`Arc`] so the
+    /// [`SlotCancelHandle`]s handed out by `get_cancel_handle` keep targeting the *current*
+    /// operation for this statement's whole life.
+    cancel: Arc<CancelSlot>,
 }
 
 impl SpannerStatement {
@@ -213,7 +215,7 @@ impl SpannerStatement {
             bind_by_name: false,
             rows_per_batch: DEFAULT_ROWS_PER_BATCH,
             data_boost: false,
-            cancel: CancelSlot::new(),
+            cancel: Arc::new(CancelSlot::new()),
         }
     }
 
@@ -2059,14 +2061,13 @@ impl Statement for SpannerStatement {
         ))
     }
 
-    fn cancel(&mut self) -> Result<()> {
-        // Latch the current operation's (sticky) signal: an in-flight execution wakes and returns
-        // Cancelled, and a cancel landing between two chunk fetches of a streamed result still
-        // cancels the next fetch — permanently, since the latch is never cleared. The statement's
-        // next operation mints a fresh signal instead, so a cancel with nothing running does not
-        // affect later executions, and later executions cannot revive a cancelled reader.
-        self.cancel.signal();
-        Ok(())
+    fn get_cancel_handle(&self) -> Box<dyn CancelHandle> {
+        // The handle latches the current operation's (sticky) signal: an in-flight execution wakes
+        // and returns Cancelled, and a cancel landing between two chunk fetches of a streamed
+        // result still cancels the next fetch — permanently, since the latch is never cleared. The
+        // statement's next operation mints a fresh signal instead, so a cancel with nothing running
+        // does not affect later executions, and later executions cannot revive a cancelled reader.
+        Box::new(SlotCancelHandle::new(self.cancel.clone()))
     }
 }
 

@@ -485,16 +485,21 @@ fn commit_ok() -> tonic::Result<tonic::Response<v1::CommitResponse>> {
     Ok(tonic::Response::new(v1::CommitResponse::default()))
 }
 
-/// One streamed `BatchWriteResponse` reporting that mutation group `0` failed with `ALREADY_EXISTS`
-/// and a `google.rpc.ErrorInfo` detail — the in-band, per-group failure shape BatchWrite uses (the
-/// RPC itself succeeds; the status rides *inside* the response, not the gRPC trailer).
-fn batch_write_group_already_exists() -> v1::BatchWriteResponse {
+/// One streamed `BatchWriteResponse` reporting that mutation group `index` failed with
+/// `ALREADY_EXISTS` and a `google.rpc.ErrorInfo` detail — the in-band, per-group failure shape
+/// BatchWrite uses (the RPC itself succeeds; the status rides *inside* the response, not the gRPC
+/// trailer).
+///
+/// `index` is relative to the mutation groups of the *active* stream attempt, which the client
+/// bounds-checks: every group must be acknowledged exactly once across the stream, or the client
+/// reopens the stream with the leftovers and rejects an index that overruns that smaller request.
+fn batch_write_group_already_exists(index: i32) -> v1::BatchWriteResponse {
     let error_info = ErrorInfo {
         reason: "DUPLICATE_KEY".to_string(),
         domain: "spanner.googleapis.com".to_string(),
     };
     v1::BatchWriteResponse {
-        indexes: vec![0],
+        indexes: vec![index],
         status: Some(spanner_grpc_mock::google::rpc::Status {
             code: tonic::Code::AlreadyExists as i32,
             message: "Row [v0] in table MockTable already exists".to_string(),
@@ -1393,7 +1398,7 @@ fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
     // Let the worker settle into the blocked fetch, then cancel from this thread.
     std::thread::sleep(Duration::from_millis(300));
     let cancel_at = Instant::now();
-    statement.cancel().expect("cancel");
+    statement.get_cancel_handle().try_cancel().expect("cancel");
 
     let (first, second) = rx
         .recv_timeout(Duration::from_secs(30))
@@ -1536,7 +1541,7 @@ fn new_operation_does_not_uncancel_an_earlier_streamed_reader() {
 
     // Cancel between two chunk fetches of the old reader, then start a NEW operation on the same
     // statement before the old reader observes the cancel.
-    statement.cancel().expect("cancel");
+    statement.get_cancel_handle().try_cancel().expect("cancel");
     let new_batches: Vec<_> = statement
         .execute()
         .expect("a new operation after a cancel must start uncancelled")
@@ -1955,7 +1960,7 @@ fn batch_write_group_failure_forwards_status_details() {
         mock.expect_batch_write().returning(move |_| {
             writes_in_mock.fetch_add(1, Ordering::SeqCst);
             let (tx, rx) = tokio::sync::mpsc::channel(1);
-            tx.try_send(Ok(batch_write_group_already_exists()))
+            tx.try_send(Ok(batch_write_group_already_exists(0)))
                 .expect("scripted stream channel sized to fit");
             Ok(tonic::Response::new(rx))
         });
@@ -2061,7 +2066,7 @@ fn batch_write_folds_same_chunk_applied_rows_into_committed_count() {
             // Two groups apply, then a third fails — all within this one chunk.
             tx.try_send(Ok(batch_write_groups_ok(vec![0, 1])))
                 .expect("scripted stream channel sized to fit");
-            tx.try_send(Ok(batch_write_group_already_exists()))
+            tx.try_send(Ok(batch_write_group_already_exists(2)))
                 .expect("scripted stream channel sized to fit");
             Ok(tonic::Response::new(rx))
         });
@@ -4498,20 +4503,21 @@ fn exec_incremental_spec_default_is_a_no_op() {
 // Retry-limit accounting per RPC path (UP-14)
 // ---------------------------------------------------------------------------
 
-// The pinned client runs two *different* retry loops, and they account for attempts differently —
-// so `spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds` do not mean the same thing
-// on every path. These tests pin the exact, observed numbers on one path of each kind, so the
-// asymmetry is a checked fact rather than a claim in a comment, and so a `google-cloud-rust` rev
-// bump that fixes it upstream (UP-14) fails here loudly instead of silently changing what a
-// caller's option means. See `src/retry.rs`'s module doc for the user-facing statement of this.
+// The pinned client runs two *different* retry loops, and they no longer agree on what
+// `spanner.retry.max_elapsed_seconds` means. These tests pin the exact, observed numbers on one
+// path of each kind, so the asymmetry is a checked fact rather than a claim in a comment, and so a
+// `google-cloud-rust` rev bump that changes it (UP-14) fails here loudly instead of silently
+// changing what a caller's option means. See `src/retry.rs`'s module doc for the user-facing
+// statement of this.
 //
 // - **Unary** RPCs (`ExecuteBatchDml`, `ExecuteSql`, `BeginTransaction`, `Commit`) go through gax's
 //   `retry_loop`, which increments `RetryState::attempt_count` *before* each attempt and pins
 //   `RetryState::start` to the real loop start. Both limits are then exact.
 // - **Server-streaming** `ExecuteStreamingSql` is dispatched outside `retry_loop`; the client
-//   hand-rolls stream resumption in `ResultSet::check_retry`, seeding `RetryState` with its own
-//   `retry_count` (retries *so far* — 0 on the first failure) and a fresh `Instant::now()` start.
-//   So the attempt limit permits one attempt too many, and the elapsed-time limit never fires.
+//   hand-rolls stream resumption in `ResultSet::check_retry`, building a fresh `RetryState` per
+//   resume decision — seeded with `1 + retry_count` (so the *attempt* limit is exact, matching the
+//   unary loop) but also with a fresh `Instant::now()` start, so the elapsed-time limit never
+//   fires.
 
 /// How many attempts each probe's mock serves before giving up with a permanent error. A retry
 /// limit that never fires stops here rather than hanging the test.
@@ -4630,17 +4636,17 @@ fn retry_max_attempts_is_exact_on_unary_rpcs() {
     }
 }
 
-/// On the **streaming** query path the same option permits `N + 1` attempts — one too many — because
-/// the client seeds the retry policy with its own `retry_count` (retries so far, `0` on the first
-/// failure) where gax's own loop would pass the 1-based attempt count. `1` therefore does *not*
-/// disable retrying here. Upstream bug (UP-14), pinned here as observed behaviour; `src/retry.rs`
-/// documents it. The `N + 1` shape (not a constant) is what proves the option reaches the streaming
-/// retry loop at all rather than being ignored.
+/// On the **streaming** query path the same option is now exact too: the client seeds its
+/// hand-rolled resume policy with `1 + retry_count`, the same 1-based attempt count gax's own loop
+/// passes, so `N` permits `N` attempts and `1` disables retrying. (It used to seed the bare
+/// `retry_count` — retries so far, `0` on the first failure — and permit `N + 1`: the attempt half
+/// of UP-14, fixed upstream.) Varying `N` rather than asserting a constant is what proves the
+/// option reaches the streaming retry loop at all rather than being ignored.
 #[test]
-fn retry_max_attempts_permits_one_extra_attempt_on_the_streaming_path() {
+fn retry_max_attempts_is_exact_on_the_streaming_path() {
     let _watchdog = Watchdog::arm(
         Duration::from_secs(120),
-        "retry_max_attempts_permits_one_extra_attempt_on_the_streaming_path",
+        "retry_max_attempts_is_exact_on_the_streaming_path",
     );
 
     for max_attempts in [1_i64, 2, 3] {
@@ -4649,12 +4655,10 @@ fn retry_max_attempts_permits_one_extra_attempt_on_the_streaming_path() {
             OptionValue::Int(max_attempts),
         );
         assert_eq!(
-            attempts,
-            max_attempts as usize + 1,
-            "max_attempts={max_attempts} currently permits {} ExecuteStreamingSql attempts \
-             (UP-14); a change here means the pinned client's stream-resume accounting moved — \
-             update src/retry.rs, docs/options.md and REVIEW.md's UP-14 to match",
-            max_attempts + 1
+            attempts, max_attempts as usize,
+            "max_attempts={max_attempts} must permit exactly {max_attempts} ExecuteStreamingSql \
+             attempts; a change here means the pinned client's stream-resume accounting moved — \
+             update src/retry.rs, docs/options.md and REVIEW.md's UP-14 to match"
         );
     }
 }
@@ -4662,9 +4666,10 @@ fn retry_max_attempts_permits_one_extra_attempt_on_the_streaming_path() {
 /// `spanner.retry.max_elapsed_seconds` bounds the unary paths, but is **inert** on the streaming
 /// query path: the client builds a fresh `RetryState` (hence `start = Instant::now()`) for every
 /// resume decision, so the gax elapsed-time decorator always compares now against a deadline one
-/// budget in the future and never exhausts. Same upstream root cause as the attempt off-by-one
-/// (UP-14). A streaming caller who wants a wall-clock bound has a working one in the separate
-/// `spanner.rpc.timeout_seconds.{query,fetch}` family.
+/// budget in the future and never exhausts. This is the half of UP-14 that is still open upstream
+/// (the attempt off-by-one, same root cause, has been fixed). A streaming caller who wants a
+/// wall-clock bound has a working one in the separate `spanner.rpc.timeout_seconds.{query,fetch}`
+/// family.
 #[test]
 fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_path() {
     let _watchdog = Watchdog::arm(

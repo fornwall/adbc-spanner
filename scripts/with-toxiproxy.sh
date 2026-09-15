@@ -76,9 +76,11 @@ cleanup() {
 trap cleanup EXIT
 
 # --- 1. Start the emulator (internal :9010/:9020, no host publishing) -------------
+# `--pull always` for the same reason as in with-emulator.sh: `:latest` is a floating
+# tag, and a cached one can be months behind what CI runs.
 echo ">> starting Spanner emulator ($EMULATOR_IMAGE) as '$EMULATOR_CONTAINER'"
 docker rm -f "$EMULATOR_CONTAINER" >/dev/null 2>&1 || true
-docker run -d --name "$EMULATOR_CONTAINER" "$EMULATOR_IMAGE" >/dev/null
+docker run -d --pull always --name "$EMULATOR_CONTAINER" "$EMULATOR_IMAGE" >/dev/null
 
 # The emulator's container IP on the docker bridge — distinct per container, so
 # concurrent emulators never collide, and it preserves the internal :9010 the admin

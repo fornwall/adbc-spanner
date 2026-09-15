@@ -10,6 +10,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use adbc_core::CancelHandle;
 use adbc_core::error::{Error, Result, Status};
 use tokio::runtime::Runtime;
 use tokio::sync::{Notify, mpsc};
@@ -128,6 +129,32 @@ impl CancelSlot {
     /// Forward a cancel to the current operation's signal, latching it forever.
     pub(crate) fn signal(&self) {
         self.0.lock().unwrap().signal();
+    }
+}
+
+/// The ADBC [`CancelHandle`] over a [`CancelSlot`], returned by the connection's and statement's
+/// `get_cancel_handle`.
+///
+/// `adbc_core` hands cancellation out as a *separate* handle (the borrow checker cannot express a
+/// `&mut self` `cancel` racing an in-flight `&mut self` execution), and the FFI exporter takes one
+/// **once**, when the connection/statement is created, then keeps it for that object's whole life.
+/// So the handle must stay aimed at whatever operation is current at `try_cancel` time, not at the
+/// one running when it was minted — which is exactly what sharing the owner's [`CancelSlot`]
+/// through an [`Arc`] gives: `signal` always latches the slot's *current* signal, the same target
+/// the deprecated `cancel()` method had.
+#[derive(Debug)]
+pub(crate) struct SlotCancelHandle(Arc<CancelSlot>);
+
+impl SlotCancelHandle {
+    pub(crate) fn new(slot: Arc<CancelSlot>) -> Self {
+        Self(slot)
+    }
+}
+
+impl CancelHandle for SlotCancelHandle {
+    fn try_cancel(&self) -> Result<()> {
+        self.0.signal();
+        Ok(())
     }
 }
 

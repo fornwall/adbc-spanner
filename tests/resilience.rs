@@ -430,7 +430,7 @@ fn cancel_interrupts_in_flight_query() {
 
     // Iterate the reader on a worker thread so it blocks pulling the *next* (slow) chunk while we
     // cancel from here. The reader carries a clone of the statement's cancel signal, so
-    // `statement.cancel()` wakes the in-flight `block_on`.
+    // `statement.get_cancel_handle().try_cancel()` wakes the in-flight `block_on`.
     let (tx, rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
         let start = Instant::now();
@@ -448,7 +448,7 @@ fn cancel_interrupts_in_flight_query() {
     // here is about exercising the in-flight-interrupt path, not about avoiding a missed signal.)
     std::thread::sleep(Duration::from_millis(2000));
     let cancel_at = Instant::now();
-    statement.cancel().expect("cancel");
+    statement.get_cancel_handle().try_cancel().expect("cancel");
 
     let (is_err, err_debug, worker_elapsed) = rx.recv_timeout(Duration::from_secs(20)).expect(
         "worker did not finish within 20s — cancel failed to interrupt the in-flight fetch",

@@ -6719,7 +6719,7 @@ fn cancel_between_stream_chunks_cancels_the_next_fetch() {
     assert_eq!(first.num_rows(), 100);
 
     // Cancel with no fetch in flight — exactly the window where a non-sticky signal was lost.
-    query.cancel().expect("cancel");
+    query.get_cancel_handle().try_cancel().expect("cancel");
 
     // The next chunk fetch must observe the latched cancel instead of streaming to completion.
     let error = reader
@@ -7772,7 +7772,7 @@ fn connection_cancel_is_sticky_until_the_next_operation() {
         .expect("first batch")
         .expect("first batch is ok");
     assert!(first.num_rows() <= 200);
-    connection.cancel().expect("cancel");
+    connection.get_cancel_handle().try_cancel().expect("cancel");
 
     // The next chunk fetch must observe the latched cancel instead of running to completion.
     let error = reader
@@ -7807,7 +7807,10 @@ fn connection_cancel_is_sticky_until_the_next_operation() {
 
     // A cancel latched with nothing at all in flight must not pre-empt an unrelated metadata
     // operation either — every connection entry point resets the signal first.
-    connection.cancel().expect("cancel with nothing in flight");
+    connection
+        .get_cancel_handle()
+        .try_cancel()
+        .expect("cancel with nothing in flight");
     let schema = connection
         .get_table_schema(None, None, "AdbcConnCancel")
         .expect("get_table_schema after a stale cancel");

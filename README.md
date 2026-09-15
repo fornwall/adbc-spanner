@@ -140,7 +140,7 @@ Early, tested end-to-end against the Spanner emulator.
   `commit()`, or by re-enabling `adbc.connection.autocommit`) is rejected while the flag is set, leaving the transaction
   open and replayable; `rollback()` and committing a query transaction still work — neither writes.
 - execute_schema() (ADBC 1.1.0) — returns a query's result schema without executing it, via Spanner's QueryMode::Plan.
-- Cancellation (ADBC 1.1.0) — both Connection::cancel() and Statement::cancel() interrupt an in-flight operation.
+- Cancellation (ADBC 1.1.0) — both Connection::get_cancel_handle() and Statement::get_cancel_handle() return a handle whose try_cancel() interrupts an in-flight operation.
 
 TODO: Go over these and merge with above:
 

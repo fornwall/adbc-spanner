@@ -34,9 +34,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# `--pull always`: the image reference is the floating `:latest` tag, so without this
+# docker keeps running whatever `latest` resolved to the first time it was cached —
+# months-stale locally, while CI (ephemeral runners) always gets the newest emulator.
+# That divergence is exactly the kind that makes a local run green and CI red.
 echo ">> starting Spanner emulator ($IMAGE) as '$CONTAINER'"
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-docker run -d --name "$CONTAINER" \
+docker run -d --pull always --name "$CONTAINER" \
   -p "${GRPC_PORT}:9010" -p "${REST_PORT}:9020" \
   "$IMAGE" >/dev/null
 
