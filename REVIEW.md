@@ -11,22 +11,13 @@ Each finding is a checkbox — tick it when fixed (or explicitly decided against
 the item), and delete it once it is no longer relevant. IDs are stable for cross-referencing, so a
 new finding never reuses a retired ID.
 
-**Severity counts:** Medium 4 · Low 2 · Upstream 4.
+**Severity counts:** Medium 3 · Upstream 4.
+
+**Declined:** CON-1 (async-context `block_on` panics) — the user ruled it out of scope on
+2026-09-15; the driver keeps panicking when entered from a Tokio worker thread. UP-13 records the
+root cause upstream.
 
 ---
-
-## Concurrency & the sync-over-async bridge
-
-- [ ] **CON-1 (Medium)** — `block_on` panics (call and drop) when the driver is entered from an async context — `src/runtime.rs:169,181`, `src/conversion.rs:369,385`, `src/driver.rs:524`
-  Any ADBC call or `RecordBatchReader::next` from a tokio worker thread panics ("Cannot block the current thread from within a runtime"); additionally, if a reader is the *last* `Arc<Runtime>` holder and is dropped on an async thread, `Runtime::drop` panics ("Cannot drop a runtime…"). There is no `Handle::try_current()` anywhere in the crate, no mitigation and no user-facing doc warning. The drop hazard now also has a **C-ABI surface**: `src/ffi/stream.rs:52`'s `PrivateData::drop` owns the boxed reader, so a driver manager calling the stream's release callback from a tokio worker thread drops the `SpannerBatchReader` — and possibly the last `Arc<Runtime>` — on an async thread. **Fix:** detect `tokio::runtime::Handle::try_current()` in `block_on_cancellable` (and `connect`'s plain `block_on`) and return a clean error advising `spawn_blocking`; replace the bare `SharedRuntime = Arc<Runtime>` alias (`src/runtime.rs:22`) with a newtype whose `Drop` uses `shutdown_background()` when a runtime context is detected. (Root cause is adbc_core's sync trait design — see UP-13.)
-
-## Performance & efficiency
-
-- [ ] **PERF-9 (Low)** — Bound cells are still passed by reference, taking the deep clone the upstream by-value API now avoids — `src/bind.rs:172,173,190`
-  `add_param` / `add_typed_param` / `ValueBinder::to` take `T: Into<Value>` as of googleapis/google-cloud-rust#6184 (`c317aab96`), but the driver still passes `&value`, which routes through `impl<T: ToValue> From<&T> for Value` → `impl ToValue for Value { self.clone() }` — a second full copy of every string/bytes/array payload on every bound-DML row and ingest cell. `cell_value` already returns an owned `Value`, so the fix is dropping the three `&`. (Was **UP-1**, an upstream ask; the upstream half landed.)
-
-- [ ] **PERF-10 (Low)** — `.to_vec()` per binary cell, no longer needed — `src/bind.rs:321-343`
-  Four arms (`Binary`, `LargeBinary`, `BinaryView`, `FixedSizeBinary`) copy each slice into a `Vec<u8>` because only `Vec<u8>` used to implement `ToValue`. The same upstream commit added `impl ToValue for [u8]` and `for &[u8]`, and `scalar_value`'s bound is already `T: ToValue`, so the four `.to_vec()`s can simply be deleted — copies drop 3 → 1 (the base64 encode is unavoidable; it is the wire form). (Was **UP-2**.)
 
 ## Utilizing Spanner well
 
