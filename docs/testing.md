@@ -145,9 +145,14 @@ scripts/with-toxiproxy.sh cargo test --test resilience -- --nocapture --test-thr
 ```
 
 Run serially (`--test-threads=1`): the tests share one global proxy. Docker is required.
-[`resilience.yml`](../.github/workflows/resilience.yml) runs it **non-gating** (manual dispatch +
-nightly). Toxiproxy injects transport faults only; the logical-gRPC-fault complement lives in the
-`tests/mock_spanner.rs` suite (see [Unit tests](#unit-tests-and-doctests) above).
+[`resilience.yml`](../.github/workflows/resilience.yml) runs it as a **gating** job on every push to
+main and every pull request, plus manual dispatch and a nightly run that files a tracking issue on
+failure. The whole suite is ~28s, and every timing assertion has one to three orders of magnitude of
+headroom, so runner jitter is not a plausible flake source. Note a check from a separate workflow
+only blocks a merge once branch protection lists it — a repo admin must add *Resilience harness
+(emulator + Toxiproxy)* as a required check. Toxiproxy injects transport faults only; the
+logical-gRPC-fault complement lives in the `tests/mock_spanner.rs` suite (see
+[Unit tests](#unit-tests-and-doctests) above).
 
 See [`tests/RESILIENCE.md`](../tests/RESILIENCE.md) for the full list of injected toxics, what each
 test proves, and the honest limitations of transport-level fault injection.
