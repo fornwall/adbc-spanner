@@ -80,22 +80,17 @@ impl Driver for SpannerDriver {
 ///
 /// The underlying Spanner client stack — the gRPC channel pool, the resolved credentials, and the
 /// [`DatabaseClient`] with its multiplexed session — is built **once**, lazily, on the first
-/// connection and *shared* by every connection this database mints: the client's own docs describe
-/// a `DatabaseClient` as a long-lived, one-per-database object whose clones cheaply share the
-/// session and channels, and ADBC's `Database` is exactly that owner. Setting **any** database
-/// option invalidates the cached stack (options affect the endpoint / credentials / database
-/// path), so the next connection rebuilds it from the new configuration. One consequence: the
-/// `SPANNER_EMULATOR_HOST` environment variable is consulted when the stack is *built* — on the
-/// first connection, or the first after a `set_option` — not once per connection.
+/// connection and *shared* by every connection this database mints (a `DatabaseClient` is a
+/// long-lived, one-per-database object whose clones cheaply share the session and channels).
+/// Setting **any** database option invalidates the cached stack, so the next connection rebuilds it
+/// from the new configuration — which also means `SPANNER_EMULATOR_HOST` is consulted when the
+/// stack is *built*, not once per connection.
 ///
-/// [`Debug`] is hand-written rather than derived so the three credential fields (`keyfile`,
-/// `keyfile_json` — a full service-account private key — and `access_token` — a live OAuth bearer
-/// token) never render in cleartext: each is shown as `Some("<redacted>")` / `None`, exposing only
-/// presence, never the secret. This mirrors `StaticTokenCredentials`, whose token lives in a
-/// sensitive `HeaderValue` for the same reason. `get_option` matches: the two secret-*holding*
-/// options (`keyfile_json`, `access_token`) are write-only and always report `NotFound`, and a
-/// connection URI may not carry them as query parameters (`URI_SECRET_OPTIONS`), while `keyfile` —
-/// a path, not a secret — both reads back normally and stays a legal query parameter.
+/// [`Debug`] is hand-written rather than derived so the three credential fields never render in
+/// cleartext: each shows as `Some("<redacted>")` / `None`, exposing presence only. `get_option`
+/// matches — the two secret-*holding* options (`keyfile_json`, `access_token`) are write-only and
+/// always report `NotFound`, and a connection URI may not carry them (`URI_SECRET_OPTIONS`), while
+/// `keyfile`, a path, both reads back normally and stays a legal query parameter.
 pub struct SpannerDatabase {
     runtime: SharedRuntime,
     /// The `uri` option exactly as the caller set it, returned verbatim by `get_option`. The
@@ -285,11 +280,9 @@ impl SpannerDatabase {
 
     /// Return the shared client stack, building it via [`Self::connect`] on first use.
     ///
-    /// The expensive parts of `connect` — the gRPC channel pool, credential resolution, and the
-    /// `CreateSession` RPC with its background session-maintenance task — are per-*database*
-    /// costs, so the stack is cached here and cheaply [`Clone`]d into every connection (the
-    /// clones share the multiplexed session and channels). `set_option` invalidates the cache. A
-    /// failed build caches nothing, so the next connection attempt retries from scratch.
+    /// The expensive parts of `connect` are per-*database* costs, so the stack is cached here and
+    /// cheaply [`Clone`]d into every connection. `set_option` invalidates the cache, and a failed
+    /// build caches nothing, so the next connection attempt retries from scratch.
     fn connect_shared(&self) -> Result<Connected> {
         // Hold the lock across the build so two concurrent `new_connection` calls cannot build
         // the stack twice. This cannot deadlock: the lock is only ever taken on caller (sync
@@ -310,8 +303,8 @@ impl SpannerDatabase {
 /// [Database Admin client cell](SharedDatabaseAdmin).
 ///
 /// `Clone` is cheap by design — the client types share their channel pool and multiplexed session
-/// across clones (and the admin cell its `Arc`) — which is what lets [`SpannerDatabase`] cache one
-/// stack and hand a clone to every connection.
+/// across clones — which is what lets [`SpannerDatabase`] cache one stack and clone it per
+/// connection.
 #[derive(Clone, Debug)]
 pub(crate) struct Connected {
     pub(crate) client: DatabaseClient,
@@ -324,13 +317,10 @@ pub(crate) struct Connected {
 /// `CREATE TABLE` a create-mode ingest issues), shared via `Arc` by every connection and statement
 /// minted from one cached [`Connected`] stack.
 ///
-/// Like [`DatabaseClient`], `DatabaseAdmin` holds its connection pool behind an internal `Arc` and
-/// its docs advise creating one and reusing it, so it is built **once** on the first DDL statement
-/// (no admin connection is opened for workloads that never run DDL) and cheaply cloned thereafter.
-/// Living inside [`Connected`] ties its lifetime to the data-plane stack's: when a database option
-/// invalidates the cached stack, the rebuilt stack starts with a fresh empty cell, so the admin
-/// client is rebuilt from the new endpoint/credentials too. A failed build caches nothing
-/// (`get_or_try_init`), so the next DDL statement retries from scratch.
+/// Built **once** on the first DDL statement — no admin connection is opened for workloads that
+/// never run DDL — and cheaply cloned thereafter. Living inside [`Connected`] ties its lifetime to
+/// the data-plane stack's, so a database option that invalidates the cached stack rebuilds the admin
+/// client from the new endpoint/credentials too. A failed build caches nothing (`get_or_try_init`).
 pub(crate) type SharedDatabaseAdmin = Arc<OnceCell<DatabaseAdmin>>;
 
 impl Optionable for SpannerDatabase {
@@ -386,12 +376,9 @@ impl Optionable for SpannerDatabase {
     }
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
-        // The two secret-holding options are **write-only**: `spanner.auth.keyfile_json` is a full
-        // service-account private key and `spanner.auth.access_token` a live bearer token, so
-        // reading either back is always `NotFound` — whether set or not — and tooling that dumps
-        // connection options can never print a usable credential. This mirrors the `Debug`
-        // redaction of the same fields; `spanner.auth.keyfile` (a filesystem path, not a secret)
-        // stays readable.
+        // The two secret-holding options are **write-only**: reading either back is always
+        // `NotFound` — set or not — so tooling that dumps connection options can never print a
+        // usable credential. `spanner.auth.keyfile` (a path, not a secret) stays readable.
         if let OptionDatabase::Other(name) = &key
             && (name == OPTION_KEYFILE_JSON || name == OPTION_ACCESS_TOKEN)
         {

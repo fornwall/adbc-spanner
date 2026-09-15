@@ -1,51 +1,18 @@
-//! Request priority and request/transaction tag options.
+//! Request priority and request/transaction tag options, plus the related commit-batching,
+//! commit-stats and change-stream-exclusion knobs.
 //!
 //! Spanner lets every request carry [`RequestOptions`](google_cloud_spanner::model::RequestOptions):
-//! a **priority** (`PRIORITY_LOW` / `PRIORITY_MEDIUM` / `PRIORITY_HIGH`) that Spanner's scheduler
-//! uses to arbitrate CPU between workloads, a free-form **request tag** for
-//! [troubleshooting with tags](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags)
-//! (surfaced in query and transaction statistics), and a **transaction tag** attached to every
-//! operation of a read/write transaction. This module parses the driver options that expose them —
-//! together with the related commit-batching and commit-stats knobs — and applies the stored values
-//! onto the client's builders:
+//! a **priority** that Spanner's scheduler uses to arbitrate CPU between workloads, a free-form
+//! **request tag** surfaced in query and transaction statistics, and a **transaction tag** attached
+//! to every operation of a read/write transaction. This module parses the driver options that
+//! expose them and applies the stored values onto the client's builders; their grammar, defaults,
+//! level and round-trip behaviour are documented on the `OPTION_*` constants and in
+//! `docs/options.md`.
 //!
-//! - [`OPTION_REQUEST_PRIORITY`](crate::OPTION_REQUEST_PRIORITY) (`spanner.request.priority`) —
-//!   `low` / `medium` / `high` (exact lowercase). Applied to every query/DML statement and
-//!   `ExecuteBatchDml` batch the driver builds (including its internal metadata reads), to the
-//!   `BatchWrite` ingest request, and — as the commit priority — to every read/write transaction
-//!   runner. Connection and statement level.
-//! - [`OPTION_REQUEST_TAG`](crate::OPTION_REQUEST_TAG) (`spanner.request.tag`) — a free-form
-//!   per-request tag, applied to every statement and `ExecuteBatchDml` batch the driver builds.
-//!   Not applied to `BatchWrite`, which ignores request tags server-side. Connection and statement
-//!   level.
-//! - [`OPTION_TRANSACTION_TAG`](crate::OPTION_TRANSACTION_TAG) (`spanner.transaction.tag`) — a
-//!   free-form per-transaction tag, applied wherever a read/write transaction runner is built
-//!   (autocommit DML, the manual-mode commit, ingest commits) and to the transactions a
-//!   `BatchWrite` ingest creates. Connection level only.
-//! - [`OPTION_MAX_COMMIT_DELAY`](crate::OPTION_MAX_COMMIT_DELAY) (`spanner.commit.max_delay`) — the
-//!   maximum amount of time Spanner may delay a **commit** to batch it with others (a
-//!   throughput-for-latency trade-off). A duration in `0..=500ms`, applied at every read/write
-//!   commit site the runner / write-only builders cover (autocommit DML, the `ExecuteBatchDml`
-//!   batch runner, the manual-mode commit, and the bulk-ingest write-only transaction).
-//!   Connection and statement level.
-//! - [`OPTION_COMMIT_STATS`](crate::OPTION_COMMIT_STATS) (`spanner.commit_stats`) — a boolean that,
-//!   when `true`, requests Spanner return commit statistics on the read/write commits the driver
-//!   builds (the same four sites as `max_commit_delay`). The returned mutation count is captured
-//!   into a [`CommitStats`] cell, readable back through `spanner.commit_stats.mutation_count`.
-//!   Connection and statement level.
-//! - [`OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS`](crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS)
-//!   (`spanner.transaction.exclude_from_change_streams`) — a boolean that, when `true`, excludes the
-//!   transaction's writes from change-stream capture. Applied at the same read/write commit sites as
-//!   `max_commit_delay`/`commit_stats` **and** on the `BatchWrite` ingest request (which carries the
-//!   flag directly). Connection and statement level.
-//!
-//! Like the read-staleness options, the connection's values become the default for statements it
-//! creates (which may override them), setting an empty string unsets a value, and every option
-//! round-trips through `get_option`. Driver-internal metadata queries (`get_objects`,
-//! `get_statistics`, `get_table_schema`) do carry the **priority** — a user who deprioritized their
-//! workload meant the driver's own full-table scans too — but are deliberately left **untagged**:
-//! tags attribute the user's own statements in Spanner's introspection tables (see
-//! [`RequestConfig::apply_priority_to_statement`]).
+//! Driver-internal metadata queries (`get_objects`, `get_statistics`, `get_table_schema`) do carry
+//! the **priority** — a user who deprioritized their workload meant the driver's own full-table
+//! scans too — but are deliberately left **untagged**: tags attribute the user's own statements in
+//! Spanner's introspection tables (see [`RequestConfig::apply_priority_to_statement`]).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

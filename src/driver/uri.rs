@@ -93,8 +93,7 @@ pub(crate) fn ensure_scheme(host: &str) -> String {
 ///
 /// The options that configure a [`SpannerDatabase`] besides the database path itself, minus the
 /// secret-holding ones ([`URI_SECRET_OPTIONS`]). The path key (`uri`) is deliberately absent — the
-/// URI's path component is the one way to name the database. Unknown keys are rejected with
-/// `InvalidArguments`.
+/// URI's path component is the one way to name the database.
 const URI_QUERY_OPTIONS: [&str; 8] = [
     OPTION_ENDPOINT,
     OPTION_EMULATOR,

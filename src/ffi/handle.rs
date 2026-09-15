@@ -205,11 +205,9 @@ unsafe fn borrowed<'a, S>(slot: *mut c_void, kind: &str) -> Result<&'a Exported<
 /// Take a reference of one's own to the object behind `slot`, keeping it alive independently of
 /// the handle.
 ///
-/// [`cancel`] is the one entry point adbc.h says must always be thread-safe, so it is the one
-/// that may legitimately still be running when [`release`] drops the handle's reference. Cloning
-/// the count here is what keeps that outcome a completed cancel rather than a use-after-free --
-/// from the clone onwards. A `Release` that overtakes the `slot` read below is a race on the
-/// caller's own struct, which the module documentation explains this cannot close.
+/// [`cancel`] is the one entry point adbc.h says must always be thread-safe, so it is the one that
+/// may legitimately still be running when [`release`] drops the handle's reference; cloning the
+/// count here keeps that a completed cancel rather than a use-after-free.
 ///
 /// # Safety
 /// `slot` must be null or a pointer produced by [`Exported::<S>::into_private_data`] that has not

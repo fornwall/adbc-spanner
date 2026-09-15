@@ -3,30 +3,8 @@
 //! The ADBC traits are synchronous and every driver call bridges into the async Spanner client via
 //! `block_on` (see [`crate::runtime`]), so without a deadline a hung RPC blocks the calling thread
 //! indefinitely, with `cancel` as the only escape. These three options bound the driver's
-//! Spanner-facing operations — the naming parallels the Flight SQL ADBC driver's
-//! `adbc.flight.sql.rpc.timeout_seconds.*` family:
-//!
-//! - [`OPTION_RPC_TIMEOUT_QUERY`](crate::OPTION_RPC_TIMEOUT_QUERY) — the **initial execution** of a
-//!   query: the `ExecuteStreamingSql` call plus the first chunk of a streamed result (which is what
-//!   settles the schema), the `execute_schema`/`execute_partitions` probes, and the initial fetch
-//!   of `read_partition`. It also bounds the driver-internal metadata reads, each of which is a
-//!   query execution: `get_objects`, `get_statistics` (both its discovery fetch and its per-table
-//!   aggregate scans), `get_table_schema`, and the shared table-exists probe.
-//! - [`OPTION_RPC_TIMEOUT_FETCH`](crate::OPTION_RPC_TIMEOUT_FETCH) — **each subsequent chunk
-//!   fetch** of a streamed result, applied inside the background prefetch task
-//!   ([`spawn_prefetch`](crate::runtime::spawn_prefetch)) so a stalled stream fails the consumer's
-//!   next batch instead of hanging the prefetcher.
-//! - [`OPTION_RPC_TIMEOUT_UPDATE`](crate::OPTION_RPC_TIMEOUT_UPDATE) — the **write paths**: DML /
-//!   batch-DML read/write transactions (including the manual-mode commit), each bulk-ingest commit
-//!   chunk, and DDL — the admin `UpdateDatabaseDdl` call **and** its long-running-operation poll
-//!   loop, which otherwise polls without any bound.
-//!
-//! Each value is a number of **seconds**, parsed as `f64` (fractions allowed); it must be finite
-//! and non-negative — `NaN`, the infinities and negatives are rejected with `InvalidArguments`,
-//! matching Flight SQL's validation. `0` disables the timeout (the same behaviour as unset, but it
-//! still round-trips through `get_option`); an empty string unsets. Like the read-staleness
-//! options, a connection's values become the default for statements it creates (which may override
-//! them), and every option round-trips through `get_option` and `get_option_double`.
+//! Spanner-facing operations; which sites each one covers, and their value grammar and defaults,
+//! are documented on the `OPTION_RPC_TIMEOUT_*` constants and in `docs/options.md`.
 //!
 //! Enforcement is an **overall deadline** per operation via [`tokio::time::timeout`]
 //! ([`with_timeout`]), not a per-attempt gax timeout: the bound covers the whole driver-side

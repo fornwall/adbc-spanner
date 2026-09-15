@@ -139,32 +139,25 @@ impl RecordBatchReader for BoundStreamReader {
 ///
 /// Arrow's importer ends in `ArrayData::new_unchecked`, so nothing a producer put in the buffers
 /// has been looked at: offsets, view buffer indices, UTF-8 and declared null counts are all still
-/// the producer's word. Everything downstream is ordinary safe Rust that trusts arrow-rs's
-/// invariants instead, and two of those reads are unchecked by design --
-/// `GenericByteViewArray::value` resolves a view through `buffers.get_unchecked`, and both byte
-/// array families hand their bytes to `from_bytes_unchecked` to make a `&str`. A malformed array
-/// is therefore undefined behavior in the consumer rather than a panic it could report, and no
-/// consumer can defend itself against it: this driver's own `crate::bind::cell_value` reads every
-/// bound value that way, for parameter binding and for bulk ingest alike. The boundary the arrays
-/// enter through is the one place that covers all of them at once.
+/// the producer's word. Downstream is ordinary safe Rust trusting arrow-rs's invariants, and two of
+/// those reads are unchecked by design -- `GenericByteViewArray::value` resolves a view through
+/// `buffers.get_unchecked`, and both byte array families make a `&str` with
+/// `from_bytes_unchecked`. A malformed array is therefore undefined behavior in the consumer
+/// rather than a reportable panic, and no consumer can defend itself: this driver's own
+/// `crate::bind::cell_value` reads every bound value that way. The boundary the arrays enter
+/// through is the one place that covers all of them at once.
 ///
-/// It covers an honest producer's bug, not a dishonest producer's lie, and nothing here can cover
-/// the second. `FFI_ArrowArray` transmits buffer pointers and no buffer lengths, so for `Utf8`,
-/// `Binary`, `LargeUtf8` and `LargeBinary` the values-buffer length *is* the last offset, which
-/// `from_ffi` reads out of the producer's own offset buffer before this function is reached; a
-/// last offset that lies yields a `Buffer` spanning memory the producer does not own, and the
-/// validation below is then itself the out-of-bounds read. That is the `unsafe` contract
-/// `from_ffi` documents rather than a defect in it, and it is not much of a security boundary
-/// either way -- the producer shares this address space. What this buys is that a well-meaning
-/// caller's bad batch is refused, by column name, instead of corrupting the driver silently.
+/// It covers an honest producer's bug, not a dishonest producer's lie. `FFI_ArrowArray` transmits
+/// buffer pointers and no lengths, so for the byte-array types the values-buffer length *is* the
+/// last offset, which `from_ffi` reads out of the producer's own offset buffer before this function
+/// is reached; a last offset that lies yields a `Buffer` spanning memory the producer does not own,
+/// and the validation below is then itself the out-of-bounds read. That is the `unsafe` contract
+/// `from_ffi` documents, and it is not much of a security boundary either way -- the producer
+/// shares this address space.
 ///
-/// The cost is one linear pass per buffer -- one offset or view header per row, a popcount over
-/// each null bitmap, and a UTF-8 scan over the bytes of a string column -- paid once, at the
-/// boundary. What follows it is per-row work of the same order and then a gRPC round trip: every
-/// bound value is converted to a Spanner `Value` by `crate::bind::cell_value`, and an ingest's
-/// rows become protobuf mutations that are serialized and TLS-encrypted on the way out. Only
-/// arrays that arrive over the C data interface pay it at all -- the Rust trait API takes an
-/// already-validated `RecordBatch`.
+/// The cost is one linear pass per buffer, paid once at the boundary, against per-row conversion
+/// work of the same order plus a gRPC round trip. Only arrays that arrive over the C data interface
+/// pay it -- the Rust trait API takes an already-validated `RecordBatch`.
 pub(super) fn validate_imported(
     data: &ArrayData,
     fields: &Fields,

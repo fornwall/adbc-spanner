@@ -33,23 +33,17 @@
 //! verbatim, each field keeping its own value.
 //!
 //! `JSON` columns keep `Utf8` storage (the value bytes are the JSON text) but carry the canonical
-//! `arrow.json` extension type as field metadata (`ARROW:extension:name` = `arrow.json`), so Arrow
-//! consumers that understand the extension recognize the logical JSON type. The extension lives on
-//! the [`Field`], not the [`DataType`]; for `ARRAY<JSON>` it sits on the list's child (`item`)
-//! field. The other Utf8-backed codes stay plain, untagged `Utf8`.
+//! `arrow.json` extension type as field metadata (`ARROW:extension:name` = `arrow.json`). The
+//! extension lives on the [`Field`], not the [`DataType`]; for `ARRAY<JSON>` it sits on the list's
+//! child (`item`) field. The other Utf8-backed codes stay plain, untagged `Utf8`.
 //!
 //! `ENUM` maps to `Int64` (its integer ordinal) and `PROTO` to `Binary` (its raw serialized proto2
-//! wire bytes, delivered base64-encoded like `BYTES`) — both lossless primitive mappings. The
-//! *structure* behind them (enum member names, proto field layout) lives only in the database's
-//! proto descriptor bundle, not in the query metadata, so the driver hands back the faithful
-//! primitive rather than a decoded `Dictionary`/`Struct`; a caller who wants the decoded form can
-//! `CAST(col AS STRING)` in SQL.
+//! wire bytes) — both lossless. The *structure* behind them (enum member names, proto field
+//! layout) lives only in the database's proto descriptor bundle, not in the query metadata, so the
+//! driver hands back the faithful primitive rather than a decoded `Dictionary`/`Struct`; a caller
+//! who wants the decoded form can `CAST(col AS STRING)` in SQL.
 //!
-//! The `TIMESTAMP` mapping is selected by [`TimestampPrecision`] (the
-//! `spanner.max_timestamp_precision` option): the default keeps the wire's full nanosecond
-//! precision but errors on instants outside Arrow's nanosecond range (~1677–2262), while
-//! `microseconds` covers Spanner's whole 0001–9999 range at microsecond precision, truncating
-//! sub-microsecond digits toward negative infinity.
+//! The `TIMESTAMP` mapping is selected by [`TimestampPrecision`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -86,11 +80,10 @@ use crate::timeout::with_timeout;
 const LIST_ITEM: &str = "item";
 
 /// Maximum nesting depth the server-provided `STRUCT`/`ARRAY` type walk ([`arrow_type`]) will
-/// descend before failing loudly. Defense-in-depth against a hostile endpoint returning
-/// pathological `STRUCT<STRUCT<…>>` metadata: the transport already bounds decode recursion
-/// (prost's `RECURSION_LIMIT = 100`, on by default), but this cap makes the guarantee local
-/// to the driver's own recursion rather than resting on the transport. `100` matches prost's limit;
-/// no legitimate result type nests remotely this deep.
+/// descend before failing loudly — defense-in-depth against a hostile endpoint returning
+/// pathological `STRUCT<STRUCT<…>>` metadata, making the guarantee local to the driver's own
+/// recursion rather than resting on prost's decode limit. `100` matches that limit; no legitimate
+/// result type nests remotely this deep.
 const MAX_TYPE_NESTING_DEPTH: usize = 100;
 
 /// Precision and scale of Spanner's `NUMERIC` type (GoogleSQL `NUMERIC` is fixed at 38 / 9).
@@ -112,9 +105,8 @@ const ARROW_JSON_EXTENSION: &str = "arrow.json";
 ///
 /// Spanner timestamps span 0001-01-01 to 9999-12-31 at nanosecond precision; Arrow's
 /// `Timestamp(Nanosecond)` `i64` spans only ~1677-09-21 to 2262-04-11. The two variants are the
-/// two lossless-or-loud ways out of that mismatch. There is deliberately **no** mode that keeps
-/// nanoseconds and silently wraps out-of-range values (as some drivers offer): a wrapped timestamp
-/// is indistinguishable from real data, i.e. silent corruption.
+/// two lossless-or-loud ways out of that mismatch; there is deliberately **no** silently-wrapping
+/// mode, since a wrapped timestamp is indistinguishable from real data.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum TimestampPrecision {
     /// `Timestamp(Nanosecond, "UTC")`, preserving the wire value's full nanosecond precision. A
@@ -199,22 +191,19 @@ pub(crate) fn rows_to_batch(
 
 /// Additional per-chunk byte budget for [`pull_chunk`], on top of the `max` (row-count) cap.
 ///
-/// The row cap alone bounds rows, not bytes: 8192 rows of `STRING(MAX)`/`BYTES(MAX)` (up to ~10 MB
-/// each) would be tens of GB per chunk, and a chunk is held roughly twice — the [`Row`]s plus the
-/// Arrow batch built from them — during conversion. So `pull_chunk` also cuts a chunk once its
-/// accumulated (approximate) wire size crosses this budget. 32 MiB is large enough that ordinary
-/// rows still batch efficiently, small enough to cap peak memory. A single row larger than the whole
-/// budget still forms its own one-row chunk (the check runs *after* the row is buffered), so
-/// streaming never stalls or emits an empty chunk.
+/// The row cap alone bounds rows, not bytes: 8192 rows of `STRING(MAX)`/`BYTES(MAX)` would be tens
+/// of GB per chunk, and a chunk is held roughly twice during conversion. So `pull_chunk` also cuts a
+/// chunk once its accumulated (approximate) wire size crosses this budget. A single row larger than
+/// the whole budget still forms its own one-row chunk (the check runs *after* the row is buffered),
+/// so streaming never stalls or emits an empty chunk.
 const CHUNK_BYTE_BUDGET: usize = 32 * 1024 * 1024;
 
 /// Pull up to `max` rows from a Spanner result set, stopping early when the stream ends — or, as an
 /// additional cap, once the accumulated rows exceed [`CHUNK_BYTE_BUDGET`] approximate bytes.
 ///
-/// `rows` is deliberately not pre-reserved to `max`: `max` is a *cap*, not a prediction (most chunks
-/// are short), and reserving it would allocate for the cap regardless — unbounded for a large
-/// `spanner.rows_per_batch`, which takes no upper bound. `Vec`'s amortised doubling costs nothing
-/// measurable next to a chunk's RPC and Arrow conversion.
+/// `rows` is deliberately not pre-reserved to `max`: `max` is a *cap*, not a prediction, and
+/// reserving it would allocate for the cap regardless — unbounded for a large
+/// `spanner.rows_per_batch`, which takes no upper bound.
 async fn pull_chunk(rs: &mut ResultSet, max: usize) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
     let mut bytes: usize = 0;
@@ -266,18 +255,14 @@ fn approx_value_bytes(value: &Value) -> usize {
 /// Wrap a Spanner [`ResultSet`] as a streaming Arrow [`RecordBatchReader`].
 ///
 /// The first chunk of rows is pulled here (Spanner delivers the column metadata with the first
-/// partial result set, so this also settles the schema). The rest of the result set is handed to a
-/// background **prefetch task** on the shared runtime (see
-/// [`spawn_prefetch`](crate::runtime::spawn_prefetch)), so the fetch of chunk N+1 overlaps the
-/// consumer's processing of chunk N; each [`Iterator::next`] converts one bounded chunk to Arrow
-/// rather than materialising the whole result up front. Waiting for a chunk is cancellable via the
-/// shared [`CancelSignal`], which also aborts the background fetch.
+/// partial result set, so this also settles the schema) and the rest is handed to a background
+/// prefetch task; see [`SpannerBatchReader`] for the streaming model.
 ///
-/// The first chunk pulled here is bounded by the caller's *query* deadline (the caller wraps this
-/// whole future in `spanner.rpc.timeout_seconds.query`); each background fetch after it is
-/// bounded by `fetch_timeout` (`spanner.rpc.timeout_seconds.fetch`) inside the prefetch task, so a
-/// stalled stream surfaces [`Status::Timeout`](adbc_core::error::Status::Timeout) on the
-/// consumer's next batch.
+/// The first chunk is bounded by the caller's *query* deadline (the caller wraps this whole future
+/// in `spanner.rpc.timeout_seconds.query`); each background fetch after it is bounded by
+/// `fetch_timeout` (`spanner.rpc.timeout_seconds.fetch`) inside the prefetch task, so a stalled
+/// stream surfaces [`Status::Timeout`](adbc_core::error::Status::Timeout) on the consumer's next
+/// batch.
 pub(crate) async fn stream_query(
     runtime: SharedRuntime,
     cancel: CancelSignal,
@@ -328,14 +313,12 @@ impl ChunkSource for ResultSetChunks {
 /// Rows are fetched from the server and converted to Arrow in bounded chunks of
 /// `spanner.rows_per_batch` rows (plus the [`CHUNK_BYTE_BUDGET`]), so a large result set is never
 /// fully held in memory. A background task on the shared runtime **prefetches ahead of the
-/// consumer** — while `next` converts and the caller processes batch N, the fetch of batch N+1 is
-/// already in flight — keeping at most one undelivered chunk buffered plus one being fetched (in
-/// the same spirit as the BigQuery ADBC driver's buffered reader). The ADBC traits are
-/// synchronous, so each `next` bridges to the async channel with a cancellable `block_on`; a
-/// latched [`CancelSignal`] both fails the wait and stops the background fetch, and dropping the
-/// reader aborts the task. The signal is the producing operation's **own** (per-operation, minted
-/// by `CancelSlot::begin_operation`), so once cancelled the reader stays cancelled — a later
-/// operation on the owning statement/connection can neither clear it nor be affected by it.
+/// consumer**, keeping at most one undelivered chunk buffered plus one being fetched. The ADBC
+/// traits are synchronous, so each `next` bridges to the async channel with a cancellable
+/// `block_on`; a latched [`CancelSignal`] both fails the wait and stops the background fetch, and
+/// dropping the reader aborts the task. The signal is the producing operation's **own**, so once
+/// cancelled the reader stays cancelled — a later operation on the owning statement/connection can
+/// neither clear it nor be affected by it.
 pub(crate) struct SpannerBatchReader {
     runtime: SharedRuntime,
     cancel: CancelSignal,
@@ -445,15 +428,13 @@ pub(crate) trait BoundStatementSource: Send {
 /// transaction** so all bound rows see a single, mutually consistent snapshot.
 ///
 /// The first statement is built and executed here and its first chunk pulled (settling the schema —
-/// every statement is the same SQL, so the schema is shared); the rest streams through the exact
-/// same machinery as [`stream_query`] — a [`BoundQueryChunks`] [`ChunkSource`] handed to
-/// [`spawn_prefetch`], so the fetch (and, when the current result set drains, the execution of the
-/// next bound row's statement) overlaps the consumer's processing of the previous chunk, and rows
-/// are converted to Arrow in bounded chunks of `batch_size` (plus the [`CHUNK_BYTE_BUDGET`]) rather
-/// than fully materialised. The `transaction` (`Arc`-shared: in a manual transaction the
-/// connection's shared snapshot, in autocommit a dedicated one) is owned by the source, hence by the
-/// prefetch task, keeping the snapshot alive for as long as chunks are pulled; Spanner read-only
-/// transactions need no commit/rollback, so dropping it is cleanup enough.
+/// every statement is the same SQL, so the schema is shared); the rest streams through the same
+/// machinery as [`stream_query`], with a [`BoundQueryChunks`] [`ChunkSource`] that also executes
+/// the next bound row's statement when the current result set drains. The `transaction`
+/// (`Arc`-shared: in a manual transaction the connection's shared snapshot, in autocommit a
+/// dedicated one) is owned by the source, hence by the prefetch task, keeping the snapshot alive
+/// for as long as chunks are pulled; Spanner read-only transactions need no commit/rollback, so
+/// dropping it is cleanup enough.
 pub(crate) async fn stream_bound_query(
     runtime: SharedRuntime,
     cancel: CancelSignal,
@@ -612,13 +593,11 @@ pub(crate) fn build_schema(
 /// extension metadata when the column is `JSON`.
 ///
 /// The storage type stays `Utf8` (the value bytes are the JSON text); only the field metadata marks
-/// it as logical JSON, so consumers that understand the extension (pyarrow, DuckDB, polars) can
-/// recognize it while others still read plain strings. Only `TypeCode::Json` is tagged — the other
-/// Utf8-backed codes (`STRING`, `UUID`, `INTERVAL`) stay untagged.
+/// it as logical JSON. Only `TypeCode::Json` is tagged — the other Utf8-backed codes stay untagged.
 ///
-/// Never fails today (every Spanner type maps to some Arrow type — `ENUM` → `Int64`, `PROTO` →
-/// `Binary`), but stays fallible so a future unmappable type can be rejected here without a
-/// signature change rippling through the schema-build path.
+/// Never fails today (every Spanner type maps to some Arrow type), but stays fallible so a future
+/// unmappable type can be rejected here without a signature change rippling through the
+/// schema-build path.
 pub(crate) fn arrow_field(
     name: impl Into<String>,
     ty: &Type,
@@ -646,14 +625,11 @@ fn arrow_field_at(
 }
 
 /// Whether an Arrow [`Field`] carries the canonical `arrow.json` extension on a string storage
-/// type — the tag this driver writes via [`json_extension_metadata`] and what other producers
-/// (pyarrow, polars) emit for logical JSON. The bind path uses this to send such values as
-/// Spanner `JSON`-typed parameters, and ingest create modes to create `JSON` columns. The storage
-/// check matters: `arrow.json` is only defined over utf8-family storage, so a tag on any other
-/// type is ignored rather than mis-bound. A `Dictionary` looks through to its **value** type —
-/// the Arrow spec allows an extension array to be dictionary-encoded (the field's storage type is
-/// then `dictionary<indices, utf8>`), and the bind path decodes the encoding transparently, so the
-/// tag must be honoured through it too.
+/// type. The bind path uses this to send such values as Spanner `JSON`-typed parameters, and ingest
+/// create modes to create `JSON` columns. The storage check matters: `arrow.json` is only defined
+/// over utf8-family storage, so a tag on any other type is ignored rather than mis-bound. A
+/// `Dictionary` looks through to its **value** type — the Arrow spec allows an extension array to be
+/// dictionary-encoded, and the bind path decodes that transparently.
 pub(crate) fn is_json_field(field: &Field) -> bool {
     let storage = match field.data_type() {
         DataType::Dictionary(_, value) => value.as_ref(),
@@ -733,10 +709,9 @@ fn arrow_type(ty: &Type, precision: TimestampPrecision, depth: usize) -> Result<
         TypeCode::Enum => DataType::Int64,
         TypeCode::Proto => DataType::Binary,
         // Unlike JSON (whose `arrow.json` tag also drives the bind path), ENUM/PROTO/INTERVAL/UUID
-        // carry no such marker, so a value read back binds as its storage type — Spanner infers the
-        // param as INT64/BYTES/STRING and won't coerce it into the column. Wrap the parameter in
-        // `CAST(@p AS ENUM<…>|PROTO<…>|INTERVAL|UUID)` to round-trip one through DML (bulk-ingest
-        // mutations are unaffected). Documented in the README type-mapping section.
+        // carry no such marker, so a value read back binds as its storage type and Spanner won't
+        // coerce it into the column. Wrap the parameter in `CAST(@p AS …)` to round-trip one through
+        // DML (bulk-ingest mutations are unaffected).
         //
         // STRING, JSON, UUID, INTERVAL and any future/unknown code are UTF-8 text.
         _ => DataType::Utf8,
@@ -1053,15 +1028,13 @@ fn build_list(field: &FieldRef, values: &[Option<&Value>]) -> Result<ArrayRef> {
 }
 
 /// Build an Arrow `Struct` array. Spanner encodes struct values **positionally** — a `ListValue`
-/// whose elements match the struct type's field order — and fields are addressed by index only.
-/// That is the sole encoding accepted here, and it is what makes Spanner's duplicate and empty
-/// field names decode correctly: a name-keyed lookup would collapse two same-named fields onto one
-/// value, and a keyed `google.protobuf.Struct` wire value could not carry them apart in
-/// the first place, being a map.
+/// whose elements match the struct type's field order — and that is the sole encoding accepted
+/// here, which is what makes Spanner's duplicate and empty field names decode correctly: a
+/// name-keyed lookup would collapse two same-named fields onto one value, and a keyed
+/// `google.protobuf.Struct` wire value could not carry them apart at all, being a map.
 ///
 /// [`build_array`]'s strict-decode policy applies here too: a present value that is not a wire list
-/// is an error, never a silent null. Field values recurse, so an undecodable field at any nesting
-/// depth errors as well.
+/// is an error, never a silent null, at any nesting depth.
 fn build_struct(fields: &Fields, values: &[Option<&Value>]) -> Result<ArrayRef> {
     let mut children: Vec<Vec<Option<&Value>>> =
         vec![Vec::with_capacity(values.len()); fields.len()];
@@ -1118,16 +1091,11 @@ fn parse_f64(value: &Value) -> Option<f64> {
 
 /// Parse a Spanner `DATE` (`YYYY-MM-DD`) into days since the Unix epoch (Arrow `Date32`).
 ///
-/// Spanner always sends a `DATE` as the fixed-width canonical `YYYY-MM-DD` (year zero-padded to four
-/// digits, 0001–9999), so this reads the three integer fields directly at fixed byte offsets rather
-/// than running chrono's general strftime interpreter, which re-tokenizes the `"%Y-%m-%d"` format
-/// string and resolves a general `Parsed` struct on *every* call — over half the temporal conversion
-/// path in profiling.
-///
-/// Only the canonical shape is accepted: anything that is not exactly ten bytes of `dddd-dd-dd`
-/// returns `None`, and a well-formed but calendar-invalid date (e.g. `2024-13-01`) is rejected by
-/// `from_ymd_opt`. Spanner's wire format never deviates from that shape, so there is no fallback to
-/// the general parser.
+/// Spanner always sends a `DATE` as the fixed-width canonical `YYYY-MM-DD` (0001–9999), so this
+/// reads the three integer fields at fixed byte offsets rather than running chrono's general
+/// strftime interpreter, which re-tokenizes the format string on *every* call — over half the
+/// temporal conversion path in profiling. Only that canonical shape is accepted: anything else
+/// returns `None`, and a calendar-invalid date is rejected by `from_ymd_opt`.
 pub(crate) fn parse_date_days(s: &str) -> Option<i32> {
     let b = s.as_bytes();
     if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
@@ -1158,13 +1126,9 @@ fn two_digits(b: &[u8], off: usize) -> Option<u32> {
 
 /// Scan a Spanner `TIMESTAMP` in its canonical UTC RFC 3339 form —
 /// `YYYY-MM-DDTHH:MM:SS[.fraction]Z`, 1–9 fractional digits — into a [`chrono::NaiveDateTime`],
-/// reading each field at a fixed byte offset instead of running chrono's general RFC 3339 parser
-/// (which additionally scans the fraction and resolves a timezone offset per row). Only the calendar
-/// arithmetic is delegated to chrono (`from_ymd_opt`/`and_hms_nano_opt`), which validates the fields.
-///
-/// Spanner always emits this exact shape (UTC, `Z` suffix), so any deviation — a non-`Z` offset, a
-/// missing field, >9 fractional digits — returns `None`. Callers turn the naive UTC datetime into an
-/// epoch instant, preserving the chrono-based range/overflow checks they already relied on.
+/// reading each field at a fixed byte offset instead of running chrono's general RFC 3339 parser.
+/// Only the calendar arithmetic is delegated to chrono (`from_ymd_opt`/`and_hms_nano_opt`), which
+/// validates the fields. Spanner always emits this exact shape, so any deviation returns `None`.
 fn scan_timestamp_utc(s: &str) -> Option<chrono::NaiveDateTime> {
     let b = s.as_bytes();
     // Shortest legal form is `YYYY-MM-DDTHH:MM:SSZ` (20 bytes); the separators are fixed.
@@ -1228,9 +1192,9 @@ pub(crate) fn parse_timestamp_nanos(s: &str) -> Option<i64> {
 /// so the integer division of the sub-second nanoseconds is a floor on the timeline (e.g.
 /// `1969-12-31T23:59:59.9999999Z` → `-1` µs, not `0`).
 ///
-/// Returns `None` for a malformed string. Every instant Spanner can store (0001-01-01 to
-/// 9999-12-31) is representable — i64 microseconds span ~±292,000 years — so the checked
-/// arithmetic only guards against hypothetical far-out-of-range inputs, never real Spanner data.
+/// Returns `None` for a malformed string. Every instant Spanner can store is representable — i64
+/// microseconds span ~±292,000 years — so the checked arithmetic only guards against hypothetical
+/// far-out-of-range inputs.
 pub(crate) fn parse_timestamp_micros(s: &str) -> Option<i64> {
     let dt = scan_timestamp_utc(s)?.and_utc();
     dt.timestamp()

@@ -2,10 +2,8 @@
 //!
 //! A database, a connection and a statement all expose the same handle prologues (`New`,
 //! `Release`) and the same eight option entry points (string/bytes/int/double setters and
-//! getters). They live here as generic `extern "C"` functions, over [`FfiHandle`] — the link
-//! between an ABI struct and the state behind its `private_data` — and over [`OptionTarget`] —
-//! how options reach that state. The vtable names the instantiation each slot needs, so each
-//! object module keeps only what is genuinely its own.
+//! getters). They live here as generic `extern "C"` functions, over [`FfiHandle`] and
+//! [`OptionTarget`]; the vtable names the instantiation each slot needs.
 
 use std::ffi::{c_char, c_void};
 use std::sync::MutexGuard;

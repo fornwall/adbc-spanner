@@ -1,9 +1,8 @@
 //! Panic containment and the small pointer/string conversions every entry point needs.
 //!
 //! Unwinding out of an `extern "C"` function is undefined behavior, so every exported entry point
-//! runs its body inside [`catch`]. What distinguishes this from a plain `catch_unwind` is what
-//! happens afterwards: see [`super::handle`], where the panic is confined to the one object whose
-//! call panicked instead of disabling the driver process-wide.
+//! runs its body inside [`catch`]; [`super::handle`] then confines the panic to the one object
+//! whose call panicked rather than the whole process.
 
 use std::any::Any;
 use std::ffi::{CStr, CString, c_char, c_void};

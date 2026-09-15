@@ -3,14 +3,11 @@
 //! Spanner's [`DirectedReadOptions`](google_cloud_spanner::model::DirectedReadOptions) let a
 //! read-only query steer where it is served: either an ordered **include** list of replica
 //! selections (Spanner tries them in order) or an **exclude** list (Spanner routes around them).
-//! Each selection targets replicas by geographic *location* (a region such as `us-east1`) and/or
-//! *type* (read-write / read-only). Directed reads apply **only** to read-only queries — Spanner
-//! returns `INVALID_ARGUMENT` if they are attached to a read/write transaction — so this module's
-//! options are applied at the driver's read-only query sites only.
-//!
-//! This module parses the single [`OPTION_DIRECTED_READ`](crate::OPTION_DIRECTED_READ)
-//! (`spanner.directed_read`) option into a small driver-owned value ([`DirectedReadSpec`]) that is
-//! unit-testable offline, then builds the client [`DirectedReadOptions`] on demand.
+//! Directed reads apply **only** to read-only queries — Spanner returns `INVALID_ARGUMENT` if they
+//! are attached to a read/write transaction — so this module's option is applied at the driver's
+//! read-only query sites only. It parses [`OPTION_DIRECTED_READ`](crate::OPTION_DIRECTED_READ)
+//! (`spanner.directed_read`) into a driver-owned value ([`DirectedReadSpec`]) that is unit-testable
+//! offline, then builds the client [`DirectedReadOptions`] on demand.
 //!
 //! # Grammar
 //!
@@ -22,25 +19,15 @@
 //! <type>       ::= "read_write" | "read_only" | "any"   (exact lowercase)
 //! ```
 //!
-//! - `<mode>` picks an include list (an ordered preference) or an exclude list.
-//! - Each `<selection>` is a `<location>`, a `<location>:<type>`, or a `:<type>` (location omitted,
-//!   any location of that type). The `<type>` defaults to `any` (any replica type) when omitted;
-//!   `any` maps to the unspecified replica type, which matches every type.
-//! - The optional `;auto_failover_disabled` suffix sets `auto_failover_disabled` on an **include**
-//!   list (Spanner then will not fall back to a replica outside the list when all listed replicas
-//!   are unavailable). It is only valid with `include` (the exclude message has no such field).
+//! A `<selection>` may omit the location (`:<type>` — any location of that type) or the type (which
+//! then defaults to `any`, the unspecified replica type, matching every type). The optional
+//! `;auto_failover_disabled` suffix is valid only with `include` (the exclude message has no such
+//! field) and stops Spanner falling back to a replica outside the list.
 //!
-//! Examples:
-//! - `include:us-east1` — prefer any replica in `us-east1`.
-//! - `include:us-east1:read_only,us-east4:read_write` — prefer a read-only replica in `us-east1`,
-//!   then a read-write replica in `us-east4`.
-//! - `exclude:us-central1` — never route to replicas in `us-central1`.
-//! - `include:us-east1;auto_failover_disabled` — prefer `us-east1` and do not fail over elsewhere.
-//! - `include::read_only` — prefer any read-only replica, in any location.
+//! Examples: `include:us-east1`, `include:us-east1:read_only,us-east4:read_write`,
+//! `exclude:us-central1`, `include:us-east1;auto_failover_disabled`, `include::read_only`.
 //!
-//! An empty string unsets the option. Malformed input is rejected with `InvalidArguments`. Like the
-//! read-staleness and request options, a connection's value becomes the default for statements it
-//! creates (which may override it) and the option round-trips through `get_option`.
+//! An empty string unsets the option; malformed input is rejected with `InvalidArguments`.
 
 use adbc_core::error::Result;
 use adbc_core::options::OptionValue;

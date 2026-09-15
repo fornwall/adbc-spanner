@@ -3,94 +3,34 @@
 //!
 //! Every data-plane RPC the driver issues is retried by the pinned Spanner client under a default
 //! policy — AIP-194 strict, additionally retrying transport / IO errors on idempotent requests (the
-//! client's [`SpannerRetryPolicy`]). On the unary RPC paths that default
-//! has **no** attempt or elapsed-time cap, so a persistently `UNAVAILABLE` backend is retried until
-//! the operation-wide [RPC timeout](crate::timeout) (if any) fires. These two options let a caller
-//! *bound* the client's retrying instead — mirroring the gax convention of an attempt count and an
-//! overall elapsed-time limit:
+//! client's [`SpannerRetryPolicy`]), uncapped on the unary paths. These options *bound* that
+//! retrying instead; unset, they change nothing. Their grammar, defaults and round-trip behaviour
+//! are documented on the `OPTION_RETRY_*` constants and in `docs/options.md`.
 //!
-//! - [`OPTION_RETRY_MAX_ATTEMPTS`](crate::OPTION_RETRY_MAX_ATTEMPTS) — the maximum number of
-//!   attempts (the first try plus retries), a positive integer. `1` disables retrying.
-//! - [`OPTION_RETRY_MAX_ELAPSED_SECONDS`](crate::OPTION_RETRY_MAX_ELAPSED_SECONDS) — an upper bound,
-//!   in seconds, on the total wall-clock time spent across attempts before the last error is
-//!   surfaced as permanent.
-//!
-//! The two are independent and may be combined (the retry loop stops at whichever limit is reached
-//! first). When neither is set the client keeps its own default policy — so this feature is purely
-//! opt-in and, by default, changes nothing.
-//!
-//! Those are the gax knobs' meanings, and what the driver asks for. The attempt limit is delivered
-//! faithfully everywhere; the *elapsed* limit is not delivered on the streaming query path — the
-//! next section is the authoritative statement, and both bullets above hold exactly on the unary
-//! paths.
-//!
-//! # What the limits actually deliver, per RPC path
-//!
-//! The pinned client runs **two different retry loops**. They now agree on attempt accounting but
-//! not on elapsed time, so `max_elapsed_seconds` lands differently depending on which RPC carries
-//! the work. That gap is an upstream defect (REVIEW.md **UP-14**), not something the driver can
-//! correct: the same [`RetryPolicyArg`] is handed to both kinds of loop, so no single compensation
-//! is right for both — and nothing a policy can do recovers a loop start the caller re-takes on
-//! every decision. The exact numbers below are pinned by `retry_max_attempts_*` /
-//! `retry_max_elapsed_seconds_*` in `tests/mock_spanner.rs`, which fail loudly if a
-//! `google-cloud-rust` rev bump changes them.
-//!
-//! - **Unary RPCs** — `ExecuteSql` (DML), `ExecuteBatchDml`, `BeginTransaction`, `Commit` — run
-//!   through gax's `retry_loop`, which increments `RetryState::attempt_count` *before* each attempt
-//!   and pins `RetryState::start` to the real start of the loop. Both limits are **exact**:
-//!   `max_attempts = N` permits `N` attempts and `1` genuinely disables retrying; the elapsed budget
-//!   bounds the loop as documented. The client's default policy here is uncapped.
-//! - **The streaming query path** — `ExecuteStreamingSql`, i.e. every read-only query — is
-//!   dispatched *outside* `retry_loop` (`server_streaming/builder.rs`'s `send()` has no retry loop
-//!   of its own, so an error returned as the RPC's *initial* status is never retried at all). Stream
-//!   resumption is hand-rolled in `ResultSet::check_retry` (`.../src/spanner/src/result_set.rs`),
-//!   which builds a fresh [`RetryState`] per resume decision. It seeds that state with
-//!   `1 + retry_count`, so:
-//!   - `max_attempts = N` permits exactly **`N`** attempts, matching the unary paths; `1` disables
-//!     retrying here too. (Before the `google-cloud-rust` rev that fixed this, the seed was the bare
-//!     `retry_count` — *retries so far*, hence `0` on the first failure — and `N` permitted `N + 1`.)
-//!   - `max_elapsed_seconds` is still **inert**: the fresh state resets `start` to `Instant::now()`,
-//!     so the gax elapsed-time decorator forever compares now against a deadline one whole budget in
-//!     the future and never exhausts. A streaming caller who needs a wall-clock bound has a working
-//!     one in the separate [RPC timeout](crate::timeout) family
-//!     (`spanner.rpc.timeout_seconds.{query,fetch}`), which does bound this path.
-//!
-//!   The client's default policy on this path is *not* uncapped either — it is
-//!   `SpannerRetryPolicy::new().with_attempt_limit(10)` (`result_set.rs`'s `apply_defaults`), i.e. 10
-//!   attempts — so setting `max_attempts` here replaces a cap rather than introducing one.
-//!
-//! Independently, three options tune the *delay between* attempts (the client's truncated
-//! exponential backoff with jitter), each opt-in and applied at the same builder sites:
-//!
-//! - [`OPTION_RETRY_BACKOFF_INITIAL_SECONDS`](crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS) — the
-//!   first inter-attempt delay, in seconds.
-//! - [`OPTION_RETRY_BACKOFF_MAX_SECONDS`](crate::OPTION_RETRY_BACKOFF_MAX_SECONDS) — the ceiling the
-//!   growing delay is truncated at, in seconds.
-//! - [`OPTION_RETRY_BACKOFF_MULTIPLIER`](crate::OPTION_RETRY_BACKOFF_MULTIPLIER) — the per-attempt
-//!   growth factor applied to the delay.
-//!
-//! Setting any one of them replaces the client's default backoff with a gax
-//! [`ExponentialBackoff`](google_cloud_gax::exponential_backoff::ExponentialBackoff): the unset
-//! knobs fall back to the client's defaults (initial 1s, maximum 60s, multiplier 2.0) and the
-//! combination is clamped to the gax recommended ranges (so it can never fail to build). These are
-//! orthogonal to the attempt / elapsed-time limits above — either family may be set without the
-//! other.
-//!
-//! **Preserving the client's behaviour under a limit.** Setting a policy on a request builder
-//! *replaces* the client's default [`SpannerRetryPolicy`], so to keep the
-//! transport-error-on-idempotent retrying while adding a bound, the base policy applied here is that
-//! very same client policy (public since googleapis/google-cloud-rust#6048), with the configured
+//! Setting a policy on a request builder *replaces* the client's default, so the base policy applied
+//! here is that very same [`SpannerRetryPolicy`] with the configured
 //! [`with_attempt_limit`](google_cloud_gax::retry_policy::RetryPolicyExt::with_attempt_limit) /
 //! [`with_time_limit`](google_cloud_gax::retry_policy::RetryPolicyExt::with_time_limit) wrappers on
-//! top. The policy is applied to every user statement/DML builder, the read/write transaction
-//! runner's begin+commit RPCs, the bulk-ingest write-only transaction, and the `ExecuteBatchDml`
-//! batch — the same builder sites the request priority/tag options cover.
+//! top, keeping the transport-error-on-idempotent retrying. The backoff knobs likewise build a gax
+//! [`ExponentialBackoff`](google_cloud_gax::exponential_backoff::ExponentialBackoff) whose unset
+//! knobs fall back to the client's defaults (1s, 60s, ×2.0), clamped to the gax recommended ranges
+//! so it can never fail to build. Both families reach the same builder sites the request
+//! priority/tag options cover.
 //!
-//! Both options exist at connection **and** statement level; a connection's values become the
-//! default for statements it creates (which may override them), an empty string unsets, and every
-//! option round-trips through `get_option` (and `get_option_int` / `get_option_double`). This
-//! bounds the client's *per-attempt* retrying; the overall per-operation deadline is the separate
-//! [RPC timeout](crate::timeout) family.
+//! # `max_elapsed_seconds` is inert on the streaming query path
+//!
+//! The pinned client runs **two** retry loops. Unary RPCs (`ExecuteSql`, `ExecuteBatchDml`,
+//! `BeginTransaction`, `Commit`) go through gax's `retry_loop`, where both limits are exact. The
+//! streaming query path (`ExecuteStreamingSql`, i.e. every read-only query) is dispatched *outside*
+//! it and hand-rolls resumption in `ResultSet::check_retry`, building a fresh `RetryState` per
+//! decision: it seeds the attempt count with `1 + retry_count`, so `max_attempts = N` is exact there
+//! too, but it re-takes `start` as `Instant::now()` every time, so the elapsed-time decorator never
+//! exhausts. That is an upstream defect (REVIEW.md **UP-14**) the driver cannot correct — the same
+//! `RetryPolicyArg` feeds both loops, and no policy can recover a loop start the caller re-takes. A
+//! streaming caller who needs a wall-clock bound has a working one in the separate
+//! [RPC timeout](crate::timeout) family (`spanner.rpc.timeout_seconds.{query,fetch}`). The client's
+//! default on this path is `with_attempt_limit(10)` rather than uncapped. The exact numbers are
+//! pinned by the `retry_max_*` tests in `tests/mock_spanner.rs`.
 
 use std::time::Duration;
 
@@ -112,8 +52,7 @@ use crate::error::invalid_argument;
 ///
 /// [`TransactionRunnerBuilder`] and [`WriteOnlyTransactionBuilder`] expose these four setters with
 /// identical signatures but share no common trait, so the body lives here once rather than as two
-/// byte-identical copies naming different types — the same reasoning as the macro of the same name
-/// in `request.rs`, kept file-local since the two bodies apply different settings.
+/// byte-identical copies naming different types.
 macro_rules! apply_to_commit_builder {
     ($(#[$attr:meta])* $name:ident($builder:ty)) => {
         $(#[$attr])*
@@ -158,17 +97,9 @@ macro_rules! apply_to_request_builder {
 /// `spanner.retry.backoff.{initial_seconds,max_seconds,multiplier}`).
 ///
 /// A connection's value is cloned into each statement it creates (which may then override either
-/// knob), mirroring how [`ReadStaleness`](crate::staleness::ReadStaleness) and
-/// [`RpcTimeouts`](crate::timeout::RpcTimeouts) are inherited.
-///
-/// Values are stored exactly as configured so `get_option` / `get_option_int` /
+/// knob). Values are stored exactly as configured so `get_option` / `get_option_int` /
 /// `get_option_double` round-trip them; [`retry_policy_arg`](Self::retry_policy_arg) turns them into
 /// a gax [`RetryPolicyArg`] (or `None`, leaving the client's default policy) at apply time.
-///
-/// The fields are set and read directly by
-/// [`impl_shared_option_dispatch`](crate::options::impl_shared_option_dispatch): the seconds knobs
-/// through [`f64_option`](crate::options::f64_option), the attempt count through
-/// [`parse_max_attempts`].
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RetryConfig {
     /// `spanner.retry.max_attempts`, when set: the maximum number of attempts (>= 1).
@@ -224,14 +155,11 @@ impl RetryConfig {
     }
 
     /// The gax backoff policy for this configuration, or `None` when none of the three backoff knobs
-    /// is set (leaving the client's default exponential backoff in place). When any is set, the
-    /// unset knobs fall back to the client's defaults (initial 1s, maximum 60s, multiplier 2.0) and
-    /// the combination is clamped to the gax recommended ranges via
-    /// [`ExponentialBackoffBuilder::clamp`] — so building it can never fail (initial delay ≥ 1ms,
-    /// maximum delay in `[1s, 24h]` and ≥ the initial delay, multiplier in `[1.0, 32.0]`).
-    ///
-    /// This is independent of [`retry_policy_arg`](Self::retry_policy_arg): a caller may tune the
-    /// backoff without bounding the attempt / elapsed-time limits, and vice versa.
+    /// is set (leaving the client's default exponential backoff in place). Unset knobs fall back to
+    /// the client's defaults (1s, 60s, ×2.0) and the combination is clamped via
+    /// [`ExponentialBackoffBuilder::clamp`] — initial delay ≥ 1ms, maximum in `[1s, 24h]` and ≥ the
+    /// initial, multiplier in `[1.0, 32.0]` — so building it can never fail. Independent of
+    /// [`retry_policy_arg`](Self::retry_policy_arg).
     fn backoff_policy_arg(&self) -> Option<BackoffPolicyArg> {
         if self.backoff_initial_seconds.is_none()
             && self.backoff_max_seconds.is_none()

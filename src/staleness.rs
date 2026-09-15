@@ -3,29 +3,19 @@
 //! By default every query reads at a **strong** bound (`TimestampBound::strong`) — it sees the
 //! effects of every transaction that committed before the read started. Spanner also supports
 //! **stale reads**, which pick an older read timestamp so the read can be served locally without a
-//! cross-replica quorum: cheaper and lock-free, ideal for analytics. This module parses the single
-//! driver option that requests a non-strong bound and maps it onto the client's [`TimestampBound`].
+//! cross-replica quorum: cheaper and lock-free, ideal for analytics. This module parses
+//! [`OPTION_READ_STALENESS`](crate::OPTION_READ_STALENESS) (`spanner.read.staleness`), whose value
+//! grammar is documented on that constant, and maps it onto the client's [`TimestampBound`]:
 //!
-//! [`OPTION_READ_STALENESS`](crate::OPTION_READ_STALENESS) (`spanner.read.staleness`) selects the
-//! bound. Its value is one of four prefixed forms — two *relative* (a duration) and two *absolute*
-//! (an RFC 3339 timestamp):
+//! - `exact:<duration>` → [`TimestampBound::exact_staleness`]
+//! - `max:<duration>` → [`TimestampBound::max_staleness`] (single-use reads only)
+//! - `read:<rfc3339>` → [`TimestampBound::read_timestamp`]
+//! - `min:<rfc3339>` → [`TimestampBound::min_read_timestamp`] (single-use reads only)
 //!
-//! - `exact:<duration>` → [`TimestampBound::exact_staleness`]: read exactly `<duration>` in the
-//!   past (a single, repeatable timestamp).
-//! - `max:<duration>` → [`TimestampBound::max_staleness`]: read at any timestamp within
-//!   `<duration>` of now (bounded staleness; the server picks, single-use reads only).
-//! - `read:<rfc3339>` → [`TimestampBound::read_timestamp`]: read exactly as of that timestamp.
-//! - `min:<rfc3339>` → [`TimestampBound::min_read_timestamp`]: read at that timestamp or later
-//!   (bounded staleness; single-use reads only).
-//!
-//! `<duration>` is a non-negative number optionally suffixed with a unit — `s` (seconds, the
-//! default), `ms`, `us`/`µs`, `ns`, `m` (minutes) or `h` (hours). Examples: `exact:10`, `exact:2.5s`,
-//! `max:500ms`, `max:1m`, `read:2026-07-07T00:00:00Z`, `min:2026-07-07T00:00:00+02:00`.
-//!
-//! The four prefixes are distinct, so a single value is unambiguous; like every option value in
-//! this driver they are lowercase and matched exactly. Malformed values are rejected
-//! with `InvalidArgument`. Set the option to an empty string to unset it (which is also how a
-//! statement clears a bound inherited from its connection).
+//! The four prefixes are distinct, so a value is unambiguous; like every option value in this
+//! driver they are lowercase and matched exactly. Malformed values are rejected with
+//! `InvalidArgument`, and an empty string unsets (which is also how a statement clears a bound
+//! inherited from its connection).
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

@@ -1,22 +1,13 @@
 //! Per-query optimizer options.
 //!
 //! Spanner lets every query carry
-//! [`QueryOptions`](google_cloud_spanner::model::execute_sql_request::QueryOptions) that select the
-//! query optimizer's behaviour: an **optimizer version** (a version string such as `"6"` or
-//! `"latest"`) and an **optimizer statistics package** (a named statistics package to plan against).
-//! This module parses the two driver options that expose them and applies the stored values onto the
-//! query statement builder:
-//!
-//! - [`OPTION_QUERY_OPTIMIZER_VERSION`](crate::OPTION_QUERY_OPTIMIZER_VERSION)
-//!   (`spanner.query.optimizer_version`) — the optimizer version. Connection and statement level.
-//! - [`OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE`](crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE)
-//!   (`spanner.query.optimizer_statistics_package`) — the optimizer statistics package. Connection
-//!   and statement level.
-//!
-//! Like the read-staleness and request-tag options, the connection's values become the default for
-//! statements it creates (which may override them), setting an empty string unsets a value, and
-//! every option round-trips through `get_option`. The values are opaque strings passed through to
-//! Spanner unchanged; the driver validates only that the option is a string.
+//! [`QueryOptions`](google_cloud_spanner::model::execute_sql_request::QueryOptions) selecting an
+//! **optimizer version** and an **optimizer statistics package**. This module parses the two driver
+//! options that expose them ([`OPTION_QUERY_OPTIMIZER_VERSION`](crate::OPTION_QUERY_OPTIMIZER_VERSION)
+//! and
+//! [`OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE`](crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE))
+//! and applies them onto the query statement builder. Both values are opaque strings passed through
+//! to Spanner unchanged; the driver validates only that the option is a string.
 
 use google_cloud_spanner::model::execute_sql_request::QueryOptions;
 use google_cloud_spanner::statement::StatementBuilder;
