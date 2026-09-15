@@ -1494,19 +1494,25 @@ fn ddl_update_timeout_fires_on_a_silent_admin_endpoint() {
          other reason"
     );
 }
-/// A server that accepts `ExecuteStreamingSql`, delivers **one** row, then goes silent forever
-/// (the stream is held open, nothing more arrives and nothing ever errors).
+/// A server that accepts `ExecuteStreamingSql`, delivers `rows` one-row messages, then goes silent
+/// forever (the stream is held open, nothing more arrives and nothing ever errors).
+///
+/// `rows = 1` lets the initial execute settle the schema and blocks the *next* chunk fetch;
+/// `rows = 0` sends nothing at all, so the block happens inside `execute` itself — which is what
+/// separates the `fetch` deadline from the `query` one.
 ///
 /// Returns the server together with the Arc that keeps every scripted stream's sender alive — the
 /// caller must hold it for as long as the stream must stay silent rather than end.
-fn silent_after_one_row_server() -> (MockServer, Arc<Mutex<Vec<PartialResultSetSender>>>) {
+fn silent_stream_server(rows: usize) -> (MockServer, Arc<Mutex<Vec<PartialResultSetSender>>>) {
     let open_streams: Arc<Mutex<Vec<PartialResultSetSender>>> = Arc::new(Mutex::new(Vec::new()));
     let streams_in_mock = open_streams.clone();
     let server = MockServer::start(move |mock| {
         mock.expect_execute_streaming_sql().returning(move |_| {
-            let (tx, rx) = tokio::sync::mpsc::channel(1);
-            tx.try_send(Ok(partial_result_set(true, &["v1"], b"rt-1", false)))
-                .expect("first message fits the channel");
+            let (tx, rx) = tokio::sync::mpsc::channel(rows.max(1));
+            for i in 0..rows {
+                tx.try_send(Ok(partial_result_set(i == 0, &["v1"], b"rt-1", false)))
+                    .expect("scripted stream channel sized to fit");
+            }
             streams_in_mock.lock().unwrap().push(tx);
             Ok(tonic::Response::new(rx))
         });
@@ -1514,7 +1520,7 @@ fn silent_after_one_row_server() -> (MockServer, Arc<Mutex<Vec<PartialResultSetS
     (server, open_streams)
 }
 
-/// Point a statement at [`silent_after_one_row_server`] with one row per batch, so `execute`
+/// Point a statement at [`silent_stream_server`] with one row per batch, so `execute`
 /// settles the schema on the delivered row and the *next* chunk fetch — the one the prefetch task
 /// runs, and the only one `spanner.rpc.timeout_seconds.fetch` bounds — blocks on the silence.
 fn silent_stream_reader(
@@ -1562,7 +1568,7 @@ fn fetch_timeout_fires_on_a_silent_stream() {
         "fetch_timeout_fires_on_a_silent_stream",
     );
 
-    let (server, _open_streams) = silent_after_one_row_server();
+    let (server, _open_streams) = silent_stream_server(1);
     let mut connection = server.connect();
 
     // Time from before `execute`: the fetch deadline cannot start ticking any earlier, so the
@@ -1632,7 +1638,7 @@ fn silent_stream_without_the_fetch_deadline_never_times_out() {
         "silent_stream_without_the_fetch_deadline_never_times_out",
     );
 
-    let (server, _open_streams) = silent_after_one_row_server();
+    let (server, _open_streams) = silent_stream_server(1);
     let mut connection = server.connect();
     let mut reader = silent_stream_reader(&mut connection, None);
 
@@ -1654,6 +1660,66 @@ fn silent_stream_without_the_fetch_deadline_never_times_out() {
             second.map(|r| r.map(|b| b.num_rows()))
         ),
     }
+}
+
+/// The **query** twin of [`fetch_timeout_fires_on_a_silent_stream`]:
+/// `spanner.rpc.timeout_seconds.query` bounds the initial execute — the RPC plus the first chunk —
+/// so a stream that is silent *from the very first message* must fail `execute` itself rather than
+/// hang. Until this test the query deadline only ever fired in `tests/integration.rs`, against the
+/// emulator; here it is deterministic and offline.
+///
+/// **Why this is not vacuous.** The mock sends nothing at all — not even the result metadata — so
+/// the only thing that can end the call is a driver-side deadline, and the *fetch* deadline is
+/// deliberately left unset (`silent_stream_reader(.., None)`), so it cannot be the one that fires.
+/// The error message names the option that expired, which pins which of the two it was. The
+/// sibling [`silent_stream_without_the_fetch_deadline_never_times_out`] already establishes that
+/// nothing else in the stack turns this silence into an error on its own.
+#[test]
+fn query_timeout_fires_on_a_stream_that_is_silent_from_the_start() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "query_timeout_fires_on_a_stream_that_is_silent_from_the_start",
+    );
+
+    let (server, _open_streams) = silent_stream_server(0);
+    let mut connection = server.connect();
+
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_RPC_TIMEOUT_QUERY.into()),
+            OptionValue::Double(0.5),
+        )
+        .expect("set the query deadline");
+    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+
+    let started = Instant::now();
+    let error = statement
+        .execute()
+        .err()
+        .expect("an execute blocked on a silent stream must expire its query deadline");
+    let elapsed = started.elapsed();
+
+    assert_eq!(error.status, AdbcStatus::Timeout, "got error: {error}");
+    assert!(
+        error
+            .message
+            .contains(adbc_spanner::OPTION_RPC_TIMEOUT_QUERY),
+        "the execute timeout error must name the query option (and so not the fetch one): {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("timed out after 0.5s"),
+        "the error must report the deadline that fired: {}",
+        error.message
+    );
+    // The deadline — not a transport failure racing it — is what ended the call: a refused
+    // connection or a reset comes back in single-digit milliseconds.
+    assert!(
+        elapsed >= Duration::from_millis(500),
+        "execute failed after {elapsed:?}, before the 0.5s query deadline could fire — the stream \
+         died for some other reason"
+    );
 }
 
 /// A new operation on the statement must not **un-cancel** a live streamed reader from an earlier
@@ -1972,10 +2038,14 @@ fn cancelled_ingest_commit_reports_ambiguous_outcome() {
         "cancelled_ingest_commit_reports_ambiguous_outcome",
     );
 
-    let server = MockServer::start(|mock| {
+    let commits = Arc::new(AtomicUsize::new(0));
+    let commits_in_mock = commits.clone();
+    let server = MockServer::start(move |mock| {
         serve_begin_transaction(mock);
-        mock.expect_commit()
-            .returning(|_| Err(tonic::Status::cancelled("commit cancelled by peer")));
+        mock.expect_commit().returning(move |_| {
+            commits_in_mock.fetch_add(1, Ordering::SeqCst);
+            Err(tonic::Status::cancelled("commit cancelled by peer"))
+        });
     });
 
     let mut connection = server.connect();
@@ -2005,6 +2075,14 @@ fn cancelled_ingest_commit_reports_ambiguous_outcome() {
         error.message.contains("outcome is unknown") && error.message.contains("duplicate rows"),
         "a cancelled chunk commit must flag its ambiguous outcome, not imply exact accounting: {}",
         error.message
+    );
+    // The ambiguity the message reports is only real if the driver left it alone: retrying the
+    // cancelled chunk is exactly what would turn "unknown outcome" into duplicate rows, so the
+    // commit must have been attempted once and not replayed.
+    assert_eq!(
+        commits.load(Ordering::SeqCst),
+        1,
+        "a cancelled chunk commit must not be retried — that is the ambiguity under test"
     );
 }
 
@@ -2862,8 +2940,8 @@ fn isolation_level_reaches_transaction_options_on_the_begin() {
 ///    `mutation_key`, then a `Commit` by transaction id with the ingest's two mutations — and no
 ///    `ExecuteBatchDml` at all (an unexpected one would also hit the unscripted-RPC catch-all).
 /// 2. **DML + mutations**: `ExecuteBatchDml` runs the buffered statement (inline-beginning the
-///    read/write transaction), and its `Commit` carries the buffered mutation; any explicit begin
-///    on this path has no `mutation_key`.
+///    read/write transaction), and its `Commit` carries the buffered mutation; because that begin
+///    is inline, the `BeginTransaction` count must still be the one the write-only path issued.
 #[test]
 fn mutations_only_manual_commit_uses_the_write_only_path() {
     let _watchdog = Watchdog::arm(
@@ -3019,10 +3097,16 @@ fn mutations_only_manual_commit_uses_the_write_only_path() {
         "a commit with buffered DML must run it via ExecuteBatchDml (the read/write runner)"
     );
     {
+        // The runner begins its read/write transaction *inline* on `ExecuteBatchDml` (the count
+        // asserted just above proves the batch ran), so no second `BeginTransaction` may appear —
+        // and in particular none carrying the write-only path's `mutation_key`. Asserting the
+        // count is what makes that check real: a `skip(1).all(...)` over the requests would be
+        // vacuously true here, since there is no second request to look at.
         let begins = begins.lock().unwrap();
-        assert!(
-            begins.iter().skip(1).all(|b| b.mutation_key.is_none()),
-            "only the write-only path begins with a mutation_key; the runner's begin has none"
+        assert_eq!(
+            begins.len(),
+            1,
+            "the DML commit must reuse the inline begin, not issue a second BeginTransaction: {begins:?}"
         );
     }
     {
@@ -3813,6 +3897,125 @@ fn directed_read_reaches_the_wire_on_queries_but_never_on_dml() {
     );
     assert_eq!(batch_dml[0].statements.len(), 1);
     assert_eq!(batch_dml[0].statements[0].sql, INSERT_SQL);
+}
+
+/// (wire): `spanner.query.optimizer_version` and `spanner.query.optimizer_statistics_package` must
+/// reach Spanner as the `ExecuteSqlRequest.query_options` the driver builds from them
+/// (`QueryOptionsConfig::apply_to_statement`, applied through `SpannerStatement::sql_builder`).
+/// Both options are otherwise only observable through `get_option`, which a driver that accepted
+/// and stored them while never putting them on the request would satisfy just as well — and the
+/// values are opaque pass-through strings, so nothing else in the stack would notice.
+///
+/// Also pins the option's two levels, as the staleness and directed-read wire tests do: the first
+/// query *inherits* both connection-level values, the second *overrides* them on the statement, and
+/// a third proves the two knobs are independent (setting only one leaves the other inherited).
+#[test]
+fn query_optimizer_options_reach_the_wire_on_queries() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "query_optimizer_options_reach_the_wire_on_queries",
+    );
+
+    let requests: Arc<Mutex<Vec<v1::ExecuteSqlRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let record = requests.clone();
+    let server = MockServer::start(move |mock| {
+        mock.expect_execute_streaming_sql()
+            .returning(move |request| {
+                record.lock().unwrap().push(request.into_inner());
+                Ok(stream_of(vec![Ok(partial_result_set(
+                    true,
+                    &["v1"],
+                    b"qo-1",
+                    true,
+                ))]))
+            });
+    });
+
+    let mut connection = server.connect();
+    // Connection-level values; statements inherit them at creation (and may override them).
+    for (key, value) in [
+        (adbc_spanner::OPTION_QUERY_OPTIMIZER_VERSION, "6"),
+        (
+            adbc_spanner::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE,
+            "auto_20260101",
+        ),
+    ] {
+        connection
+            .set_option(
+                OptionConnection::Other(key.into()),
+                OptionValue::String(value.into()),
+            )
+            .expect("set the connection-level query optimizer option");
+    }
+
+    let mut run_query = |sql: &str, overrides: &[(&str, &str)]| {
+        let mut statement = connection.new_statement().expect("new statement");
+        for (key, value) in overrides {
+            statement
+                .set_option(
+                    OptionStatement::Other((*key).into()),
+                    OptionValue::String((*value).into()),
+                )
+                .expect("set the statement-level query optimizer option");
+        }
+        statement.set_sql_query(sql).unwrap();
+        statement
+            .execute()
+            .expect("query against mock server")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect batches");
+    };
+    run_query("SELECT c FROM Inherited", &[]);
+    run_query(
+        "SELECT c FROM Overridden",
+        &[
+            (adbc_spanner::OPTION_QUERY_OPTIMIZER_VERSION, "latest"),
+            (
+                adbc_spanner::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE,
+                "custom_package",
+            ),
+        ],
+    );
+    run_query(
+        "SELECT c FROM PartlyOverridden",
+        &[(adbc_spanner::OPTION_QUERY_OPTIMIZER_VERSION, "7")],
+    );
+
+    let requests = requests.lock().unwrap();
+    let options_for = |sql: &str| {
+        requests
+            .iter()
+            .find(|request| request.sql == sql)
+            .unwrap_or_else(|| panic!("no ExecuteSqlRequest for {sql:?}"))
+            .query_options
+            .clone()
+    };
+    assert_eq!(requests.len(), 3, "one request per query");
+    assert_eq!(
+        options_for("SELECT c FROM Inherited"),
+        Some(v1::execute_sql_request::QueryOptions {
+            optimizer_version: "6".to_string(),
+            optimizer_statistics_package: "auto_20260101".to_string(),
+        }),
+        "both connection-level values must be inherited onto the request's query_options"
+    );
+    assert_eq!(
+        options_for("SELECT c FROM Overridden"),
+        Some(v1::execute_sql_request::QueryOptions {
+            optimizer_version: "latest".to_string(),
+            optimizer_statistics_package: "custom_package".to_string(),
+        }),
+        "statement-level values must override the inherited connection-level ones on the wire"
+    );
+    assert_eq!(
+        options_for("SELECT c FROM PartlyOverridden"),
+        Some(v1::execute_sql_request::QueryOptions {
+            optimizer_version: "7".to_string(),
+            optimizer_statistics_package: "auto_20260101".to_string(),
+        }),
+        "the two knobs are independent: overriding the version must leave the inherited \
+         statistics package in place"
+    );
 }
 
 /// SPAN-7 (wire): every mutation-free autocommit `ExecuteBatchDml` batch is by construction the
@@ -4851,15 +5054,34 @@ fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_pat
         "retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_path",
     );
 
-    // A 50ms budget against a 10ms backoff: the unary loop gives up well inside the probe cap.
+    // Control: with the budget **unset**, nothing bounds the unary retry loop — only the mock's
+    // own cap stops it. Measuring it here rather than assuming it makes the bounded run below a
+    // comparison against an observed baseline instead of against a constant that might coincide
+    // with it.
+    let unbounded = unary_attempts(
+        adbc_spanner::OPTION_RETRY_MAX_ELAPSED_SECONDS,
+        OptionValue::String(String::new()),
+    );
+    assert_eq!(
+        unbounded,
+        RETRY_PROBE_CAP + 1,
+        "with no elapsed budget the unary retry loop must run until the mock's cap ends it"
+    );
+
+    // A 150ms budget against the constant 10ms backoff (gax applies *full* jitter, so each delay
+    // is drawn from 0..=10ms) plus a loopback RPC: this machine lands in the high single digits.
+    // The assertion is a band rather than a count because the loop is wall-clock driven, so the
+    // exact number is machine speed — but both ends carry weight. `< unbounded` proves the budget
+    // fired at all; `>= 2` proves it did not simply abandon the very first failure, which is how a
+    // too-small budget would make this test pass for the wrong reason.
     let unary = unary_attempts(
         adbc_spanner::OPTION_RETRY_MAX_ELAPSED_SECONDS,
-        OptionValue::Double(0.05),
+        OptionValue::Double(0.15),
     );
     assert!(
-        unary < RETRY_PROBE_CAP,
-        "a 50ms elapsed budget must exhaust the unary retry loop, but it ran {unary} attempts \
-         (the probe cap is {RETRY_PROBE_CAP})"
+        (2..unbounded).contains(&unary),
+        "a 150ms elapsed budget must bound the unary retry loop without collapsing it to a single \
+         attempt, but it ran {unary} (unbounded: {unbounded})"
     );
 
     // The streaming loop runs until the mock stops it: the budget never fires.
