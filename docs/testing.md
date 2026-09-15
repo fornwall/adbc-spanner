@@ -63,11 +63,22 @@ flowchart TD
 
 ## Emulator integration tests
 
-[`tests/integration.rs`](../tests/integration.rs) runs the whole driver end-to-end against a local
-[Cloud Spanner emulator](https://cloud.google.com/spanner/docs/emulator): schema setup via the admin
-clients, DML insert, typed `SELECT`, partitioned execution, and an **FFI smoke test** that loads the
-built cdylib through the ADBC driver manager (the `AdbcSpannerInit` C entrypoint) and runs a query.
-It is gated on `SPANNER_EMULATOR_HOST` and self-skips when unset.
+Two binaries run the driver end-to-end against a local
+[Cloud Spanner emulator](https://cloud.google.com/spanner/docs/emulator). Both are gated on
+`SPANNER_EMULATOR_HOST` and self-skip when unset.
+
+- [`tests/integration.rs`](../tests/integration.rs) — the driver's behaviour: schema setup via the
+  admin clients, DML, typed `SELECT`, bulk ingest, manual transactions, partitioned execution,
+  `get_objects`/`get_statistics`, and an **FFI smoke test** that loads the built cdylib through the
+  ADBC driver manager (the `AdbcSpannerInit` C entrypoint) and runs a query.
+- [`tests/ffi_lifecycle.rs`](../tests/ffi_lifecycle.rs) — the raw C-ABI lifecycle battery, driving
+  the cdylib through `libloading` rather than the managed wrappers, so it reaches double-release,
+  error-struct reuse and stream-release paths the managed API never hits. Its queries are table-less
+  `GENERATE_ARRAY`s, so it needs no schema and takes no serialization guard.
+
+Both binaries must be named explicitly in CI — `cargo test --test integration` alone does **not**
+run the second one, so a new `tests/*.rs` needs a matching edit in
+[`ci.yml`](../.github/workflows/ci.yml).
 
 ```sh
 scripts/with-emulator.sh cargo test          # runs the emulator in Docker, then tears it down

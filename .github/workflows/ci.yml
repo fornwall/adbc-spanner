@@ -102,7 +102,9 @@ jobs:
         run: cargo test --doc --all-features
 
       - name: Integration tests (Spanner emulator)
-        run: cargo test --test integration
+        # Name every emulator-backed binary explicitly. A new `tests/*.rs` does NOT
+        # run here until it is added, so adding one means editing this line too.
+        run: cargo test --test integration --test ffi_lifecycle
 
   # End-to-end test of the Python package (python/) against the emulator: build
   # the driver, drop it into the package exactly as the wheel job does, install
