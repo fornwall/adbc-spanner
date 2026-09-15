@@ -179,56 +179,27 @@ spanner.connect(db_kwargs={
 })
 ```
 
-## Connection options
+## Options
 
-`connect()` takes just three keyword arguments — every driver setting travels as an option key,
-best spelled with the `DatabaseOptions` / `ConnectionOptions` / `StatementOptions` constants (see
-[Typed option keys](#typed-option-keys)):
+`connect()` takes three keyword arguments, and every other driver setting travels as an option key:
 
 | kwarg          | Description                                                                                                                                |
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `db_kwargs=`   | Database-level options, keyed with the `DatabaseOptions` constants (credentials, emulator, endpoint, …). See the table below.               |
-| `conn_kwargs=` | Connection-level options, keyed with the `ConnectionOptions` constants (`adbc.connection.*` / `spanner.*`), e.g. `ConnectionOptions.READONLY`. |
-| `autocommit=`  | `False` (the DBAPI default) groups statements into manual transactions (queries or DML — one kind each; DDL always applies immediately); `True` applies each immediately — see [Transactions](#transactions). |
+| `db_kwargs=`   | Database-level options (credentials, emulator, endpoint, …). A `uri` is required; everything else is optional.                              |
+| `conn_kwargs=` | Connection-level options (`adbc.connection.*` / `spanner.*`).                                                                               |
+| `autocommit=`  | `False` (the DBAPI default) groups statements into manual transactions; `True` applies each immediately — see [Transactions](#transactions). |
 
-A database URI is required; everything else is optional. The database-level credential and
-endpoint options are:
+Statement-level options go per cursor, either as `conn.cursor(adbc_stmt_kwargs={...})` or as
+`cur.adbc_statement.set_options(...)`.
 
-| `DatabaseOptions` member       | Raw key                                       | Description                                                                                     |
-| ------------------------------ | --------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `URI`                          | `uri`                                         | A `spanner://` connection URI whose path is the database path, e.g. `spanner:///projects/<p>/instances/<i>/databases/<d>` (**required**). The scheme is required; a bare path is rejected. Query parameters may name database options, but **not** the secret-holding `KEYFILE_JSON` / `ACCESS_TOKEN` (URIs get logged). |
-| `ENDPOINT`                     | `spanner.endpoint`                            | Explicit gRPC endpoint (e.g. an emulator at `localhost:9010`); defaults to production Spanner.   |
-| `EMULATOR`                     | `spanner.emulator`                            | `"true"` to connect with anonymous credentials for the emulator.                                |
-| `KEYFILE`                      | `spanner.auth.keyfile`                        | Path to a service-account / credential JSON file (default: Application Default Credentials).     |
-| `KEYFILE_JSON`                 | `spanner.auth.keyfile_json`                   | The same credential JSON passed inline as a string instead of a file path. Write-only: never readable back via `get_option`, and not accepted as a `URI` query parameter — pass it here instead. |
-| `ACCESS_TOKEN`                 | `spanner.auth.access_token`                   | OAuth 2.0 bearer token sent verbatim (no refresh); mutually exclusive with the keyfile / impersonation options. Write-only: never readable back via `get_option`, and not accepted as a `URI` query parameter — pass it here instead. |
-| `IMPERSONATE_TARGET_PRINCIPAL` | `spanner.auth.impersonate.target_principal`   | Service account to impersonate on top of the base credentials.                                  |
-| `IMPERSONATE_DELEGATES`        | `spanner.auth.impersonate.delegates`          | Delegation chain for impersonation — a comma-separated string of emails.                         |
-| `IMPERSONATE_SCOPES`           | `spanner.auth.impersonate.scopes`             | OAuth scopes for the impersonated token (comma-separated; default cloud-platform).              |
-| `IMPERSONATE_LIFETIME`         | `spanner.auth.impersonate.lifetime`           | Lifetime of the impersonated token, in seconds (default `3600`).                                |
-
-Every other setting is passed the same way — via `db_kwargs=` (database-level), `conn_kwargs=`
-(connection-level), or per cursor with `conn.cursor(adbc_stmt_kwargs={...})`. The complete,
-authoritative list — every option with its type, default, and behaviour — is in
-[docs/options.md](https://github.com/fornwall/adbc-spanner/blob/main/docs/options.md). A few that
-are handy from Python:
-
-| `ConnectionOptions` / `StatementOptions` member | Raw key                    | Level      | Description                                                                                   |
-| ----------------------------------------------- | -------------------------- | ---------- | --------------------------------------------------------------------------------------------- |
-| `ConnectionOptions.READONLY`                    | `adbc.connection.readonly` | connection | `"true"` rejects all writes on the connection (see below); queries still run.                 |
-| `READ_STALENESS`                                | `spanner.read.staleness`   | conn/stmt  | Serve reads from a bounded-stale snapshot, e.g. `"max:10s"` or `"exact:5s"`, for lower latency. |
-| `DIRECTED_READ`                                 | `spanner.directed_read`    | conn/stmt  | Steer read-only queries to specific replicas, e.g. `"include:us-east1:read_only"` or `"exclude:us-central1"`. |
-| `MAX_COMMIT_DELAY`                              | `spanner.commit.max_delay` | conn/stmt  | Max delay Spanner may add to a read/write commit to batch it with others, e.g. `"100ms"` (a duration in `0..=500ms`) — trades a little latency for throughput. |
-| `COMMIT_STATS`                                  | `spanner.commit_stats`     | conn/stmt  | `"true"` requests commit statistics on read/write commits; read the mutation count of the most recent commit back with `get_option_int("spanner.commit_stats.mutation_count")` (on the statement for autocommit DML / bulk ingest, on the connection for a manual-mode commit). |
-| `EXCLUDE_TXN_FROM_CHANGE_STREAMS`               | `spanner.transaction.exclude_from_change_streams` | conn/stmt | `"true"` excludes the transaction's writes from change-stream capture (only for change streams created with `allow_txn_exclusion = true`); applies to DML/ingest write commits and the BatchWrite path. |
-| `QUERY_OPTIMIZER_VERSION`                       | `spanner.query.optimizer_version` | conn/stmt | Pin the query optimizer version, e.g. `"6"` or `"latest"` (also `QUERY_OPTIMIZER_STATISTICS_PACKAGE`). |
-| `StatementOptions.ROWS_PER_BATCH`               | `spanner.rows_per_batch`   | statement  | Rows per streamed Arrow batch (default `8192`); lower it to cap peak memory.                   |
-
-### Typed option keys
-
-The `DatabaseOptions`, `ConnectionOptions`, and `StatementOptions` enums (each member's `.value` is
-the raw key) are the recommended way to name options — for typo-safety and discoverability, the same
-style as the BigQuery ADBC driver's `DatabaseOptions`:
+**Every option in
+[docs/options.md](https://github.com/fornwall/adbc-spanner/blob/main/docs/options.md) works here** —
+that page is the authoritative reference for each one's type, default, allowed values and
+round-trip behaviour. The `DatabaseOptions`, `ConnectionOptions` and `StatementOptions` enums in
+`adbc_driver_spanner` mirror those keys one for one: each member's `.value` *is* the raw key
+(`DatabaseOptions.KEYFILE.value == "spanner.auth.keyfile"`). Naming options through the enums is the
+recommended style — for typo-safety and discoverability, the same convention as the BigQuery ADBC
+driver — but a raw string works anywhere an enum value does.
 
 ```python
 import adbc_driver_spanner.dbapi as spanner
@@ -250,75 +221,25 @@ with spanner.connect(
 reads, so a `max:<d>`/`min:<t>` bound is pinned there to its most-stale legal equivalent: exact
 staleness `<d>` / read timestamp `<t>`.)
 
-The enums cover the full option surface for the `db_kwargs=` / `conn_kwargs=` /
-`adbc_stmt_kwargs=` escape hatches. Every key is documented in
-[docs/options.md](https://github.com/fornwall/adbc-spanner/blob/main/docs/options.md).
-
-### Read-only connections
-
-Pass `conn_kwargs={ConnectionOptions.READONLY.value: "true"}` to guarantee a connection can only
-read — any `INSERT`/`UPDATE`/`DELETE`, DDL, or bulk ingest raises, while queries still run:
-
-```python docs-test: skip
-import adbc_driver_spanner.dbapi as spanner
-from adbc_driver_spanner import ConnectionOptions, DatabaseOptions
-
-with spanner.connect(db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/p/instances/i/databases/d"},
-                     conn_kwargs={ConnectionOptions.READONLY.value: "true"}) as conn:
-    conn.cursor().execute("SELECT 1")   # ok
-    # any INSERT/UPDATE/DELETE, DDL or adbc_ingest raises
-```
-
-The guarantee also covers `conn.commit()`: in the default manual-transaction mode DML buffers
-until commit (see [Transactions](#transactions)), so a connection turned read-only *after* some
-DML was buffered raises `ProgrammingError` on `conn.commit()` — and on switching the connection to
-autocommit, which commits pending work — instead of writing. The transaction stays open and
-replayable: clear
-the flag and commit again to apply it, or `conn.rollback()` (never gated — discarding buffered work
-writes nothing) to discard it. Committing a query transaction is likewise always allowed.
-
-### Smaller result batches
-
-Results stream back as Arrow record batches. Lower `spanner.rows_per_batch` on the cursor to cap
-peak memory on a wide or large result:
-
-```python
-import adbc_driver_spanner.dbapi as spanner
-from adbc_driver_spanner import DatabaseOptions, StatementOptions
-
-with spanner.connect(
-    db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
-) as conn:
-    with conn.cursor() as cur:
-        cur.adbc_statement.set_options(**{StatementOptions.ROWS_PER_BATCH.value: "1024"})
-        cur.execute("SELECT SingerId, FirstName FROM Singers")
-        reader = cur.fetch_record_batch()    # batches of <= 1024 rows
-        table = reader.read_all()
-```
+**Read-only connections.** `conn_kwargs={ConnectionOptions.READONLY.value: "true"}` guarantees a
+connection can only read: any `INSERT`/`UPDATE`/`DELETE`, DDL or `adbc_ingest` raises, and so does
+`conn.commit()` if DML was buffered before the flag went on — the transaction stays open and
+replayable, and `conn.rollback()` is never gated. Queries still run.
 
 ## Transactions
 
 A DBAPI connection is **autocommit-off by default**, so statements run in manual transactions
 ended by `conn.commit()` (or discarded by `conn.rollback()`). A manual transaction is exactly one
 kind of work — **queries or DML** — fixed by its *first* statement; a statement of the other kind
-raises `adbc_driver_manager.ProgrammingError` (ADBC `InvalidState`) until you commit or roll back:
+raises `adbc_driver_manager.ProgrammingError` (ADBC `InvalidState`) until you commit or roll back.
+Queries in such a transaction share one consistent snapshot and ending it costs no round-trip; DML
+is **buffered** and applied atomically on `conn.commit()`, so there are no read-your-writes. **DDL
+is not transaction-aware**: `CREATE`/`ALTER`/`DROP` always apply immediately, `rollback()` cannot
+undo them, and DDL issued after buffered DML executes *before* it.
 
-- **Queries share one snapshot.** The first query opens a Spanner multi-use read-only
-  transaction, and every query until `commit()`/`rollback()` reads from that same consistent
-  snapshot — rows committed by others in the meantime stay invisible. Ending a query transaction
-  is free (Spanner read-only transactions need no commit RPC), so commit or roll back as soon as
-  you no longer need the snapshot.
-- **DML is buffered — no read-your-writes.** `INSERT`/`UPDATE`/`DELETE` (and bulk ingest) buffer
-  and apply atomically on `conn.commit()`. A query inside a DML transaction could not see the
-  buffered writes, so it is rejected rather than silently returning a stale (*pre-insert*)
-  result.
-- **DDL is not transaction-aware.** `CREATE`/`ALTER`/`DROP` always apply **immediately** (Spanner
-  DDL runs through the admin API and is never transactional — the same no-special-handling
-  approach as the ADBC BigQuery driver), regardless of the transaction: `commit()` is not needed
-  and `rollback()` cannot undo them, and DDL issued after buffered DML executes *before* it. A
-  `;`-separated DDL batch still applies as one `UpdateDatabaseDdl` call.
-
-Connect with `autocommit=True` if you want every statement to apply immediately.
+Connect with `autocommit=True` if you want every statement to apply immediately. The full model is
+in
+[docs/transactions.md](https://github.com/fornwall/adbc-spanner/blob/main/docs/transactions.md).
 
 ```python
 import adbc_driver_spanner.dbapi as spanner
