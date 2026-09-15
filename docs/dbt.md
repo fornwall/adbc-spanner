@@ -1,12 +1,15 @@
 # dbt on Spanner: an autocommit materialization strategy (design sketch)
 
-> **Status: forward-looking design sketch — not an implemented or official adapter.** There is no
-> `dbt-spanner` adapter in this repository (or anywhere) today, and nothing on this page is a
-> supported feature. It reasons about *how* a future [dbt](https://docs.getdbt.com/) adapter built on
-> the `adbc-spanner` driver would implement its core materializations, and why the design is anchored
-> on **autocommit** rather than multi-statement transactions. The SQL shown is illustrative: it is
-> checked against Cloud Spanner's documented GoogleSQL dialect and against how *this* driver actually
-> behaves, but no adapter emits it. See the [README](../README.md) for the driver's real capabilities.
+> **Status: forward-looking design sketch — not an implemented or official adapter, and not
+> maintained in lockstep with the driver.** There is no `dbt-spanner` adapter in this repository (or
+> anywhere) today, and nothing on this page is a supported feature. It reasons about *how* a future
+> [dbt](https://docs.getdbt.com/) adapter built on the `adbc-spanner` driver would implement its core
+> materializations, and why the design is anchored on **autocommit** rather than multi-statement
+> transactions. The SQL shown is illustrative: no adapter emits it.
+>
+> Nothing here is a source of truth about the driver. Before relying on any statement about driver
+> behaviour, check it against the [README](../README.md),
+> [docs/options.md](options.md) and [docs/transactions.md](transactions.md), which own those facts.
 
 ## The pieces
 
@@ -44,30 +47,19 @@ non-transactional-DDL warehouse — is to run in **autocommit** and get atomicit
 
 ## Why autocommit, concretely
 
-This driver defaults to autocommit. Setting `adbc.connection.autocommit=false` enters a manual mode
-that **buffers** DML and applies it in one read/write transaction at `commit`. For a dbt
-materialization that mode is the wrong tool, for three independent reasons:
+This driver defaults to autocommit. Its manual mode
+(`adbc.connection.autocommit=false`) is the wrong tool for a dbt materialization on all three of the
+counts that matter here — one kind of work per transaction, no read-your-writes on buffered DML, and
+DDL that is not in the transaction at all and can reorder ahead of it. Each is documented, with its
+reason, in [docs/transactions.md](transactions.md).
 
-- **One kind of work per transaction.** A manual transaction is exactly one of **queries or DML**,
-  fixed by its first statement; a statement of the other kind fails with `InvalidState` until
-  `commit`/`rollback`.
-- **No read-your-writes.** Writes stay buffered until commit, so a query could never see them —
-  rather than silently returning the pre-insert state, the driver **rejects** the query (the rule
-  above). A build that reads a table it just wrote fails loudly instead of being quietly wrong, but
-  it still cannot work as written.
-- **DDL is not in the transaction at all.** DDL executes immediately through the admin API, so a
-  `CREATE TABLE` issued *after* a buffered `INSERT` actually runs *before* it, and `rollback` cannot
-  undo it. Program order across DDL and buffered DML is not preserved.
-
-Autocommit sidesteps all of this: **each statement commits before the next runs**, so a table that
+Autocommit sidesteps all of it: **each statement commits before the next runs**, so a table that
 step *N* writes is fully visible to step *N+1* and the sequence reads like ordinary sequential SQL.
 The price — no cross-statement atomicity — is paid back by making the *only* step that publishes the
 new data a single atomic one.
 
 > **Do not** set `adbc.connection.autocommit=false` around a multi-step materialization expecting to
 > read intermediate writes back. Use autocommit plus a rename swap.
-
-See [docs/transactions.md](transactions.md) for the full transaction semantics.
 
 ## Dialect notes the adapter must honour
 
@@ -298,9 +290,8 @@ Beyond credentials, several options are directly useful in a profile or per-mode
 ## Summary
 
 Spanner has no CTAS and no transactional DDL, so a dbt adapter cannot lean on transaction-wrapped
-builds — and this driver's manual mode (one kind of work per transaction, buffered DML, no
-read-your-writes, DDL applied immediately and out of order) makes wrapping a materialization in
-`autocommit=false` actively incorrect. The workable design, mirroring `dbt-bigquery`, runs entirely in
+builds — and this driver's manual mode makes wrapping a materialization in `autocommit=false`
+actively incorrect. The workable design, mirroring `dbt-bigquery`, runs entirely in
 **autocommit** so each step is committed and visible to the next, and takes its atomicity from a
 single **`RENAME TABLE` swap** for tables and from individually-complete **`INSERT OR UPDATE`**
 statements for incremental and snapshot models. Seeds ride the driver's native bulk-ingest path. None
