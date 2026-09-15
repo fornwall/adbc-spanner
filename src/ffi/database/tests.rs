@@ -166,7 +166,7 @@ fn setting_the_same_option_twice_keeps_the_later_value() {
     );
     assert_eq!(
         get(&mut database, adbc_core::constants::ADBC_OPTION_URI).unwrap(),
-        "projects/p/instances/i/databases/second"
+        "spanner:///projects/p/instances/i/databases/second"
     );
     assert_eq!(release(&mut database), ADBC_STATUS_OK);
 }
@@ -212,7 +212,7 @@ fn a_failed_init_keeps_the_buffered_options_for_a_retry() {
     );
     assert_eq!(
         get(&mut database, adbc_core::constants::ADBC_OPTION_URI).unwrap(),
-        DATABASE
+        format!("spanner:///{DATABASE}")
     );
     assert_eq!(
         get(&mut database, crate::OPTION_ENDPOINT).unwrap(),
