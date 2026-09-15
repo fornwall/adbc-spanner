@@ -16,156 +16,66 @@ Early, tested end-to-end against the Spanner emulator.
 
 ## Spanner ADBC quirks
 
-- Spanner does not support returning columnar results directly - rows are pulled from Spanner and
-  converted to Arrow in bounded chunks (with configurable size).
-- DML: A `;`-separated batch (e.g. `DELETE; INSERT`) runs atomically in one read/write transaction using
-  [batch DML](https://docs.cloud.google.com/spanner/docs/samples/spanner-dml-batch-update). A batch
-  must be all-DML: mixing in a query or DDL is rejected up front with `InvalidArguments` (before
-  anything is buffered in a manual transaction).
-- DDL (`CREATE`/`ALTER`/`DROP`/`RENAME`/…): Routed to the Database Admin `UpdateDatabaseDdl` API. A
-  `;`-separated batch (e.g. a intermediate-table build then rename swap) is submitted as a single
-  [schema change](https://docs.cloud.google.com/spanner/docs/schema-updates) near-atomic (but not
-  truly atomic, as Spanner does not support atomic DDL) operation.
+- Spanner returns rows, not columns: rows are pulled in bounded chunks and converted to Arrow on
+  demand (`spanner.rows_per_batch`, default 8192), with a background task prefetching the next chunk.
+- DML: a `;`-separated batch (e.g. `DELETE; INSERT`) runs atomically in one read/write transaction
+  using [batch DML](https://docs.cloud.google.com/spanner/docs/samples/spanner-dml-batch-update). A
+  batch must be all-DML: mixing in a query or DDL is rejected up front with `InvalidArguments`.
+- DDL (`CREATE`/`ALTER`/`DROP`/`RENAME`/…): routed to the Database Admin `UpdateDatabaseDdl` API. A
+  `;`-separated batch is submitted as a single
+  [schema change](https://docs.cloud.google.com/spanner/docs/schema-updates) — near-atomic, but not
+  truly atomic, since Spanner has no atomic DDL.
 
 ## Supported optional ADBC functionality
 
-- [Bulk ingestion](https://arrow.apache.org/adbc/current/format/specification.html#bulk-ingestion)
-  are supported.
-    - Maps to [insert mutations](https://docs.cloud.google.com/spanner/docs/modify-mutation-api).
-    - The ingest commits in one transaction when it fits Spanner's
-      [per-commit limits](https://docs.cloud.google.com/spanner/quotas#limits-for). A larger ingest
-      in autocommit mode is automatically split into chunks that fits those limits, in which case the
-      ingestion is **not atomic as a whole**. In a manual transaction the mutations are buffered —
-      unchunked — and committed atomically with any buffered DML on `commit`; but note the transaction
-      limits.
-    - All four `adbc.ingest.mode` values are supported: `create` (the ADBC spec default — create
-      the table first, failing if it exists),
-      `append` (insert into an existing table), `create_append` (create if absent, then insert) and
-      `replace` (drop and recreate).
-      The three create modes build the table from the ingest data's Arrow schema and declare **no
-      primary key**: the ingest data carries none, and Spanner keys a keyless table on a
-      [hidden `rowid` column](https://cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys)
-      of its own that no `SELECT *` (and neither `get_table_schema` nor `get_objects`) returns — so the
-      created table holds exactly the columns you ingested. A primary key fixes Spanner's physical row
-      layout, so choosing one is the user's call, not the driver's: `CREATE TABLE … PRIMARY KEY (…)`
-      yourself and ingest with `append`, which is also the only way duplicate rows conflict. For non-atomic,
-      high-throughput ("firehose") loads, set `spanner.ingest.batch_write=true` to route an autocommit
-      ingest's per-chunk mutations through Spanner's **BatchWrite** RPC instead of a write-only
-      transaction (insert/count/error semantics and chunking preserved; BatchWrite applies its mutation
-      groups non-atomically). It only affects autocommit ingests — a manual transaction ignores it and
-      still buffers and commits atomically. The priority and transaction-tag options apply on that path;
-      the request-tag option does not (Spanner ignores per-request tags on BatchWrite), and neither do
-      `commit.max_delay` / `commit_stats`, since BatchWrite carries no per-request commit options.
-- Manual transactions (setting `adbc.connection.autocommit=false` plus `commit()`/`rollback()`):
-    - A manual transaction is exactly **one of two kinds — queries or DML — fixed by its first
-      statement**; a statement of the other kind is rejected with `InvalidState` until `commit()`
-      or `rollback()` ends the transaction.
-    - **Queries**: the first data-returning query opens one multi-use read-only transaction, and
-      every query in the transaction runs on it — a single consistent snapshot, pinned at the
-      first query's `spanner.read.staleness` bound (rows committed by others mid-transaction stay
-      invisible until the transaction ends). `commit()`/`rollback()` are local no-ops on the wire:
-      Spanner read-only transactions need no commit or rollback RPC. (`execute_partitions` is
-      allowed but runs in its own batch read-only transaction — it does not share the snapshot;
-      `execute_schema`, a plan-only probe, stays outside the transaction model entirely.)
-    - **DML**: DML statements and bulk-ingest insert mutations are buffered and applied
-      atomically in one read/write transaction on commit, so `execute_update` returns `None`
-      rather than an affected-row count — the count is unknown until the buffered batch commits.
-      A transaction that buffered **only mutations** (bulk ingests, no DML) commits through
-      Spanner's replay-protected write-only commit instead, which applies the mutations exactly
-      once even across ambiguous transport failures (a replayed read/write commit could apply
-      them twice).
-      Because writes are buffered, a DML transaction has **no read-your-writes**; that is exactly
-      why a query inside it is rejected rather than silently returning a *pre-insert* result. The
-      buffer-and-commit shape follows from the preview client exposing read/write transactions
-      only through a closure-based runner; it will be revisited once the client exposes
-      begin/commit handles. DML with a
-      [`THEN RETURN`](https://cloud.google.com/spanner/docs/dml-returning) clause returns its
-      rows: `execute()` yields them as an Arrow result (autocommit mode only — buffered manual
-      transactions cannot produce them).
-    - **DDL is not transaction-aware** — the same no-special-handling approach as the ADBC
-      BigQuery driver: DDL always executes **immediately** through the admin API (Spanner DDL is
-      never transactional), regardless of the transaction state. It neither fixes the
-      transaction's kind nor is rejected by it; `commit()` is not needed and `rollback()` cannot
-      undo it; and DDL issued after buffered DML executes *before* it (the DML/DDL reorder
-      caveat). A `;`-separated DDL batch still applies as one `UpdateDatabaseDdl` call.
-- Transaction isolation level — the adbc.connection.transaction.isolation_level option is honored for serializable,
-  repeatable_read, snapshot, and default. serializable, repeatable_read and snapshot map natively onto Spanner's two
-  levels — snapshot included, since Spanner implements repeatable read as snapshot isolation — while default sends no
-  level, which Spanner reads as serializable. The three levels Spanner does not natively expose are promoted upward to
-  the weakest supported level that still satisfies them (read_uncommitted/read_committed → repeatable_read;
-  linearizable → serializable), which is spec-permitted and safe; get_option reports the effective level, and an
-  unknown level string is still rejected. It applies only to the driver's read/write transactions (autocommit DML and
-  the manual-mode DML commit); query-kind manual transactions are Spanner read-only snapshot reads, which take no
-  isolation level, so the option is inert on them.
-- Parameter binding: `bind`/`bind_stream` an Arrow batch whose columns become Spanner named
-  parameters; each bound row runs the statement once. How columns pair with the query's `@name`
-  parameters is set by the `adbc.statement.bind_by_name` statement option (the [SQLite reference
-  driver's convention](https://github.com/apache/arrow-adbc/issues/3362)), a boolean defaulting to
-  `false`: **positional** (the default) binds the *i*-th bound column to the *i*-th distinct
-  parameter in query order, ignoring column names — the ADBC ordinal contract that positional
-  clients and validation suites rely on; **`true`** is strict by-name (a column `id` binds `@id`,
-  order-independent), where a bound column that names no query parameter fails with
-  `InvalidArguments` naming the missing parameter — for clients whose column names are authoritative
-  and may not match the parameters' textual order. A bound *query*
-  over several rows executes all of them in one shared read-only snapshot (a multi-use read-only
-  transaction at the configured staleness bound), so the per-row results are mutually consistent,
-  and its results stream in `spanner.rows_per_batch` chunks like any other query. Because Spanner
-  accepts the bounded-staleness kinds only on single-use transactions, a `max:<d>`/`min:<t>` bound
-  is pinned there to its most-stale legal equivalent (exact staleness `<d>` / read timestamp `<t>`).
-- Metadata: `get_table_types()`, `get_table_schema()`, and `get_objects()` (catalog/schema/table/
-  column introspection from `INFORMATION_SCHEMA`; columns report the Spanner-native type, e.g.
-  `STRING(MAX)`, as `xdbc_type_name`).
-- Statistics: `get_statistics()` computes exact table/column counts with one aggregate scan per table
-  — `ROW_COUNT`, and per column `NULL_COUNT` (plus `DISTINCT_COUNT` for groupable types). Spanner has
-  no cheap pre-computed statistics, so an `approximate` request gets the same exact scans (exact
-  values always satisfy an approximate request, and each row is flagged as not approximate);
-  `get_statistic_names` is empty (Spanner has no custom named statistics).
-- `execute_schema()`: a query's result schema without running it (via `QueryMode::Plan`), so tools
-  can introspect output columns — including a top-level `WITH` — with no data scan.
-- Partitioned execution: `execute_partitions()` splits a query into independently executable
-  partitions via Spanner's `PartitionQuery` API, each serialized as a self-contained opaque ADBC
-  descriptor, and `Connection::read_partition()` streams one partition's rows back as Arrow.
-  `spanner.data_boost` bakes [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview)
-  into the descriptors; Spanner chooses the partition count.
-  **A descriptor is opaque but *executable*** — it carries the SQL text plus the session and
-  transaction identity, and `read_partition()` runs whatever it contains with the connection's
-  credentials — and it is **not** authenticated, so transport descriptors only over trusted channels
-  and never execute one from an untrusted source.
-- Read-only connections — `adbc.connection.readonly=true` is supported, making the connection reject all writes while still
-  allowing queries. The commit paths are covered too: committing a manual transaction's buffered DML/ingest work (via
-  `commit()`, or by re-enabling `adbc.connection.autocommit`) is rejected while the flag is set, leaving the transaction
-  open and replayable; `rollback()` and committing a query transaction still work — neither writes.
-- execute_schema() (ADBC 1.1.0) — returns a query's result schema without executing it, via Spanner's QueryMode::Plan.
-- Cancellation (ADBC 1.1.0) — both Connection::get_cancel_handle() and Statement::get_cancel_handle() return a handle whose try_cancel() interrupts an in-flight operation.
-- Bulk ingest — the `adbc.ingest.*` surface (the four `adbc.ingest.mode` values, plus
-  `adbc.ingest.target_table` / `target_db_schema`) is implemented over native Spanner mutations.
-  `adbc.ingest.target_catalog` and `adbc.ingest.temporary` are accepted only at their spec-default
-  values (`""` and `false`) as no-ops, so generic clients that always set them keep working; a
-  non-empty catalog or `temporary=true` fails with `NotImplemented` (Spanner has a single unnamed
-  catalog and no temporary tables).
-- Statistics (ADBC 1.1.0) — get_statistics() returns exact row/null/distinct counts and get_statistic_names() returns a
-  correctly-typed empty result.
-- Typed option getters (ADBC 1.1.0) — get_option_int(), get_option_double(), and get_option_bytes() are implemented alongside
-  the string getter.
-- Parameter schema — get_parameter_schema() describes a parameterized statement's bind parameters
-  with their real Spanner-inferred types: a `QueryMode: PLAN` probe returns the statement's
-  undeclared parameters typed from the surrounding SQL (an INSERT's `@p` targeting an `INT64`
-  column comes back as Arrow `Int64`, a `JSON` parameter carries the `arrow.json` extension tag).
-  Queries plan in a read-only transaction; DML plans in a read/write transaction (the plan executes
-  nothing and commits empty). A parameter the probe cannot type — DDL, DML on a read-only
-  connection, or a type the SQL context doesn't pin down — is reported as Arrow `Null`, ADBC's
-  convention for an undetermined parameter type.
-- get_objects with constraints — catalog/schema/table/column introspection including foreign-key constraint_column_usage, not
-  just the minimal object listing.
-- Current catalog / schema options (ADBC 1.1.0) — adbc.connection.catalog / adbc.connection.db_schema are accepted, but only
-  the default empty value is valid: Spanner has a single unnamed catalog, and although it supports named schemas (addressed by
-  qualified name, e.g. sales.Orders, and enumerated by get_objects) it has no settable session/current schema to point at one.
-- adbc.statement.bind_by_name — the SQLite-reference-driver bind-by-name convention is honored (a de-facto optional convention
-  rather than a formal spec option).
+Every option named here is specified in full in **[docs/options.md](docs/options.md)**.
+
+- **Streaming queries** — `execute()` returns a lazy Arrow `RecordBatchReader`.
+- **DML and DDL** — `execute_update()`, including `;`-separated batches and
+  [`THEN RETURN`](https://cloud.google.com/spanner/docs/dml-returning) rows (autocommit only).
+- **Manual transactions** — `adbc.connection.autocommit=false` plus `commit()`/`rollback()`. A
+  transaction is exactly one kind of work, queries *or* DML, fixed by its first statement; DDL is
+  never transaction-aware. See **[docs/transactions.md](docs/transactions.md)**.
+- **Isolation levels** — `adbc.connection.transaction.isolation_level`, honoured for read/write
+  transactions and inert on queries.
+- **Read-only connections** — `adbc.connection.readonly=true` rejects every write, including the
+  commit of buffered work, while queries still run.
+- **Parameter binding** — `bind`/`bind_stream` an Arrow batch whose columns become Spanner `@name`
+  parameters; each bound row runs the statement once, and a multi-row bound *query* shares one
+  read-only snapshot. Positional by default; `adbc.statement.bind_by_name=true` switches to strict
+  by-name.
+- **Bulk ingest** — the `adbc.ingest.*` surface, shipped as native
+  [insert mutations](https://docs.cloud.google.com/spanner/docs/modify-mutation-api) rather than
+  per-row `INSERT` DML. All four `adbc.ingest.mode` values work; the three table-building modes
+  declare **no primary key**, so Spanner keys the table on a
+  [hidden `rowid`](https://cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys)
+  of its own and the created table holds exactly the columns you ingested. An autocommit ingest too
+  large for one commit is split into chunks, so it is **not atomic as a whole**.
+- **Partitioned execution** — `execute_partitions()` / `read_partition()`, optionally on
+  [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview). **A partition
+  descriptor is opaque but *executable*** — it carries the SQL text plus session and transaction
+  identity, is **not** authenticated, and `read_partition()` runs it with the connection's
+  credentials, so transport descriptors only over trusted channels.
+- **`execute_schema()`** — a query's result schema without running it, via `QueryMode::Plan`.
+- **`get_parameter_schema()`** — bind parameters typed by a PLAN probe from the surrounding SQL; a
+  parameter the probe cannot type is reported as Arrow `Null`, ADBC's "type undetermined".
+- **Metadata** — `get_info()`, `get_objects()` (including foreign-key `constraint_column_usage`;
+  columns report the Spanner-native type, e.g. `STRING(MAX)`, as `xdbc_type_name`),
+  `get_table_types()`, `get_table_schema()`.
+- **Statistics** — `get_statistics()` computes exact `ROW_COUNT` / `NULL_COUNT` / `DISTINCT_COUNT`
+  with one aggregate scan per table; Spanner has no cheaper pre-computed source, so an
+  `approximate` request gets the same exact scans (each row flagged as not approximate).
+  `get_statistic_names()` is an empty, correctly-typed result set.
+- **Cancellation** — `Connection::get_cancel_handle()` / `Statement::get_cancel_handle()`. The
+  signal is sticky: it interrupts the in-flight call and stays latched until the object's next
+  operation, so a cancel between chunk fetches still cancels the next fetch.
+- **Typed option getters** — `get_option_int()`, `get_option_double()` and `get_option_bytes()`.
+- **Current catalog / schema** — `adbc.connection.catalog` and `adbc.connection.db_schema` are
+  accepted at their empty default only (see below).
 
 ## Unsupported optional ADBC functionality
 
-- [Substrait](https://substrait.io/) plans are unsupported.
+- [Substrait](https://substrait.io/) plans — Spanner executes GoogleSQL/PostgreSQL text.
 - Incremental `execute_partitions` — `adbc.statement.exec.incremental` accepts only the spec default
   `false`; `true` fails with `NotImplemented`.
 - Temporary ingest tables — `adbc.ingest.temporary=true` fails with `NotImplemented` (Spanner has
@@ -183,62 +93,33 @@ Early, tested end-to-end against the Spanner emulator.
   call the driver makes to read or write data — with its transaction semantics, batching limits and
   the driver's call sites — and what the driver deliberately does not use.
 - Connecting to production Spanner or a [Spanner emulator](https://docs.cloud.google.com/spanner/docs/emulator).
-- [Timestamp bounds](https://cloud.google.com/spanner/docs/timestamp-bounds): Queries read at a
-  [strong](https://docs.cloud.google.com/spanner/docs/timestamp-bounds#strong) bound by default.
-  Bounded or exact staleness can be achieved through ADBC options.  
+- [Timestamp bounds](https://cloud.google.com/spanner/docs/timestamp-bounds): queries read at a
+  [strong](https://docs.cloud.google.com/spanner/docs/timestamp-bounds#strong) bound by default;
+  bounded or exact staleness through ADBC options.
 - [Request priorities](https://cloud.google.com/blog/topics/developers-practitioners/introducing-request-priorities-cloud-spanner-apis)
-  are supported through ADBC options. Default is high priority.
-- [Request and transaction tags](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags)
-  are supported through ADBC options.
-- [Directed reads](https://cloud.google.com/spanner/docs/directed-reads) are supported through ADBC options.
-- [Commit statistics](https://docs.cloud.google.com/spanner/docs/commit-statistics) are supported
-  through ADBC options.
-- [Custom timeouts](https://docs.cloud.google.com/spanner/docs/custom-timeout-and-retry) are
-  supported through ADBC options.
-- [Retry policies](https://docs.cloud.google.com/spanner/docs/custom-timeout-and-retry)
-  are supported through ADBC options.
-- [Throughput optimized writes](https://docs.cloud.google.com/spanner/docs/throughput-optimized-writes)
-  are supported through ADBC options.
-- [Change streams](https://cloud.google.com/spanner/docs/change-streams) work through the driver's
-  ordinary SQL paths — no dedicated support is needed. `CREATE CHANGE STREAM … FOR <table>` /
-  `DROP CHANGE STREAM` run through the DDL path like any other DDL; the stream is introspectable via
-  `INFORMATION_SCHEMA.CHANGE_STREAMS` / `CHANGE_STREAM_TABLES`; and its generated
+  (default high),
+  [request and transaction tags](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags),
+  [directed reads](https://cloud.google.com/spanner/docs/directed-reads),
+  [commit statistics](https://docs.cloud.google.com/spanner/docs/commit-statistics),
+  [custom timeouts and retry policies](https://docs.cloud.google.com/spanner/docs/custom-timeout-and-retry),
+  [throughput optimized writes](https://docs.cloud.google.com/spanner/docs/throughput-optimized-writes)
+  and [partitioned DML](https://docs.cloud.google.com/spanner/docs/dml-partitioned) — all through
+  ADBC options.
+- [Change streams](https://cloud.google.com/spanner/docs/change-streams) ride the ordinary SQL
+  paths: `CREATE`/`DROP CHANGE STREAM` through the DDL path, `INFORMATION_SCHEMA.CHANGE_STREAMS` /
+  `CHANGE_STREAM_TABLES` as plain queries, and the generated
   [`READ_<stream>` table-valued function](https://cloud.google.com/spanner/docs/change-streams/details#change_streams-query-syntax)
-  runs as an ordinary query, with the driver mapping its nested `ChangeRecord`
-  (`data_change_record` / `heartbeat_record` / `child_partitions_record`) natively to Arrow.
+  as an ordinary query whose nested `ChangeRecord` maps natively to Arrow.
 - Error reporting: a Spanner/gRPC failure maps onto the closest ADBC status, keeps the exact numeric
   gRPC code in the ADBC error's `vendor_code` (so a retry loop can detect `ABORTED` = 10 precisely),
   and forwards the response's structured
   [`google.rpc.Status` details](https://cloud.google.com/apis/design/errors) into the ADBC error's
-  *details*: each detail becomes a `(key, value)` pair whose key is the lowercased proto type name
-  (e.g. `google.rpc.errorinfo`, `google.rpc.retryinfo`) and whose value is the detail's ProtoJSON
-  encoding as UTF-8 bytes (self-describing via `"@type"`; no `-bin` key suffix since the value is
-  text, not binary protobuf). These let a caller see *why* a call failed beyond the status code —
-  for example `google.rpc.QuotaFailure` on `RESOURCE_EXHAUSTED`, `google.rpc.BadRequest` /
-  `ErrorInfo` on `INVALID_ARGUMENT`, or `google.rpc.PreconditionFailure` on `FAILED_PRECONDITION`.
-  One caveat for C callers using the ADBC **1.1.0** error layout: there the spec reserves
-  `vendor_code` as the discriminant that marks the error as carrying details
-  (`ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA`, `INT32_MIN`), so the driver must stamp that sentinel over
-  the numeric gRPC code — and hands the code back as one more detail, keyed
-  `adbc.spanner.vendor_code` with its decimal value as text (`10` for `ABORTED`), present only when
-  there is a gRPC code to report. Rust consumers and C callers using the 1.0.0 layout read the code
-  straight from `vendor_code` as described above.
-  (Spanner's `RetryInfo` on `ABORTED` is forwarded the same way, but rarely reaches a caller: the
-  client's read/write transaction runner retries aborted transactions itself — consuming that
-  `retryDelay` for its own backoff — so an `ABORTED` normally never surfaces from a DML/commit
-  path.) Note this per-detail, type-name-keyed ProtoJSON layout deliberately diverges from the
-  Flight SQL ADBC driver, which emits a single `grpc-status-details-bin` detail holding the whole
-  `google.rpc.Status` as binary protobuf — so a consumer written to Flight SQL's convention won't
-  interoperate. The reason is that the pinned preview client decodes details into serde-modelled
-  types whose only supported encoding is ProtoJSON, with no binary-protobuf path.
-  On a `PERMISSION_DENIED` (which maps to `Unauthorized`), the driver additionally *appends* a short
-  IAM-guidance string to the error message. Spanner's own message already names the missing permission
-  (e.g. `spanner.databases.select`), which is preserved verbatim, so the driver does not re-parse it
-  or name a specific role; it appends a fixed hint to grant an IAM role that includes the missing
-  permission and links <https://cloud.google.com/spanner/docs/iam>. (No predefined role is named —
-  matching the ADBC BigQuery driver, whose only fixed auth guidance is a re-authentication hint plus a
-  doc link and names no roles either.) The guidance only augments the message; the status,
-  `vendor_code` and forwarded details are unchanged.
+  *details* — each keyed by the lowercased proto type name (`google.rpc.errorinfo`,
+  `google.rpc.quotafailure`, …) with the detail's ProtoJSON encoding as the value. On a
+  `PERMISSION_DENIED` (→ `Unauthorized`) the driver appends a short IAM hint to the message;
+  Spanner's own message already names the missing permission and is preserved verbatim.
+  See [docs/adbc.md § Errors](docs/adbc.md#7-errors) for the C-ABI 1.1.0 wrinkle, and
+  `src/error.rs` for the full contract.
 
 ## Shared library (loadable driver)
 
@@ -253,37 +134,21 @@ To build one yourself: `cargo build --release` → `target/release/libadbc_spann
 ### Configuration options
 
 Options exist at three levels — **database**, **connection** and **statement** — matching the ADBC
-object they are set on (`new_database_with_opts` or `set_option` on the database, `set_option` on
-the connection, `set_option` on the statement). Driver-specific options use the bare `spanner.*`
-prefix; the standard `adbc.*` (spec) options the driver honours — autocommit, read-only, isolation
-level, bulk ingest, and so on — are accepted alongside them.
+object they are set on. Driver-specific options use the bare `spanner.*` prefix; the standard
+`adbc.*` (spec) options the driver honours are accepted alongside them.
 
 **[docs/options.md](docs/options.md) is the complete, authoritative reference**: every option, at
 each level, with its exact type and allowed values, default, and `get_option` round-trip behaviour.
 
 The Spanner database is set with the standard `uri` database option, a **connection URI** with the
-`spanner://` scheme: its path is the database path, and its query parameters are database-level
-options (see [docs/options.md](docs/options.md#connection-uris)):
+`spanner://` scheme — its path is the database path, its query parameters are database-level
+options (grammar and rules in
+[docs/options.md § Connection URIs](docs/options.md#connection-uris)):
 
 ```text
 spanner:///projects/p/instances/i/databases/d?spanner.endpoint=http://localhost:9010&spanner.emulator=true
 spanner://localhost:9010/projects/p/instances/i/databases/d
 ```
-
-The `spanner://` scheme is **required** — a bare database path is rejected (this matches the ADBC
-BigQuery driver, whose `uri` likewise requires the `bigquery://` scheme). The URI path is the
-database path; an optional `//host:port` authority becomes `spanner.endpoint`
-(write `spanner:///projects/…`, with three slashes, when no
-endpoint host is intended). Query parameters must be database-level option names (unknown
-keys are rejected); values are percent-decoded per RFC 3986 (`+` is a literal plus, not a space).
-The two secret-holding options, `spanner.auth.keyfile_json` and `spanner.auth.access_token`, are
-**not** accepted as query parameters — a URI is routinely logged (shell history, process listings,
-tracing spans), so set those as options directly; `spanner.auth.keyfile`, a path, is fine in a URI.
-The URI is expanded into the individual options immediately when it is set, so precedence is
-plain last-writer-wins: an option set after the URI overrides it, and a URI set after an option
-overwrites only the fields the URI actually carries. `get_option("uri")` returns the URI verbatim —
-the exact string last set, query parameters included — so a dumped configuration replays into the
-same state (`NotFound` until one is set; a rejected URI is never stored).
 
 ### Authentication
 
@@ -295,63 +160,25 @@ Credentials are resolved in this order:
    `spanner.auth.impersonate.target_principal`, or `spanner.auth.access_token`) is refused at connect time
    rather than silently ignoring them; ambient ADC (e.g. `GOOGLE_APPLICATION_CREDENTIALS`) does not
    conflict.
-2. **Access token** — a caller-supplied OAuth 2.0 bearer token via `spanner.auth.access_token` (see
-   below).
+2. **Access token** — a caller-supplied OAuth 2.0 bearer token via `spanner.auth.access_token`, sent
+   verbatim with no refresh. Mutually exclusive with the keyfile and impersonation options.
 3. **Service account** — a key supplied inline via `spanner.auth.keyfile_json` or read from the path
    in `spanner.auth.keyfile`.
 4. **[Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)**
    otherwise (e.g. `GOOGLE_APPLICATION_CREDENTIALS`, gcloud login, or the metadata server).
 
+[Service-account impersonation](https://cloud.google.com/iam/docs/service-account-impersonation)
+(`spanner.auth.impersonate.*`) layers on top of whichever of those is in effect, and
+`spanner.auth.quota_project` decouples the project billed for API quota from the one owning the
+data; both groups are specified in
+[docs/options.md § Database options](docs/options.md#database-options).
+
 The two secret-holding options — `spanner.auth.keyfile_json` (a live private key) and
 `spanner.auth.access_token` (a live bearer token) — are **write-only**: reading either back via
-`get_option` always fails with `NotFound`, whether the option is set or not, so tooling that dumps
-connection options never prints a usable credential. They likewise cannot be passed as `uri` query
-parameters — a connection URI is the most-logged configuration artifact there is — so they must be
-set as options directly. `spanner.auth.keyfile` is a filesystem path, not a secret: it stays
-readable and remains valid in a URI.
-
-#### OAuth access token
-
-Setting `spanner.auth.access_token` authenticates with a bearer token you have already obtained out of
-band — for example from `gcloud auth print-access-token`, a Workload Identity exchange, or another
-auth library. The token is sent verbatim as the `Authorization: Bearer <token>` header on every
-request and is **never refreshed**, so you are responsible for supplying a valid, unexpired token
-(and re-connecting once it expires). Because it is a complete credential on its own, it is mutually
-exclusive with `spanner.auth.keyfile`, `spanner.auth.keyfile_json`, and
-`spanner.auth.impersonate.target_principal` — combining them is refused at connect time.
-
-#### Service-account impersonation
-
-Setting `spanner.auth.impersonate.target_principal` layers
-[service-account impersonation](https://cloud.google.com/iam/docs/service-account-impersonation) on
-top of whichever base credentials above are in effect: the base credentials call the IAM Credentials
-`generateAccessToken` API to mint a short-lived token for the target service account, and the driver
-authenticates as that target. The option group follows gcloud's `--impersonate-service-account`
-(and `google-cloud-auth`'s `impersonated` builder) naming:
-
-- `spanner.auth.impersonate.target_principal` — the target service-account email (**required** to enable
-  impersonation; when unset, authentication is unchanged).
-- `spanner.auth.impersonate.delegates` — an optional delegation chain (comma-separated), where each
-  service account has the *Token Creator* role on the next and the last on the target.
-- `spanner.auth.impersonate.scopes` — optional OAuth scopes (comma-separated); defaults to the
-  `cloud-platform` scope.
-- `spanner.auth.impersonate.lifetime` — optional token lifetime in seconds; defaults to `3600` (one hour).
-
-#### Quota / billing project
-
-Setting `spanner.auth.quota_project` charges the named project for Spanner API quota — sent as the
-`x-goog-user-project` request header — while the data stays owned by whatever project the database
-path names. This is needed when the credential's home project differs from the target project, or in
-resource-sharing setups; the caller must hold `serviceusage.services.use` on the quota project. It
-mirrors the BigQuery ADBC driver's `bigquery.auth.quota_project` (and gcloud's `--billing-project`).
-
-The value is attached to whichever credentials are in effect (Application Default Credentials,
-`spanner.auth.keyfile`/`spanner.auth.keyfile_json`, impersonation, or `spanner.auth.access_token`), so it composes
-with every credential path. It is a bare project id — not a secret — so it round-trips through
-`get_option`, and `""` unsets it. It is refused in emulator mode (which forces anonymous credentials
-and ignores billing), like the credential options. If the `GOOGLE_CLOUD_QUOTA_PROJECT` environment
-variable is set, the underlying auth library gives it precedence over this option. End-to-end billing
-behaviour can only be observed against a real project, not the emulator.
+`get_option` always fails with `NotFound`, whether set or not, so tooling that dumps connection
+options never prints a usable credential. They likewise cannot be passed as `uri` query parameters —
+a connection URI is the most-logged configuration artifact there is. `spanner.auth.keyfile` is a
+filesystem path, not a secret: it stays readable and remains valid in a URI.
 
 ## Type mapping
 
