@@ -75,6 +75,27 @@ fn begin_operation_does_not_uncancel_an_earlier_operations_signal() {
     assert_eq!(cancelled.unwrap_err().status, Status::Cancelled);
 }
 
+// The ADBC cancel handle always reports success, even with nothing in flight — adbc.h asks for
+// `InvalidState` there, but the driver cannot tell idle from a live streamed reader (see
+// `SlotCancelHandle`). The latch such a cancel sets is superseded by the next operation.
+#[test]
+fn cancel_handle_reports_ok_when_nothing_is_in_flight() {
+    let runtime = new_runtime().unwrap();
+    let slot = Arc::new(CancelSlot::new());
+    let handle = SlotCancelHandle::new(slot.clone());
+    assert!(
+        handle.try_cancel().is_ok(),
+        "an idle cancel still reports Ok"
+    );
+    let cancel = slot.begin_operation();
+    let result: Result<i32> = block_on_cancellable(&runtime, &cancel, async { Ok(5) });
+    assert_eq!(
+        result.unwrap(),
+        5,
+        "the idle cancel did not arm the next operation"
+    );
+}
+
 /// One step of a [`ScriptedSource`]: a ready chunk (or error), or a fetch that never completes.
 enum Step {
     Chunk(Result<Vec<i32>>),

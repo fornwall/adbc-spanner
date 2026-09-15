@@ -248,7 +248,10 @@ The Arrow → Spanner value mapping and the ingest table-building logic are in
   credential and only move it over trusted channels.)
 - **`cancel`** — interrupt an in-flight operation. The cancel signal is *sticky*: it interrupts the
   current blocking Spanner call and stays latched until the object's next operation, so a cancel
-  landing between the chunk fetches of a streamed result still cancels the next fetch.
+  landing between the chunk fetches of a streamed result still cancels the next fetch. A cancel
+  with **nothing** in flight returns OK rather than the `INVALID_STATE` adbc.h asks for (the driver
+  does not track operation liveness) and is otherwise a no-op — the latch it sets is superseded by
+  the object's next operation.
 
 ---
 

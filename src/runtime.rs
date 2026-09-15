@@ -142,6 +142,17 @@ impl CancelSlot {
 /// one running when it was minted — which is exactly what sharing the owner's [`CancelSlot`]
 /// through an [`Arc`] gives: `signal` always latches the slot's *current* signal, the same target
 /// the deprecated `cancel()` method had.
+///
+/// **Known deviation from adbc.h**, which documents `AdbcStatementCancel`/`AdbcConnectionCancel` as
+/// returning `ADBC_STATUS_INVALID_STATE` "if there is no query to cancel": [`Self::try_cancel`] is
+/// unconditionally `Ok`. The driver does not track whether an operation is in flight, and doing so
+/// accurately is harder than it looks — an operation's lifetime runs past the entry point that
+/// started it, until every reader it produced is released. Only the *streaming* readers hold a
+/// [`CancelSignal`], so any liveness test derived from the signal would call a connection idle right
+/// after `get_objects` (a fully materialized reader) and reject a cancel the C++ validation suite's
+/// `MetadataGetObjectsCancel` requires to succeed. The PostgreSQL reference driver is equally
+/// permissive. A cancel with nothing in flight latches the slot's current signal, which the next
+/// [`CancelSlot::begin_operation`] supersedes — so it is a no-op beyond the `Ok`.
 #[derive(Debug)]
 pub(crate) struct SlotCancelHandle(Arc<CancelSlot>);
 
@@ -152,6 +163,8 @@ impl SlotCancelHandle {
 }
 
 impl CancelHandle for SlotCancelHandle {
+    /// Always `Ok`, including with nothing in flight — see the type's doc for why the
+    /// `InvalidState`-when-idle the ADBC spec asks for is not implemented.
     fn try_cancel(&self) -> Result<()> {
         self.0.signal();
         Ok(())

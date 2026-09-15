@@ -145,8 +145,8 @@ pub(super) unsafe extern "C" fn statement_cancel(
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
     // Dispatch-free on purpose, through the handle stored at `statement_new`; see
-    // `handle::cancel`. With no operation in flight it reports `InvalidState`, which is exactly
-    // what ADBC asks for.
+    // `handle::cancel`. `InvalidState` is reported only for a released handle — a cancel with no
+    // operation in flight returns OK, a documented deviation (see `SlotCancelHandle`).
     unsafe { super::handle::cancel::<State>(slot_of(statement), KIND, error) }
 }
 
