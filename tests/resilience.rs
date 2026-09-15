@@ -39,10 +39,12 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use adbc_core::error::{Error as AdbcError, Result as AdbcResult, Status as AdbcStatus};
 use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, OptionValue};
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_spanner::{SpannerConnection, SpannerDatabase, SpannerDriver};
-use arrow_array::Int64Array;
+use arrow_array::{Int64Array, RecordBatch};
+use arrow_schema::ArrowError;
 use google_cloud_lro::Poller;
 use google_cloud_spanner::client::Spanner;
 use google_cloud_spanner_admin_instance_v1::model::Instance;
@@ -510,10 +512,20 @@ fn reset_peer_surfaces_error_then_recovers() {
     toxi.remove_toxic("resil_reset");
 
     match faulted {
-        Some(result) => assert!(
-            result.is_err(),
-            "query under reset_peer should surface an error, got Ok"
+        Some(Ok(())) => panic!(
+            "query under reset_peer reported success — the RST never reached the driver \
+             (toxiproxy problem?)"
         ),
+        Some(Err(error)) => {
+            // Not a bare `is_err()`: a `NotImplemented`, an `InvalidArguments` from a malformed
+            // request or any other unrelated failure would satisfy that and prove nothing about
+            // transport handling. See `assert_transport_error`.
+            assert_transport_error(&error, "the query run under a reset_peer toxic");
+            eprintln!(
+                "reset_peer surfaced {:?} (vendor_code {}): {}",
+                error.status, error.vendor_code, error.message
+            );
+        }
         None => panic!("query under reset_peer hung past the watchdog — driver did not fail fast"),
     }
 
@@ -700,6 +712,11 @@ fn update_timeout_bounds_a_faulted_write_then_recovers_when_unset() {
         eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
         return;
     };
+    // Placed after the skip check so a plain multi-threaded `cargo test` (env unset) still skips.
+    // Required like every sibling test: `ensure_setup()` below mutates the process-global
+    // SPANNER_EMULATOR_HOST via `std::env::set_var`, which is a data race against any concurrent
+    // test thread — and this test is a prime candidate for being run alone, by name, by hand.
+    let _serial = SerialGuard::new();
     ensure_setup();
 
     let connection = Arc::new(Mutex::new(connect()));
@@ -763,7 +780,7 @@ fn update_timeout_bounds_a_faulted_write_then_recovers_when_unset() {
     );
     assert_eq!(
         error.status,
-        adbc_core::error::Status::Timeout,
+        AdbcStatus::Timeout,
         "the expired deadline must surface as ADBC Timeout; got: {error:?}"
     );
     assert!(
@@ -897,27 +914,40 @@ fn mid_stream_disconnect_after_batches_surfaces_error_then_recovers() {
     toxi.add_reset_peer("resil_midstream_reset", 0);
     let (tx, rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
-        let result: Result<Vec<_>, _> = reader.collect();
-        let _ = tx.send((result.is_err(), format!("{:?}", result.err())));
+        let _ = tx.send(drain_counting_rows(reader));
     });
     let outcome = rx.recv_timeout(Duration::from_secs(45));
     // Clear the toxic regardless, so a failure doesn't leave the proxy poisoned for other tests.
     toxi.remove_toxic("resil_midstream_reset");
 
-    let Ok((is_err, err_debug)) = outcome else {
+    let Ok((post_fault_rows, error)) = outcome else {
         panic!(
             "draining the reader after a mid-stream reset hung past the 45s watchdog — the driver \
              did not surface the disconnect"
         )
     };
     worker.join().ok();
+    let error = error.unwrap_or_else(|| {
+        panic!(
+            "a mid-stream disconnect after {consumed_rows} rows were consumed must surface an \
+             error, but the stream ended cleanly after {post_fault_rows} further rows — the \
+             driver treated a truncated stream as complete"
+        )
+    });
+    // Not a bare `is_err()`: assert this is the driver's rendering of the injected transport
+    // failure, so an unrelated error (or a driver-side guard) cannot satisfy the test.
+    let error = adbc_error_of(&error);
+    assert_transport_error(error, "the chunk fetch after a mid-stream reset");
+    // And it really was mid-stream: the query asks for every row, so a short result plus an error
+    // is the shape a truncated stream must have.
     assert!(
-        is_err,
-        "a mid-stream disconnect after {consumed_rows} rows were consumed must surface an error, \
-         got Ok — the driver treated a truncated stream as complete"
+        consumed_rows + post_fault_rows < STREAM_ROWS as usize,
+        "the reset landed after all {STREAM_ROWS} rows had been delivered — nothing was actually \
+         interrupted mid-stream"
     );
     eprintln!(
-        "mid-stream disconnect surfaced a clean error after {consumed_rows} rows: {err_debug}"
+        "mid-stream disconnect surfaced {:?} after {consumed_rows} + {post_fault_rows} rows: {}",
+        error.status, error.message
     );
 
     // Recovery: with the toxic gone, a fresh query succeeds again once the channel re-establishes.
@@ -987,29 +1017,46 @@ fn truncated_stream_surfaces_error_then_recovers() {
 
     let (tx, rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
-        let result: Result<Vec<_>, _> = reader.collect();
-        let rows: usize = result
-            .as_ref()
-            .map_or(0, |batches| batches.iter().map(|b| b.num_rows()).sum());
-        let _ = tx.send((result.is_err(), rows, format!("{:?}", result.err())));
+        let _ = tx.send(drain_counting_rows(reader));
     });
     let outcome = rx.recv_timeout(Duration::from_secs(45));
     // Clear the toxic regardless, so a failure doesn't leave the proxy poisoned for other tests.
     toxi.remove_toxic("resil_truncate");
 
-    let Ok((is_err, rows, err_debug)) = outcome else {
+    let Ok((rows, error)) = outcome else {
         panic!(
             "draining a truncated stream hung past the 45s watchdog — the driver did not surface \
              the truncation"
         )
     };
     worker.join().ok();
+    let error = error.unwrap_or_else(|| {
+        panic!(
+            "a truncated stream must surface an error, but the stream ended cleanly with {rows} \
+             rows — the driver treated a truncated result as complete (the query selects all \
+             {STREAM_ROWS} rows)"
+        )
+    });
+    // The premise of this test is that the cut lands *mid*-stream: rows must have reached the
+    // consumer before it, and the result must be short. Without both, a cap that truncated the
+    // very first fetch (or none at all) would satisfy a bare `is_err()`.
     assert!(
-        is_err,
-        "a truncated stream must surface an error, got Ok with {rows} rows — the driver treated a \
-         truncated result as complete (the query selects all {STREAM_ROWS} rows)"
+        rows > 0,
+        "no rows were delivered before the truncation — the {TRUNCATE_AFTER_BYTES}-byte cap cut \
+         the stream before any batch reached the consumer, so this did not exercise a truncation \
+         *mid*-stream"
     );
-    eprintln!("truncated stream surfaced a clean error: {err_debug}");
+    assert!(
+        rows < STREAM_ROWS as usize,
+        "all {STREAM_ROWS} rows arrived before the error — the byte cap did not truncate anything"
+    );
+    // Not a bare `is_err()`: pin the failure to the driver's transport-error path.
+    let error = adbc_error_of(&error);
+    assert_transport_error(error, "the chunk fetch that ran past the truncation point");
+    eprintln!(
+        "truncated stream surfaced {:?} after {rows} of {STREAM_ROWS} rows: {}",
+        error.status, error.message
+    );
 
     // Recovery: with the cap gone, a fresh query succeeds again once the channel re-establishes.
     let connection = Arc::new(Mutex::new(connection));
@@ -1047,20 +1094,86 @@ fn query_int(connection: &Arc<Mutex<SpannerConnection>>, sql: &str) -> i64 {
 }
 
 /// Run `SELECT 1` on the shared connection, returning the ADBC result.
-fn query_one(connection: &Arc<Mutex<SpannerConnection>>) -> adbc_core::error::Result<()> {
+///
+/// A stream failure is unwrapped back to the driver's **own** [`AdbcError`] rather than re-wrapped
+/// as `Internal`: the callers assert on `status`/`message`, and flattening every stream error to
+/// one status here would make those assertions vacuous.
+fn query_one(connection: &Arc<Mutex<SpannerConnection>>) -> AdbcResult<()> {
     let mut conn = connection.lock().expect("connection lock");
     let mut s = conn.new_statement()?;
     s.set_sql_query("SELECT 1 AS one")?;
     let reader = s.execute()?;
     for batch in reader {
-        batch.map_err(|e| {
-            adbc_core::error::Error::with_message_and_status(
-                format!("stream error: {e}"),
-                adbc_core::error::Status::Internal,
-            )
-        })?;
+        batch.map_err(|e| adbc_error_of(&e).clone())?;
     }
     Ok(())
+}
+
+/// Recover the driver's own [`AdbcError`] from an error surfaced by a streaming reader.
+///
+/// A [`RecordBatchReader`](arrow_array::RecordBatchReader)'s only error channel is [`ArrowError`],
+/// so the driver boxes its ADBC error inside `ArrowError::ExternalError` — the same wrapping
+/// `src/ffi/stream.rs` unwraps to turn a cancelled read into `ECANCELED`. Walking the source chain
+/// back down to it is what lets these tests assert on the ADBC `status` instead of grepping a
+/// stringified debug blob.
+fn adbc_error_of(error: &ArrowError) -> &AdbcError {
+    std::iter::successors(Some(error as &(dyn std::error::Error + 'static)), |error| {
+        error.source()
+    })
+    .find_map(|link| link.downcast_ref::<AdbcError>())
+    .unwrap_or_else(|| panic!("the reader error does not wrap an ADBC error: {error:?}"))
+}
+
+/// Assert that `error` is the driver's translation of a genuine **transport** failure, in the
+/// situation named by `context`.
+///
+/// A bare `assert!(result.is_err())` is satisfied by anything that fails — a `NotImplemented`, an
+/// `InvalidArguments` from a malformed request, a driver-side `InvalidState` guard — so it proves
+/// nothing about how the driver handles the injected fault. Every fault this harness injects
+/// reaches the caller through `error::from_spanner`, which
+///
+/// - prefixes the message with `Spanner error:` (a driver-side guard never does), and
+/// - maps the failure to exactly one of two statuses: [`AdbcStatus::Internal`] when the client
+///   reports a transport error carrying no gRPC status — what a `reset_peer` RST or a `limit_data`
+///   close produces, observed as `the transport reports an error: ... h2 protocol error ...` — or
+///   [`AdbcStatus::IO`] when the same fault arrives as a gRPC `UNAVAILABLE`/`ABORTED` instead.
+///
+/// Both are accepted because which of the two a TCP-level fault turns into is the client's
+/// business and not a driver contract; everything else is not this fault.
+fn assert_transport_error(error: &AdbcError, context: &str) {
+    assert!(
+        matches!(error.status, AdbcStatus::Internal | AdbcStatus::IO),
+        "{context} must fail with a transport status (Internal, or IO for a gRPC UNAVAILABLE), \
+         got {:?} (vendor_code {}): {}",
+        error.status,
+        error.vendor_code,
+        error.message
+    );
+    assert!(
+        error.message.starts_with("Spanner error:"),
+        "{context} must surface the Spanner client's own failure (a `Spanner error:` message from \
+         error::from_spanner), not a driver-side error that merely happens to be an Err; got: {}",
+        error.message
+    );
+}
+
+/// Drain a record-batch reader to exhaustion or to its first error, returning the number of rows
+/// delivered **before** that error.
+///
+/// `collect::<Result<Vec<_>, _>>()` throws the successfully-yielded batches away, which loses
+/// exactly the fact a mid-stream fault test needs: that real rows reached the consumer before the
+/// stream died, and that the result was nonetheless short.
+fn drain_counting_rows(
+    reader: impl Iterator<Item = Result<RecordBatch, ArrowError>>,
+) -> (usize, Option<ArrowError>) {
+    let mut rows = 0usize;
+    for item in reader {
+        match item {
+            Ok(batch) => rows += batch.num_rows(),
+            Err(error) => return (rows, Some(error)),
+        }
+    }
+    (rows, None)
 }
 
 /// Drive `query_one` on a worker thread and wait up to `timeout`. Returns `Some(result)` if the
@@ -1069,7 +1182,7 @@ fn query_one(connection: &Arc<Mutex<SpannerConnection>>) -> adbc_core::error::Re
 fn run_query_bounded(
     connection: &Arc<Mutex<SpannerConnection>>,
     timeout: Duration,
-) -> Option<adbc_core::error::Result<()>> {
+) -> Option<AdbcResult<()>> {
     let conn = connection.clone();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {

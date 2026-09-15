@@ -5,26 +5,54 @@ name: Resilience (fault injection)
 # Toxiproxy's admin API and asserts the driver behaves sanely (cancel interrupts an in-flight query;
 # a connection reset surfaces a clean error and then recovers).
 #
-# Non-gating on purpose (modeled on foundry-validation.yml): fault injection is inherently a bit
-# heavy and timing-sensitive, so it must never block PRs. It runs on manual dispatch and on a nightly
-# schedule. The canonical functional suites (ci.yml / adbc-validation.yml) stay the gate.
+# GATING, on every push to main and every pull request (plus manual dispatch and a nightly run that
+# additionally files a tracking issue on failure). It used to run nightly only, which meant the six
+# tests in tests/resilience.rs contributed ZERO gating coverage: `cargo test --test resilience`
+# appears nowhere else (ci.yml runs --test mock_spanner / --lib / --doc / --test integration, never a
+# bare `cargo test`), so a transport-handling regression could merge and only be noticed the next
+# morning. Making it gating was affordable because the suite is cheap and its margins are wide: the
+# whole Docker bring-up + 6 tests measured ~40s wall-clock locally (test time ~28s), and every timing
+# assertion runs an order of magnitude inside its bound (cancel lands in ~2ms against a 4s bound; the
+# 2s RPC deadline fires in ~2.0s against a 15s bound; the watchdogs are 20-45s against a 28s whole
+# suite). The job is kept in its own workflow rather than folded into ci.yml because it needs its own
+# Docker topology (an emulator with no published ports plus a host-network Toxiproxy, wired by
+# scripts/with-toxiproxy.sh) which would collide with ci.yml's emulator *service container*, and
+# because the nightly + issue-reporting leg belongs next to it.
+#
+# NOTE for repo admins: a check from any workflow only *blocks* a merge once branch protection lists
+# it as required — add "Resilience harness (emulator + Toxiproxy)" there. If it ever turns flaky,
+# demote it back to schedule-only rather than letting a red-but-ignored check erode the gate.
 #
 # Honest scope: Toxiproxy injects TRANSPORT faults only — it cannot make the emulator emit a gRPC
 # status such as ABORTED, so this harness does NOT cover Spanner's ABORTED-driven transaction replay.
 # See tests/RESILIENCE.md.
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
   schedule:
-    # Nightly at 04:30 UTC.
+    # Nightly at 04:30 UTC. The nightly run adds the tracking-issue leg below; the gating value
+    # comes from the push/pull_request triggers.
     - cron: "30 4 * * *"
+
+# Cancel superseded PR runs (a rapid re-push cancels the in-flight run for the same
+# ref); pushes to main are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
   resilience:
-    name: Resilience harness (emulator + Toxiproxy, non-gating)
+    name: Resilience harness (emulator + Toxiproxy)
     runs-on: ubuntu-latest
+    # The suite bounds every test with its own watchdog and runs in well under a minute; this is the
+    # backstop for a hang *outside* the tests (a Docker pull or an emulator that never comes up), so
+    # a wedged gating job fails in minutes instead of burning the default 6h.
+    timeout-minutes: 30
 
     # `with-toxiproxy.sh` exports TOXIPROXY_URL / SPANNER_EMULATOR_HOST for the test; this makes the
     # `toxi()` gate panic instead of self-skipping if that wiring ever breaks, so the resilience

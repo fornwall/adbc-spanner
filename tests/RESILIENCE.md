@@ -9,7 +9,7 @@ asserts the driver behaves sanely under them.
 There are two fault-injection harnesses, split by layer:
 
 - **This one (Toxiproxy) — transport faults**: latency, bandwidth throttles, TCP resets. Needs
-  Docker; non-gating CI.
+  Docker; **gating** CI (see *CI status* below).
 - **`tests/mock_spanner.rs` — logical gRPC faults**: an in-process mock
   `google.spanner.v1.Spanner` server (the pinned client's own `spanner-grpc-mock` crate) scripted
   per RPC to return exact gRPC statuses (`ABORTED` + `RetryInfo`, mid-stream `UNAVAILABLE`, a
@@ -43,18 +43,75 @@ must not overlap.
 Without `TOXIPROXY_URL` + `SPANNER_EMULATOR_HOST` set, the tests **self-skip**, so a plain
 `cargo test` stays green everywhere — exactly like `tests/integration.rs`.
 
-CI runs it non-gating via `.github/workflows/resilience.yml` (manual dispatch + nightly).
+### CI status: gating
+
+`.github/workflows/resilience.yml` runs this suite on **every push to `main` and every pull
+request** (plus manual dispatch, and a nightly run that files a tracking issue on failure). It is a
+**gate**, not a nightly-only report.
+
+It was nightly-only until then, which meant these six tests contributed *zero* gating coverage:
+`cargo test --test resilience` appears in no other workflow (`ci.yml` runs `--test mock_spanner`,
+`--lib --features fuzzing`, `--doc` and `--test integration` — never a bare `cargo test`), so a
+transport-handling regression could merge and be caught the next morning at best.
+
+Making it gating is affordable, because the suite is cheap and its assertions are not tight races:
+
+| | measured | bound |
+| --- | --- | --- |
+| whole suite (6 tests, serial) | ~28s | `timeout-minutes: 30` on the job |
+| Docker bring-up + run, end to end | ~40s | — |
+| cancel latency (`cancel_interrupts_in_flight_query`) | ~2ms | 4s |
+| RPC deadline (`update_timeout_bounds_…`) | ~2.0s, for a 2s deadline | 15s |
+| per-test hang watchdogs | never reached | 20-45s |
+
+Every timing assertion therefore has one to three orders of magnitude of headroom, which is what
+makes the suite safe on a shared CI runner. It stays in its **own workflow** rather than moving into
+`ci.yml` because it needs its own Docker topology (an emulator with no published ports plus a
+host-network Toxiproxy, wired by `scripts/with-toxiproxy.sh`) which would collide with `ci.yml`'s
+emulator *service container*, and because the nightly + issue-filing leg belongs beside it.
+
+Two operational notes:
+
+- A check from a separate workflow blocks a merge only once **branch protection** lists it as
+  required: add *Resilience harness (emulator + Toxiproxy)*.
+- If it ever does turn flaky, **demote it back to schedule-only** (drop the `push`/`pull_request`
+  triggers) rather than leaving a red check people learn to ignore — that erodes every other gate
+  too.
 
 ## What the harness injects, and what each test proves
 
 | Toxic | Test | Assertion |
 | --- | --- | --- |
 | `bandwidth` (downstream throttle) | `cancel_interrupts_in_flight_query` | Throttling a ~48 MB result to 2000 KB/s keeps the streaming reader blocked in a real network read; `Statement::cancel` from another thread interrupts it in **milliseconds** with `Status::Cancelled`, instead of blocking ~18s for the rest of the stream. Drives the real `CancelSignal` → `block_on_cancellable` path. |
-| `reset_peer` (immediate TCP RST) | `reset_peer_surfaces_error_then_recovers` | A query under the reset surfaces a **clean ADBC error** (no panic; no unbounded hang — a watchdog thread bounds it), and once the toxic is removed a subsequent query **recovers** as the gRPC channel re-establishes through the proxy. |
+| `reset_peer` (immediate TCP RST) | `reset_peer_surfaces_error_then_recovers` | A query under the reset surfaces a **clean ADBC error** (no panic; no unbounded hang — a watchdog thread bounds it), and once the toxic is removed a subsequent query **recovers** as the gRPC channel re-establishes through the proxy. The error is checked with `assert_transport_error` (see *Asserting on the error* below), not merely for being an `Err`. |
 | `reset_peer` (immediate TCP RST) | `commit_under_transport_fault_never_loses_the_write` | A manual-transaction `commit()` started under the reset must **never lose the buffered DML**: the write has to land once the toxic is removed. With the pinned client the commit *blocks and heals* — it retries internally and succeeds on its own once the transport recovers (see the limitation below). If a future client surfaces the error instead, the test's other branch asserts the driver kept the buffer so a retried `commit()` replays it (guarding the take-before-apply regression, where a retried commit vacuously succeeded on an emptied buffer — a silent lost write). The buffered DML is an idempotent UPDATE, so the assertion holds regardless of whether the faulted commit reached the emulator. |
 | `reset_peer` (immediate TCP RST) | `update_timeout_bounds_a_faulted_write_then_recovers_when_unset` | With `spanner.rpc.timeout_seconds.update` set to a short deadline, an autocommit write launched under the reset — which the client would otherwise retry unboundedly (*block-and-heal*, per the row above) — fails with ADBC **`Status::Timeout`** within the deadline, naming the option, instead of hanging (a watchdog thread bounds it, so a real hang fails the test loudly). Then the **contrast**: with the deadline unset (`""`) and the toxic removed, the *same* write succeeds once the channel re-establishes — proving the expired deadline poisoned nothing (no lingering cancellation, session damage, or lost write). The idempotent `SET Val = 1` makes the recovery assertion immune to whether any faulted attempt reached the emulator. |
-| `reset_peer` (immediate TCP RST) | `mid_stream_disconnect_after_batches_surfaces_error_then_recovers` | The consumer first pulls **several real batches** off a large streamed result (with no fault), proving rows were delivered; then a `reset_peer` toxic is injected and the rest is drained on a watchdog-bounded worker thread. The next post-buffer chunk fetch must surface a **clean ADBC error** — not a hang, not a panic, and not a silently-short result — and once the toxic is removed a fresh query **recovers**. This drives the streaming **resumption** path (a later chunk fetched over a channel that was just reset), complementing `reset_peer_surfaces_error_then_recovers`, which resets a query *before* it starts. |
-| `limit_data` (orderly close after N bytes) | `truncated_stream_surfaces_error_then_recovers` | A `limit_data` toxic closes the connection cleanly after `TRUNCATE_AFTER_BYTES` downstream bytes — a cap above the ~12 MB receive buffer (so `execute()` and the first batches succeed) but well below the ~48 MB result (so the stream is cut mid-flight). The reader must surface an **error** on the fetch that runs past the cap, never treating a **truncated** result as complete; then a fresh query **recovers** once the cap is removed. Unlike `reset_peer`'s abrupt RST this is an orderly mid-message close, specifically guarding against silent truncation. |
+| `reset_peer` (immediate TCP RST) | `mid_stream_disconnect_after_batches_surfaces_error_then_recovers` | The consumer first pulls **several real batches** off a large streamed result (with no fault), proving rows were delivered; then a `reset_peer` toxic is injected and the rest is drained on a watchdog-bounded worker thread. The next post-buffer chunk fetch must surface a **clean ADBC error** (`assert_transport_error`) — not a hang, not a panic, and not a silently-short result — and the delivered row count must come out **short of `STREAM_ROWS`**, proving the cut really was mid-stream. Once the toxic is removed a fresh query **recovers**. This drives the streaming **resumption** path (a later chunk fetched over a channel that was just reset), complementing `reset_peer_surfaces_error_then_recovers`, which resets a query *before* it starts. |
+| `limit_data` (orderly close after N bytes) | `truncated_stream_surfaces_error_then_recovers` | A `limit_data` toxic closes the connection cleanly after `TRUNCATE_AFTER_BYTES` downstream bytes — a cap above the ~12 MB receive buffer (so `execute()` and the first batches succeed) but well below the ~48 MB result (so the stream is cut mid-flight). The reader must surface an **error** (`assert_transport_error`) on the fetch that runs past the cap, never treating a **truncated** result as complete; the rows delivered before it must be **more than zero and fewer than `STREAM_ROWS`** — without that pair the test would pass even if the stream had been cut before the first batch, which is its whole premise (observed: ~4500 of 24000 rows). Then a fresh query **recovers** once the cap is removed. Unlike `reset_peer`'s abrupt RST this is an orderly mid-message close, specifically guarding against silent truncation. |
+
+## Asserting on the error
+
+A bare `assert!(result.is_err())` is satisfied by *anything* that fails — a `NotImplemented`, an
+`InvalidArguments` from a malformed request, a driver-side `InvalidState` guard — so it proves
+nothing about how the driver handles the injected fault. Every fault surfaced by this harness goes
+through `error::from_spanner`, so `assert_transport_error` (in `tests/resilience.rs`) pins both
+halves of what that produces:
+
+- **status** is `Internal` (the client reports a transport error carrying no gRPC status — what a
+  `reset_peer` RST or a `limit_data` close produces, observed as `the transport reports an error:
+  … h2 protocol error …`) **or** `IO` (the same fault arriving as a gRPC `UNAVAILABLE`/`ABORTED`).
+  Which of the two a TCP-level fault becomes is the client's business, not a driver contract, so
+  both are accepted — but nothing else is.
+- **message** starts with `Spanner error:`, the prefix `from_spanner` adds. A driver-side guard
+  never has it, so this is what separates "the injected fault came back" from "something else
+  failed".
+
+The reader's errors arrive as `ArrowError::ExternalError`; `adbc_error_of` walks the source chain
+back to the driver's `adbc_core::error::Error` (the same wrapping `src/ffi/stream.rs` unwraps to
+report `ECANCELED`), which is what lets these assertions look at a `status` rather than grep a
+debug string. `cancel_interrupts_in_flight_query` and
+`update_timeout_bounds_a_faulted_write_then_recovers_when_unset` assert their exact statuses
+(`Cancelled`, `Timeout`) directly.
 
 ## Honest limitations (read this)
 
