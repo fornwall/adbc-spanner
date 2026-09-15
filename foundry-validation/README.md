@@ -61,12 +61,28 @@ the key at each row back through the same mapping as the plain column.
 **`type/select/*` is done** (all pass or `skip`): each override supplies a Spanner `setup_query` —
 `idx` is the `PRIMARY KEY` and `res` the native-typed value column, with literals adjusted for
 Spanner (`X'..'` → `FROM_HEX('..')`, `\`/`'` escaping in strings). Because `idx` is the key here,
-`FLOAT32`/`FLOAT64` round-trip (unlike in `type/bind`). `timestamptz` also round-trips: the case
-includes `9999-12-31`, so the override reads it under `spanner.max_timestamp_precision=microseconds`
-(a per-case `setup.connection.options`, reverted after) → `Timestamp(Microsecond, "UTC")` over
-Spanner's full 0001–9999 range. `skip`ped: narrower integers (→ `INT64`), `DECIMAL` (fixed 38,9),
-`TIME` (no type), and the tz-naive `timestamp` (Spanner `TIMESTAMP` is UTC-aware, so a no-timezone
-read-back never matches).
+`FLOAT32`/`FLOAT64` round-trip (unlike in `type/bind`). `skip`ped: narrower integers (→ `INT64`),
+`DECIMAL` (fixed 38,9), and `TIME` (no type).
+
+The **timestamp precision matrix** is the largest block here. Upstream
+([adbc-drivers/validation#274](https://github.com/adbc-drivers/validation/pull/274)) replaced the
+single `timestamp`/`timestamptz` pair with `timestamp0`…`timestamp9` plus a `tz` variant of each —
+one case per SQL `TIMESTAMP(p)`, whose expected Arrow unit follows `p` (0 → second, 1–3 →
+millisecond, 4–6 → microsecond, 7–9 → nanosecond). Spanner has exactly **one** timestamp type: a
+UTC-aware absolute instant with **nanosecond** precision over 0001–9999. So each half of the matrix
+lands differently:
+
+- **`timestamp4tz`–`timestamp9tz` pass**, and each has a Spanner override with one `res TIMESTAMP`
+  column. `7tz`/`8tz`/`9tz` run in the driver's default nanosecond read mode — verified to the i64
+  boundaries, since `timestamp9tz` includes `1677-09-21 00:12:43.145224192` and
+  `2262-04-11 23:47:16.854775807`. `4tz`/`5tz`/`6tz` reach `0001-01-01`/`9999-12-31`, outside Arrow's
+  nanosecond range, so those read under `spanner.max_timestamp_precision=microseconds` (a per-case
+  `setup.connection.options`, reverted after) → `Timestamp(Microsecond, "UTC")` over the full
+  0001–9999 range; their values carry at most 6 fractional digits, so nothing is lost.
+- **`timestamp0tz`–`timestamp3tz` skip**: the driver reads Spanner `TIMESTAMP` as `Timestamp(Nanosecond)`
+  or `Timestamp(Microsecond)`, never the second/millisecond unit those cases expect.
+- **`timestamp0`–`timestamp9` (tz-naive) all skip**: Spanner `TIMESTAMP` is UTC-aware, so a
+  no-timezone read-back never matches, at any precision.
 
 **`type/literal/*` is done** (all pass or `skip`): each case selects a typed literal/cast; the base
 corpus uses portable-SQL type names Spanner rejects (`SMALLINT`/`INT`/`BIGINT`/`REAL`/`DOUBLE
@@ -83,8 +99,17 @@ suite ingests with `mode="create"`, so the driver now builds the table from the 
 schema, adding a synthetic `adbc_ingest_key` UUID primary key (Spanner requires one; the ingest
 `INSERT`s omit it so the `DEFAULT (GENERATE_UUID())` fills it). `append`/`create`/`create_append`/
 `replace` are all supported. `skip`ped: narrower integers (→ `INT64`), all `DECIMAL` variants (fixed
-38,9), `TIME`/view/fixed-size-binary (no type), tz-naive `timestamp` (Spanner `TIMESTAMP` is
-UTC-aware), and `timestamptz` at non-nanosecond units (Spanner returns nanosecond).
+38,9), `TIME`/fixed-size-binary (no type), tz-naive `timestamp` (Spanner `TIMESTAMP` is UTC-aware),
+and `timestamptz` at non-nanosecond units (Spanner returns nanosecond).
+
+`test_create_long_values`
+([#275](https://github.com/adbc-drivers/validation/pull/275)) ingests 1 KiB–128 KiB values — well
+under Spanner's 10 MiB per-cell limit — and its fixtures learned the large/view Arrow layouts in
+[#300](https://github.com/adbc-drivers/validation/pull/300). The suite's default is to run it on
+`ingest/string` and `ingest/binary` only; `tests/test_ingest.py` widens `long_value_queries` to all
+six variable-length variants (`string`, `large_string`, `string_view`, `binary`, `large_binary`,
+`binary_view`), which all land in Spanner `STRING(MAX)`/`BYTES(MAX)` through the same `bind::cell_value`
+mapping. All six pass.
 
 **`connection`/`statement` metadata is mostly done.** Fixed via quirks config (real `get_info`
 values, `current_catalog`/`current_schema` = `""`, a Spanner `sample_table` `query_override`) and two

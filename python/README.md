@@ -17,8 +17,9 @@ pandas, polars, DuckDB, or PyArrow with no per-row Python conversion.
 ```sh
 pip install adbc-driver-spanner
 
-# For the DataFrame / Arrow helpers (fetch_df, fetch_arrow_table, adbc_ingest, …):
-pip install "adbc-driver-spanner[dbapi]" pandas
+# For the DataFrame / Arrow helpers (fetch_df, fetch_arrow_table, adbc_ingest, …).
+# The `dbapi` extra pulls in PyArrow and pandas:
+pip install "adbc-driver-spanner[dbapi]"
 ```
 
 The wheels ship a prebuilt native library, so there is nothing to compile. Prebuilt wheels are

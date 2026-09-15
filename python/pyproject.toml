@@ -32,8 +32,14 @@ classifiers = [
 dependencies = ["adbc-driver-manager>=1.0"]
 
 [project.optional-dependencies]
-# Arrow result helpers used by the DBAPI layer (fetch_arrow_table/fetch_df).
-dbapi = ["pyarrow>=8"]
+# Arrow/DataFrame result helpers used by the DBAPI layer (fetch_arrow_table/fetch_df).
+# `adbc_driver_spanner.dbapi` is a thin wrapper over `adbc_driver_manager.dbapi`, so
+# delegate to that package's own `dbapi` extra (pyarrow + pandas) instead of
+# maintaining a second, drifting floor here — the old standalone `pyarrow>=8` sat
+# below the `pyarrow>=14.0.1` the driver manager actually requires. The explicit
+# pyarrow floor is kept so `pip install adbc-driver-spanner[dbapi]` still states the
+# Arrow requirement the docs talk about.
+dbapi = ["adbc-driver-manager[dbapi]>=1.0", "pyarrow>=14.0.1"]
 
 [project.urls]
 Homepage = "https://github.com/fornwall/adbc-spanner"

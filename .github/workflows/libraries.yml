@@ -427,10 +427,13 @@ jobs:
           # Only drives `setup.py bdist_wheel` to repackage the prebuilt libraries;
           # the wheel tag is forced to py3-none-<platform>, so this version does not
           # affect the artifact. Pinned (not "3.x") for a reproducible release host.
-          python-version: "3.13"
+          python-version: "3.14"
 
       - name: Install build tooling
-        run: python -m pip install --upgrade setuptools wheel
+        # setuptools only: it has vendored the `bdist_wheel` command since v70.1, and
+        # `python/setup.py` imports it from there, so the standalone `wheel` package is
+        # no longer part of this build.
+        run: python -m pip install --upgrade setuptools
 
       - name: Download platform libraries
         uses: actions/download-artifact@v8

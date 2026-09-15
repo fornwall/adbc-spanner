@@ -35,7 +35,18 @@ cd "$REPO_ROOT"
 # adbc-drivers/validation#256, whose `test_query_bind_dictionary` binds the `type/bind/string`
 # and `type/bind/large_string` cases dictionary-encoded (what a pandas categorical produces);
 # the driver decodes those in `bind::cell_value`, so both cases are gate-enforced.
-VALIDATION_REF="${ADBC_VALIDATION_REF:-1c20ca4bd11f6976f29fe45d15c501d3b75ad413}"
+#
+# Three later upstream changes shape what this harness now covers:
+#   - #274 replaced the single `type/select/timestamp{,tz}` case with a 0..9 precision
+#     matrix (`timestamp0`..`timestamp9` and the `tz` variants). Spanner's single
+#     nanosecond TIMESTAMP covers the `4tz`..`9tz` half of it — see
+#     foundry-validation/queries/spanner/type/select/.
+#   - #275/#282/#300 added `test_create_long_values` (1 KiB..128 KiB values) and taught
+#     its fixtures the large/view layouts, so tests/test_ingest.py widens
+#     `long_value_queries` from the default {string, binary} to all six.
+#   - #294/#301/#302 retry rows-affected DDL, isolate the replacement tables per input
+#     type, and add `test_append_schema_mismatch` (which the driver passes unchanged).
+VALIDATION_REF="${ADBC_VALIDATION_REF:-744481372bd09d04125b977c30e2e178832d7ac6}"
 VALIDATION_REPO="${ADBC_VALIDATION_REPO:-adbc-drivers/validation}"
 PYTHON="${PYTHON:-python3}"
 EMULATOR_DATABASE="projects/test-project/instances/test-instance/databases/adbc-test"

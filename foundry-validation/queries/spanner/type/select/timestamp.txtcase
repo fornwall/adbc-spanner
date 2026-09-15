@@ -1,3 +1,0 @@
-// part: metadata
-
-skip = "case includes 9999-12-31, outside Arrow's nanosecond timestamp range (~1677-2262)"

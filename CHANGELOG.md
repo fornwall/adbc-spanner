@@ -13,6 +13,11 @@ Releases are cut with [`cargo-release`](https://github.com/crate-ci/cargo-releas
 ### Changed
 
 - MSRV raised to 1.98.1; the pinned dev/CI toolchain (`rust-toolchain.toml`) moves with it.
+- The `adbc-driver-spanner` wheel's `dbapi` extra now delegates to `adbc-driver-manager[dbapi]`
+  instead of declaring a standalone `pyarrow>=8`. That floor sat below the `pyarrow>=14.0.1` the
+  driver manager's DBAPI layer actually requires, so it could resolve an install that then failed at
+  import; the extra now also pulls in pandas, which `fetch_df()` needs. Installing
+  `adbc-driver-spanner` without the extra is unaffected.
 
 ### Removed
 

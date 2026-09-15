@@ -1,0 +1,22 @@
+// Spanner override: idx PRIMARY KEY, one native TIMESTAMP column, GoogleSQL literals.
+// Spanner TIMESTAMP stores nanoseconds and the case's values sit inside Arrow's
+// nanosecond range (~1677-2262, inclusive of both i64 boundaries), so the driver's
+// default nanosecond read mode round-trips every digit — no precision option needed.
+
+// part: metadata
+
+[setup]
+drop = "test_timestamptz"
+
+// part: setup_query
+
+CREATE TABLE test_timestamptz (
+    idx INT64,
+    res TIMESTAMP
+) PRIMARY KEY (idx);
+INSERT INTO test_timestamptz (idx, res) VALUES (1, TIMESTAMP '2023-05-15 13:45:30.123456789+00');
+INSERT INTO test_timestamptz (idx, res) VALUES (2, TIMESTAMP '2000-01-01 00:00:00.234567890+00');
+INSERT INTO test_timestamptz (idx, res) VALUES (3, TIMESTAMP '1969-07-20 20:17:40.345678901+00');
+INSERT INTO test_timestamptz (idx, res) VALUES (4, TIMESTAMP '1677-09-21 00:12:43.145224192+00');
+INSERT INTO test_timestamptz (idx, res) VALUES (5, TIMESTAMP '2262-04-11 23:47:16.854775807+00');
+INSERT INTO test_timestamptz (idx, res) VALUES (6, NULL);

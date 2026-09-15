@@ -1,0 +1,3 @@
+// part: metadata
+
+skip = "Spanner TIMESTAMP is timezone-aware (UTC); the driver returns Timestamp(_, UTC), so a tz-naive read-back never matches"

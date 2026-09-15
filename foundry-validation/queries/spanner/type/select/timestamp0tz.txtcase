@@ -1,0 +1,3 @@
+// part: metadata
+
+skip = "Spanner has one TIMESTAMP type, which the driver reads as Arrow Timestamp(Nanosecond) (default) or Timestamp(Microsecond) via spanner.max_timestamp_precision, never the case's Second unit"

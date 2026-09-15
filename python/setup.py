@@ -10,12 +10,14 @@ Metadata lives in ``pyproject.toml``; this file exists only to:
 """
 
 from setuptools import setup
+from setuptools.command.bdist_wheel import bdist_wheel
 from setuptools.dist import Distribution
 
-try:  # pragma: no cover - depends on installed wheel version
-    from wheel.bdist_wheel import bdist_wheel
-except ImportError:  # newer setuptools vendors it here
-    from setuptools.command.bdist_wheel import bdist_wheel
+# ``bdist_wheel`` is imported straight from setuptools, which has vendored it since
+# v70.1 — well below the ``setuptools>=77`` this project's build already requires (see
+# pyproject.toml). The old ``wheel.bdist_wheel`` fallback is therefore unreachable, and
+# the ``wheel`` package now emits a FutureWarning for that import path and plans to
+# drop it, so there is nothing left to fall back to.
 
 
 class BinaryDistribution(Distribution):
