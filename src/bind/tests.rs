@@ -23,6 +23,14 @@ fn bind_row(
     bind_params(builder, &names, batch, row)
 }
 
+/// The wire encoding of every parameter bound from `batch` at `row`, as the built statement's
+/// `Debug` rendering carries it: `INT64` binds as `StringValue("<digits>")`, `FLOAT64` as
+/// `NumberValue`, `BOOL` as `BoolValue`, `BYTES` as base64 inside a `StringValue`, and a SQL NULL
+/// as `NullValue`.
+fn bound(builder: StatementBuilder, batch: &RecordBatch, row: usize) -> String {
+    format!("{:?}", bind_row(builder, batch, row).unwrap().build())
+}
+
 #[test]
 fn binds_narrow_integers_as_int64() {
     // Int16 / Int32 widen to Spanner INT64 (its only integer type).
@@ -36,8 +44,15 @@ fn binds_narrow_integers_as_int64() {
             Arc::new(Int32Array::from(vec![Some(9i32), None])),
         ],
     );
-    assert!(bind_row(Statement::builder("SELECT @a, @b"), &b, 0).is_ok());
-    assert!(bind_row(Statement::builder("SELECT @a, @b"), &b, 1).is_ok());
+    let row0 = bound(Statement::builder("SELECT @a, @b"), &b, 0);
+    assert!(row0.contains(r#"StringValue("7")"#), "Int16 7: {row0}");
+    assert!(row0.contains(r#"StringValue("9")"#), "Int32 9: {row0}");
+    // Widened, not passed through in a narrower numeric encoding.
+    assert!(!row0.contains("NumberValue"), "{row0}");
+    // The null row binds both columns as typed NULLs, with no value left over.
+    let row1 = bound(Statement::builder("SELECT @a, @b"), &b, 1);
+    assert_eq!(row1.matches("NullValue(NullValue)").count(), 2, "{row1}");
+    assert!(!row1.contains("StringValue"), "{row1}");
 }
 
 #[test]
@@ -67,8 +82,9 @@ fn binds_unsigned_integers_as_int64() {
     );
     assert!(dbg.contains(r#"StringValue("255")"#), "u8::MAX: {dbg}");
     assert!(dbg.contains(r#"StringValue("65535")"#), "u16::MAX: {dbg}");
-    // The null row still binds (typed null).
-    assert!(bind_row(Statement::builder("SELECT @p0, @p1, @p2"), &b, 1).is_ok());
+    // The null row binds all three columns as typed nulls.
+    let row1 = bound(Statement::builder("SELECT @p0, @p1, @p2"), &b, 1);
+    assert_eq!(row1.matches("NullValue(NullValue)").count(), 3, "{row1}");
 }
 
 #[test]
@@ -91,8 +107,9 @@ fn binds_half_floats_as_doubles() {
         dbg.contains("-1.5"),
         "f16 -1.5 must widen exactly to -1.5: {dbg}"
     );
-    // The null row still binds (typed null).
-    assert!(bind_row(Statement::builder("SELECT @v"), &b, 1).is_ok());
+    // The null row binds as a typed null.
+    let row1 = bound(Statement::builder("SELECT @v"), &b, 1);
+    assert!(row1.contains("NullValue(NullValue)"), "{row1}");
 }
 
 #[test]
@@ -502,9 +519,21 @@ fn bind_params_reuses_resolved_names_across_rows() {
     );
     let names = resolve_parameter_names("SELECT @a, @b", &b, false).unwrap();
     assert_eq!(names, vec!["a", "b"]);
-    for row in 0..b.num_rows() {
-        assert!(bind_params(Statement::builder("SELECT @a, @b"), &names, &b, row).is_ok());
-    }
+    let bind = |row| {
+        let built = bind_params(Statement::builder("SELECT @a, @b"), &names, &b, row).unwrap();
+        format!("{:?}", built.build())
+    };
+    // Each row binds its own cells through the one resolved mapping.
+    let row0 = bind(0);
+    assert!(row0.contains(r#"StringValue("1")"#), "{row0}");
+    assert!(row0.contains(r#"StringValue("2")"#), "{row0}");
+    let row1 = bind(1);
+    assert!(row1.contains(r#"StringValue("3")"#), "{row1}");
+    assert!(row1.contains(r#"StringValue("4")"#), "{row1}");
+    assert!(
+        !row1.contains(r#"StringValue("1")"#),
+        "row 1 kept row 0 values: {row1}"
+    );
 }
 
 #[test]
@@ -537,7 +566,15 @@ fn binds_date_timestamp_and_numeric() {
             ),
         ],
     );
-    assert!(bind_row(Statement::builder("SELECT @d, @t, @n"), &b, 0).is_ok());
+    let row0 = bound(Statement::builder("SELECT @d, @t, @n"), &b, 0);
+    for needle in [
+        r#"StringValue("2024-01-15")"#,
+        r#"StringValue("2024-01-15T12:34:56.789012Z")"#,
+        // NUMERIC keeps its full scale rather than collapsing to "1.5".
+        r#"StringValue("1.500000000")"#,
+    ] {
+        assert!(row0.contains(needle), "missing {needle} in: {row0}");
+    }
 }
 
 #[test]
@@ -591,7 +628,16 @@ fn binds_timestamp_at_every_unit() {
             Arc::new(TimestampNanosecondArray::from(vec![ns]).with_timezone("UTC")),
         ],
     );
-    assert!(bind_row(Statement::builder("SELECT @s, @m, @n"), &b, 0).is_ok());
+    // Each unit formats to exactly its own precision — the second-resolution column gains no
+    // spurious fractional digits, and the nanosecond one keeps all nine.
+    let row0 = bound(Statement::builder("SELECT @s, @m, @n"), &b, 0);
+    for needle in [
+        r#"StringValue("2024-01-15T12:34:56Z")"#,
+        r#"StringValue("2024-01-15T12:34:56.789Z")"#,
+        r#"StringValue("2024-01-15T12:34:56.789012999Z")"#,
+    ] {
+        assert!(row0.contains(needle), "missing {needle} in: {row0}");
+    }
 }
 
 #[test]
@@ -605,7 +651,8 @@ fn binds_null_nanosecond_timestamp() {
         )],
         vec![Arc::new(TimestampNanosecondArray::from(vec![None::<i64>]))],
     );
-    assert!(bind_row(Statement::builder("SELECT @n"), &b, 0).is_ok());
+    let row0 = bound(Statement::builder("SELECT @n"), &b, 0);
+    assert!(row0.contains("NullValue(NullValue)"), "{row0}");
 }
 
 #[test]
@@ -624,7 +671,8 @@ fn null_temporal_and_numeric_bind() {
             ),
         ],
     );
-    assert!(bind_row(Statement::builder("SELECT @d, @n"), &b, 0).is_ok());
+    let row0 = bound(Statement::builder("SELECT @d, @n"), &b, 0);
+    assert_eq!(row0.matches("NullValue(NullValue)").count(), 2, "{row0}");
 }
 
 #[test]
@@ -654,7 +702,11 @@ fn binds_numeric_beyond_a_96_bit_decimal() {
                 .unwrap(),
         )],
     );
-    assert!(bind_row(Statement::builder("SELECT @n"), &b, 0).is_ok());
+    let row0 = bound(Statement::builder("SELECT @n"), &b, 0);
+    assert!(
+        row0.contains(r#"StringValue("1000000000000000000000.000000000")"#),
+        "10^30 at scale 9 must format exactly: {row0}"
+    );
 }
 
 #[test]
@@ -671,8 +723,12 @@ fn binds_large_string_and_binary() {
             Arc::new(LargeBinaryArray::from(vec![Some(b"bytes".as_ref()), None])),
         ],
     );
-    assert!(bind_row(Statement::builder("SELECT @s, @b"), &b, 0).is_ok());
-    assert!(bind_row(Statement::builder("SELECT @s, @b"), &b, 1).is_ok());
+    let row0 = bound(Statement::builder("SELECT @s, @b"), &b, 0);
+    assert!(row0.contains(r#"StringValue("hello")"#), "{row0}");
+    // BYTES travel base64-encoded inside a StringValue: b"bytes" is "Ynl0ZXM=".
+    assert!(row0.contains(r#"StringValue("Ynl0ZXM=")"#), "{row0}");
+    let row1 = bound(Statement::builder("SELECT @s, @b"), &b, 1);
+    assert_eq!(row1.matches("NullValue(NullValue)").count(), 2, "{row1}");
 }
 
 #[test]
@@ -695,8 +751,14 @@ fn binds_view_strings_and_binaries() {
             ])),
         ],
     );
-    assert!(bind_row(Statement::builder("SELECT @s, @b"), &b, 0).is_ok());
-    assert!(bind_row(Statement::builder("SELECT @s, @b"), &b, 1).is_ok());
+    let row0 = bound(Statement::builder("SELECT @s, @b"), &b, 0);
+    assert!(row0.contains(r#"StringValue("hello view")"#), "{row0}");
+    assert!(
+        row0.contains(r#"StringValue("dmlldyBieXRlcw==")"#),
+        "b\"view bytes\" base64: {row0}"
+    );
+    let row1 = bound(Statement::builder("SELECT @s, @b"), &b, 1);
+    assert_eq!(row1.matches("NullValue(NullValue)").count(), 2, "{row1}");
 }
 
 #[test]
@@ -717,8 +779,17 @@ fn binds_int8_and_date64() {
             ])),
         ],
     );
-    assert!(bind_row(Statement::builder("SELECT @i, @d"), &b, 0).is_ok());
-    assert!(bind_row(Statement::builder("SELECT @i, @d"), &b, 1).is_ok());
+    let row0 = bound(Statement::builder("SELECT @i, @d"), &b, 0);
+    assert!(
+        row0.contains(r#"StringValue("7")"#),
+        "Int8 widens to INT64: {row0}"
+    );
+    assert!(
+        row0.contains(r#"StringValue("2024-01-15")"#),
+        "Date64 milliseconds become a DATE string: {row0}"
+    );
+    let row1 = bound(Statement::builder("SELECT @i, @d"), &b, 1);
+    assert_eq!(row1.matches("NullValue(NullValue)").count(), 2, "{row1}");
 }
 
 #[test]
@@ -757,7 +828,19 @@ fn binds_view_arrays_as_list_elements() {
         ],
         vec![Arc::new(strings.finish()), Arc::new(bytes.finish())],
     );
-    assert!(bind_row(Statement::builder("SELECT @s, @b"), &b, 0).is_ok());
+    let row0 = bound(Statement::builder("SELECT @s, @b"), &b, 0);
+    // The string list keeps its null element in place rather than dropping it.
+    assert!(
+        row0.contains(
+            r#"ListValue { values: [Value { kind: Some(StringValue("a")) }, Value { kind: Some(NullValue(NullValue)) }] }"#
+        ),
+        "{row0}"
+    );
+    // b"b" is "Yg==" base64.
+    assert!(
+        row0.contains(r#"ListValue { values: [Value { kind: Some(StringValue("Yg==")) }] }"#),
+        "{row0}"
+    );
 }
 
 #[test]
@@ -1033,16 +1116,35 @@ fn binds_int64_array_including_null_array_and_null_element() {
         vec![Field::new("tags", arr.data_type().clone(), true)],
         vec![Arc::new(arr)],
     );
-    for row in 0..3 {
-        assert!(
-            bind_row(
-                Statement::builder("INSERT INTO t (tags) VALUES (@tags)"),
-                &b,
-                row
-            )
-            .is_ok()
-        );
-    }
+    let bind = |row| {
+        bound(
+            Statement::builder("INSERT INTO t (tags) VALUES (@tags)"),
+            &b,
+            row,
+        )
+    };
+    // A populated array keeps its null element in place.
+    let row0 = bind(0);
+    assert!(
+        row0.contains(
+            r#"ListValue { values: [Value { kind: Some(StringValue("1")) }, Value { kind: Some(NullValue(NullValue)) }, Value { kind: Some(StringValue("3")) }] }"#
+        ),
+        "{row0}"
+    );
+    // A null array cell is a bare NullValue, not an empty list...
+    let row1 = bind(1);
+    assert!(row1.contains("NullValue(NullValue)"), "{row1}");
+    assert!(
+        !row1.contains("ListValue"),
+        "a null array must not be []: {row1}"
+    );
+    // ...and an empty array really is an empty list, not a NULL.
+    let row2 = bind(2);
+    assert!(row2.contains("ListValue { values: [] }"), "{row2}");
+    assert!(
+        !row2.contains("NullValue"),
+        "an empty array must not be NULL: {row2}"
+    );
 }
 
 #[test]
@@ -1105,7 +1207,19 @@ fn binds_arrays_of_each_supported_element_type() {
             Arc::new(nums),
         ],
     );
-    assert!(bind_row(Statement::builder("SELECT @f, @bo, @s, @d, @t, @n"), &b, 0).is_ok());
+    // Each element type keeps its own Spanner encoding inside the ListValue.
+    let row0 = bound(Statement::builder("SELECT @f, @bo, @s, @d, @t, @n"), &b, 0);
+    for needle in [
+        // FLOAT64 stays a number; the null element survives in place.
+        r#"ListValue { values: [Value { kind: Some(NumberValue(1.5)) }, Value { kind: Some(NullValue(NullValue)) }] }"#,
+        r#"ListValue { values: [Value { kind: Some(BoolValue(true)) }] }"#,
+        r#"ListValue { values: [Value { kind: Some(StringValue("hi")) }] }"#,
+        r#"ListValue { values: [Value { kind: Some(StringValue("2024-01-15")) }] }"#,
+        r#"ListValue { values: [Value { kind: Some(StringValue("2024-01-15T12:34:56.789012Z")) }] }"#,
+        r#"ListValue { values: [Value { kind: Some(StringValue("1.500000000")) }] }"#,
+    ] {
+        assert!(row0.contains(needle), "missing {needle} in: {row0}");
+    }
 }
 
 #[test]
