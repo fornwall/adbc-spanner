@@ -1,58 +1,22 @@
-# A step-by-step guide to the Spanner ADBC driver
+# How the Spanner ADBC driver maps onto ADBC
 
-This document explains what `adbc-spanner` is and how it works, starting from first principles.
-It is written for someone who has **not** used Apache Arrow or ADBC before. It focuses on the big
-picture — what the pieces are, how they fit together, and how the standard ADBC interface is
-implemented on top of Google Cloud Spanner — rather than on the fine details of the driver's
-internals.
+This document explains how `adbc-spanner` implements the standard
+[ADBC](https://arrow.apache.org/adbc/) interface on top of Google Cloud Spanner: the one structural
+decision that shapes the code, and what each ADBC operation actually does against Spanner.
 
-If you already know ADBC and just want the exhaustive option list, jump to
-[docs/options.md](options.md). If you want to run the driver, see the [README](../README.md).
+It assumes the ADBC concepts themselves. If you have not met them, read
+[what ADBC is](https://arrow.apache.org/adbc/current/index.html) and the
+[ADBC specification](https://arrow.apache.org/adbc/current/format/specification.html) first — in
+particular the four-object hierarchy (driver → database → connection → statement) and Arrow's
+`RecordBatch` / `RecordBatchReader` streaming model, both of which this driver simply implements.
 
----
-
-## 1. The problem this solves
-
-Say you have a program and you want it to run SQL against a database and get the results back.
-There are two long-standing ways to do this:
-
-- **ODBC / JDBC** — old, ubiquitous standards. They hand results back **one row at a time**, as
-  loosely-typed cells. For analytics workloads (millions of rows, column-at-a-time processing) this
-  row-by-row copying is slow and wasteful.
-- **A database-specific client library** — fast, but now your program is welded to one database's
-  API. Switch databases and you rewrite everything.
-
-**ADBC (Arrow Database Connectivity)** is a newer standard that fixes both problems:
-
-1. It is a **single, database-agnostic API**. Your program talks to "an ADBC driver"; swapping
-   Spanner for DuckDB or BigQuery means swapping the driver, not your code.
-2. Results come back as **Apache Arrow** data, not one row at a time.
-
-`adbc-spanner` is the ADBC **driver for Google Cloud Spanner**: the adapter that makes Spanner
-look like a generic ADBC database to any ADBC-speaking program.
-
-### What is Apache Arrow?
-
-Arrow is a standard **in-memory layout for tabular data**. Instead of storing a table row by row,
-Arrow stores it **column by column**: all the values of column A contiguously, then all of column
-B, and so on. This "columnar" layout is what analytics engines want — it is cache-friendly, it
-vectorizes well, and, crucially, it is the *same* layout everywhere. Two programs that both speak
-Arrow can share a table with **zero conversion or copying**.
-
-The key Arrow term you will see throughout this driver is the **`RecordBatch`**: a chunk of a
-table — a set of columns of equal length, with a **schema** (the column names and types) attached.
-A query result is delivered as a **stream of `RecordBatch`es** (`RecordBatchReader`): you pull one
-batch, process it, pull the next. This is why a huge result set never has to fit in memory all at
-once — the driver converts Spanner rows to Arrow batches on demand as you iterate.
+For the exhaustive option list see [docs/options.md](options.md); for Spanner's transaction model
+and the gRPC calls underneath, [docs/transactions.md](transactions.md). To run the driver, see the
+[README](../README.md).
 
 ---
 
-## 2. The ADBC object model
-
-ADBC is not one flat API; it is a small hierarchy of four objects. You create them top-down, and
-each one is progressively more specific. This driver names them `SpannerX`, in three Rust modules —
-`SpannerDriver` and `SpannerDatabase` share [`src/driver.rs`](../src/driver.rs), since the driver's
-only job is to build databases:
+## 1. The four objects, in this driver
 
 ```
 SpannerDriver  ──▶  SpannerDatabase  ──▶  SpannerConnection  ──▶  SpannerStatement
@@ -60,76 +24,52 @@ SpannerDriver  ──▶  SpannerDatabase  ──▶  SpannerConnection  ──�
     driver itself)     credentials, etc.)      transaction scope)       statement to run)
 ```
 
-| Object | What it represents | You typically have… |
+| Object | What it represents | Where it lives |
 | --- | --- | --- |
-| **Driver** | The loaded driver code itself — the entrypoint. | one |
-| **Database** | *Configuration*: which Spanner database, which credentials, which endpoint. No connection is opened yet — it only holds options. | one per target database |
-| **Connection** | A live handle you run work against. Owns transaction state (autocommit vs. manual) and the metadata-introspection calls. | one per thread / unit of work |
-| **Statement** | A single SQL statement (or bulk-ingest operation) to configure and execute. | many, short-lived |
+| **Driver** | The loaded driver code itself — the entrypoint. | [`src/driver.rs`](../src/driver.rs) |
+| **Database** | *Configuration*: which Spanner database, which credentials, which endpoint. No connection is opened yet. | [`src/driver.rs`](../src/driver.rs) |
+| **Connection** | A live handle you run work against. Owns transaction state and the metadata calls. | [`src/connection.rs`](../src/connection.rs) |
+| **Statement** | A single SQL statement (or bulk-ingest operation) to configure and execute. | [`src/statement.rs`](../src/statement.rs) |
 
-The rule of thumb: **options set higher up become defaults lower down.** A staleness bound set on
-the connection is inherited by every statement it creates; the statement can then override it.
-Configuration flows down the hierarchy.
-
-In Rust, each of these is a *trait* defined by the `adbc_core` crate (`Driver`, `Database`,
-`Connection`, `Statement`). This driver's job is to **implement those four traits** for Spanner.
-That is, at heart, the whole driver: four Rust structs implementing four standard traits.
+Each is a trait in the `adbc_core` crate, and the driver is, at heart, four Rust structs
+implementing those four traits. Options set higher up become defaults lower down: a staleness bound
+set on the connection is inherited by every statement it creates, which can then override it.
 
 ---
 
-## 3. The entrypoint: how the shared library gets loaded
-
-The driver can be used two ways, and it is worth understanding both because they explain the shape
-of the code.
-
-### As a Rust crate
+## 2. The entrypoint: loading the shared library
 
 A Rust program adds `adbc-spanner` as a dependency and calls `SpannerDriver::try_new()` directly.
-The four objects above are just Rust structs; you call their methods. This is the direct path.
+Everything else goes through the **shared library**: built as a `cdylib` the crate compiles to
+`libadbc_spanner.so` / `.dylib` / `.dll`, which any ADBC driver manager can load at runtime without
+compiling against this crate.
 
-### As a loadable shared library (the C ABI)
-
-The more interesting path — and the reason ADBC exists as a standard — is the **shared library**.
-When built as a `cdylib`, the crate compiles to `libadbc_spanner.so` (Linux) / `.dylib` (macOS) /
-`.dll` (Windows). Any program in any language that has an **ADBC driver manager** can load this
-file at runtime and talk to Spanner, without ever compiling against this crate.
-
-How does a driver manager, handed nothing but a path to a `.so` file, find its way in? By a single
-**exported C function** — the entrypoint. That is the *entire* contract between the driver manager
-and the driver: one symbol.
-
-In this crate that symbol — and everything behind it — lives in [`src/ffi/`](../src/ffi), the
-driver's own hand-written export layer (`mod.rs` builds the vtable; `abi.rs` transcribes the C
-header; `error.rs`, `guard.rs`, `handle.rs`, `options.rs`, `stream.rs` and `import.rs` hold one
-concern each; and `database.rs`, `connection.rs` and `statement.rs` hold the entry points of one
-ADBC object each). It exports two C symbols:
+The entire contract between a driver manager and a driver is one exported C symbol. This crate
+exports two:
 
 - **`AdbcSpannerInit`** — the driver-specific init symbol. ADBC's naming convention derives it from
   the library name: `libadbc_spanner` → `AdbcSpannerInit`.
 - **`AdbcDriverInit`** — a generic fallback name the driver manager tries when the caller does not
   name an explicit entrypoint.
 
-You can see the symbol is really there:
-
 ```sh
 cargo build --release
 nm -D --defined-only target/release/libadbc_spanner.so | grep AdbcSpannerInit
 ```
 
-When a driver manager calls this init function, it receives a **table of C function pointers** —
-one per ADBC operation (open database, open connection, set option, execute, get next batch, …).
-Each of those pointers is a small entry point that translates the C arguments and calls the
-corresponding method on the Rust structs. From then on, every call the manager makes crosses the C
-boundary into safe Rust. Arrow data itself crosses this boundary through the **Arrow C Data
-Interface** — a small, stable C struct layout that lets two languages share the same columnar
-buffers *without copying them*. This is the second reason Arrow matters here: it is not just the
-in-memory format, it is also the zero-copy wire format across the language boundary.
+Calling the init function yields a table of C function pointers, one per ADBC operation. Each
+pointer is a small entry point that translates the C arguments and calls the corresponding method
+on the Rust structs. Arrow data itself crosses the boundary through the **Arrow C Data Interface**,
+so result sets and bound parameters move without being copied.
 
-The driver fills in that vtable for **both** ADBC revisions: a 1.1.0 caller gets the full table
-(including `ErrorGetDetail*` and `ErrorFromArrayStream`), while a 1.0.0 caller — which allocated a
-smaller struct — gets exactly the 1.0.0 prefix it owns.
+That layer is this driver's own code, in [`src/ffi/`](../src/ffi) — `mod.rs` builds the vtable,
+`abi.rs` transcribes the C header, and `error.rs`, `guard.rs`, `handle.rs`, `options.rs`,
+`stream.rs`, `import.rs` and the three per-object modules hold one concern each. It fills the
+vtable for **both** ADBC revisions: a 1.1.0 caller gets the full table (including `ErrorGetDetail*`
+and `ErrorFromArrayStream`), while a 1.0.0 caller — which allocated a smaller struct — gets exactly
+the 1.0.0 prefix it owns.
 
-So, loading from Python looks like this — no Rust in sight:
+Loading from Python needs no Rust:
 
 ```python
 import adbc_driver_manager
@@ -140,76 +80,58 @@ db = adbc_driver_manager.AdbcDatabase(
 )
 ```
 
-(There is also a published Python package, `adbc-driver-spanner`, that bundles the prebuilt library
-and a friendly DBAPI 2.0 interface, so you do not have to do this by hand — see
-[python/README.md](../python/README.md).)
+(The published `adbc-driver-spanner` package bundles the prebuilt library and a DBAPI 2.0 interface,
+so you do not have to do this by hand — see [python/README.md](../python/README.md).)
 
-> **Note on `unsafe`.** Crossing the C ABI is the only `unsafe` code in the whole crate, and all of
-> it is confined to `src/ffi/` — where every entry point contains panics (unwinding out of an
-> `extern "C"` function would be undefined behaviour) and nothing outside the module is aware the
-> driver is exported over C. The pure-Rust build (no `ffi` feature) forbids `unsafe` outright.
-> Everything you write on top of this driver is safe.
+> **Note on `unsafe`.** Crossing the C ABI is the only `unsafe` code in the crate, and all of it is
+> confined to `src/ffi/`, where every entry point contains panics (unwinding out of an `extern "C"`
+> function would be undefined behaviour). The pure-Rust build (no `ffi` feature) forbids `unsafe`
+> outright.
 
 ---
 
-## 4. One structural fact that shapes everything: sync over async
+## 3. One structural fact that shapes everything: sync over async
 
-Before walking through the interface, one design point explains a lot of the code.
-
-The **ADBC traits are synchronous** — `execute()` returns a result, it does not return a future.
-But the underlying Google Cloud Spanner client is **asynchronous** (async Rust, built on Tokio).
-So every driver method has to bridge the two: it runs the async Spanner call to completion on a
-shared Tokio runtime and blocks until it finishes.
+The **ADBC traits are synchronous** — `execute()` returns a result, not a future. The Google Cloud
+Spanner client is **asynchronous** (async Rust on Tokio). So every driver method bridges the two: it
+runs the async Spanner call to completion on a shared Tokio runtime and blocks until it finishes.
 
 ```
 ADBC method (sync)  ──▶  runtime.block_on(async Spanner call)  ──▶  result
 ```
 
-There is **one** shared runtime, created once by the driver and passed by reference (`Arc`) into
-every database, connection, and statement. You will see `runtime.block_on(...)` at the boundary of
-essentially every operation. That is the whole trick: a synchronous ADBC surface over an
-asynchronous client.
+There is **one** shared runtime, created once by the driver and passed by `Arc` into every database,
+connection and statement. You will see `runtime.block_on(...)` at the boundary of essentially every
+operation. That is the whole trick, and it is why the driver never builds a second runtime.
 
 ---
 
-## 5. Walking through the interface
+## 4. Walking through the interface
 
-Now the interesting part: what the standard ADBC operations are, and how each is implemented on
-Spanner. This is the "big picture" tour — enough to understand *what* each call does and *how* it
-maps onto Spanner, without diving into the line-by-line internals.
+### 4.1 Opening a database (configuration)
 
-### 5.1 Opening a database (configuration)
-
-You start with a `SpannerDriver`, then ask it for a `SpannerDatabase`, passing options. The one
-required option is the standard `uri` option, a `spanner://` **connection URI** whose path is the
-**database path** `projects/<project>/instances/<instance>/databases/<database>` and whose query
-parameters pack the endpoint and other options into the one string:
+You ask a `SpannerDriver` for a `SpannerDatabase`, passing options. The one required option is the
+standard `uri` option, a `spanner://` **connection URI** whose path is the database path and whose
+query parameters pack the endpoint and other database options into the one string:
 
 ```
 spanner:///projects/p/instances/i/databases/d?spanner.emulator=true
 ```
 
 A bare database path is not accepted — the `spanner://` scheme is required (write the three-slash
-`spanner:///projects/...` form when no endpoint host is intended).
+`spanner:///projects/...` form when no endpoint host is intended). The database object is **pure
+configuration**: no network happens until a connection is opened. Credentials can come from
+Application Default Credentials, a service-account key file, an OAuth access token, or
+impersonation; or, for local development, you point at a **Spanner emulator** and use anonymous
+credentials. All of it is option plumbing in [`src/driver.rs`](../src/driver.rs).
 
-The database object is **pure configuration** — no network happens yet. It just holds the path,
-the credentials configuration, the endpoint, and any inherited options. Credentials can come from
-Application Default Credentials (the usual GCP path), a service-account key file
-(`spanner.auth.keyfile`), an OAuth access token, or impersonation; or, for local development, you point
-at a **Spanner emulator** and use anonymous credentials. All of this is option plumbing on the
-database object, handled in [`src/driver.rs`](../src/driver.rs).
+### 4.2 Opening a connection
 
-### 5.2 Opening a connection
+`database.new_connection()` builds the actual Spanner client and gives you a `SpannerConnection` —
+the object you run work against. It owns the transaction mode (autocommit by default, §4.5) and the
+metadata calls (§4.6).
 
-`database.new_connection()` builds the actual Spanner client and gives you a `SpannerConnection`.
-This is the object you run work against. It owns two things worth knowing about:
-
-- **Transaction mode** (autocommit by default — see §5.5).
-- **The metadata / introspection calls** (§5.6).
-
-### 5.3 Running a query — `execute`
-
-This is the core read path. You create a statement, set its SQL, and call `execute()`:
+### 4.3 Running a query — `execute`
 
 ```rust
 let mut statement = connection.new_statement()?;
@@ -221,38 +143,34 @@ for batch in reader {
 }
 ```
 
-What happens under the hood:
+Under the hood:
 
-1. The driver runs the query against Spanner in a single-use read-only transaction (a cheap,
-   lock-free snapshot read).
-2. It does **not** pull all the rows. Instead `execute()` returns a **lazy** `RecordBatchReader`.
-   Each time you ask the reader for the next batch, the driver pulls the next bounded chunk of rows
-   from Spanner (chunk size = `spanner.rows_per_batch`, default 8192) and converts just that chunk
-   into an Arrow `RecordBatch`.
-3. To keep the pipeline full, a background task **prefetches** the next chunk from Spanner while
-   your code is still processing the current one.
+1. The query runs against Spanner in a single-use read-only transaction (a cheap, lock-free
+   snapshot read).
+2. `execute()` does **not** pull all the rows. It returns a **lazy** `RecordBatchReader`; each time
+   you ask for the next batch, the driver pulls the next bounded chunk of rows (chunk size =
+   `spanner.rows_per_batch`, default 8192) and converts just that chunk to Arrow.
+3. A background task **prefetches** the next chunk while your code processes the current one.
 
-The upshot: a result set of any size streams through bounded memory. The row → Arrow type mapping
-(Spanner `INT64` → Arrow `Int64`, `TIMESTAMP` → Arrow nanosecond timestamp, `ARRAY`/`STRUCT` →
-Arrow `List`/`Struct`, and so on) lives in [`src/conversion.rs`](../src/conversion.rs); the full
-table is in the [README type-mapping section](../README.md#type-mapping).
+So a result set of any size streams through bounded memory. The row → Arrow type mapping lives in
+[`src/conversion.rs`](../src/conversion.rs); the full table is in the
+[README type-mapping section](../README.md#type-mapping).
 
 One mapping is worth calling out, because Arrow is *narrower* than Spanner here: Arrow's nanosecond
-timestamp is an `i64` count of nanoseconds, which only spans ~1677–2262, while Spanner `TIMESTAMP`
-spans years 0001–9999. By default a value outside that window is a loud `InvalidArguments` error
-(never a silently wrapped one); set `spanner.max_timestamp_precision=microseconds` to map
-`TIMESTAMP` to a microsecond Arrow timestamp instead, which covers Spanner's whole range at the
-cost of truncating sub-microsecond digits.
+timestamp is an `i64` count of nanoseconds, spanning only ~1677–2262, while Spanner `TIMESTAMP`
+spans years 0001–9999. By default a value outside that window is a loud `InvalidArguments` error,
+never a silently wrapped one; `spanner.max_timestamp_precision=microseconds` maps `TIMESTAMP` to a
+microsecond Arrow timestamp instead, covering Spanner's whole range at the cost of truncating
+sub-microsecond digits.
 
 DML with a `THEN RETURN` clause also comes back through `execute()` as an Arrow result, since it
 produces rows.
 
-### 5.4 Changing data — `execute_update`
+### 4.4 Changing data — `execute_update`
 
-For DML (`INSERT`/`UPDATE`/`DELETE`) and DDL (`CREATE`/`ALTER`/`DROP`/…), you call `execute_update`
-instead. It returns an **affected-row count** rather than a result stream — or `None` when no count
-exists. Which of Spanner's three very different execution surfaces a statement lands on is decided
-from its leading keyword (autocommit mode shown; §5.5 covers manual transactions):
+`execute_update` returns an **affected-row count** rather than a result stream — or `None` when no
+count exists. Which of Spanner's three very different execution surfaces a statement lands on is
+decided from its leading keyword (autocommit mode shown; §4.5 covers manual transactions):
 
 ```mermaid
 flowchart TD
@@ -275,68 +193,18 @@ flowchart TD
 The DML/DDL detection and statement splitting live in [`src/sql.rs`](../src/sql.rs); the execution
 in [`src/statement.rs`](../src/statement.rs).
 
-### 5.5 Transactions
+### 4.5 Transactions
 
-By default a connection is in **autocommit** mode: every statement commits on its own. Each query
-gets a fresh read snapshot; each DML statement gets its own read/write transaction; DDL applies
-immediately.
+By default a connection is in **autocommit** mode: every statement commits on its own. Setting
+`adbc.connection.autocommit` to `false` enters **manual** mode, where a transaction is exactly one
+kind of work — **queries** or **DML** — fixed by its *first* statement, and DDL is never
+transaction-aware.
 
-Set the standard `adbc.connection.autocommit` option to `false` to enter **manual** mode, then call
-`commit()` or `rollback()` on the connection to end the transaction. A manual transaction is
-exactly one kind of work — **queries** or **DML** — fixed by its *first* statement; a statement of
-the other kind fails with `InvalidState` until the transaction ends:
+The full model, its consequences and the gRPC calls behind each path are in
+**[docs/transactions.md](transactions.md)**; the `src/connection.rs` module doc is the code-level
+version.
 
-```mermaid
-stateDiagram-v2
-    [*] --> Unset: autocommit = false
-    Unset --> Queries: first statement is a query
-    Unset --> DML: first statement is DML
-    Queries --> Queries: another query — same snapshot
-    Queries --> Unset: commit() / rollback()
-    DML --> DML: more DML / ingest rows — buffered
-    DML --> Unset: commit() replays the buffer
-    DML --> Unset: rollback() drops it
-    note right of Queries
-        DML here → InvalidState
-    end note
-    note right of DML
-        a query here → InvalidState
-        (no read-your-writes)
-    end note
-```
-
-- **Queries** all run on one shared multi-use read-only transaction, so every read in the
-  transaction observes a single consistent snapshot; `commit()`/`rollback()` simply drop it
-  (Spanner read-only transactions need no commit RPC).
-- **DML** is **buffered** and replayed atomically inside a single read/write runner call at
-  `commit()` time. This shape comes from the preview Spanner client, which exposes read/write
-  transactions only through a **closure-based runner** — there is no "open a transaction, run
-  statements against it, then commit" handle. Two consequences: **no read-your-writes** (a query
-  could not see the buffered DML, which is exactly why the kind rule rejects it — `INSERT` then
-  `SELECT COUNT(*)` would return the *pre-insert* count), and **`execute_update` returns `None`**
-  — the affected-row count is genuinely unknown until the buffered batch commits.
-
-**DDL is not transaction-aware** — the same no-special-handling approach as the ADBC BigQuery
-driver: it always executes immediately through the admin `UpdateDatabaseDdl` API (Spanner DDL is
-never transactional), whatever the transaction state, so DDL issued after buffered DML executes
-*before* it and `rollback()` cannot undo it.
-
-Two standard options ride along with this:
-
-- `adbc.connection.transaction.isolation_level` applies to **read/write** transactions only.
-  `serializable`, `repeatable_read` and `snapshot` map straight onto Spanner's own levels
-  (`snapshot` → `REPEATABLE_READ`, which is *how* Spanner implements snapshot isolation); weaker
-  spec levels are promoted up to the weakest level that still satisfies them; `default` sends no
-  level at all, which Spanner reads as `SERIALIZABLE`. It is inert on read-only queries, which take
-  a timestamp bound instead of an isolation level.
-- `adbc.connection.readonly` (default `false`) makes a connection reject every write — DML, DDL,
-  ingest and any commit of buffered work fail with `InvalidState`, while queries still run.
-
-This is a deliberate, documented trade-off; genuine read-your-writes waits on the client exposing
-real begin/commit handles. For the full model see the [`SpannerConnection`
-rustdoc](../src/connection.rs) and the [README transactions bullet](../README.md#supported-optional-adbc-functionality).
-
-### 5.6 Introspection — asking the database about itself
+### 4.6 Introspection — asking the database about itself
 
 ADBC standardizes a set of **metadata** calls so a generic tool (a data browser, a BI client) can
 discover what is in a database without knowing it is Spanner. Each returns its answer as — of
@@ -352,38 +220,26 @@ course — an Arrow result:
 | `get_statistic_names` | "What non-standard statistics exist?" | None — an empty (but correctly typed) result set. |
 | `get_parameter_schema` | "What parameters does this statement take?" | If data is already bound, its Arrow schema *is* the answer. Otherwise the `@name` parameters are read out of the SQL and typed by a PLAN-only probe; one the probe cannot type is reported as `Null`, ADBC's "type unknown". |
 
-The point of this table is not the details but the *shape*: ADBC turns "tell me about yourself"
-into ordinary calls that return Arrow, and this driver answers each by querying Spanner's own
-catalog and reshaping the answer into the Arrow layout ADBC expects.
+### 4.7 Parameters and bulk ingest — `bind`
 
-### 5.7 Parameters and bulk ingest — `bind`
-
-You rarely want to paste values into SQL text. ADBC lets you **bind** an Arrow `RecordBatch` of
-parameter values to a statement before executing it. Two uses:
+ADBC lets you **bind** an Arrow `RecordBatch` of parameter values to a statement before executing
+it. Two uses:
 
 - **Parameterized queries / DML.** Bind one batch whose columns supply the `@param` values. By
   default binding is *positional* (the i-th bound column fills the i-th distinct parameter); set
   `adbc.statement.bind_by_name = true` to match by column name instead.
-- **Bulk ingest** — the fast bulk-load path. You point a statement at a target table, bind a big
-  `RecordBatch` (or a whole stream of them via `bind_stream`), and the driver writes the rows.
-  Crucially it ships them as native Spanner **insert mutations**, not one `INSERT` statement per
-  row, so nothing is SQL-parsed per row. The standard `adbc.ingest.mode` option picks the
-  behaviour: `append` to an existing table, or `create` / `create_append` / `replace`, which build
-  the table via DDL from the incoming Arrow schema. Arrow data carries no primary key, so the
-  create modes declare none and let Spanner key the table on its own hidden `rowid` column; for a
-  table keyed on your own columns, write the `CREATE TABLE` yourself and ingest with `append`. Because
-  Spanner caps how much a single commit may write, a large ingest is committed **chunk by chunk**
-  (so it is not atomic as a whole; a failure reports how many rows earlier chunks already
-  committed).
+- **Bulk ingest.** Point a statement at a target table, bind a big `RecordBatch` (or a stream of
+  them via `bind_stream`), and the driver writes the rows as native Spanner **insert mutations**,
+  not one `INSERT` statement per row, so nothing is SQL-parsed per row. `adbc.ingest.mode` picks the
+  behaviour; because Spanner caps how much a single commit may write, a large ingest is committed
+  **chunk by chunk** and is therefore not atomic as a whole.
 
 The Arrow → Spanner value mapping and the ingest table-building logic are in
 [`src/bind.rs`](../src/bind.rs).
 
-### 5.8 The rest of the surface
+### 4.8 The rest of the surface
 
-A few more standard ADBC operations, in brief:
-
-- **`execute_schema`** — get a query's result schema *without running it*, via a PLAN-only probe.
+- **`execute_schema`** — a query's result schema *without running it*, via a PLAN-only probe.
   Queries only: DML and DDL are rejected, since neither can be planned this way.
 - **`execute_partitions` / `read_partition`** — split a large read into independent partitions that
   can be executed in parallel, possibly on different machines. `execute_partitions` produces opaque,
@@ -396,29 +252,21 @@ A few more standard ADBC operations, in brief:
 
 ---
 
-## 6. Configuration, the ADBC way
+## 5. Configuration, the ADBC way
 
 Everything tunable is an **option** — a string key/value set on one of the four objects with
-`set_option` (or via the driver manager's `AdbcDatabaseSetOption` / `…ConnectionSetOption` /
-`…StatementSetOption`, or Python `db_kwargs` / `conn_kwargs`). The conventions:
+`set_option` (or the driver manager's `AdbcDatabaseSetOption` / `…ConnectionSetOption` /
+`…StatementSetOption`, or Python `db_kwargs` / `conn_kwargs`). Standard, spec-defined options use
+the `adbc.*` prefix and mean the same on every ADBC driver; Spanner-specific options use
+`spanner.*`. Setting an unknown option fails with `NotImplemented`; reading an unset one fails with
+`NotFound`.
 
-- **Standard, spec-defined options** use the `adbc.*` prefix — e.g. `adbc.connection.autocommit`,
-  `adbc.connection.readonly`, `adbc.statement.bind_by_name`. These mean the same thing on every
-  ADBC driver.
-- **Spanner-specific options** use the `spanner.*` prefix — e.g. `spanner.read.staleness`,
-  `spanner.request.priority`, `spanner.commit.max_delay`.
-- Options set on a higher object are inherited as **defaults** by lower ones (connection → statement),
-  and can be overridden lower down. Setting an option to `""` typically unsets it.
-- Most options **round-trip**: `get_option` reads back what you set.
-- Setting an unknown option fails with `NotImplemented`; reading an unset one fails with `NotFound`.
-
-The complete, authoritative reference — every option at every level, with exact types, defaults,
-and round-trip behaviour — is [docs/options.md](options.md). That is the page to consult when you
-actually need a specific knob; this document only explains the *mechanism*.
+[docs/options.md](options.md) is the complete, authoritative reference — every option at every
+level, with exact types, defaults, and round-trip behaviour.
 
 ---
 
-## 7. Errors
+## 6. Errors
 
 ADBC has its own small set of error **status codes** (`InvalidArguments`, `NotFound`,
 `AlreadyExists`, `InvalidState`, `NotImplemented`, `Timeout`, …). Spanner speaks gRPC status codes.
@@ -444,20 +292,9 @@ older 1.0.0 error layout read the code from `vendor_code` itself.
 
 ---
 
-## 8. Putting it together — the mental model
+## 7. Where to go next
 
-1. A driver manager (or your Rust code) loads the driver via its **one exported entrypoint**.
-2. You configure a **Database** (which Spanner database, which credentials) — no network yet.
-3. You open a **Connection** — now there is a live Spanner client, and a transaction mode.
-4. You create **Statements**, set SQL or bind Arrow data, and execute them.
-5. Reads stream back as **Arrow `RecordBatch`es**, pulled from Spanner in bounded, prefetched
-   chunks; writes go through DML transactions, DDL through the admin API, and bulk loads through
-   native mutations.
-6. Every synchronous ADBC call **blocks on** the async Spanner client via one shared runtime.
-7. Options flow **down** the hierarchy; errors are **translated** from gRPC to ADBC at the boundary.
-
-That is the whole driver. From here, the natural next reads are the
-[README](../README.md) for the feature list and type mapping, [docs/options.md](options.md) for the
-configuration reference, [docs/transactions.md](transactions.md) for Spanner's transaction model and
-the gRPC calls the driver makes underneath all of the above, and the module-level rustdoc in
-[`src/`](../src) for any internal you want to go deeper on.
+The natural next reads are the [README](../README.md) for the feature list and type
+mapping, [docs/options.md](options.md) for the configuration reference,
+[docs/transactions.md](transactions.md) for Spanner's transaction model and the gRPC calls the
+driver makes underneath all of the above, and the module-level rustdoc in [`src/`](../src).

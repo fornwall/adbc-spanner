@@ -118,7 +118,7 @@ Every option named here is specified in full in **[docs/options.md](docs/options
   `google.rpc.quotafailure`, …) with the detail's ProtoJSON encoding as the value. On a
   `PERMISSION_DENIED` (→ `Unauthorized`) the driver appends a short IAM hint to the message;
   Spanner's own message already names the missing permission and is preserved verbatim.
-  See [docs/adbc.md § Errors](docs/adbc.md#7-errors) for the C-ABI 1.1.0 wrinkle, and
+  See [docs/adbc.md § Errors](docs/adbc.md#6-errors) for the C-ABI 1.1.0 wrinkle, and
   `src/error.rs` for the full contract.
 
 ## Shared library (loadable driver)
