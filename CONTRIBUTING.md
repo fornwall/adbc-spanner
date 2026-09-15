@@ -37,8 +37,6 @@ pushing.
 ## Pull requests
 
 - Match the surrounding style; keep `fmt` and `clippy` clean (CI fails otherwise).
-- Add a note to the `## [Unreleased]` section of [CHANGELOG.md](CHANGELOG.md) for any user-visible
-  change (a new option, behavior change, or bug fix).
 - Keep changes truthful and focused; the existing code favors "why" comments at every non-obvious
   constraint — follow that convention.
 
