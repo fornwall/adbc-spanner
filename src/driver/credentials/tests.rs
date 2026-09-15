@@ -424,7 +424,23 @@ fn authorized_user_credential_json_is_accepted() {
         "refresh_token": "test-refresh-token"
     }"#;
     let runtime = new_runtime().unwrap();
-    runtime.block_on(async { assert!(build_credentials_from_json(json, None).is_ok()) });
+    runtime.block_on(async {
+        let credentials = build_credentials_from_json(json, None).unwrap();
+        // Which flow was taken is the whole point: an `authorized_user` key must reach the
+        // user-account provider, not the service-account one it has no private key for.
+        let built = format!("{credentials:?}");
+        assert!(built.contains("UserCredentials"), "{built}");
+        assert!(!built.contains("ServiceAccount"), "{built}");
+        assert!(built.contains("quota_project_id: None"), "{built}");
+
+        // A quota project reaches the same builder rather than being dropped on this path.
+        let credentials = build_credentials_from_json(json, Some("billing-project")).unwrap();
+        let built = format!("{credentials:?}");
+        assert!(
+            built.contains(r#"quota_project_id: Some("billing-project")"#),
+            "{built}"
+        );
+    });
 }
 
 // A `service_account` keyfile is still routed to the service-account flow. A key with an invalid
@@ -641,14 +657,28 @@ fn impersonated_credentials_build_without_network() {
     let runtime = new_runtime().unwrap();
     runtime.block_on(async {
         let source = build_credentials_from_json(source_json, None).unwrap();
-        let result = build_impersonated_credentials(
+        let impersonated = build_impersonated_credentials(
             source,
             "target@project.iam.gserviceaccount.com",
             &["delegate@project.iam.gserviceaccount.com".to_string()],
             &["https://www.googleapis.com/auth/cloud-platform".to_string()],
             Duration::from_secs(1200),
             Some("my-billing-project"),
+        )
+        .unwrap();
+
+        // Impersonation *layers* on the base credential rather than replacing it, so the result
+        // must be the impersonated provider wrapping the `authorized_user` source — and the
+        // impersonated builder's own quota project is the one that wins.
+        let built = format!("{impersonated:?}");
+        assert!(built.contains("ImpersonatedServiceAccount"), "{built}");
+        assert!(
+            built.contains("source_credentials: Credentials { inner: UserCredentials"),
+            "{built}"
         );
-        assert!(result.is_ok());
+        assert!(
+            built.contains(r#"quota_project_id: Some("my-billing-project")"#),
+            "{built}"
+        );
     });
 }

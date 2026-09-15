@@ -158,13 +158,43 @@ fn multi_use_pins_bounded_staleness_kinds() {
     assert!(s.multi_use_timestamp_bound().unwrap().is_some());
 }
 
+/// The absolute read bounds hand the client a [`SystemTime`], which has no signed representation
+/// of its own — pre-epoch instants are built by subtracting from the epoch, and the sub-second part
+/// is always a positive offset from the *floor* second. Getting that wrong shifts a pre-epoch
+/// timestamp by up to a second, which no `is_ok()` would notice, so the conversion is round-tripped
+/// back to a `DateTime` here.
 #[test]
-fn to_system_time_round_trips_via_bound() {
-    // Ensure the client accepts our SystemTime conversion for realistic timestamps.
-    let bound = ReadBound::ReadTimestamp(dt("2026-07-07T12:34:56.789Z"));
-    assert!(bound.to_timestamp_bound().is_ok());
-    let bound = ReadBound::MinReadTimestamp(dt("1999-12-31T23:59:59Z"));
-    assert!(bound.to_timestamp_bound().is_ok());
+fn to_system_time_round_trips_every_timestamp_it_is_given() {
+    for rfc3339 in [
+        "2026-07-07T12:34:56.789Z",
+        "1999-12-31T23:59:59Z",
+        "1970-01-01T00:00:00Z",
+        // Pre-epoch, with a fractional part: the case the two-branch conversion exists for.
+        "1969-12-31T23:59:59.250Z",
+        "1901-12-13T20:45:52.123456789Z",
+    ] {
+        let original = dt(rfc3339);
+        let round_tripped: DateTime<Utc> = to_system_time(original).into();
+        assert_eq!(round_tripped, original, "{rfc3339}");
+    }
+
+    // The epoch itself is exactly `UNIX_EPOCH`, not an offset from it.
+    assert_eq!(to_system_time(dt("1970-01-01T00:00:00Z")), UNIX_EPOCH);
+    // A quarter second before the epoch really is a quarter second before it.
+    assert_eq!(
+        UNIX_EPOCH
+            .duration_since(to_system_time(dt("1969-12-31T23:59:59.750Z")))
+            .unwrap(),
+        Duration::from_millis(250)
+    );
+
+    // And the client accepts the conversion for both absolute bound kinds.
+    ReadBound::ReadTimestamp(dt("2026-07-07T12:34:56.789Z"))
+        .to_timestamp_bound()
+        .unwrap();
+    ReadBound::MinReadTimestamp(dt("1999-12-31T23:59:59Z"))
+        .to_timestamp_bound()
+        .unwrap();
 }
 
 /// A value with no recognised prefix must echo itself and enumerate the four forms — the mistake
