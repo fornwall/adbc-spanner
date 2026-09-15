@@ -289,6 +289,24 @@ fn builds_create_table_sql() {
     );
 }
 
+/// A wide ingest schema with one unmappable column must say *which* column: the Arrow type alone
+/// leaves the caller to guess among the rest.
+#[test]
+fn create_table_sql_names_the_column_it_cannot_map() {
+    let schema = Schema::new(vec![
+        Field::new("ok", DataType::Int64, true),
+        Field::new("weird", DataType::UInt64, true),
+    ]);
+    let err = create_table_sql("t", None, &schema, false).unwrap_err();
+    assert_eq!(err.status, adbc_core::error::Status::InvalidArguments);
+    assert!(
+        err.message.starts_with("ingest column \"weird\": "),
+        "{}",
+        err.message
+    );
+    assert!(err.message.contains("UInt64"), "{}", err.message);
+}
+
 #[test]
 fn builds_insert_mutations() {
     // A two-column row becomes one insert mutation carrying the raw column names and the same
@@ -417,16 +435,22 @@ fn by_name_mode_binds_by_name_and_leaves_extra_params_unbound() {
 }
 
 #[test]
-fn by_name_mode_rejects_an_unmatched_column_naming_the_parameter() {
+fn by_name_mode_rejects_an_unmatched_column_naming_the_column() {
     // bind_by_name=true: a bound column with no matching query parameter is a hard
-    // InvalidArguments error naming the missing parameter — never a silent positional
-    // fallback (which is what the default bind_by_name=false does with this input).
+    // InvalidArguments error naming that *column* (it is a column name, not a parameter) and the
+    // parameters the query does declare — never a silent positional fallback (which is what the
+    // default bind_by_name=false does with this input).
     let b = int_batch(&["a", "x"]);
     let err = resolve_parameter_names("SELECT @a, @b", &b, true).unwrap_err();
     assert_eq!(err.status, adbc_core::error::Status::InvalidArguments);
     assert!(
-        err.message.contains("could not find parameter \"x\""),
-        "error must name the missing parameter: {}",
+        err.message.contains("cannot bind column \"x\""),
+        "error must name the offending column: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("[\"a\", \"b\"]"),
+        "error must name the query's parameters: {}",
         err.message
     );
 }

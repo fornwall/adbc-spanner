@@ -19,14 +19,20 @@ fn maps_grpc_codes_to_adbc_status() {
         status_for_grpc_code(Code::InvalidArgument),
         Status::InvalidArguments
     );
-    assert_eq!(
-        status_for_grpc_code(Code::OutOfRange),
-        Status::InvalidArguments
-    );
+    // A data fault, not a malformed request — adbc.h's InvalidData, like the PostgreSQL driver's
+    // SQLSTATE class 22.
+    assert_eq!(status_for_grpc_code(Code::OutOfRange), Status::InvalidData);
+    // Deliberately InvalidState rather than Integrity: Spanner reports constraint violations *and*
+    // genuine wrong-state failures with this one code, and telling them apart would mean sniffing
+    // the server's message text.
     assert_eq!(
         status_for_grpc_code(Code::FailedPrecondition),
         Status::InvalidState
     );
+    // A dedicated status exists for "an unknown error occurred"; Internal would claim a defect.
+    assert_eq!(status_for_grpc_code(Code::Unknown), Status::Unknown);
+    // Data lost or corrupted in transit is an I/O failure.
+    assert_eq!(status_for_grpc_code(Code::DataLoss), Status::IO);
     assert_eq!(
         status_for_grpc_code(Code::DeadlineExceeded),
         Status::Timeout
@@ -77,18 +83,14 @@ fn from_status_parts_maps_numeric_codes_like_from_spanner() {
 }
 
 #[test]
-fn unmapped_and_unknown_codes_fall_back_to_internal() {
-    for code in [
-        Code::ResourceExhausted,
-        Code::Internal,
-        Code::Unknown,
-        Code::DataLoss,
-        Code::Ok,
-        // An out-of-range numeric decodes to some non-mapped `Code` and still hits the wildcard.
-        Code::from(9999),
-    ] {
+fn unmapped_codes_fall_back_to_internal() {
+    for code in [Code::ResourceExhausted, Code::Internal, Code::Ok] {
         assert_eq!(status_for_grpc_code(code), Status::Internal);
     }
+    // An out-of-range numeric decodes to `Unknown`, which now has its own arm — the catch-all is
+    // still mandatory (the `Code` enum is `#[non_exhaustive]`), it is just no longer what an
+    // unrecognised wire code reaches.
+    assert_eq!(status_for_grpc_code(Code::from(9999)), Status::Unknown);
 }
 
 #[test]
@@ -432,4 +434,52 @@ fn unrecognised_detail_keys_off_its_type_url() {
     assert_eq!(details[0].0, "mycompany.customdetail");
     let parsed: serde_json::Value = serde_json::from_slice(&details[0].1).unwrap();
     assert_eq!(parsed, custom);
+}
+
+/// [`unsupported`] is the verbatim sibling of [`not_implemented`]: a caller that already has a
+/// whole sentence must not have a second one glued onto it.
+#[test]
+fn unsupported_keeps_the_message_verbatim() {
+    let error = unsupported("Substrait plans: Spanner executes GoogleSQL text, not Substrait");
+    assert_eq!(error.status, Status::NotImplemented);
+    assert_eq!(
+        error.message,
+        "Substrait plans: Spanner executes GoogleSQL text, not Substrait"
+    );
+    // The bare-noun helper still composes its sentence.
+    assert_eq!(
+        not_implemented("Substrait plans").message,
+        "Substrait plans is not supported by the Spanner ADBC driver"
+    );
+}
+
+/// An option getter cannot distinguish "recognized but unset" from "not a key of this driver", so
+/// the one error it is licensed to raise names both rather than advising a `set_option` that would
+/// then be rejected.
+#[test]
+fn option_not_set_covers_the_unknown_key_case_too() {
+    let error = option_not_set("spanner.read.stalenesss");
+    assert_eq!(error.status, Status::NotFound);
+    assert_eq!(
+        error.message,
+        "option spanner.read.stalenesss is not set or not recognized by this driver"
+    );
+}
+
+/// Annotating rewrites the message and nothing else — in particular the gRPC code and the
+/// forwarded `google.rpc.Status` details survive, which a rebuild-and-copy idiom only does until
+/// the next field is added.
+#[test]
+fn annotate_rewrites_only_the_message() {
+    let mut original = err("boom", Status::Internal);
+    original.vendor_code = 42;
+    original.details = Some(vec![("google.rpc.retryinfo".to_string(), b"{}".to_vec())]);
+    let annotated = annotate(original, |m| format!("table \"t\": {m}"));
+    assert_eq!(annotated.message, "table \"t\": boom");
+    assert_eq!(annotated.status, Status::Internal);
+    assert_eq!(annotated.vendor_code, 42);
+    assert_eq!(
+        annotated.details,
+        Some(vec![("google.rpc.retryinfo".to_string(), b"{}".to_vec())])
+    );
 }

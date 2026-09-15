@@ -152,10 +152,20 @@ impl ReadStaleness {
     }
 }
 
-/// Error describing the accepted `spanner.read.staleness` grammar.
-const GRAMMAR_MSG: &str = "spanner.read.staleness must be one of \"exact:<duration>\", \
-     \"max:<duration>\", \"read:<rfc3339>\" or \"min:<rfc3339>\" (e.g. \"exact:10s\", \
-     \"max:500ms\", \"read:2026-07-07T00:00:00Z\", \"min:2026-07-07T00:00:00+02:00\")";
+/// The four accepted `spanner.read.staleness` forms, each with a worked example — the tail of
+/// every grammar rejection.
+const GRAMMAR_FORMS: &str = "\"exact:<duration>\" (e.g. \"exact:10s\"), \"max:<duration>\" \
+     (e.g. \"max:500ms\"), \"read:<rfc3339>\" (e.g. \"read:2026-07-07T00:00:00Z\") or \
+     \"min:<rfc3339>\" (e.g. \"min:2026-07-07T00:00:00+02:00\")";
+
+/// Reject `value` as not matching the [`GRAMMAR_FORMS`], echoing it so an empty or whitespace
+/// value is visible and the caller can see which of the four prefixes they missed.
+fn grammar_err(value: &str) -> adbc_core::error::Error {
+    invalid_argument(format!(
+        "option {}: {value:?} is not a valid read bound; expected {GRAMMAR_FORMS}",
+        crate::OPTION_READ_STALENESS
+    ))
+}
 
 /// Parse a `spanner.read.staleness` value into a [`ReadBound`]. Accepts the four prefixed forms —
 /// the *relative* `exact:<duration>` / `max:<duration>` and the *absolute* `read:<rfc3339>` /
@@ -172,27 +182,55 @@ fn parse_read_bound(value: &str) -> Result<ReadBound> {
         match kind.trim() {
             "exact" => return Ok(ReadBound::ExactStaleness(parse_duration(arg.trim())?)),
             "max" => return Ok(ReadBound::MaxStaleness(parse_duration(arg.trim())?)),
-            "read" => return Ok(ReadBound::ReadTimestamp(parse_rfc3339(arg.trim())?)),
-            "min" => return Ok(ReadBound::MinReadTimestamp(parse_rfc3339(arg.trim())?)),
+            // An explicit timestamp prefix: the caller clearly meant an RFC 3339 timestamp, so the
+            // parser's own complaint about it is the useful part and is forwarded.
+            "read" => return parse_rfc3339(value, arg.trim()).map(ReadBound::ReadTimestamp),
+            "min" => return parse_rfc3339(value, arg.trim()).map(ReadBound::MinReadTimestamp),
             // Not a known kind — fall through and try a bare RFC 3339 timestamp (which also
             // contains colons), else report the grammar error.
             _ => {}
         }
     }
-    parse_rfc3339(value).map(ReadBound::ReadTimestamp)
+    // No recognised prefix: the likely mistake is the prefix, not the timestamp, so report the
+    // grammar rather than a chrono complaint about text that was never meant to be a timestamp.
+    DateTime::parse_from_rfc3339(value)
+        .map(|t| ReadBound::ReadTimestamp(t.with_timezone(&Utc)))
+        .map_err(|_| grammar_err(value))
 }
 
-/// Parse an RFC 3339 timestamp into a UTC [`DateTime`].
-fn parse_rfc3339(value: &str) -> Result<DateTime<Utc>> {
-    Ok(DateTime::parse_from_rfc3339(value)
-        .map_err(|e| invalid_argument(format!("{GRAMMAR_MSG}: {e}")))?
+/// Parse the RFC 3339 `timestamp` argument of a `read:`/`min:`-prefixed `value` into a UTC
+/// [`DateTime`], quoting the whole option value and forwarding the parser's own diagnosis.
+fn parse_rfc3339(value: &str, timestamp: &str) -> Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(timestamp)
+        .map_err(|e| {
+            invalid_argument(format!(
+                "option {}: {value:?} does not carry a valid RFC 3339 timestamp ({e}); expected \
+                 {GRAMMAR_FORMS}",
+                crate::OPTION_READ_STALENESS
+            ))
+        })?
         .with_timezone(&Utc))
 }
 
-/// Parse a non-negative duration with an optional unit suffix (`s` default, `ms`, `us`/`µs`, `ns`,
-/// `m`, `h`). Shared with the `spanner.commit.max_delay` option (see [`crate::request`]).
+/// Parse a non-negative duration for the `spanner.read.staleness` option — a thin wrapper over
+/// [`parse_duration_for`]. Any other option must name itself via that function instead.
 pub(crate) fn parse_duration(value: &str) -> Result<Duration> {
-    let bad = || invalid_argument(format!("invalid staleness duration {value:?}"));
+    parse_duration_for(value, crate::OPTION_READ_STALENESS)
+}
+
+/// Parse a non-negative duration with an optional unit suffix (`s` default, `ms`, `us`/`µs`, `ns`,
+/// `m`, `h`), naming `key` in the rejection.
+///
+/// The grammar is shared between `spanner.read.staleness` and `spanner.commit.max_delay` (see
+/// [`crate::request`]), so the option key is a parameter: a rejection that named a fixed option
+/// would point the caller at a key they never set.
+pub(crate) fn parse_duration_for(value: &str, key: &str) -> Result<Duration> {
+    let bad = || {
+        invalid_argument(format!(
+            "option {key}: {value:?} is not a valid duration; expected a number with an optional \
+             unit suffix (s [default], ms, us/µs, ns, m, h), e.g. \"500ms\""
+        ))
+    };
     // Order matters: check the two-letter suffixes before the single-letter ones.
     let (number, unit_secs): (&str, f64) = if let Some(n) = value.strip_suffix("ms") {
         (n, 1e-3)

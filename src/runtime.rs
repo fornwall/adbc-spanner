@@ -161,7 +161,11 @@ impl CancelHandle for SlotCancelHandle {
 /// The error every cancelled operation surfaces, whether it was cancelled while parked in
 /// [`block_on_cancellable`] or inside a background prefetch task ([`spawn_prefetch`]).
 fn cancelled_err() -> Error {
-    err("operation cancelled", Status::Cancelled)
+    err(
+        "operation cancelled: the ADBC cancel handle for this connection or statement was \
+         signalled; execute the operation again to retry it",
+        Status::Cancelled,
+    )
 }
 
 /// Run `future` on `runtime`, returning [`Status::Cancelled`] if `cancel` is signalled before it

@@ -8,14 +8,13 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use adbc_core::error::{Result, Status};
+use adbc_core::error::Result;
 use adbc_core::options::InfoCode;
 use adbc_core::schemas::GET_INFO_SCHEMA;
 use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::DataType;
 
-use crate::error::err;
-use crate::nested::{arrow_err, dense_union};
+use crate::nested::{arrow_err, dense_union, shape_err};
 use crate::{DRIVER_NAME, DRIVER_VERSION, VENDOR_NAME};
 
 /// Type ids of the `info_value` union branches this driver populates (see [`GET_INFO_SCHEMA`]:
@@ -137,12 +136,7 @@ pub(crate) fn build(codes: Option<HashSet<InfoCode>>) -> Result<RecordBatch> {
     // GET_INFO_SCHEMA exactly (branch names, nullability and type ids all).
     let union_fields = match GET_INFO_SCHEMA.field(1).data_type() {
         DataType::Union(fields, _) => fields.clone(),
-        other => {
-            return Err(err(
-                format!("GET_INFO_SCHEMA info_value is not a union: {other:?}"),
-                Status::Internal,
-            ));
-        }
+        _ => return Err(shape_err("`info_value` to be a union")),
     };
 
     let string_child: ArrayRef = Arc::new(StringArray::from_iter(strings));

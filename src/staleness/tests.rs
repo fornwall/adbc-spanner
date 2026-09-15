@@ -166,3 +166,65 @@ fn to_system_time_round_trips_via_bound() {
     let bound = ReadBound::MinReadTimestamp(dt("1999-12-31T23:59:59Z"));
     assert!(bound.to_timestamp_bound().is_ok());
 }
+
+/// A value with no recognised prefix must echo itself and enumerate the four forms — the mistake
+/// is the prefix, so a chrono complaint about text that was never a timestamp only misleads.
+#[test]
+fn grammar_rejection_echoes_the_value_and_omits_the_timestamp_parser_detail() {
+    let error = parse_read_bound("stale:10s").unwrap_err();
+    assert_eq!(error.status, Status::InvalidArguments);
+    assert_eq!(
+        error.message,
+        "option spanner.read.staleness: \"stale:10s\" is not a valid read bound; expected \
+         \"exact:<duration>\" (e.g. \"exact:10s\"), \"max:<duration>\" (e.g. \"max:500ms\"), \
+         \"read:<rfc3339>\" (e.g. \"read:2026-07-07T00:00:00Z\") or \"min:<rfc3339>\" \
+         (e.g. \"min:2026-07-07T00:00:00+02:00\")"
+    );
+    assert!(
+        !error.message.contains("invalid characters"),
+        "{}",
+        error.message
+    );
+}
+
+/// With an explicit `read:`/`min:` prefix the caller did mean a timestamp, so the parser's own
+/// diagnosis is the useful part and is forwarded alongside the grammar.
+#[test]
+fn timestamp_rejection_keeps_the_parser_detail() {
+    for bad in ["read:nope", "min:12345"] {
+        let error = parse_read_bound(bad).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments, "{bad}");
+        assert!(
+            error.message.starts_with(&format!(
+                "option spanner.read.staleness: {bad:?} does not carry a valid RFC 3339 timestamp ("
+            )),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("expected \"exact:<duration>\""),
+            "{}",
+            error.message
+        );
+    }
+}
+
+/// The duration grammar is shared with `spanner.commit.max_delay`, so the rejection names the key
+/// the caller actually set and lists the accepted unit suffixes.
+#[test]
+fn duration_rejection_names_its_option_and_the_units() {
+    let error = parse_duration_for("1x", crate::OPTION_MAX_COMMIT_DELAY).unwrap_err();
+    assert_eq!(error.status, Status::InvalidArguments);
+    assert_eq!(
+        error.message,
+        "option spanner.commit.max_delay: \"1x\" is not a valid duration; expected a number with \
+         an optional unit suffix (s [default], ms, us/µs, ns, m, h), e.g. \"500ms\""
+    );
+    // The staleness wrapper names the staleness key instead.
+    assert!(
+        parse_duration("1x")
+            .unwrap_err()
+            .message
+            .starts_with("option spanner.read.staleness: \"1x\" is not a valid duration;")
+    );
+}

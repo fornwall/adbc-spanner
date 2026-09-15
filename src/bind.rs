@@ -118,9 +118,10 @@ pub(crate) fn bind_params(
 ///   suites pass parameters as `$1`/`?` with columns not named after the parameters.
 /// - **By name** (`bind_by_name = true`): each column binds to `@<its own name>`,
 ///   order-independent. A column whose name is not one of the query's parameters is rejected here
-///   with `InvalidArguments` naming the missing parameter (a parameter no column names is simply
-///   left unbound, which Spanner rejects at execution time). Use this when the bound column names
-///   are authoritative and may not match the parameters' textual order.
+///   with `InvalidArguments` naming that column and the parameters the query does declare (a
+///   parameter no column names is simply left unbound, which Spanner rejects at execution time).
+///   Use this when the bound column names are authoritative and may not match the parameters'
+///   textual order.
 ///
 /// Lexing the SQL to find its `@name` parameters is the expensive part, so callers resolve once per
 /// (sql, batch) and reuse the result across every row via [`bind_params`].
@@ -139,8 +140,10 @@ pub(crate) fn resolve_parameter_names(
             params.iter().map(String::as_str).collect();
         if let Some(missing) = column_names.iter().find(|c| !param_set.contains(*c)) {
             return Err(invalid_argument(format!(
-                "could not find parameter {missing:?}: adbc.statement.bind_by_name is true, \
-                 so every bound column must name one of the query's parameters (got {params:?})",
+                "cannot bind column {missing:?}: adbc.statement.bind_by_name is true, so every \
+                 bound column must be named after one of the query's parameters, which are \
+                 {params:?}; rename the column or set adbc.statement.bind_by_name to false to \
+                 bind positionally",
             )));
         }
         return Ok(column_names.iter().map(|c| (*c).to_string()).collect());
@@ -634,7 +637,8 @@ pub(crate) fn spanner_column_type(data_type: &DataType) -> Result<String> {
         DataType::Dictionary(_, value) => spanner_column_type(value)?,
         other => {
             return Err(invalid_argument(format!(
-                "cannot create a Spanner column for Arrow type {other:?}"
+                "cannot create a Spanner column for Arrow type {other:?}; cast it to a type with \
+                 a Spanner equivalent before ingesting"
             )));
         }
     })
@@ -679,11 +683,12 @@ pub(crate) fn create_table_sql(
 ) -> Result<String> {
     let mut columns: Vec<String> = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
-        columns.push(format!(
-            "{} {}",
-            quote_ident(field.name()),
-            spanner_field_type(field)?
-        ));
+        // Name the offending column: the rejection is per-field, and a wide ingest schema gives
+        // the caller no other way to find which of its columns has no Spanner type.
+        let column_type = spanner_field_type(field).map_err(|e| {
+            crate::error::annotate(e, |m| format!("ingest column {:?}: {m}", field.name()))
+        })?;
+        columns.push(format!("{} {}", quote_ident(field.name()), column_type));
     }
     let guard = if if_not_exists { "IF NOT EXISTS " } else { "" };
     Ok(format!(

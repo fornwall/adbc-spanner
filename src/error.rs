@@ -9,12 +9,53 @@ pub(crate) fn err(message: impl Into<String>, status: Status) -> Error {
     Error::with_message_and_status(message, status)
 }
 
-/// A `NotImplemented` error for functionality this driver does not (yet) support.
+/// A `NotImplemented` error for a **bare noun** naming functionality this driver does not (yet)
+/// support, e.g. `not_implemented("ingest mode \"upsert\"")`. The noun is composed into a full
+/// sentence here; a caller that already has one must use [`unsupported`] instead, or the two
+/// collide into ungrammatical text.
 pub(crate) fn not_implemented(what: &str) -> Error {
     err(
         format!("{what} is not supported by the Spanner ADBC driver"),
         Status::NotImplemented,
     )
+}
+
+/// A `NotImplemented` error carrying `message` **verbatim** — the sibling of [`not_implemented`]
+/// for callers that have already phrased the whole sentence (typically because they name a cause
+/// after a `:` or a remedy after a `;`, which no fixed suffix can follow grammatically).
+// The callers that need it live in `driver.rs`, `connection.rs` and `statement.rs`; the helper is
+// introduced here first so they can converge on it.
+#[allow(dead_code)]
+pub(crate) fn unsupported(message: impl Into<String>) -> Error {
+    err(message, Status::NotImplemented)
+}
+
+/// The `NotFound` error every option getter raises for a key it cannot answer.
+///
+/// `adbc.h` licenses exactly one failure for the getters, and the driver reaches it two ways: the
+/// key is recognised but unset, or it is not a key of this driver at all. The getters cannot tell
+/// those apart (an unrecognised key falls through to the same arm), so the message names **both**
+/// possibilities rather than telling the caller to set a key that a later `set_option` would
+/// reject as unknown.
+// The getters that raise this live in `options.rs` and the per-object modules; the wording is
+// introduced here first so they can all converge on it.
+#[allow(dead_code)]
+pub(crate) fn option_not_set(key: &str) -> Error {
+    not_found(format!(
+        "option {key} is not set or not recognized by this driver"
+    ))
+}
+
+/// Rewrite an error's message **in place**, keeping every other field.
+///
+/// The annotating call sites — adding the offending table/column to an error raised deeper down —
+/// must preserve `vendor_code` and `details`, which is what makes the annotated error still
+/// carry the gRPC code and the forwarded `google.rpc.Status` details. Rebuilding the error and
+/// copying those two fields back by hand does that only until a third field is added, so the
+/// mutation is done once, here.
+pub(crate) fn annotate(mut error: Error, f: impl FnOnce(&str) -> String) -> Error {
+    error.message = f(&error.message);
+    error
 }
 
 /// An `InvalidState` error, used when the caller invokes an operation out of order
@@ -133,8 +174,8 @@ pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
 /// `details` are untouched. The emulator does not enforce IAM, so this path is covered by the unit
 /// tests here plus a `tests/mock_spanner.rs` synthetic `PERMISSION_DENIED`, not by the emulator
 /// integration test.
-const PERMISSION_DENIED_GUIDANCE: &str = " (the caller lacks the required Spanner IAM permission; \
-    grant an IAM role that includes it — see https://cloud.google.com/spanner/docs/iam)";
+const PERMISSION_DENIED_GUIDANCE: &str =
+    "; grant an IAM role that includes it — see https://cloud.google.com/spanner/docs/iam";
 
 /// Map a gRPC status' `google.rpc.Status` details onto ADBC error details.
 ///
@@ -225,8 +266,24 @@ fn status_for_grpc_code(code: Code) -> Status {
         // ADBC distinguishes the two: failed authentication vs. an authenticated-but-forbidden call.
         Code::Unauthenticated => Status::Unauthenticated,
         Code::PermissionDenied => Status::Unauthorized,
-        Code::InvalidArgument | Code::OutOfRange => Status::InvalidArguments,
+        Code::InvalidArgument => Status::InvalidArguments,
+        // Out of range is a *data* fault, not a malformed request: Spanner raises it for values the
+        // query produced or consumed (numeric overflow, an index past the end), which is exactly
+        // adbc.h's InvalidData ("invalid data was processed (not a programming error) ... a
+        // division by zero may have occurred during query execution") and where the PostgreSQL
+        // driver sends SQLSTATE class 22.
+        Code::OutOfRange => Status::InvalidData,
         // "The preconditions for the operation are not met" — matches ADBC's InvalidState.
+        //
+        // Deliberately *not* ADBC's Integrity, even though Spanner reports foreign-key, CHECK and
+        // NOT NULL violations with this code: it also reports genuine wrong-state failures with it
+        // (a database still being created, a schema change in flight, an operation the current
+        // schema does not allow), and one code cannot be split without sniffing the server's
+        // message text, which is untyped and version-dependent. Integrity asserts "the database's
+        // integrity was affected", so guessing it for a wrong-state error is the worse mislabel of
+        // the two; upstream agrees the code is not a clean fit (the Flight SQL driver maps it to
+        // Unknown). A caller that needs the distinction has the exact code in `vendor_code` (9) and
+        // the forwarded `google.rpc.PreconditionFailure` detail, both typed.
         Code::FailedPrecondition => Status::InvalidState,
         Code::DeadlineExceeded => Status::Timeout,
         Code::Cancelled => Status::Cancelled,
@@ -240,7 +297,13 @@ fn status_for_grpc_code(code: Code) -> Status {
         // environmental, not a driver/database defect, so IO rather than the "driver bug"-flavoured
         // Internal; ADBC has no closer variant, and the exact code survives in `vendor_code` (10).
         Code::Aborted => Status::IO,
-        // ResourceExhausted, Internal, Unknown, DataLoss, Ok and anything unrecognised.
+        // ADBC has a dedicated "an unknown error occurred" status; Internal claims a driver or
+        // database *defect*, which is more than this code says. The Flight SQL driver maps it so.
+        Code::Unknown => Status::Unknown,
+        // Unrecoverable data loss or corruption in transit — adbc.h's IO ("an I/O error occurred"),
+        // as the Flight SQL driver maps it, rather than the driver-bug-flavoured Internal.
+        Code::DataLoss => Status::IO,
+        // ResourceExhausted, Internal, Ok and anything unrecognised.
         _ => Status::Internal,
     }
 }

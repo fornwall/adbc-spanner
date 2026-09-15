@@ -25,7 +25,7 @@ pub(crate) fn arrow_err(e: ArrowError) -> Error {
 }
 
 /// An `Internal` error for a metadata result schema without the expected shape.
-fn shape_err(expected: &str) -> Error {
+pub(crate) fn shape_err(expected: &str) -> Error {
     err(
         format!("unexpected ADBC result schema shape: expected {expected}"),
         Status::Internal,
