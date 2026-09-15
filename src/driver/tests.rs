@@ -33,7 +33,7 @@ fn database_options_round_trip() {
 
     assert_eq!(
         db.get_option_string(OptionDatabase::Uri).unwrap(),
-        "projects/p/instances/i/databases/d"
+        "spanner:///projects/p/instances/i/databases/d"
     );
     assert_eq!(
         db.get_option_string(OptionDatabase::Other(OPTION_ENDPOINT.into()))

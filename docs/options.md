@@ -94,7 +94,7 @@ holds configuration).
 
 | Option | Type / allowed values | Default | Round-trips | Description |
 | ------ | --------------------- | ------- | ----------- | ----------- |
-| `uri` | string: a `spanner://` connection URI carrying the database path `projects/<p>/instances/<i>/databases/<d>` (see [Connection URIs](#connection-uris)) | — (required) | yes, when set (reports the expanded database path, not the original URI) | **Standard ADBC.** A `spanner://` connection URI whose path is the fully-qualified Spanner database path. A bare database path is **not** accepted — the scheme is required (matching the ADBC BigQuery driver's `bigquery://`). Connecting without it fails with `InvalidState`. |
+| `uri` | string: a `spanner://` connection URI carrying the database path `projects/<p>/instances/<i>/databases/<d>` (see [Connection URIs](#connection-uris)) | — (required) | yes, when set (**verbatim**: the exact string that was set, query parameters included) | **Standard ADBC.** A `spanner://` connection URI whose path is the fully-qualified Spanner database path. A bare database path is **not** accepted — the scheme is required (matching the ADBC BigQuery driver's `bigquery://`). Connecting without it fails with `InvalidState`. |
 | `spanner.endpoint` | string: gRPC endpoint URL, e.g. `http://localhost:9010` | unset (production Spanner service) | yes, when set | Explicit gRPC endpoint, e.g. a Spanner emulator. Takes precedence over the endpoint derived from `SPANNER_EMULATOR_HOST` (see [Environment](#environment)). |
 | `spanner.emulator` | boolean | `false` (forced `true` when `SPANNER_EMULATOR_HOST` is set non-empty) | yes, always (`true`/`false`) | Connect with **anonymous credentials** (emulator mode). Combining emulator mode with explicitly configured credentials (`spanner.auth.keyfile`, `spanner.auth.keyfile_json`, `spanner.auth.impersonate.target_principal`, or `spanner.auth.access_token`) is refused at connect time with `InvalidState` instead of silently ignoring them; ambient ADC does not conflict. |
 | `spanner.auth.keyfile` | string: path to a credential JSON file | unset (Application Default Credentials) | yes, when set | Path to a Google credential JSON key file (dbt's `keyfile`). The credential flow is auto-detected from the JSON's `"type"` field: `service_account`, `authorized_user`, `impersonated_service_account`, or `external_account`. Overridden by `spanner.auth.keyfile_json` if both are set. See [README § Authentication](../README.md#authentication). |
@@ -134,8 +134,11 @@ point at a credential.
 
 The URI is expanded into the individual options at the moment it is set, so precedence is
 last-writer-wins per option: a later `set_option` overrides what the URI carried, and the URI
-overwrites only the options it actually names. `get_option("uri")` reports the stored database
-path, not the original URI.
+overwrites only the options it actually names. `get_option("uri")` returns the URI **verbatim** —
+the exact string last set, query parameters and all — so a configuration dump replays back into the
+same state; what the URI expanded into is readable under the expanded options' own keys. Until a
+`uri` is set, `get_option("uri")` fails with `NotFound`, and a rejected URI is never stored, so it
+cannot be read back either.
 
 ## Connection-only options
 

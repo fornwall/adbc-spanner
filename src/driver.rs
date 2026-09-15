@@ -97,6 +97,9 @@ impl Driver for SpannerDriver {
 /// a path, not a secret — both reads back normally and stays a legal query parameter.
 pub struct SpannerDatabase {
     runtime: SharedRuntime,
+    /// The `uri` option exactly as the caller set it, returned verbatim by `get_option`. The
+    /// fields below hold what it expanded into; this is only the string itself.
+    uri: Option<String>,
     database: Option<String>,
     endpoint: Option<String>,
     emulator: bool,
@@ -134,6 +137,7 @@ impl std::fmt::Debug for SpannerDatabase {
         let redact = |value: &Option<String>| value.as_ref().map(|_| "<redacted>");
         f.debug_struct("SpannerDatabase")
             .field("runtime", &self.runtime)
+            .field("uri", &self.uri)
             .field("database", &self.database)
             .field("endpoint", &self.endpoint)
             .field("emulator", &self.emulator)
@@ -167,6 +171,7 @@ impl SpannerDatabase {
     pub(crate) fn new(runtime: SharedRuntime) -> Self {
         Self {
             runtime,
+            uri: None,
             database: None,
             endpoint: None,
             emulator: false,
@@ -398,7 +403,9 @@ impl Optionable for SpannerDatabase {
             ));
         }
         let value = match &key {
-            OptionDatabase::Uri => self.database.clone(),
+            // adbc.h: `GetOption` serves *the option value*, so the URI comes back exactly as
+            // it was set; what it expanded into reads back under the expanded options' own keys.
+            OptionDatabase::Uri => self.uri.clone(),
             OptionDatabase::Other(name) if name == OPTION_ENDPOINT => self.endpoint.clone(),
             OptionDatabase::Other(name) if name == OPTION_EMULATOR => {
                 Some(self.emulator.to_string())

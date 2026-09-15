@@ -281,8 +281,9 @@ The two secret-holding options, `spanner.auth.keyfile_json` and `spanner.auth.ac
 tracing spans), so set those as options directly; `spanner.auth.keyfile`, a path, is fine in a URI.
 The URI is expanded into the individual options immediately when it is set, so precedence is
 plain last-writer-wins: an option set after the URI overrides it, and a URI set after an option
-overwrites only the fields the URI actually carries. `get_option("uri")` returns the stored
-database path, not the original URI.
+overwrites only the fields the URI actually carries. `get_option("uri")` returns the URI verbatim —
+the exact string last set, query parameters included — so a dumped configuration replays into the
+same state (`NotFound` until one is set; a rejected URI is never stored).
 
 ### Authentication
 

@@ -31,27 +31,32 @@ impl SpannerDatabase {
     /// only the fields the URI actually carries (its path, its `//host` authority, and its query
     /// parameters — in that order, so a `spanner.endpoint` query parameter beats the authority).
     ///
-    /// `get_option("uri")` intentionally returns the stored **database path**, not a reconstruction
-    /// of the full URI; the expanded options are readable under their own keys.
+    /// The accepted URI is *also stored verbatim*, and that exact string — query parameters and all
+    /// — is what `get_option("uri")` returns, as adbc.h requires of `GetOption` (it serves the
+    /// option value). So a set/get pair round-trips, and replaying a dumped configuration lands in
+    /// the same state; what the URI expanded into stays readable under the expanded options' own
+    /// keys.
     ///
-    /// The whole URI is validated before any field is mutated, so a rejected URI leaves the
-    /// configuration untouched.
+    /// The whole URI is validated, and expanded, before it is stored, so a rejected URI leaves the
+    /// configuration untouched and is never retrievable through `get_option`.
     pub(super) fn set_uri_option(&mut self, value: String) -> Result<()> {
         let Some(remainder) = connection_uri_remainder(&value) else {
             return Err(invalid_argument(format!(
-                "the `uri` option must be a `spanner://` connection URI, not a bare database path \
-                 — write `spanner:///{value}` (three slashes, no endpoint host) or \
-                 `spanner://<host:port>/{value}`"
+                "the `uri` option value {value:?} is not a `spanner://` connection URI: a bare \
+                 database path or a foreign scheme is not accepted; write `spanner:///{value}` \
+                 (three slashes, no endpoint host) or `spanner://<host:port>/{value}`"
             )));
         };
-        self.apply_connection_uri(remainder)
+        self.apply_connection_uri(&value, remainder)?;
+        self.uri = Some(value);
+        Ok(())
     }
 
     /// Expand a parsed connection URI (see [`parse_connection_uri`]) into this database's option
     /// fields: path → database, authority → [`OPTION_ENDPOINT`], query parameters → the options
     /// they name (validated against a scratch instance first, so failure leaves `self` unchanged).
-    fn apply_connection_uri(&mut self, remainder: &str) -> Result<()> {
-        let parsed = parse_connection_uri(remainder)?;
+    fn apply_connection_uri(&mut self, uri: &str, remainder: &str) -> Result<()> {
+        let parsed = parse_connection_uri(uri, remainder)?;
         // Dry-run the query parameters against a scratch database so a bad *value* (e.g.
         // `spanner.emulator=maybe`) is caught before `self` is touched at all.
         let mut scratch = SpannerDatabase::new(self.runtime.clone());
@@ -141,16 +146,21 @@ struct ParsedConnectionUri {
 /// spanner://emulator-host:9010/projects/p/instances/i/databases/d
 /// ```
 ///
-/// - The **path** must be a full database path, `projects/<p>/instances/<i>/databases/<d>`; a
-///   leading `/` is tolerated (`spanner:projects/…`, `spanner:/projects/…` and
-///   `spanner:///projects/…` are equivalent).
+/// - The `//` is **required**, so the no-endpoint spelling is the three-slash `spanner:///…`
+///   (empty authority); the single-slash `spanner:/…` and scheme-only `spanner:…` forms are
+///   rejected, as [docs/options.md] documents.
+/// - The **path** must be a full database path, `projects/<p>/instances/<i>/databases/<d>`.
 /// - An optional `//host[:port]` **authority** names the gRPC endpoint; it is taken verbatim as
 ///   the [`OPTION_ENDPOINT`] value.
 /// - **Query parameters** are full driver option names from [`URI_QUERY_OPTIONS`]; unknown keys are
 ///   rejected, as are the secret-holding keys of [`URI_SECRET_OPTIONS`] (which name a dedicated
 ///   error). Keys and values are percent-decoded ([`percent_decode`]; `+` is *not* a space).
 /// - A `#fragment` is meaningless here and rejected rather than silently dropped.
-fn parse_connection_uri(remainder: &str) -> Result<ParsedConnectionUri> {
+///
+/// `uri` is the whole option value, carried along only so the errors can quote what the caller set.
+///
+/// [docs/options.md]: https://github.com/fornwall/adbc-spanner/blob/main/docs/options.md#connection-uris
+fn parse_connection_uri(uri: &str, remainder: &str) -> Result<ParsedConnectionUri> {
     let (remainder, fragment) = match remainder.split_once('#') {
         Some((rest, fragment)) => (rest, Some(fragment)),
         None => (remainder, None),
@@ -170,10 +180,11 @@ fn parse_connection_uri(remainder: &str) -> Result<ParsedConnectionUri> {
     // required — a scheme-only `spanner:path` or single-slash `spanner:/path` is rejected, so the
     // accepted form is always `spanner://`.
     let after_authority = before_query.strip_prefix("//").ok_or_else(|| {
-        invalid_argument(
-            "connection URI must use the `spanner://` form (two slashes after the scheme); \
-             write `spanner:///projects/...` when no endpoint host is intended",
-        )
+        invalid_argument(format!(
+            "the `uri` option value {uri:?} does not use the required `spanner://` form: the \
+             scheme must be followed by two slashes; write `spanner:///projects/...` (three \
+             slashes) when no endpoint host is intended"
+        ))
     })?;
     let (authority, path) = match after_authority.split_once('/') {
         Some((authority, path)) => (Some(authority), path),
@@ -191,11 +202,10 @@ fn parse_connection_uri(remainder: &str) -> Result<ParsedConnectionUri> {
         }
         _ => {
             return Err(invalid_argument(format!(
-                "connection URI path {path:?} is not a Spanner database path \
-                 (projects/<project>/instances/<instance>/databases/<database>); note that in \
-                 `spanner://projects/...` the `projects` segment is parsed as a host authority — \
-                 write `spanner:///projects/...` (or `spanner:/projects/...`) when no endpoint \
-                 host is intended"
+                "the `uri` option's connection URI path {path:?} is not a Spanner database path: \
+                 it must be projects/<project>/instances/<instance>/databases/<database>, and in \
+                 `spanner://projects/...` the `projects` segment parses as a host authority; \
+                 write `spanner:///projects/...` (three slashes) when no endpoint host is intended"
             )));
         }
     };

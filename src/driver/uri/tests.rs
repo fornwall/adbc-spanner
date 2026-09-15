@@ -325,18 +325,15 @@ fn a_uri_fragment_is_rejected() {
 }
 
 #[test]
-fn get_option_uri_returns_the_database_path_after_a_uri() {
-    // Documented: `get_option("uri")` reports the stored database path, not the original URI;
-    // the expanded options round-trip under their own keys.
+fn get_option_uri_returns_the_uri_verbatim() {
+    // adbc.h: `GetOption` serves the option *value*, so the URI comes back exactly as set —
+    // query parameters included — while what it expanded into reads back under its own keys.
+    let uri = format!(
+        "spanner:///{DB_PATH}?spanner.endpoint=http://localhost:9010&spanner.emulator=true"
+    );
     let mut db = new_database();
-    set_uri(
-        &mut db,
-        &format!(
-            "spanner:///{DB_PATH}?spanner.endpoint=http://localhost:9010&spanner.emulator=true"
-        ),
-    )
-    .unwrap();
-    assert_eq!(db.get_option_string(OptionDatabase::Uri).unwrap(), DB_PATH);
+    set_uri(&mut db, &uri).unwrap();
+    assert_eq!(db.get_option_string(OptionDatabase::Uri).unwrap(), uri);
     assert_eq!(
         db.get_option_string(OptionDatabase::Other(OPTION_ENDPOINT.into()))
             .unwrap(),
@@ -347,6 +344,79 @@ fn get_option_uri_returns_the_database_path_after_a_uri() {
             .unwrap(),
         "true"
     );
+}
+
+#[test]
+fn get_option_uri_is_not_found_until_a_uri_is_set() {
+    // The database path has no other source, so an unset `uri` reports `NotFound` rather than
+    // some invented value.
+    let db = new_database();
+    let error = db.get_option_string(OptionDatabase::Uri).unwrap_err();
+    assert_eq!(error.status, Status::NotFound);
+}
+
+#[test]
+fn the_last_uri_set_is_the_one_returned() {
+    let mut db = new_database();
+    set_uri(&mut db, &format!("spanner:///{DB_PATH}")).unwrap();
+    let last = "spanner://host:9010/projects/p2/instances/i2/databases/d2?spanner.emulator=true";
+    set_uri(&mut db, last).unwrap();
+    assert_eq!(db.get_option_string(OptionDatabase::Uri).unwrap(), last);
+    assert_eq!(
+        db.database.as_deref(),
+        Some("projects/p2/instances/i2/databases/d2")
+    );
+}
+
+#[test]
+fn a_uri_survives_a_set_get_set_replay() {
+    // The property that makes profile dump-and-replay work: feeding `get_option("uri")` straight
+    // back into `set_option` is accepted and lands in the identical state.
+    let uri = format!(
+        "spanner://authority:9010/{DB_PATH}\
+         ?spanner.endpoint=http%3A%2F%2Flocalhost%3A9010\
+         &spanner.emulator=true\
+         &spanner.auth.keyfile=/path/key.json"
+    );
+    let mut db = new_database();
+    set_uri(&mut db, &uri).unwrap();
+    let dumped = db.get_option_string(OptionDatabase::Uri).unwrap();
+    assert_eq!(dumped, uri);
+
+    let mut replayed = new_database();
+    set_uri(&mut replayed, &dumped).unwrap();
+    assert_eq!(
+        replayed.get_option_string(OptionDatabase::Uri).unwrap(),
+        uri
+    );
+    assert_eq!(replayed.database, db.database);
+    assert_eq!(replayed.endpoint, db.endpoint);
+    assert_eq!(replayed.emulator, db.emulator);
+    assert_eq!(replayed.keyfile, db.keyfile);
+}
+
+#[test]
+fn a_rejected_uri_is_never_retrievable() {
+    // Validation happens before the URI is stored, so a refusal — a secret-bearing parameter
+    // above all — leaves nothing behind for a config dump to find.
+    let mut db = new_database();
+    for bad in [
+        format!("spanner:///{DB_PATH}?{OPTION_ACCESS_TOKEN}=ya29.uri-token"),
+        format!("spanner:///{DB_PATH}?{OPTION_KEYFILE_JSON}=%7B%7D"),
+        format!("spanner:///{DB_PATH}?bogus.key=1"),
+        format!("spanner:/{DB_PATH}"),
+        DB_PATH.to_string(),
+    ] {
+        assert!(set_uri(&mut db, &bad).is_err(), "uri: {bad}");
+        let error = db.get_option_string(OptionDatabase::Uri).unwrap_err();
+        assert_eq!(error.status, Status::NotFound, "uri: {bad}");
+    }
+
+    // ... and a rejected URI does not disturb an already-stored one either.
+    let good = format!("spanner:///{DB_PATH}");
+    set_uri(&mut db, &good).unwrap();
+    assert!(set_uri(&mut db, &format!("spanner:///{DB_PATH}?bogus.key=1")).is_err());
+    assert_eq!(db.get_option_string(OptionDatabase::Uri).unwrap(), good);
 }
 
 #[test]
