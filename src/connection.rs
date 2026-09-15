@@ -100,7 +100,11 @@ mod exec;
 mod txn;
 
 use crate::metadata::{check_lookup_catalog, metadata_sql_builder, table_exists};
-pub(crate) use exec::{apply_isolation, run_batch_dml, run_batch_txn, write_mutations_txn};
+pub(crate) use exec::{build_runner, run_batch_dml, run_batch_txn, write_mutations_txn};
+// Every runner now comes from `build_runner`; this re-export survives only so the
+// `crate::connection::apply_isolation` doc link in `options.rs` keeps resolving.
+#[allow(unused_imports)]
+pub(crate) use exec::apply_isolation;
 use exec::{isolation_to_adbc_string, parse_isolation_level};
 use txn::{ManualTxn, check_commit_writable};
 pub(crate) use txn::{SharedTxn, TxnKind, TxnState, lock_txn};

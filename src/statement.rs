@@ -36,7 +36,7 @@ use google_cloud_spanner::statement::{Statement as SpannerSql, StatementBuilder}
 use google_cloud_spanner::transaction::{MultiUseReadOnlyTransaction, ReadWriteTransaction};
 
 use crate::bind;
-use crate::connection::{SharedTxn, TxnKind, apply_isolation, lock_txn};
+use crate::connection::{SharedTxn, TxnKind, build_runner, lock_txn};
 use crate::conversion::{
     BoundStatementSource, TimestampPrecision, result_set_to_batch, stream_bound_query, stream_query,
 };
@@ -416,15 +416,7 @@ impl SpannerStatement {
         // DML with THEN RETURN is a write path: the update timeout bounds the whole transaction.
         let update_timeout = self.config.timeouts.update_timeout();
         let transaction = async move {
-            let runner =
-                retry
-                    .apply_to_runner(request.apply_to_runner(apply_isolation(
-                        client.read_write_transaction(),
-                        isolation,
-                    )))
-                    .build()
-                    .await
-                    .map_err(from_spanner)?;
+            let runner = build_runner(&client, isolation, &request, retry).await?;
             let outcome = runner
                 .run(move |transaction: ReadWriteTransaction| {
                     let statements = statements.clone();
@@ -1036,14 +1028,7 @@ impl SpannerStatement {
                 self.config.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
                 async move {
-                    let runner = retry
-                        .apply_to_runner(request.apply_to_runner(apply_isolation(
-                            client.read_write_transaction(),
-                            isolation,
-                        )))
-                        .build()
-                        .await
-                        .map_err(from_spanner)?;
+                    let runner = build_runner(&client, isolation, &request, retry).await?;
                     let outcome = runner
                         .run(move |transaction: ReadWriteTransaction| {
                             let statement = plan_stmt.clone();
