@@ -21,7 +21,7 @@ use crate::error::{
     err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
 };
 use crate::options::impl_typed_option_getters;
-use crate::runtime::{SharedRuntime, new_runtime};
+use crate::runtime::{SharedRuntime, block_on, new_runtime};
 use crate::{
     OPTION_ACCESS_TOKEN, OPTION_EMULATOR, OPTION_ENDPOINT, OPTION_IMPERSONATE_DELEGATES,
     OPTION_IMPERSONATE_LIFETIME, OPTION_IMPERSONATE_SCOPES, OPTION_IMPERSONATE_TARGET_PRINCIPAL,
@@ -521,7 +521,7 @@ impl SpannerDatabase {
         // anonymous credentials win.
         let credentials_json = self.credentials_json()?;
 
-        self.runtime.block_on(async move {
+        block_on(&self.runtime, async move {
             let mut builder = Spanner::builder();
             if let Some(endpoint) = endpoint {
                 builder = builder.with_endpoint(endpoint);
