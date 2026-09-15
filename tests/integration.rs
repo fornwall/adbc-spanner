@@ -700,14 +700,16 @@ fn query_and_dml_round_trip() {
     );
 }
 
-/// `get_table_schema` reflects a table's real column types, honours the catalog argument (Spanner's
-/// single catalog is the empty string, so `Some("")` behaves like `None` and any other catalog is
-/// `NotFound`), and escapes a hostile table name rather than interpolating it into the probe SQL.
+/// `get_table_schema` reflects a table's real column types, honours the catalog argument (the
+/// connection's single catalog is the database id, so naming it behaves like `None` and any other
+/// catalog is `NotFound`), and escapes a hostile table name rather than interpolating it into the
+/// probe SQL.
 #[test]
 fn get_table_schema_reports_column_types() {
     let Some(mut fx) = fixture_unguarded() else {
         return;
     };
+    let catalog = fx.target.database.clone();
     let connection = &mut fx.connection;
 
     // --- get_table_schema reflects the table's column types ---
@@ -729,12 +731,12 @@ fn get_table_schema_reports_column_types() {
         .expect_err("hostile table name must not resolve");
     assert_eq!(hostile.status, adbc_core::error::Status::NotFound);
 
-    // The catalog argument is honoured: Spanner's single catalog is the empty string, so `Some("")`
-    // behaves like `None`, while any other catalog is NotFound (nothing can exist in it).
-    let empty_catalog = connection
-        .get_table_schema(Some(""), None, "Singers")
-        .expect("get_table_schema with the default empty catalog");
-    assert_eq!(empty_catalog, singers_schema);
+    // The catalog argument is honoured: the connection's one catalog is the database id, so naming
+    // it behaves like `None`, while any other catalog is NotFound (nothing can exist in it).
+    let own_catalog = connection
+        .get_table_schema(Some(&catalog), None, "Singers")
+        .expect("get_table_schema with the connection's own catalog");
+    assert_eq!(own_catalog, singers_schema);
     let bogus_catalog = connection
         .get_table_schema(Some("nosuchcatalog"), None, "Singers")
         .expect_err("a named catalog does not exist in Spanner");
@@ -2372,9 +2374,9 @@ fn get_objects_reports_catalog_schema_table_columns() {
 
 /// The `get_objects` depth and filter contract, which is where peer drivers have shipped bugs:
 ///
-/// - **`Catalogs` depth** reports Spanner's single unnamed catalog with a NULL `db_schemas` list
-///   (this depth needs no `INFORMATION_SCHEMA` data and issues no queries at all), and a catalog
-///   filter that excludes `""` yields zero rows.
+/// - **`Catalogs` depth** reports the connection's single catalog — the database id — with a NULL
+///   `db_schemas` list (this depth needs no `INFORMATION_SCHEMA` data and issues no queries at
+///   all), and a catalog filter that matches no catalog yields zero rows.
 /// - **`Schemas` depth** populates the schemas (the default `""` schema is present) but leaves each
 ///   schema's table list NULL.
 /// - **Round trip**: every value `get_table_types` reports works as a `get_objects` `table_type`
@@ -2389,10 +2391,11 @@ fn get_objects_depth_and_filter_boundaries() {
     let Some(mut fx) = fixture_unguarded() else {
         return;
     };
+    let catalog = fx.target.database.clone();
     let connection = &mut fx.connection;
 
-    // --- get_objects at Catalogs depth: the single unnamed catalog with a NULL db_schemas
-    // list (this depth needs no INFORMATION_SCHEMA data and issues no queries at all).
+    // --- get_objects at Catalogs depth: the single catalog — the database id — with a NULL
+    // db_schemas list (this depth needs no INFORMATION_SCHEMA data and issues no queries at all).
     let catalogs = connection
         .get_objects(ObjectDepth::Catalogs, None, None, None, None, None)
         .expect("get_objects at Catalogs depth")
@@ -2403,8 +2406,8 @@ fn get_objects_depth_and_filter_boundaries() {
     let catalog_name = col::<StringArray>(cb.column(0));
     assert_eq!(
         catalog_name.value(0),
-        "",
-        "Spanner's single unnamed catalog"
+        catalog,
+        "the connection's single catalog is the database id"
     );
     let cb_schemas = col::<ListArray>(cb.column(1));
     assert!(
@@ -2412,7 +2415,7 @@ fn get_objects_depth_and_filter_boundaries() {
         "catalog_db_schemas must be NULL at Catalogs depth"
     );
 
-    // A catalog filter that excludes "" yields zero rows even at Catalogs depth.
+    // A catalog filter matching no catalog yields zero rows even at Catalogs depth.
     let none = connection
         .get_objects(ObjectDepth::Catalogs, Some("nope"), None, None, None, None)
         .expect("get_objects with excluding catalog filter")
@@ -2421,7 +2424,7 @@ fn get_objects_depth_and_filter_boundaries() {
     assert_eq!(
         none.iter().map(|b| b.num_rows()).sum::<usize>(),
         0,
-        "a catalog filter excluding \"\" must match nothing"
+        "a catalog filter matching no catalog must return nothing"
     );
 
     // --- get_objects at Schemas depth: schemas are populated (the default "" schema is
@@ -4558,7 +4561,7 @@ fn conformance_via_driver_manager() {
          CREATE TABLE AdbcConf (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
     );
 
-    // get_objects: canonical schema and one catalog row (Spanner's single unnamed catalog).
+    // get_objects: canonical schema and one catalog row (the connection's single catalog).
     let reader = connection
         .get_objects(ObjectDepth::All, None, None, None, None, None)
         .expect("get_objects");
@@ -4699,10 +4702,16 @@ fn ffi_count(connection: &mut adbc_driver_manager::ManagedConnection, table: &st
 /// `with_retry_policy` / `with_begin_retry_policy` / `with_commit_retry_policy` apply path.
 ///
 /// Parsing, validation, unsetting and inherit-then-override are unit-tested offline in
-/// `src/retry.rs`. This is read-only-plus-one-row, so it takes no schema serial guard.
+/// `src/retry.rs`.
+///
+/// It takes the [`serial_guard`] even though it creates no schema: the `DELETE` below opens a real
+/// **read/write transaction**, and the emulator rejects a schema change database-wide while one is
+/// in progress — so running it unguarded made an arbitrary concurrent DDL test fail with
+/// `Schema change operation rejected because a concurrent schema change operation or read-write
+/// transaction is already in progress`. See [`fixture_unguarded`].
 #[test]
 fn retry_tuning_round_trip_and_execute() {
-    let Some(mut fx) = fixture_unguarded() else {
+    let Some(mut fx) = fixture() else {
         return;
     };
     let connection = &mut fx.connection;
@@ -4957,7 +4966,7 @@ fn named_schema_round_trip() {
         .collect::<Result<Vec<_>, _>>()
         .expect("collect objects");
 
-    // Locate the `adbc_ns` schema in the single (unnamed) catalog's db_schemas list.
+    // Locate the `adbc_ns` schema in the single catalog's db_schemas list.
     let ob = &objects[0];
     let schema_list = col::<ListArray>(ob.column(1));
     let schemas = schema_list.value(0);
@@ -5129,8 +5138,17 @@ fn fixture() -> Option<Fixture> {
     build_fixture(true)
 }
 
-/// [`fixture`] without the schema [`serial_guard`], for tests that issue no DDL and so cannot
-/// collide with another test's schema change.
+/// [`fixture`] without the schema [`serial_guard`], for tests that cannot collide with another
+/// test's schema change.
+///
+/// **Read-only only.** The bar is not "issues no DDL" — the emulator rejects a schema change while
+/// *any* read-write transaction is in progress database-wide, so a single unguarded write is enough
+/// to fail whichever guarded DDL test happens to be running. That is exactly how
+/// `retry_tuning_round_trip_and_execute` — one no-op `DELETE`, documented as too small to matter —
+/// made an arbitrary DDL test fail about one run in ten under load. So a test may use this only if
+/// it issues no DML, no DDL and no bulk ingest: queries, `execute_schema`/`prepare` probes and the
+/// metadata surfaces (`get_objects` / `get_table_schema` / `get_statistics`) are all read-only and
+/// fine; anything that writes takes [`fixture`] instead.
 fn fixture_unguarded() -> Option<Fixture> {
     build_fixture(false)
 }
