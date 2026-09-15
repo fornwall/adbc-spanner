@@ -41,8 +41,8 @@ with spanner.connect(
         df = cur.fetch_df()          # -> pandas.DataFrame
 ```
 
-`connect()` returns an ordinary DBAPI connection: use `cur.execute(...)` with `?`/`@name`
-parameters, `cur.fetchone()` / `cur.fetchall()`, `conn.commit()`, and so on. The `fetch_*`
+`connect()` returns an ordinary DBAPI connection: use `cur.execute(...)` with GoogleSQL's `@name`
+parameters (there is no `?` placeholder in GoogleSQL), `cur.fetchone()` / `cur.fetchall()`, `conn.commit()`, and so on. The `fetch_*`
 helpers below add zero-copy Arrow output on top.
 
 ## Authentication

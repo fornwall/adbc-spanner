@@ -71,8 +71,13 @@ See [docs/transactions.md](transactions.md) for the full transaction semantics.
 
 ## Dialect notes the adapter must honour
 
-- **Every table needs an explicit `PRIMARY KEY`.** Spanner has no implicit `rowid`. Every model needs
-  a key — from a configured `unique_key`, or a surrogate. A keyless model is not expressible.
+- **A `CREATE TABLE` the adapter writes should name a `PRIMARY KEY`.** A key fixes Spanner's
+  physical row layout, so a model that has one — from a configured `unique_key`, or a surrogate —
+  should declare it. A keyless model *is* expressible: Spanner keys a table created without a
+  `PRIMARY KEY` clause on a [hidden `rowid`](https://cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys)
+  of its own (which is what the driver's ingest create modes rely on), but such a table cannot be
+  addressed by key — no upsert, no incremental merge — so it suits seeds and snapshots of
+  append-only data rather than incremental models.
 - **Backtick identifier quoting**: `` `my_model` ``.
 - **[GoogleSQL types](https://cloud.google.com/spanner/docs/data-types)**: `INT64`, `FLOAT64`,
   `NUMERIC`, `BOOL`, `STRING(MAX)` / `STRING(n)`, `BYTES(MAX)`, `DATE`, `TIMESTAMP`, `JSON`,
@@ -84,9 +89,13 @@ See [docs/transactions.md](transactions.md) for the full transaction semantics.
   as their input, so an upsert-from-query is one statement.
 - **No joins in `UPDATE`.** `UPDATE … FROM other_table` does not exist; correlate with a subquery in
   the `SET` expression or `WHERE` clause instead. Primary-key columns cannot be `UPDATE`d.
-- **No partitioned DML here.** Spanner's partitioned DML supports only `UPDATE`/`DELETE`
-  ([`INSERT` is unsupported](https://cloud.google.com/spanner/docs/dml-partitioned)), and this
-  driver exposes no way to request it — so it is not an escape hatch for large loads.
+- **Partitioned DML is `UPDATE`/`DELETE` only.** The driver exposes it as the
+  `spanner.dml.partitioned` statement option, which is the escape hatch for a large `UPDATE` or
+  `DELETE` that would otherwise blow the per-commit mutation limit. It is *not* one for large
+  **loads**: [`INSERT` is unsupported](https://cloud.google.com/spanner/docs/dml-partitioned).
+  It is also non-atomic and may apply a partition more than once, so the statement must be
+  idempotent, and `execute_update` returns a lower bound rather than an exact row count — see
+  [docs/options.md](options.md#statement-only-options).
 
 ## Table materialization
 
@@ -226,10 +235,10 @@ WHERE s.`dbt_scd_id` NOT IN (SELECT `dbt_scd_id` FROM `my_snapshot`);
 ## Seeds → bulk ingest
 
 A dbt `seed` loads a CSV as a table. That maps onto the driver's
-[bulk-ingest](../README.md#status) path rather than row-by-row `INSERT` DML: set
+[bulk-ingest](../README.md#supported-optional-adbc-functionality) path rather than row-by-row `INSERT` DML: set
 `adbc.ingest.target_table` and hand over an Arrow table (in Python, `cur.adbc_ingest(table, data,
 mode=…)`), which the driver writes as native **insert mutations** — nothing is SQL-parsed or planned
-per row. Relevant knobs (full list in [docs/options.md](options.md#statement-options)):
+per row. Relevant knobs (full list in [docs/options.md](options.md#statement-only-options)):
 
 - **`adbc.ingest.mode`** — `create` / `create_append` / `replace` build the table from the seed's
   Arrow schema; `append` requires it to exist.

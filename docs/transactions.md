@@ -135,7 +135,9 @@ join a transaction, and are not ordered against buffered DML by the driver.
 ## 2. How the driver maps ADBC transactions onto this
 
 **Autocommit is the default.** Each statement stands alone: a query runs on a single-use read-only
-transaction, and DML (including a `;`-separated batch, sent as one `ExecuteBatchDml`) runs in its own
+transaction — except a *bound* query over more than one parameter row, which builds its own
+multi-use read-only transaction so every row's statement shares one snapshot (§`ExecuteStreamingSql`
+below) — and DML (including a `;`-separated batch, sent as one `ExecuteBatchDml`) runs in its own
 read/write transaction that commits immediately.
 
 **Manual mode** starts when `adbc.connection.autocommit` is set to `false`. The Spanner client
@@ -170,7 +172,11 @@ stateDiagram-v2
 
 - **Query transactions** (`ManualTxn::Read`) open one shared multi-use read-only transaction on the
   first data-returning query (`SpannerStatement::manual_read_transaction`), pinned at that
-  statement's `spanner.read.staleness`. Every later query joins it, so all reads share one snapshot;
+  statement's `spanner.read.staleness`. Because the bounded kinds are single-use only (§1), a
+  bounded bound is not an error here: `ReadStaleness::multi_use_timestamp_bound` first rewrites it
+  to its most-stale legal equivalent (`ReadBound::pinned_for_multi_use`, `src/staleness.rs`) —
+  `max:<d>` becomes `exact:<d>` and `min:<ts>` becomes `read:<ts>` — so the snapshot pins silently
+  rather than failing. Every later query joins it, so all reads share one snapshot;
   later statements' staleness is ignored, because the snapshot is already pinned. `commit` and
   `rollback` merely drop it — a read-only transaction has nothing to commit or roll back.
 - **DML transactions** (`ManualTxn::Dml`) buffer DML statements and bulk-ingest insert mutations
@@ -316,9 +322,13 @@ behalf. Each is covered below.
     non-idempotent single-use commit. Its two callers are the mutations-only manual commit
     (`apply_transaction`, `src/connection.rs`) and each autocommit ingest chunk
     (`write_mutation_chunk`, `src/statement.rs`).
-  - **Commit stats / delay / priority / tag** attach at exactly four sites — the three runner sites
-    above via `RequestConfig::apply_to_runner` and the write-only site via `apply_to_write_only`
-    (`src/request.rs`).
+  - **Commit stats and commit delay** attach at exactly four sites — the three runner sites above
+    via `RequestConfig::apply_to_runner` and the write-only site via `apply_to_write_only`
+    (`src/request.rs`). The **priority and the tags** reach those same four commit builders, but are
+    not confined to them: `apply_to_batch_dml` carries the priority and request tag on the
+    `ExecuteBatchDml` request, `apply_to_batch_write` the priority and transaction tag on
+    `BatchWrite`, and `apply_priority_to_statement` the priority alone on the driver's own
+    (deliberately untagged) metadata reads.
 - **One commit may be two `Commit` RPCs.** On a multiplexed session, if the `CommitResponse` carries
   a `precommit_token`, the client immediately re-issues `Commit` with that token and **zero
   mutations** (`<client>/src/read_write_transaction.rs:659-677`, and the same in
@@ -326,8 +336,10 @@ behalf. Each is covered below.
   double-apply — but it means a "single" commit is not always a single round-trip.
 - **Abort replay is unbounded by default.** The runner's `ABORTED` retry is a *separate* policy from
   `spanner.retry.*`: `BasicTransactionRetryPolicy` defaults to no attempt cap and no total timeout
-  (`<client>/src/transaction_retry_policy.rs:77-84`), honouring the `RetryInfo.retry_delay`. Only
-  `spanner.rpc.timeout_seconds.update` bounds it from the driver side.
+  (`<client>/src/transaction_retry_policy.rs:77-84`), honouring the `RetryInfo.retry_delay`. From
+  the driver side it is bounded only by the RPC timeout wrapping the runner call —
+  `spanner.rpc.timeout_seconds.update` for `run_batch_txn` and `execute_returning_dml`, but
+  `…timeout_seconds.query` for `plan_dml_parameter_types`, which is a schema probe (§4).
 - **Driver-side budgeting.** Because the 80,000 cap counts index entries the driver cannot see, bulk
   ingest budgets each chunk at **20,000 mutations** (`INGEST_CHUNK_MUTATION_LIMIT`,
   `src/statement.rs` — a quarter of the cap, for headroom) and **4 MiB**
@@ -376,11 +388,12 @@ behalf. Each is covered below.
 - **Where we use it.** This is the driver's universal read path — wire path
   `/google.spanner.v1.Spanner/ExecuteStreamingSql` (`<client>/src/server_streaming/builder.rs:70`),
   reached via the client's `execute_query`. The transaction it runs on is one of:
-  - **Single-use** — seven sites. Four take a timestamp bound through the `staleness::single_use`
+  - **Single-use** — seven sites. Five take a timestamp bound through the `staleness::single_use`
     helper (`src/staleness.rs`): `execute_query_reader` (plain `execute`), `execute_bound_query`
-    (bound query over ≤1 row), `run_partition_query`'s PLAN probe, and
-    `SpannerConnection::get_table_schema`. Three build an unbound `client.single_use()` directly:
-    `plan_parameter_types`, `execute_schema`'s PLAN probe, and the ingest `table_exists` probe
+    (bound query over ≤1 row), `run_partition_query`'s PLAN probe, `execute_schema`'s PLAN probe
+    (`plan_query_schema`, which honours the statement's read staleness like the data read it
+    describes) and `SpannerConnection::get_table_schema`. Two build an unbound
+    `client.single_use()` directly: `plan_parameter_types` and the ingest `table_exists` probe
     (`src/connection.rs`).
   - **Multi-use** read-only transactions — four sites, each one snapshot shared by several reads:
     `manual_read_transaction` (the manual-mode shared snapshot), `execute_bound_query` over >1 row
@@ -514,7 +527,9 @@ behalf. Each is covered below.
   budget still applies. It is **ignored** in manual mode, which buffers and commits atomically
   instead.
 - **Which options reach it.** `RequestConfig::apply_to_batch_write` (`src/request.rs`) carries
-  `spanner.request.priority` and `spanner.transaction.tag`. Three do **not** apply:
+  `spanner.request.priority`, `spanner.transaction.tag` and
+  `spanner.transaction.exclude_from_change_streams` (the flag rides the `BatchWriteRequest`
+  directly). Three do **not** apply:
   `spanner.request.tag` (Spanner ignores per-request tags on `BatchWrite`, so the client's builder
   exposes no setter), and `spanner.commit.max_delay` / `spanner.commit_stats` (`BatchWrite` takes no
   per-request commit options).

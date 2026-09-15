@@ -55,7 +55,7 @@ While the crate is pre-1.0, the public surface may still shift between minor ver
 Always cut releases with [`cargo-release`](https://github.com/crate-ci/cargo-release) (configured
 under `[package.metadata.release]` in `Cargo.toml`) — never bump the version, commit, or tag by
 hand. Hand-rolling a release risks a malformed tag or a version that disagrees with `Cargo.toml`
-(which the `python-wheels` CI job rejects), and cargo-release does the exact same steps
+(which the `version-gate` CI job rejects), and cargo-release does the exact same steps
 deterministically.
 
 Prerequisites: `cargo install cargo-release` and push access to `main`.

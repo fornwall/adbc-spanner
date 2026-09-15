@@ -50,7 +50,9 @@ once — the driver converts Spanner rows to Arrow batches on demand as you iter
 ## 2. The ADBC object model
 
 ADBC is not one flat API; it is a small hierarchy of four objects. You create them top-down, and
-each one is progressively more specific. This driver names them `SpannerX`, one Rust module each:
+each one is progressively more specific. This driver names them `SpannerX`, in three Rust modules —
+`SpannerDriver` and `SpannerDatabase` share [`src/driver.rs`](../src/driver.rs), since the driver's
+only job is to build databases:
 
 ```
 SpannerDriver  ──▶  SpannerDatabase  ──▶  SpannerConnection  ──▶  SpannerStatement
@@ -99,7 +101,8 @@ and the driver: one symbol.
 In this crate that symbol — and everything behind it — lives in [`src/ffi/`](../src/ffi), the
 driver's own hand-written export layer (`mod.rs` builds the vtable; `abi.rs` transcribes the C
 header; `error.rs`, `guard.rs`, `handle.rs`, `options.rs`, `stream.rs` and `import.rs` hold one
-concern each). It exports two C symbols:
+concern each; and `database.rs`, `connection.rs` and `statement.rs` hold the entry points of one
+ADBC object each). It exports two C symbols:
 
 - **`AdbcSpannerInit`** — the driver-specific init symbol. ADBC's naming convention derives it from
   the library name: `libadbc_spanner` → `AdbcSpannerInit`.
@@ -331,7 +334,7 @@ Two standard options ride along with this:
 
 This is a deliberate, documented trade-off; genuine read-your-writes waits on the client exposing
 real begin/commit handles. For the full model see the [`SpannerConnection`
-rustdoc](../src/connection.rs) and the [README transactions bullet](../README.md#status).
+rustdoc](../src/connection.rs) and the [README transactions bullet](../README.md#supported-optional-adbc-functionality).
 
 ### 5.6 Introspection — asking the database about itself
 

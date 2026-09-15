@@ -21,12 +21,11 @@ Early, tested end-to-end against the Spanner emulator.
 - DML: A `;`-separated batch (e.g. `DELETE; INSERT`) runs atomically in one read/write transaction using
   [batch DML](https://docs.cloud.google.com/spanner/docs/samples/spanner-dml-batch-update). A batch
   must be all-DML: mixing in a query or DDL is rejected up front with `InvalidArguments` (before
-  anything is buffered in a manual transaction). TODO: Multiple DML in a transaction does the same?
+  anything is buffered in a manual transaction).
 - DDL (`CREATE`/`ALTER`/`DROP`/`RENAME`/…): Routed to the Database Admin `UpdateDatabaseDdl` API. A
   `;`-separated batch (e.g. a intermediate-table build then rename swap) is submitted as a single
   [schema change](https://docs.cloud.google.com/spanner/docs/schema-updates) near-atomic (but not
-  truly atomic, as Spanner does not support atomic DDL) operation. TODO: Multiple DDL in a transactio
-  does the same?
+  truly atomic, as Spanner does not support atomic DDL) operation.
 
 ## Supported optional ADBC functionality
 
@@ -38,10 +37,9 @@ Early, tested end-to-end against the Spanner emulator.
       in autocommit mode is automatically split into chunks that fits those limits, in which case the
       ingestion is **not atomic as a whole**. In a manual transaction the mutations are buffered —
       unchunked — and committed atomically with any buffered DML on `commit`; but note the transaction
-      limits. TODO: Surprising/complex with auto-chunking in autocommit - perhaps opt-in through option
-      for non-atomic ingestion?
-    - All four `adbc.ingest.mode` values are supported: `create` (the ADBC spec default — create the
-    - table first, failing if it exists),
+      limits.
+    - All four `adbc.ingest.mode` values are supported: `create` (the ADBC spec default — create
+      the table first, failing if it exists),
       `append` (insert into an existing table), `create_append` (create if absent, then insert) and
       `replace` (drop and recreate).
       The three create modes build the table from the ingest data's Arrow schema and declare **no
@@ -58,8 +56,6 @@ Early, tested end-to-end against the Spanner emulator.
       still buffers and commits atomically. The priority and transaction-tag options apply on that path;
       the request-tag option does not (Spanner ignores per-request tags on BatchWrite), and neither do
       `commit.max_delay` / `commit_stats`, since BatchWrite carries no per-request commit options.
-      TODO: Move BatchWrite to section below. perhaps a dedicated bulk ingestion explaining everything around
-      that - supported moves, BatchWrite, transaction splitting, transaction behaviour, etc.
 - Manual transactions (setting `adbc.connection.autocommit=false` plus `commit()`/`rollback()`):
     - A manual transaction is exactly **one of two kinds — queries or DML — fixed by its first
       statement**; a statement of the other kind is rejected with `InvalidState` until `commit()`
@@ -141,11 +137,12 @@ Early, tested end-to-end against the Spanner emulator.
   open and replayable; `rollback()` and committing a query transaction still work — neither writes.
 - execute_schema() (ADBC 1.1.0) — returns a query's result schema without executing it, via Spanner's QueryMode::Plan.
 - Cancellation (ADBC 1.1.0) — both Connection::get_cancel_handle() and Statement::get_cancel_handle() return a handle whose try_cancel() interrupts an in-flight operation.
-
-TODO: Go over these and merge with above:
-
-- Bulk ingest — the full adbc.ingest.* surface (append/create/create_append/replace modes, plus target
-  catalog/db_schema/temporary - TODO, what are those) is implemented over native Spanner mutations.
+- Bulk ingest — the `adbc.ingest.*` surface (the four `adbc.ingest.mode` values, plus
+  `adbc.ingest.target_table` / `target_db_schema`) is implemented over native Spanner mutations.
+  `adbc.ingest.target_catalog` and `adbc.ingest.temporary` are accepted only at their spec-default
+  values (`""` and `false`) as no-ops, so generic clients that always set them keep working; a
+  non-empty catalog or `temporary=true` fails with `NotImplemented` (Spanner has a single unnamed
+  catalog and no temporary tables).
 - Statistics (ADBC 1.1.0) — get_statistics() returns exact row/null/distinct counts and get_statistic_names() returns a
   correctly-typed empty result.
 - Typed option getters (ADBC 1.1.0) — get_option_int(), get_option_double(), and get_option_bytes() are implemented alongside
@@ -169,6 +166,14 @@ TODO: Go over these and merge with above:
 ## Unsupported optional ADBC functionality
 
 - [Substrait](https://substrait.io/) plans are unsupported.
+- Incremental `execute_partitions` — `adbc.statement.exec.incremental` accepts only the spec default
+  `false`; `true` fails with `NotImplemented`.
+- Temporary ingest tables — `adbc.ingest.temporary=true` fails with `NotImplemented` (Spanner has
+  none).
+- Named catalogs — a non-empty `adbc.connection.catalog` or `adbc.ingest.target_catalog` fails with
+  `NotImplemented`; Spanner has a single, unnamed catalog.
+- A settable current schema — a non-empty `adbc.connection.db_schema` fails with `NotImplemented`.
+  Spanner has named schemas, but no session-level schema to select one.
 
 ## Supported Spanner functionality
 
