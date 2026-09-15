@@ -311,15 +311,12 @@ fn connect_via_connection_uri() {
 
     let mut driver = SpannerDriver::try_new().expect("create driver");
     let database = driver
-        .new_database_with_opts([(OptionDatabase::Uri, OptionValue::String(uri))])
+        .new_database_with_opts([(OptionDatabase::Uri, OptionValue::String(uri.clone()))])
         .expect("create database from connection URI");
 
-    // The URI expands into the underlying options: `uri` reads back as the bare database path, and
-    // the query parameters round-trip under their own option keys.
-    assert_eq!(
-        database.get_option_string(OptionDatabase::Uri).unwrap(),
-        target.database_path()
-    );
+    // The URI expands into the underlying options: `uri` itself reads back verbatim (the ADBC
+    // set/get round-trip), and the query parameters round-trip under their own option keys.
+    assert_eq!(database.get_option_string(OptionDatabase::Uri).unwrap(), uri);
     if target.is_emulator {
         let host = std::env::var("SPANNER_EMULATOR_HOST").unwrap();
         assert_eq!(
@@ -6570,14 +6567,14 @@ fn bind_by_name_modes() {
         (20, 10),
         "bind_by_name=true must bind matching columns by name"
     );
-    // true with an unmatched column: a hard InvalidArguments error naming the parameter, instead
-    // of a silent positional fallback.
+    // true with an unmatched column: a hard InvalidArguments error naming the column, instead of a
+    // silent positional fallback.
     let error = query_pair(&mut connection, batch(["a", "x"]), Some("true"))
         .expect_err("bind_by_name=true must reject an unmatched column");
     assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
     assert!(
-        error.message.contains("could not find parameter \"x\""),
-        "error must name the missing parameter: {}",
+        error.message.contains("cannot bind column \"x\""),
+        "error must name the unmatched column: {}",
         error.message
     );
     // The same partial match under the default (positional) binding succeeds: column 0 -> @a,
