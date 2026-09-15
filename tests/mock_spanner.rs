@@ -4326,16 +4326,18 @@ fn exclude_from_change_streams_reaches_the_wire_on_runner_commits() {
 /// 2. An autocommit **DML** carries the priority + request tag on its `ExecuteBatchDml`
 ///    (`apply_to_batch_dml`) *and* the priority + transaction tag on the `Commit` that ends its
 ///    read/write transaction (`apply_to_runner`'s commit priority + transaction tag).
-/// 3. A driver-internal **metadata** read (`get_table_schema`) sends **empty** `RequestOptions` —
-///    the driver deliberately leaves its own introspection queries untagged, so nothing a user tags
-///    leaks onto the metadata path. This is the non-vacuous half: the query above proves the options
-///    *do* flow when a user sets them, so an empty-options metadata query proves the driver is
-///    choosing not to tag it, not merely that the options were never set.
+/// 3. A driver-internal **metadata** read (`get_table_schema`) carries the **priority but no
+///    tags**. Priority is a workload knob — a user who asked for `low` wants the driver's own
+///    `INFORMATION_SCHEMA` reads and full-table stats scans deprioritized too — while tags are
+///    attribution, naming the *user's* statement in Spanner's `QUERY_STATS`/`TRANSACTION_STATS`;
+///    tagging a query the user never wrote would corrupt that. This is the non-vacuous half: the
+///    query above proves all three options flow when set, so a tag-free metadata query proves the
+///    driver is choosing not to tag it, not merely that nothing was set.
 #[test]
-fn request_priority_and_tags_reach_queries_and_commits_but_not_metadata() {
+fn request_priority_reaches_metadata_reads_but_tags_do_not() {
     let _watchdog = Watchdog::arm(
         Duration::from_secs(120),
-        "request_priority_and_tags_reach_queries_and_commits_but_not_metadata",
+        "request_priority_reaches_metadata_reads_but_tags_do_not",
     );
 
     const USER_QUERY: &str = "SELECT c FROM MockTable";
@@ -4454,13 +4456,22 @@ fn request_priority_and_tags_reach_queries_and_commits_but_not_metadata() {
         .iter()
         .find(|q| q.sql != USER_QUERY)
         .expect("get_table_schema issued a metadata ExecuteStreamingSql");
-    // Untagged: whether the driver omits RequestOptions entirely or sends a default-valued one, the
-    // effective priority/tags must be empty — nothing the user set may leak onto the metadata path.
+    // Priority yes, tags no. Priority is a workload knob: a user who asked for `low` wants the
+    // driver's own INFORMATION_SCHEMA reads and full-table stats scans deprioritized too. Tags are
+    // attribution: they name the user's statement in Spanner's QUERY_STATS/TRANSACTION_STATS, so
+    // putting the user's tag on a query the user never wrote would corrupt that attribution.
     let metadata_options = metadata.request_options.clone().unwrap_or_default();
     assert_eq!(
-        metadata_options,
-        v1::RequestOptions::default(),
-        "a driver-internal metadata read must send empty RequestOptions (no priority, no tags)"
+        metadata_options.priority, high,
+        "spanner.request.priority must reach a driver-internal metadata read"
+    );
+    assert_eq!(
+        metadata_options.request_tag, "",
+        "spanner.request.tag must NOT leak onto a driver-internal metadata read"
+    );
+    assert_eq!(
+        metadata_options.transaction_tag, "",
+        "spanner.transaction.tag must NOT leak onto a driver-internal metadata read"
     );
 
     // The ExecuteBatchDml carries the priority + request tag.

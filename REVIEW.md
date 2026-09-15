@@ -4,33 +4,20 @@ The **open** findings from the full-project review originally run on 2026-07-13 
 passes (correctness & error handling, concurrency & the sync-over-async bridge, ADBC spec
 compliance, type conversion & the data path, performance, Spanner utilization, security, testing,
 and idiomatic code/clarity). Resolved findings have been removed; everything below was
-re-verified against the source on 2026-09-15 (line references refreshed, wording corrected where
+re-verified against the source on 2026-09-16 (line references refreshed, wording corrected where
 the codebase moved under it).
 
 Each finding is a checkbox — tick it when fixed (or explicitly decided against, noting why next to
 the item), and delete it once it is no longer relevant. IDs are stable for cross-referencing, so a
 new finding never reuses a retired ID.
 
-**Severity counts:** Medium 3 · Upstream 4.
+**Severity counts:** Upstream 4 (nothing actionable in-repo).
 
 **Declined:** CON-1 (async-context `block_on` panics) — the user ruled it out of scope on
 2026-09-15; the driver keeps panicking when entered from a Tokio worker thread. UP-13 records the
 root cause upstream.
 
 ---
-
-## Utilizing Spanner well
-
-- [ ] **SPAN-2 (Medium)** — Partitioned DML not exposed — `src/statement.rs:940-957,1055,1894-1906`; client `partitioned_dml_transaction.rs:169`
-  Large backfills/`DELETE WHERE` are forced through a single read/write transaction into the mutation-cap cliff the ingest bisect exists to dodge. Every DML statement funnels through `run_or_buffer`, whose autocommit arm calls `connection::run_batch_dml`; nothing in `src/` references partitioned DML (`docs/transactions.md` records the non-use explicitly). **Fix:** a `spanner.dml.partitioned` boolean statement option routing single, non-`THEN RETURN` DML through `partitioned_dml_transaction().execute_update(...)` (reject in manual mode and for `;`-batches; return PDML's lower-bound count).
-
-- [ ] **SPAN-3 (Medium)** — `get_statistics` (and `get_objects`) scans ignore priority/tag/directed-read/retry config — `src/statistics.rs:206-219,248-256`
-  The full-table `COUNT(*)`/`COUNTIF`/`COUNT(DISTINCT)` scans are the heaviest queries the driver issues on its own, yet `query_txn` builds a bare `SpannerSql::builder(sql).build()` — default priority, no tags, default replicas, the client's unbounded retry policy — even when the connection configured otherwise. Staleness *is* honored (the SPAN-5 shared multi-use transaction, `src/statistics.rs:101-111`) and so are the RPC timeouts, so the precedent exists; `collect_statistics`' signature (`src/statistics.rs:86-94`, called from `src/connection.rs:1555-1563`) is the structural proof that the rest is never even passed in. **Fix:** apply the connection's `RequestConfig`, `DirectedRead`, and `RetryConfig` to the scan statements — noting that the `RequestConfig` half needs an explicit ruling first, since the driver deliberately leaves driver-internal metadata queries untagged. `get_objects` (`src/objects.rs`, called at `src/connection.rs:1422-1435`) has the identical shape and should be fixed in the same pass.
-
-## Testing
-
-- [ ] **TEST-7 (Medium)** — Fetch timeout never observed firing end-to-end through the option on a real stream
-  `src/timeout.rs:351` (`fetch_timeout_fires_inside_the_prefetch_task`) fires one, but synthetically — a hand-rolled stalling source through `with_timeout` + `spawn_prefetch`, no option plumbing, no `SpannerBatchReader`, no gRPC stream. `rpc_timeouts` (`tests/integration.rs:8354`) exercises `fetch` only on the happy path; the deadlines it makes fire are `query` and `update`. **Fix:** reuse the silent-stream script from `cancel_unblocks_a_reader_hung_on_a_silent_stream` (`tests/mock_spanner.rs:1356`, whose doc comment calls it "the foundation for future timeout tests"), set `fetch=0.5`, and assert the second `next()` yields `Status::Timeout`. (The update-path gating twin already exists — `ddl_update_timeout_fires_on_a_silent_admin_endpoint`, `tests/mock_spanner.rs:1449`; the fetch path has none.)
 
 ## Upstream candidates
 

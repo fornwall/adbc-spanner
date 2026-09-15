@@ -617,8 +617,10 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   `spanner.transaction.tag` connection-only; parsed/applied via `RequestConfig` in `src/request.rs`
   — every user statement builder goes through `SpannerStatement::sql_builder`, `run_batch_dml`
   applies the priority + request tag to the `ExecuteBatchDml` batch and the runner [commit priority +
-  transaction tag], `batch_write_chunk` the priority + transaction tag; driver-internal metadata
-  queries stay untagged), directed
+  transaction tag], `batch_write_chunk` the priority + transaction tag; driver-internal metadata queries
+  (`get_objects`/`get_statistics`/`get_table_schema`, via `metadata_sql_builder`) carry the
+  **priority** but stay **untagged** — priority is a workload knob, tags are user-statement
+  attribution in `QUERY_STATS`/`TRANSACTION_STATS`), directed
   reads (`spanner.directed_read` at connection + statement level [statement inherits, then overrides;
   `""` unsets — the staleness pattern; round-trip via `get_option`] — a replica selection for
   read-only queries parsed by `DirectedRead`/`parse` in `src/directed_read.rs` [unit-tested offline]
@@ -665,8 +667,8 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   probe), fetch = each later chunk [inside the `spawn_prefetch` task, and each `next_bound_chunk`
   of a bound-query stream], update = DML/batch-DML/manual-commit/ingest-chunk paths **and DDL**
   (`run_ddl`'s admin `UpdateDatabaseDdl` call plus its LRO poll loop). So no driver-side network
-  path is left unbounded; unlike the tags/priority options (which leave metadata queries
-  untagged), the timeouts do bound them), and retry tuning
+  path is left unbounded; unlike the request-tag options (which leave metadata queries untagged),
+  the timeouts do bound them), and retry tuning
   (`spanner.retry.{max_attempts,max_elapsed_seconds}` at connection + statement level [statement
   inherits, then overrides; `""` unsets — the staleness/timeout pattern; round-trip via
   `get_option`/`get_option_int`/`get_option_double`] — `RetryConfig` in `src/retry.rs` bounds the
