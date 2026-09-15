@@ -44,7 +44,7 @@ use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, Opti
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_spanner::{SpannerConnection, SpannerDriver};
 use arrow_array::cast::AsArray;
-use arrow_array::{Date32Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Date32Array, Int64Array, RecordBatch, RecordBatchReader, StringArray};
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use prost::Message;
 use spanner_grpc_mock::MockSpanner;
@@ -1493,6 +1493,167 @@ fn ddl_update_timeout_fires_on_a_silent_admin_endpoint() {
         "returned in {elapsed:?}, before the 0.25s deadline could fire — the DDL failed for some \
          other reason"
     );
+}
+/// A server that accepts `ExecuteStreamingSql`, delivers **one** row, then goes silent forever
+/// (the stream is held open, nothing more arrives and nothing ever errors).
+///
+/// Returns the server together with the Arc that keeps every scripted stream's sender alive — the
+/// caller must hold it for as long as the stream must stay silent rather than end.
+fn silent_after_one_row_server() -> (MockServer, Arc<Mutex<Vec<PartialResultSetSender>>>) {
+    let open_streams: Arc<Mutex<Vec<PartialResultSetSender>>> = Arc::new(Mutex::new(Vec::new()));
+    let streams_in_mock = open_streams.clone();
+    let server = MockServer::start(move |mock| {
+        mock.expect_execute_streaming_sql().returning(move |_| {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(Ok(partial_result_set(true, &["v1"], b"rt-1", false)))
+                .expect("first message fits the channel");
+            streams_in_mock.lock().unwrap().push(tx);
+            Ok(tonic::Response::new(rx))
+        });
+    });
+    (server, open_streams)
+}
+
+/// Point a statement at [`silent_after_one_row_server`] with one row per batch, so `execute`
+/// settles the schema on the delivered row and the *next* chunk fetch — the one the prefetch task
+/// runs, and the only one `spanner.rpc.timeout_seconds.fetch` bounds — blocks on the silence.
+fn silent_stream_reader(
+    connection: &mut SpannerConnection,
+    fetch_seconds: Option<f64>,
+) -> Box<dyn RecordBatchReader + Send + 'static> {
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionValue::Int(1),
+        )
+        .expect("set rows_per_batch");
+    if let Some(seconds) = fetch_seconds {
+        statement
+            .set_option(
+                OptionStatement::Other(adbc_spanner::OPTION_RPC_TIMEOUT_FETCH.into()),
+                OptionValue::Double(seconds),
+            )
+            .expect("set the fetch deadline");
+    }
+    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+    statement.execute().expect("execute settles the schema")
+}
+
+/// (c″) TEST-7: the **fetch** twin of the silent-stream tests above —
+/// `spanner.rpc.timeout_seconds.fetch` bounds each *subsequent* chunk fetch of a live streamed
+/// result, set through the ordinary statement option surface and observed firing on a real gRPC
+/// stream (`src/timeout.rs`'s own `fetch_timeout_fires_inside_the_prefetch_task` exercises
+/// `with_timeout` + `spawn_prefetch` directly, with no option plumbing and no `SpannerBatchReader`).
+///
+/// **Why this is not vacuous.** The stream delivers one row *successfully* before going silent, and
+/// `spanner.rows_per_batch = 1` makes that row a complete first chunk. So the initial execute —
+/// the only thing `spanner.rpc.timeout_seconds.query` covers — has already returned by the time
+/// anything blocks; the blocked position is the prefetch task's fetch of chunk 2, which only the
+/// fetch deadline bounds (the query deadline is not even set here). A stream that was silent from
+/// the *start* would instead block inside `execute`, where the query deadline would fire and the
+/// test would pass with the fetch deadline unwired. The sibling
+/// [`silent_stream_without_the_fetch_deadline_never_times_out`] closes the loop from the other
+/// side: the same silent stream, with the option unset, produces nothing at all in the same window.
+#[test]
+fn fetch_timeout_fires_on_a_silent_stream() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "fetch_timeout_fires_on_a_silent_stream",
+    );
+
+    let (server, _open_streams) = silent_after_one_row_server();
+    let mut connection = server.connect();
+
+    // Time from before `execute`: the fetch deadline cannot start ticking any earlier, so the
+    // whole call must still outlast it. Anything faster means the stream failed for some other
+    // reason (a refused connection or a reset comes back in single-digit milliseconds).
+    let started = Instant::now();
+    let mut reader = silent_stream_reader(&mut connection, Some(0.5));
+
+    let first = reader
+        .next()
+        .expect("first batch exists")
+        .expect("first batch is the row delivered before the server went silent");
+    assert_eq!(first.num_rows(), 1);
+
+    let error = reader
+        .next()
+        .expect("the expired fetch deadline yields an item")
+        .expect_err("the fetch blocked on the silent stream must expire its deadline");
+    let elapsed = started.elapsed();
+
+    let ArrowError::ExternalError(source) = &error else {
+        panic!("expected the reader to surface the driver error, got: {error}");
+    };
+    let adbc_error = source
+        .downcast_ref::<adbc_core::error::Error>()
+        .expect("the reader error wraps the ADBC error");
+    assert_eq!(
+        adbc_error.status,
+        AdbcStatus::Timeout,
+        "got error: {adbc_error}"
+    );
+    // Assert the message too: a refactor that folded this into a generic IO/stream error would
+    // otherwise still satisfy the status check via some unrelated path.
+    assert!(
+        adbc_error
+            .message
+            .contains(adbc_spanner::OPTION_RPC_TIMEOUT_FETCH),
+        "the chunk-fetch timeout error must name the fetch option: {}",
+        adbc_error.message
+    );
+    assert!(
+        adbc_error.message.contains("timed out after 0.5s"),
+        "the error must report the deadline that fired: {}",
+        adbc_error.message
+    );
+    assert!(
+        elapsed >= Duration::from_millis(500),
+        "the reader failed after {elapsed:?}, before the 0.5s fetch deadline could fire — the \
+         stream died for some other reason"
+    );
+}
+
+/// The non-vacuity control for [`fetch_timeout_fires_on_a_silent_stream`]: with
+/// `spanner.rpc.timeout_seconds.fetch` **unset**, the very same silent stream produces no item at
+/// all within a window several times the deadline that test uses. Nothing else in the stack —
+/// no client-side default, no other option — turns this silence into an error, so the `Timeout`
+/// the sibling test observes can only come from the fetch deadline.
+///
+/// The reader is driven on a worker thread that is deliberately **not** joined: it stays blocked
+/// on the silent stream until the process exits (dropping the server at the end of the test aborts
+/// the server task, which is what eventually unblocks it). A detached blocked thread does not keep
+/// the test binary from exiting; the [`Watchdog`] is the backstop if anything else hangs.
+#[test]
+fn silent_stream_without_the_fetch_deadline_never_times_out() {
+    let _watchdog = Watchdog::arm(
+        Duration::from_secs(120),
+        "silent_stream_without_the_fetch_deadline_never_times_out",
+    );
+
+    let (server, _open_streams) = silent_after_one_row_server();
+    let mut connection = server.connect();
+    let mut reader = silent_stream_reader(&mut connection, None);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let first = reader.next();
+        // Blocks until the process tears the server down.
+        let second = reader.next();
+        let _ = tx.send((first, second));
+    });
+
+    // Four times the sibling test's 0.5s deadline: if the fetch were bounded by anything at all,
+    // this would have produced its error long before the window closes.
+    match rx.recv_timeout(Duration::from_secs(2)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Err(other) => panic!("the reader thread died unexpectedly: {other}"),
+        Ok((_, second)) => panic!(
+            "with the fetch deadline unset, a silent stream must not produce an item; got: {:?}",
+            second.map(|r| r.map(|b| b.num_rows()))
+        ),
+    }
 }
 
 /// A new operation on the statement must not **un-cancel** a live streamed reader from an earlier
