@@ -229,25 +229,17 @@ const SUPPORTED_CREDENTIAL_TYPES: &str =
 /// Build Google credentials from an inline JSON key, auto-detecting the credential flow from the
 /// JSON's top-level `"type"` field, as Google's own auth libraries (and gcloud) do.
 ///
-/// Standard Google credential JSON carries a `"type"` discriminator; each value maps to a distinct
-/// auth flow with its own required fields:
+/// Standard Google credential JSON carries a `"type"` discriminator, each value mapping to a
+/// distinct auth flow with its own required fields: `service_account`, `authorized_user`,
+/// `impersonated_service_account` and `external_account`.
 ///
-/// - `service_account` — a service-account key (`private_key` / `client_email`).
-/// - `authorized_user` — end-user Application Default Credentials from `gcloud auth
-///   application-default login`.
-/// - `impersonated_service_account` — impersonation of a target service account.
-/// - `external_account` — Workload/Workforce Identity Federation.
+/// `google-cloud-auth`'s top-level `Builder` already dispatches on this field, but only for
+/// credentials it loads itself from the environment; it offers no entry point taking inline JSON,
+/// so the dispatch happens here — do **not** funnel every keyfile through the `service_account`
+/// builder instead: any other type then fails or misbehaves.
 ///
-/// The underlying `google-cloud-auth` top-level `Builder` already dispatches on this field, but only
-/// for credentials it loads itself from the environment (the `GOOGLE_APPLICATION_CREDENTIALS` var or
-/// the well-known ADC file). It offers no entry point that takes inline JSON, so the dispatch has to
-/// happen here for the JSON supplied through the `spanner.auth.keyfile` / `spanner.auth.keyfile_json`
-/// options — do not funnel every keyfile through the `service_account` builder instead: any other
-/// type then fails or misbehaves.
-///
-/// `quota_project`, when `Some`, is attached to whichever builder is selected via its
-/// `with_quota_project_id`, so the resulting credentials send the `x-goog-user-project` billing
-/// header (the `spanner.auth.quota_project` option).
+/// `quota_project`, when `Some`, is attached to whichever builder is selected, so the credentials
+/// send the `x-goog-user-project` billing header.
 fn build_credentials_from_json(json: &str, quota_project: Option<&str>) -> Result<Credentials> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|e| {
         err(

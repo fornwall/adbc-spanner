@@ -36,17 +36,15 @@ use crate::timeout::with_timeout;
 /// The `int64` branch of the `statistic_value` union (see `STATISTIC_VALUE_SCHEMA`).
 const INT64_BRANCH: i8 = 0;
 
-/// How many per-table aggregate statistics scans to run concurrently. Each scan is one independent
-/// read-only query, so running a small bounded batch of them at once (rather than strictly one after
-/// another) cuts the wall-clock of `get_statistics` near-linearly on a many-table database without
-/// unbounded fan-out against Spanner. They all share the driver's one Tokio runtime.
+/// How many per-table aggregate statistics scans to run concurrently — a small bounded batch cuts
+/// the wall-clock of `get_statistics` near-linearly on a many-table database without unbounded
+/// fan-out against Spanner.
 const STATISTICS_SCAN_CONCURRENCY: usize = 8;
 
 /// Zero-based column indices into the `INFORMATION_SCHEMA` discovery batches read by
-/// [`collect_statistics`], named to mirror the `SELECT` list of the query that produces each batch.
-/// They must stay in lockstep with those `SELECT`s: reading through the names (rather than bare
-/// integers) makes a query edit that reorders or adds a column a compile-time concern here instead
-/// of a silent misread.
+/// [`collect_statistics`], mirroring the `SELECT` list that produces each batch. Reading through
+/// the names makes a query edit that reorders columns a compile-time concern, not a silent
+/// misread.
 mod tables_col {
     // `SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES`
     pub(super) const TABLE_SCHEMA: usize = 0;

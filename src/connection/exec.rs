@@ -63,15 +63,11 @@ pub(crate) async fn build_runner(
 ///
 /// Spanner implements `REPEATABLE_READ` as *snapshot isolation* — its proto definition matches
 /// ADBC's [`snapshot`] almost verbatim — so `snapshot` is an exact match, not a promotion, and
-/// Spanner's `REPEATABLE_READ` is *stronger* than the ANSI level of the same name, satisfying a
-/// `repeatable_read` request too.
-///
-/// The remaining two levels are **promoted upward** to the weakest supported level that still
-/// satisfies their guarantees rather than rejected: isolation levels are minimum-guarantee
-/// contracts, so a stronger level always satisfies a weaker one's request. The spec's "if the
-/// desired isolation level is not supported … return an appropriate error" targets the opposite
-/// case, a driver that can only offer something *weaker*; this driver never downgrades, and the
-/// SQL standard and JDBC's `setTransactionIsolation` likewise sanction substituting higher.
+/// Spanner's `REPEATABLE_READ` is *stronger* than the ANSI level of the same name. The remaining
+/// two levels are **promoted upward** to the weakest supported level that still satisfies their
+/// guarantees rather than rejected: isolation levels are minimum-guarantee contracts, so a stronger
+/// level always satisfies a weaker one's request, and the spec's "return an appropriate error"
+/// targets the opposite case, a driver that can only offer something *weaker*.
 ///
 /// | requested          | mapped to         | rationale                                                  |
 /// |--------------------|-------------------|------------------------------------------------------------|

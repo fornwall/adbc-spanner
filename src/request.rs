@@ -94,8 +94,7 @@ macro_rules! apply_to_request_builder {
 ///
 /// [`TransactionRunnerBuilder`] and [`WriteOnlyTransactionBuilder`] expose these four setters with
 /// identical signatures but share no common trait, so the body lives here once rather than as two
-/// byte-identical copies each needing every new commit setting added to it; each method still names
-/// its own concrete builder type.
+/// byte-identical copies naming different types.
 macro_rules! apply_to_commit_builder {
     ($(#[$attr:meta])* $name:ident($builder:ty)) => {
         $(#[$attr])*
@@ -123,9 +122,8 @@ macro_rules! apply_to_commit_builder {
 
 /// The request priority / tag configuration held by a connection or statement.
 ///
-/// A connection's value is cloned into each statement it creates (which may then override the
-/// priority and request tag; the transaction tag stays connection-level), mirroring how
-/// [`ReadStaleness`](crate::staleness::ReadStaleness) is inherited.
+/// A connection's value is cloned into each statement it creates, which may then override the
+/// priority and request tag; the transaction tag stays connection-level.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RequestConfig {
     /// Parsed `spanner.request.priority`, with the raw option string kept for `get_option`
@@ -251,10 +249,10 @@ impl RequestConfig {
     /// Apply **only** the priority to a statement builder, for the driver's own internal metadata
     /// reads (`get_objects`, `get_statistics`, `get_table_schema`).
     ///
-    /// The tags are deliberately left off: a request/transaction tag exists to attribute a *user*
-    /// statement in Spanner's introspection tables, so tagging a query the user never wrote would
-    /// corrupt that attribution. The priority is the opposite — a connection set to `low` wants its
-    /// heavy `COUNT(*)`-per-table scans deprioritized too, which is precisely what the option is for.
+    /// The tags are deliberately left off: they exist to attribute a *user* statement in Spanner's
+    /// introspection tables, so tagging a query the user never wrote would corrupt that
+    /// attribution. The priority is the opposite — a connection set to `low` wants its heavy
+    /// per-table scans deprioritized too.
     #[must_use]
     pub(crate) fn apply_priority_to_statement(
         &self,
@@ -277,12 +275,10 @@ impl RequestConfig {
     /// Apply the priority and transaction tag to a `BatchWrite` builder (the
     /// `spanner.ingest.batch_write` firehose ingest path).
     ///
-    /// The **request** tag is deliberately not applied: per-request tags apply only to queries and
-    /// reads, and Spanner ignores them on `BatchWrite` (the client's builder exposes no setter for
-    /// that reason). Nor is there a commit delay or commit-stats setter — BatchWrite carries no
-    /// per-request commit options — so this is not one of the `apply_to_commit_builder!` sites. The
-    /// change-stream exclusion flag *is* applied, though: `BatchWriteTransactionBuilder` exposes
-    /// `set_exclude_txn_from_change_streams` (it rides the `BatchWriteRequest` directly).
+    /// The **request** tag is deliberately not applied: Spanner ignores per-request tags on
+    /// `BatchWrite`, so the client's builder exposes no setter. Nor is there a commit delay or
+    /// commit-stats setter — BatchWrite carries no per-request commit options — so this is not one
+    /// of the `apply_to_commit_builder!` sites. The change-stream exclusion flag *is* applied.
     #[must_use]
     pub(crate) fn apply_to_batch_write(
         &self,
@@ -318,10 +314,9 @@ impl RequestConfig {
 ///
 /// Interior-mutable and `Arc`-shared so the driver's commit paths (which take `&self`) can record
 /// into it while `get_option_int` (also `&self`) reads it back. Each connection and statement owns
-/// its **own** cell — a statement does not inherit the connection's — because the count belongs to
-/// whichever object actually ran the commit (statement: autocommit DML / bulk ingest; connection:
-/// the manual-mode commit). Unset (`None`) until such a commit has run; `get_option` surfaces that
-/// as [`Status::NotFound`](adbc_core::error::Status::NotFound).
+/// its **own** cell, because the count belongs to whichever object actually ran the commit. Unset
+/// until such a commit has run, which `get_option` surfaces as
+/// [`Status::NotFound`](adbc_core::error::Status::NotFound).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CommitStats {
     mutation_count: Arc<Mutex<Option<i64>>>,

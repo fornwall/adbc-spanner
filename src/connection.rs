@@ -1,32 +1,11 @@
 //! The [`SpannerConnection`] — an ADBC connection backed by a Spanner [`DatabaseClient`].
 //!
-//! ## Transactions
-//!
-//! By default the connection is in **autocommit** mode: every statement runs in its own Spanner
-//! transaction (a single-use read-only transaction for queries, a read/write transaction for DML).
-//!
-//! Setting `adbc.connection.autocommit` to `false` begins **manual** transaction mode, where a
-//! transaction is exactly one of two kinds — **queries** or **DML** — fixed by its *first*
-//! statement; a statement of the other kind is rejected with [`Status::InvalidState`] until
-//! [`Connection::commit`] or [`Connection::rollback`] ends it:
-//!
-//! - **Queries**: one **multi-use read-only transaction** carries every query of the transaction,
-//!   so all reads observe a single consistent snapshot (pinned at the first query's
-//!   `spanner.read.staleness` bound). Commit and rollback are local — a Spanner read-only
-//!   transaction needs no RPC, so the snapshot is simply dropped.
-//! - **DML**: Spanner's client exposes read/write transactions only through a closure-based runner
-//!   (no public begin/commit handle), so the driver *buffers* DML statements — and the insert
-//!   **mutations** of any bulk ingest — and applies the whole batch atomically in one read/write
-//!   transaction on commit. That also makes retry-on-abort safe: the buffer is simply replayed.
-//!
-//! **DDL is not transaction-aware**: it always executes immediately through the admin
-//! `UpdateDatabaseDdl` API (Spanner DDL is never transactional) and leaves the transaction state
-//! untouched, so DDL issued after buffered DML runs before it.
-//!
-//! The user-facing consequences — no read-your-writes, `None` DML counts before commit, the
-//! commit-failure replay semantics and the read-only-connection commit guard — are documented on
-//! [`SpannerConnection`] and in
+//! The transaction model — autocommit by default; a manual transaction being exactly one of two
+//! kinds, queries or DML, fixed by its first statement; DML buffering until commit; DDL always
+//! immediate — is documented on [`SpannerConnection`] and in
 //! [docs/transactions.md](https://github.com/fornwall/adbc-spanner/blob/main/docs/transactions.md).
+//! The invariants that keep it sound under concurrent statements live on `TxnState`'s methods in
+//! [`txn`].
 
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -101,22 +80,19 @@ pub struct SpannerConnection {
     spanner: Spanner,
     database: String,
     /// The lazily-built Database Admin client for the DDL path, shared (`Arc`) with every statement
-    /// the connection creates — and, via the cached [`Connected`] stack, with every other connection
-    /// on the same database — so the first DDL statement builds it and later ones clone it (see
-    /// [`SharedDatabaseAdmin`]).
+    /// the connection creates and — via the cached [`Connected`] stack — every other connection on
+    /// the same database (see [`SharedDatabaseAdmin`]).
     admin: SharedDatabaseAdmin,
-    /// Every option-settable value on this connection — the readonly flag, the isolation level, the
-    /// read staleness, request/retry/timeout/optimizer config and this connection's commit-stats
-    /// cell. Each statement the connection creates starts from a [`SharedConfig::inherit`]ed copy
-    /// and may override the fields it exposes; see [`SharedConfig`] for the per-field detail.
+    /// Every option-settable value on this connection. Each statement it creates starts from a
+    /// [`SharedConfig::inherit`]ed copy and may override the fields it exposes; see
+    /// [`SharedConfig`] for the per-field detail.
     config: SharedConfig,
     txn: SharedTxn,
     /// Per-operation cancellation for this connection's metadata/commit operations (see
     /// [`Connection::get_cancel_handle`]): each entry point mints a fresh [`CancelSignal`] here,
-    /// and a cancel latches the current one — forever, so a cancelled `read_partition` stream stays
-    /// cancelled even after this connection starts a new operation. Shared through an [`Arc`] so
-    /// the [`SlotCancelHandle`]s handed out by `get_cancel_handle` keep targeting the *current*
-    /// operation for this connection's whole life.
+    /// and a cancel latches the current one forever, so a cancelled `read_partition` stream stays
+    /// cancelled. Shared through an [`Arc`] so the [`SlotCancelHandle`]s handed out by
+    /// `get_cancel_handle` keep targeting the *current* operation.
     cancel: Arc<CancelSlot>,
 }
 
@@ -170,8 +146,7 @@ impl SpannerConnection {
         statements: Vec<SpannerSql>,
         mutations: Vec<Mutation>,
     ) -> Result<()> {
-        // Mint a fresh cancel signal: a stale cancel cannot leak in, and no later operation can
-        // un-cancel this one's streamed reader (see `CancelSlot`).
+        // Mint a fresh cancel signal for this operation (see `CancelSlot`).
         self.cancel.begin_operation();
         if statements.is_empty() {
             return write_mutations_txn(
@@ -222,11 +197,9 @@ impl Optionable for SpannerConnection {
                     crate::options::bool_option(value, "option adbc.connection.autocommit")?;
                 // Enabling autocommit commits any active manual transaction. The mode flip and the
                 // state take are one lock acquisition (`enter_autocommit`), so nothing a
-                // concurrent statement buffers is stranded behind the flip. Like `commit`, a
-                // failed apply must not lose the work: `restore_manual` re-enters manual mode with
-                // the state restored, so apply from a borrow — the taken state must still be
-                // around to restore. (A taken read-only transaction has nothing to apply; dropping
-                // it ends the snapshot.)
+                // concurrent statement buffers is stranded behind the flip. Like `commit`, a failed
+                // apply must not lose the work: `restore_manual` re-enters manual mode with the
+                // state restored, so apply from a borrow.
                 let pending = {
                     let mut st = lock_txn(&self.txn);
                     if enable && !st.autocommit {
@@ -255,19 +228,17 @@ impl Optionable for SpannerConnection {
             OptionConnection::Other(k) if k == crate::OPTION_TRANSACTION_TAG => {
                 self.config.request.set_transaction_tag(value)?;
             }
-            // Every other `spanner.*` option the connection and statement dispatch identically —
-            // request priority/tag, directed read, staleness, max_commit_delay, commit_stats, query
-            // optimizer opts, RPC timeouts, retry tuning — goes through the shared table. An
-            // unrecognised key returns `None`, mapped to the same `NotImplemented` as before.
+            // Every other `spanner.*` option the connection and statement dispatch identically
+            // goes through the shared table; an unrecognised key returns `None`, mapped to
+            // `NotImplemented`.
             OptionConnection::Other(k) => {
                 if self.set_shared_option(k, value)?.is_none() {
                     return Err(unknown_option("connection", &connection_option_name(&key)));
                 }
             }
-            // Spanner has no settable current catalog/schema (named schemas are addressed by
-            // qualified name and enumerated by `get_objects`, but none can be made "current"). Both
-            // are fixed at `""`: setting `""` is a conformant no-op, a non-empty value is
-            // unsupported → `NotImplemented` (see `check_unnamed_catalog_or_schema`).
+            // Spanner has no settable current catalog/schema; both are fixed at `""`, so setting
+            // `""` is a conformant no-op and anything else is `NotImplemented` (see
+            // `check_unnamed_catalog_or_schema`).
             OptionConnection::CurrentCatalog => {
                 check_unnamed_catalog_or_schema(value, "current catalog")?;
             }
@@ -296,12 +267,10 @@ impl Optionable for SpannerConnection {
                 .map(str::to_string)
                 .ok_or_else(|| option_not_set(crate::OPTION_TRANSACTION_TAG)),
             // Every other `spanner.*` option the connection and statement report identically —
-            // including `spanner.commit_stats.mutation_count` — goes through the shared table, which
-            // returns the same `NotFound` for an unset (or unknown) key.
+            // including `spanner.commit_stats.mutation_count` — goes through the shared table.
             OptionConnection::Other(k) => self.shared_option_string(k),
-            // A Spanner database has a single, unnamed catalog and (default) schema — both the empty
-            // string in INFORMATION_SCHEMA, which is what `get_objects` reports — so the "current"
-            // catalog/schema are reported as "". (They can't be switched; setting them is unsupported.)
+            // A Spanner database has a single, unnamed catalog and default schema — both the empty
+            // string in INFORMATION_SCHEMA — so the "current" values are reported as "".
             OptionConnection::CurrentCatalog | OptionConnection::CurrentSchema => Ok(String::new()),
             other => Err(option_not_set(&connection_option_name(other))),
         }
@@ -359,8 +328,7 @@ impl Connection for SpannerConnection {
         table_type: Option<Vec<&str>>,
         column_name: Option<&str>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        // Mint a fresh cancel signal: a stale cancel cannot leak in, and no later operation can
-        // un-cancel this one's streamed reader (see `CancelSlot`).
+        // Mint a fresh cancel signal for this operation (see `CancelSlot`).
         self.cancel.begin_operation();
         let out_schema = adbc_core::schemas::GET_OBJECTS_SCHEMA.clone();
         // Spanner has a single catalog (""); a catalog filter that excludes it yields no rows.
@@ -399,8 +367,7 @@ impl Connection for SpannerConnection {
         db_schema: Option<&str>,
         table_name: &str,
     ) -> Result<Schema> {
-        // Mint a fresh cancel signal: a stale cancel cannot leak in, and no later operation can
-        // un-cancel this one's streamed reader (see `CancelSlot`).
+        // Mint a fresh cancel signal for this operation (see `CancelSlot`).
         self.cancel.begin_operation();
         check_lookup_catalog(catalog)?;
         let table = qualified_table(db_schema, table_name);
@@ -489,8 +456,7 @@ impl Connection for SpannerConnection {
         table_name: Option<&str>,
         approximate: bool,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        // Mint a fresh cancel signal: a stale cancel cannot leak in, and no later operation can
-        // un-cancel this one's streamed reader (see `CancelSlot`).
+        // Mint a fresh cancel signal for this operation (see `CancelSlot`).
         self.cancel.begin_operation();
         let out_schema = adbc_core::schemas::GET_STATISTICS_SCHEMA.clone();
         // Spanner is a single unnamed catalog (""); a catalog filter that excludes it yields nothing.
@@ -570,8 +536,7 @@ impl Connection for SpannerConnection {
         &self,
         partition: impl AsRef<[u8]>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        // Mint a fresh cancel signal: a stale cancel cannot leak in, and no later operation can
-        // un-cancel this one's streamed reader (see `CancelSlot`).
+        // Mint a fresh cancel signal for this operation (see `CancelSlot`).
         self.cancel.begin_operation();
         // Decode the opaque descriptor produced by `Statement::execute_partitions`. It carries the
         // session, transaction id, partition token and Data Boost flag, so it executes on this

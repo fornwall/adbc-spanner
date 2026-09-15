@@ -137,10 +137,9 @@ impl SpannerStatement {
     /// (summed across chunk transactions), or `None` when the rows were buffered for a
     /// manual-transaction commit.
     ///
-    /// An ingest small enough for one chunk (the common case) applies atomically; one large enough
-    /// to need several chunks does **not** — each chunk commits in its own transaction, so a
-    /// mid-ingest failure leaves the earlier chunks' rows committed (the error reports their exact
-    /// count — see [`note_rows_already_committed`]).
+    /// An ingest small enough for one chunk applies atomically; one needing several does **not** —
+    /// each chunk commits in its own transaction, so a mid-ingest failure leaves the earlier
+    /// chunks' rows committed (the error reports their exact count).
     pub(super) fn run_ingest(&mut self, table: &str) -> Result<Option<i64>> {
         if self.config.is_read_only() {
             return Err(invalid_state("cannot ingest: the connection is read-only"));
@@ -162,16 +161,11 @@ impl SpannerStatement {
     /// on every exit path (success, failed DDL, failed insert) in one place.
     fn run_bound_ingest(&self, table: &str) -> Result<Option<i64>> {
         // Reject a DML-kind ingest inside a manual *query* transaction BEFORE any DDL side effect:
-        // DDL is not transaction-aware and runs immediately, so a create/replace-mode ingest would
-        // otherwise create (or drop) the table before `run_ingest_mutations`'s kind check rejects
-        // it. This guard changes no state; the authoritative check still runs under the txn lock at
-        // buffer time.
-        //
-        // It only closes the race for the single-threaded case: a concurrent statement could fix
-        // the transaction to query-kind between this check and the DDL, orphaning the table. Fully
-        // closing it would mean holding the connection-wide txn lock across a multi-second admin
-        // `UpdateDatabaseDdl` RPC. The residual window is the documented "DDL is not
-        // transaction-aware" caveat (see `run_ddl`).
+        // DDL runs immediately, so a create/replace-mode ingest would otherwise create (or drop)
+        // the table before `run_ingest_mutations`'s kind check rejects it. This guard changes no
+        // state; the authoritative check still runs under the txn lock at buffer time, and it only
+        // closes the race for the single-threaded case — fully closing it would mean holding the
+        // connection-wide txn lock across a multi-second admin RPC.
         {
             let txn = lock_txn(&self.txn);
             if !txn.autocommit() {
@@ -235,15 +229,14 @@ impl SpannerStatement {
     /// pending buffer exactly as it was.
     ///
     /// **Autocommit mode** builds and ships the mutations chunk by chunk, each chunk in its own
-    /// write-only transaction (with the client's retry/replay protection), returning the ingested
-    /// row count summed across chunks. Spanner caps a single commit at ~80,000 mutations (roughly
-    /// rows × columns, plus secondary-index entries) and ~100 MB, which 10k rows × 10 columns
-    /// already crosses. An ingest that fits [`IngestChunkBudget`]'s conservative budgets still
-    /// commits as one atomic transaction; only one needing several chunks — which could not have
-    /// committed as one transaction anyway — loses whole-ingest atomicity, and a later chunk's
-    /// failure reports exactly how many rows the earlier chunks committed (see
-    /// [`note_rows_already_committed`]). A chunk that still overshoots the mutation cap is
-    /// bisected and retried — see [`write_mutation_range`](Self::write_mutation_range).
+    /// write-only transaction (with the client's retry/replay protection). Spanner caps a single
+    /// commit at ~80,000 mutations (roughly rows × columns, plus secondary-index entries) and
+    /// ~100 MB, which 10k rows × 10 columns already crosses. An ingest that fits
+    /// [`IngestChunkBudget`]'s conservative budgets still commits as one atomic transaction; only
+    /// one needing several chunks — which could not have committed as one anyway — loses
+    /// whole-ingest atomicity, and a later chunk's failure reports exactly how many rows the
+    /// earlier ones committed. A chunk that still overshoots the cap is bisected and retried — see
+    /// [`write_mutation_range`](Self::write_mutation_range).
     fn run_ingest_mutations(&self, table: &str) -> Result<Option<i64>> {
         // Mutations name their target table directly (no SQL quoting; a named schema joins with a
         // plain dot).
@@ -268,16 +261,14 @@ impl SpannerStatement {
             let rows = self.bound.iter().map(RecordBatch::num_rows).sum();
             let mutations = self.build_range_mutations(&target, 0, rows)?;
             // An empty append buffers nothing and would commit clean, so a missing target table
-            // would never surface — probe existence now (as the autocommit path does, and outside
-            // the txn lock) so a manual-mode empty append to an absent table still fails NotFound,
-            // consistent with what a non-empty manual append surfaces at commit.
+            // would never surface — probe existence now (outside the txn lock) so a manual-mode
+            // empty append to an absent table still fails NotFound.
             self.check_empty_append_target(table, rows as i64)?;
             let mut txn = lock_txn(&self.txn);
             if !txn.autocommit() {
-                // `buffer_mutation` re-checks the DML kind under this lock (a concurrent
-                // statement may have fixed the transaction to queries in the unlocked window);
-                // a rejection fails the *first* call, before anything is buffered, so
-                // all-or-nothing still holds. Its first success fixes the transaction's kind.
+                // `buffer_mutation` re-checks the DML kind under this lock (a concurrent statement
+                // may have fixed the transaction to queries in the unlocked window); a rejection
+                // fails the *first* call, before anything is buffered.
                 for mutation in mutations {
                     txn.buffer_mutation(mutation)?;
                 }
@@ -287,11 +278,10 @@ impl SpannerStatement {
             // autocommit commits the manual transaction): fall through to the autocommit path
             // below, exactly where a fresh mode check would have routed this ingest.
         }
-        // Autocommit: walk the flattened row sequence (all bound batches concatenated), cutting it
-        // into commit chunks by `IngestChunkBudget`. A chunk is a contiguous `[start, end)` range
-        // rather than a materialised `Vec<Mutation>`; its mutations are (re)built cheaply from the
-        // batches on demand (`commit_ingest_range`), so nothing is cloned up front just to enable
-        // the write-only path's bisect-and-retry when a chunk overshoots the per-commit cap.
+        // Autocommit: walk the flattened row sequence, cutting it into commit chunks by
+        // `IngestChunkBudget`. A chunk is a contiguous `[start, end)` range rather than a
+        // materialised `Vec<Mutation>`, rebuilt cheaply from the batches on demand, so nothing is
+        // cloned up front just to enable the bisect-and-retry when a chunk overshoots the cap.
         let mut total = 0_i64;
         let mut budget = IngestChunkBudget::default();
         let mut chunk_start = 0_usize;
