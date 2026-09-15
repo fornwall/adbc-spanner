@@ -1015,6 +1015,82 @@ mod tests {
         assert!(built.contains("User%"), "{built}");
     }
 
+    /// The SQL text of a built statement, as its `Debug` rendering carries it.
+    fn sql_of(statement: &SpannerSql) -> String {
+        let built = format!("{statement:?}");
+        let rest = built.split_once("sql: \"").expect("a sql field").1;
+        rest.split_once('"').expect("a closing quote").0.to_string()
+    }
+
+    /// The two queries that carry a hidden-column predicate, assembled exactly as
+    /// `collect_objects` assembles them. Together they are what keeps a keyless ingest-created
+    /// table's implicit `rowid` — and the `PK_<table>` / `CK_IS_NOT_NULL_<table>_rowid`
+    /// constraints that exist only to describe it — out of every schema surface, so the predicate
+    /// must land in the `WHERE` ahead of the `LIKE` filters rather than beside or after them.
+    #[test]
+    fn filtered_query_hides_hidden_columns_and_their_constraints() {
+        let config = SharedConfig::default();
+        let columns = filtered_query(
+            &config,
+            "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, \
+             IS_NULLABLE, SPANNER_TYPE \
+             FROM INFORMATION_SCHEMA.COLUMNS",
+            Some(HIDE_HIDDEN_COLUMNS),
+            &[
+                ("TABLE_SCHEMA", None),
+                ("TABLE_NAME", Some("User%")),
+                ("COLUMN_NAME", None),
+            ],
+            Some("TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"),
+        );
+        assert_eq!(
+            sql_of(&columns),
+            "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, \
+             IS_NULLABLE, SPANNER_TYPE \
+             FROM INFORMATION_SCHEMA.COLUMNS \
+             WHERE NOT CAST(IS_HIDDEN AS BOOL) \
+             AND TABLE_NAME LIKE @p0 \
+             ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
+        );
+
+        // The constraint predicate correlates on the outer query's `tc` alias, so the base SQL
+        // must keep that alias for the subquery to resolve at all.
+        let constraints = filtered_query(
+            &config,
+            "SELECT TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE \
+             FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc",
+            Some(HIDE_HIDDEN_COLUMN_CONSTRAINTS),
+            &[("TABLE_SCHEMA", None), ("TABLE_NAME", None)],
+            None,
+        );
+        assert_eq!(
+            sql_of(&constraints),
+            "SELECT TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE \
+             FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc \
+             WHERE NOT EXISTS ( \
+             SELECT 1 FROM INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE AS u \
+             JOIN INFORMATION_SCHEMA.COLUMNS AS c \
+             ON c.TABLE_SCHEMA = u.TABLE_SCHEMA AND c.TABLE_NAME = u.TABLE_NAME \
+             AND c.COLUMN_NAME = u.COLUMN_NAME \
+             WHERE u.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA \
+             AND u.CONSTRAINT_NAME = tc.CONSTRAINT_NAME \
+             AND CAST(c.IS_HIDDEN AS BOOL))"
+        );
+
+        // The schemata query carries no base predicate, so a `LIKE` filter opens the `WHERE`.
+        let schemata = filtered_query(
+            &config,
+            "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA",
+            None,
+            &[("SCHEMA_NAME", Some("app"))],
+            None,
+        );
+        assert_eq!(
+            sql_of(&schemata),
+            "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME LIKE @p0"
+        );
+    }
+
     fn sample() -> Vec<DbSchema> {
         vec![DbSchema {
             name: String::new(),

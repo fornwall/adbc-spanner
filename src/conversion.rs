@@ -1311,6 +1311,28 @@ mod tests {
     use arrow_array::{Array, StringArray, TimestampMicrosecondArray};
     use google_cloud_spanner::value::ToValue;
 
+    /// A driver error reaching a `RecordBatchReader` consumer must stay a *boxed* ADBC error, not
+    /// a stringified one: the C ABI's stream export (`src/ffi/stream.rs`) recovers the ADBC status
+    /// by walking `ArrowError`'s source chain and downcasting back to
+    /// [`adbc_core::error::Error`]. Stringify it and every FFI unit test still passes while a
+    /// cancelled read stops reporting `ECANCELED` — the one thing that whole export layer exists
+    /// for. This is the assertion that ties the two ends together.
+    #[test]
+    fn to_arrow_error_boxes_the_adbc_error_for_the_ffi_stream_export() {
+        let error = crate::error::err("operation cancelled", Status::Cancelled);
+        let arrow = to_arrow_error(error);
+        let ArrowError::ExternalError(boxed) = &arrow else {
+            panic!("the driver error must stay an ExternalError, not be stringified: {arrow:?}")
+        };
+        let recovered = boxed
+            .downcast_ref::<adbc_core::error::Error>()
+            .expect("the ADBC error must be recoverable by downcast");
+        assert_eq!(recovered.status, Status::Cancelled);
+        assert_eq!(recovered.message, "operation cancelled");
+        // And the message still reaches a consumer that only renders the ArrowError.
+        assert!(arrow.to_string().contains("operation cancelled"), "{arrow}");
+    }
+
     /// The `arrow.json` extension name attached to a Field's metadata, if any.
     fn extension_name(field: &Field) -> Option<&str> {
         field

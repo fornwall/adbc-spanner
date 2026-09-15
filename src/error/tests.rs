@@ -483,3 +483,39 @@ fn annotate_rewrites_only_the_message() {
         Some(vec![("google.rpc.retryinfo".to_string(), b"{}".to_vec())])
     );
 }
+
+/// [`chain`] is what the C ABI's Arrow stream export walks to find the driver's own error behind
+/// an [`ArrowError`](arrow_schema::ArrowError), so it must yield the outermost error *and* every
+/// error it wraps, outermost first — including the last link, which has no source of its own.
+#[cfg(feature = "ffi")]
+#[test]
+fn chain_walks_from_the_outermost_error_to_the_innermost() {
+    use arrow_schema::ArrowError;
+
+    let cancelled = err("operation cancelled", Status::Cancelled);
+    let inner = ArrowError::ExternalError(Box::new(cancelled));
+    let outer = ArrowError::ExternalError(Box::new(inner));
+
+    let links: Vec<String> = chain(&outer).map(ToString::to_string).collect();
+    assert_eq!(
+        links.len(),
+        3,
+        "outer, inner, and the driver error: {links:?}"
+    );
+    assert!(
+        links
+            .last()
+            .is_some_and(|last| last.contains("operation cancelled")),
+        "{links:?}"
+    );
+    // The buried driver error is recoverable by downcast, which is exactly what the export layer
+    // does with it.
+    let recovered = chain(&outer)
+        .find_map(|link| link.downcast_ref::<Error>())
+        .expect("the driver error must be reachable through the chain");
+    assert_eq!(recovered.status, Status::Cancelled);
+
+    // A lone error with no source is a one-element chain, not an empty one.
+    let alone = err("no source", Status::Internal);
+    assert_eq!(chain(&alone).count(), 1);
+}
