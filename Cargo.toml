@@ -128,7 +128,14 @@ libc = "0.2"
 # their shared internal crates (gax, gaxi, ...) resolve to one compatible copy.
 # NOTE: git dependencies cannot be published to crates.io — switch these back to
 # versioned releases once `Type::struct_type()` is published.
-google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ec54ef0ad69ecd24487c1d3b93a2e4082d820b58" }
+# `default-features = false` drops the default `builtin-metrics` feature: a background pipeline
+# that auto-exports Spanner client latency metrics to Cloud Monitoring. The driver never configures
+# or reads an OpenTelemetry MeterProvider, so it is pure weight — it pulls in `google-cloud-api`,
+# `google-cloud-monitoring-v3`, `uuid`, `opentelemetry_sdk/{metrics,rt-tokio}` and
+# `gaxi/_internal-http-client`, measured at ~1.25 MB (-6.9%) of the shipped cdylib.
+# `default-rustls-provider` is the *other* default and must stay: it installs the aws-lc rustls
+# crypto provider the TLS stack is hardwired to.
+google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ec54ef0ad69ecd24487c1d3b93a2e4082d820b58", default-features = false, features = ["default-rustls-provider"] }
 # Anonymous / service-account credentials.
 google-cloud-auth = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ec54ef0ad69ecd24487c1d3b93a2e4082d820b58" }
 # The `Poller` trait, to await the admin `UpdateDatabaseDdl` long-running operation used for DDL.
@@ -201,9 +208,16 @@ broken_intra_doc_links = "deny"
 private_intra_doc_links = "warn"
 
 [profile.release]
-# Smaller shipped shared libraries. codegen-units = 1 shaves ~21% off the cdylib
-# (17.8 → 14.0 MB) for ~2x the clean-build codegen time; lto = "fat" measured as
-# no further win over thin, so keep thin.
+# Smaller shipped shared libraries. codegen-units = 1 shaves ~28% off the cdylib
+# (25.2 -> 18.2 MB) for ~2x the clean-build codegen time; lto = "fat" re-measured as no
+# further win over thin (-448 bytes, 0.002%), so keep thin.
+#
+# Two bigger levers are deliberately NOT taken. opt-level "s"/"z" would give another
+# 27-29%, but costs 12-280% on the Spanner-rows -> Arrow hot path (benches/conversion.rs).
+# panic = "abort" would give 16.5%, but src/ffi/{guard,handle,stream}.rs build per-object
+# panic containment on catch_unwind: with unwinding off, a driver panic would kill the
+# host process instead of disabling one object, breaking the adbc.h contract that a driver
+# returns ADBC_STATUS_INTERNAL rather than terminating its caller.
 strip = true
 lto = "thin"
 codegen-units = 1

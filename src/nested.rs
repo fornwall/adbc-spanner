@@ -37,7 +37,7 @@ pub(crate) fn field(fields: &Fields, name: &str) -> Result<FieldRef> {
     fields
         .find(name)
         .map(|(_, f)| f.clone())
-        .ok_or_else(|| shape_err(&format!("a `{name}` field")))
+        .ok_or_else(|| shape_err(&format!("field `{name}`")))
 }
 
 /// The item field of a `List` field.

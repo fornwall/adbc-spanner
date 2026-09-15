@@ -30,7 +30,7 @@ fn shape_lookups_find_their_target_or_name_what_was_missing() {
     assert_eq!(items.name(), "items");
     let error = field(&fields, "absent").unwrap_err();
     assert_eq!(error.status, Status::Internal);
-    assert!(error.message.contains("`absent` field"), "{error}");
+    assert!(error.message.contains("field `absent`"), "{error}");
 
     let item = list_item(&items).unwrap();
     assert_eq!(item.name(), "item");

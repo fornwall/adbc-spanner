@@ -942,18 +942,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "google-cloud-api"
-version = "1.7.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=ec54ef0ad69ecd24487c1d3b93a2e4082d820b58#ec54ef0ad69ecd24487c1d3b93a2e4082d820b58"
-dependencies = [
- "bytes",
- "google-cloud-wkt",
- "serde",
- "serde_json",
- "serde_with",
-]
-
-[[package]]
 name = "google-cloud-auth"
 version = "1.16.0"
 source = "git+https://github.com/googleapis/google-cloud-rust?rev=ec54ef0ad69ecd24487c1d3b93a2e4082d820b58#ec54ef0ad69ecd24487c1d3b93a2e4082d820b58"
@@ -1088,25 +1076,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "google-cloud-monitoring-v3"
-version = "1.12.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=ec54ef0ad69ecd24487c1d3b93a2e4082d820b58#ec54ef0ad69ecd24487c1d3b93a2e4082d820b58"
-dependencies = [
- "async-trait",
- "bytes",
- "google-cloud-api",
- "google-cloud-gax",
- "google-cloud-gax-internal",
- "google-cloud-rpc",
- "google-cloud-type",
- "google-cloud-wkt",
- "serde",
- "serde_json",
- "serde_with",
- "tracing",
-]
-
-[[package]]
 name = "google-cloud-rpc"
 version = "1.6.0"
 source = "git+https://github.com/googleapis/google-cloud-rust?rev=ec54ef0ad69ecd24487c1d3b93a2e4082d820b58#ec54ef0ad69ecd24487c1d3b93a2e4082d820b58"
@@ -1126,18 +1095,14 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "bytes",
- "google-cloud-api",
  "google-cloud-auth",
  "google-cloud-gax",
  "google-cloud-gax-internal",
- "google-cloud-monitoring-v3",
  "google-cloud-rpc",
  "google-cloud-spanner-admin-database-v1",
  "google-cloud-spanner-admin-instance-v1",
  "google-cloud-wkt",
  "http",
- "opentelemetry",
- "opentelemetry_sdk",
  "prost",
  "prost-types",
  "rand 0.10.2",
@@ -1150,7 +1115,6 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "uuid",
 ]
 
 [[package]]
@@ -1954,8 +1918,6 @@ dependencies = [
  "portable-atomic",
  "rand 0.9.5",
  "thiserror",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]
@@ -3325,15 +3287,6 @@ name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
-
-[[package]]
-name = "uuid"
-version = "1.26.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
-dependencies = [
- "getrandom 0.4.3",
-]
 
 [[package]]
 name = "valuable"
