@@ -169,8 +169,8 @@ fn bind_one(
 ) -> Result<StatementBuilder> {
     let (value, param_type) = cell_value(name, field, column, row)?;
     Ok(match param_type {
-        Some(t) => builder.add_typed_param(name, &value, t),
-        None => builder.add_param(name, &value),
+        Some(t) => builder.add_typed_param(name, value, t),
+        None => builder.add_param(name, value),
     })
 }
 
@@ -187,7 +187,7 @@ pub(crate) fn insert_mutation(table: &str, batch: &RecordBatch, row: usize) -> R
     let mut builder = Mutation::new_insert_builder(table);
     for (i, field) in batch.schema().fields().iter().enumerate() {
         let (value, _param_type) = cell_value(field.name(), field, batch.column(i).as_ref(), row)?;
-        builder = builder.set(field.name().clone()).to(&value);
+        builder = builder.set(field.name().clone()).to(value);
     }
     Ok(builder.build())
 }
@@ -318,27 +318,21 @@ fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
         DataType::Utf8View => {
             |_, _, a, i| Ok(scalar_value(a.is_null(i), || a.as_string_view().value(i)))
         }
-        DataType::Binary => |_, _, a, i| {
-            Ok(scalar_value(a.is_null(i), || {
-                a.as_binary::<i32>().value(i).to_vec()
-            }))
-        },
-        DataType::LargeBinary => |_, _, a, i| {
-            Ok(scalar_value(a.is_null(i), || {
-                a.as_binary::<i64>().value(i).to_vec()
-            }))
-        },
-        DataType::BinaryView => |_, _, a, i| {
-            Ok(scalar_value(a.is_null(i), || {
-                a.as_binary_view().value(i).to_vec()
-            }))
-        },
+        DataType::Binary => {
+            |_, _, a, i| Ok(scalar_value(a.is_null(i), || a.as_binary::<i32>().value(i)))
+        }
+        DataType::LargeBinary => {
+            |_, _, a, i| Ok(scalar_value(a.is_null(i), || a.as_binary::<i64>().value(i)))
+        }
+        DataType::BinaryView => {
+            |_, _, a, i| Ok(scalar_value(a.is_null(i), || a.as_binary_view().value(i)))
+        }
         // `FixedSizeBinary(n)` is a byte string of a fixed width; it maps to Spanner BYTES exactly
         // like the variable-width binary kinds (the width is a layout detail Spanner does not carry
         // — a BYTES column has no fixed length — so the read path returns plain `Binary`).
         DataType::FixedSizeBinary(_) => |_, _, a, i| {
             Ok(scalar_value(a.is_null(i), || {
-                a.as_fixed_size_binary().value(i).to_vec()
+                a.as_fixed_size_binary().value(i)
             }))
         },
         DataType::Date32 => |name, _, a, i| {
@@ -403,7 +397,7 @@ fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
 fn primitive_binder<T, V>() -> ScalarBinder
 where
     T: ArrowPrimitiveType,
-    V: From<T::Native> + ToValue,
+    V: From<T::Native> + Into<Value>,
 {
     |_, _, a, i| {
         Ok(scalar_value(a.is_null(i), || {
@@ -442,20 +436,29 @@ fn null_value() -> Value {
 }
 
 /// Convert a scalar (or a null) to its Spanner wire [`Value`].
-fn scalar_value<T: ToValue>(is_null: bool, value: impl FnOnce() -> T) -> Value {
+///
+/// The bound is [`Into<Value>`] rather than [`ToValue`] deliberately: `Into` **consumes** the
+/// scalar, so an owned `String` (the `DATE`/`TIMESTAMP`/`NUMERIC` encodings) moves into the wire
+/// value, where `ToValue` takes `&self` and would copy it. Borrowed scalars (`&str`, `&[u8]`) still
+/// convert through the client's blanket `impl<T: ToValue + ?Sized> From<&T> for Value`, so every
+/// type a [`ScalarBinder`] produces is accepted either way.
+fn scalar_value<T: Into<Value>>(is_null: bool, value: impl FnOnce() -> T) -> Value {
     if is_null {
         null_value()
     } else {
-        value().to_value()
+        value().into()
     }
 }
 
 /// Like [`scalar_value`] but the conversion is fallible (the string-formatted temporal types).
-fn try_scalar_value<T: ToValue>(is_null: bool, value: impl FnOnce() -> Result<T>) -> Result<Value> {
+fn try_scalar_value<T: Into<Value>>(
+    is_null: bool,
+    value: impl FnOnce() -> Result<T>,
+) -> Result<Value> {
     Ok(if is_null {
         null_value()
     } else {
-        value()?.to_value()
+        value()?.into()
     })
 }
 
@@ -484,10 +487,13 @@ fn list_cell_value(
     let value = match elem {
         // A null cell is a null array; each present element keeps its own null via `scalar_binder`.
         None => null_value(),
-        Some(a) => (0..a.len())
-            .map(|i| bind(name, item_type, a.as_ref(), i))
-            .collect::<Result<Vec<Value>>>()?
-            .to_value(),
+        // `Value::from(Vec<Value>)` consumes the elements (`impl<T: Into<Value>> From<Vec<T>>`);
+        // `Vec::to_value` would deep-copy every one of them instead.
+        Some(a) => Value::from(
+            (0..a.len())
+                .map(|i| bind(name, item_type, a.as_ref(), i))
+                .collect::<Result<Vec<Value>>>()?,
+        ),
     };
     Ok((
         value,
