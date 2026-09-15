@@ -3991,14 +3991,25 @@ fn get_objects_filter_pushdown_matches_client_filtering() {
 /// over the network, so this is kept modest to bound the emulator wall-clock.
 const PROP_CASES: u32 = 64;
 
+/// Cases for [`prop_temporal_round_trip`], whose DATE / TIMESTAMP / NUMERIC generators are a strict
+/// subset of [`prop_bind_round_trip`]'s. Only the *write* path differs (SQL literals rather than
+/// bound parameters), so the extra cases re-explore a value space [`PROP_CASES`] already covers at
+/// full width — they cost emulator round trips under the global schema guard and buy nothing.
+const PROP_TEMPORAL_CASES: u32 = 20;
+
 /// A `ProptestConfig` for the emulator round-trips: a bounded case count and no on-disk regression
 /// file (a persisted seed is useless anyway — reproducing it needs a live emulator).
-fn prop_config() -> ProptestConfig {
+fn prop_config_with(cases: u32) -> ProptestConfig {
     ProptestConfig {
-        cases: PROP_CASES,
+        cases,
         failure_persistence: None,
         ..ProptestConfig::default()
     }
+}
+
+/// [`prop_config_with`] at the default [`PROP_CASES`].
+fn prop_config() -> ProptestConfig {
+    prop_config_with(PROP_CASES)
 }
 
 /// Run a statement that returns no rows (DDL / DML), panicking on error.
@@ -4211,7 +4222,7 @@ fn prop_temporal_round_trip() {
     let connection = RefCell::new(connect_with_retry(&database));
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
 
-    proptest!(prop_config(), |(
+    proptest!(prop_config_with(PROP_TEMPORAL_CASES), |(
         od in proptest::option::of((1i32..=9999, 1u32..=12, 1u32..=28)),
         ot in proptest::option::of((1678i32..=2261, 1u32..=12, 1u32..=28, 0u32..24, 0u32..60, 0u32..60, 0u32..1_000_000)),
         on in proptest::option::of((any::<bool>(), 0u128..10u128.pow(28), 0u32..1_000_000_000)),
@@ -4695,15 +4706,17 @@ fn ffi_count(connection: &mut adbc_driver_manager::ManagedConnection, table: &st
     col::<Int64Array>(batches[0].column(0)).value(0)
 }
 
-/// Retry-tuning options (`spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds`)
-/// round-trip through `get_option` / `get_option_int` / `get_option_double`, inherit onto statements
-/// then override, and — most importantly — a statement carrying a bounded retry policy still
-/// executes a real query and DML successfully against the emulator (exercising the
-/// `with_retry_policy` / `with_begin_retry_policy` / `with_commit_retry_policy` apply path). This is
-/// read-only-plus-one-row so it does not need the schema serial guard.
+/// Retry-tuning options (`spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds`): the
+/// keys route through the real ADBC surface onto `RetryConfig` — including the numeric getters and
+/// statement inheritance — and, most importantly, a statement carrying a bounded retry policy still
+/// executes a real query and DML successfully against the emulator, exercising the
+/// `with_retry_policy` / `with_begin_retry_policy` / `with_commit_retry_policy` apply path.
+///
+/// Parsing, validation, unsetting and inherit-then-override are unit-tested offline in
+/// `src/retry.rs`. This is read-only-plus-one-row, so it takes no schema serial guard.
 #[test]
 fn retry_tuning_round_trip_and_execute() {
-    let Some(mut fx) = fixture() else {
+    let Some(mut fx) = fixture_unguarded() else {
         return;
     };
     let connection = &mut fx.connection;
@@ -4727,32 +4740,12 @@ fn retry_tuning_round_trip_and_execute() {
         30.0
     );
 
-    // A statement inherits the connection's values, then overrides independently.
+    // A statement inherits the connection's values.
     let st_attempts = OptionStatement::Other("spanner.retry.max_attempts".into());
-    let st_elapsed = OptionStatement::Other("spanner.retry.max_elapsed_seconds".into());
     let mut stmt = connection.new_statement().expect("new statement");
     assert_eq!(stmt.get_option_string(st_attempts.clone()).unwrap(), "4");
-    assert_eq!(stmt.get_option_string(st_elapsed.clone()).unwrap(), "30");
-    stmt.set_option(st_attempts.clone(), OptionValue::String("2".into()))
+    stmt.set_option(st_attempts, OptionValue::String("2".into()))
         .expect("override max_attempts");
-    stmt.set_option(st_elapsed.clone(), OptionValue::String(String::new()))
-        .expect("unset max_elapsed_seconds");
-    assert_eq!(stmt.get_option_string(st_attempts.clone()).unwrap(), "2");
-    assert_eq!(
-        stmt.get_option_string(st_elapsed.clone())
-            .unwrap_err()
-            .status,
-        Status::NotFound
-    );
-
-    // A bad value is rejected and leaves the stored value intact.
-    assert_eq!(
-        stmt.set_option(st_attempts.clone(), OptionValue::String("0".into()))
-            .unwrap_err()
-            .status,
-        Status::InvalidArguments
-    );
-    assert_eq!(stmt.get_option_string(st_attempts.clone()).unwrap(), "2");
 
     // The statement's bounded retry policy is actually applied to a live query.
     stmt.set_sql_query("SELECT 1 AS one").unwrap();
@@ -6200,7 +6193,8 @@ fn execute_partitions_round_trip() {
 
     let mut statement = connection.new_statement().expect("new statement");
     // The Data Boost option round-trips through get_option. Data Boost is baked into each
-    // descriptor at partition-creation time (below), so it travels with the token.
+    // descriptor at partition-creation time (asserted on the descriptors below), so it travels
+    // with the token rather than being re-supplied at `read_partition` time.
     let data_boost_key = || OptionStatement::Other(adbc_spanner::OPTION_DATA_BOOST.into());
     statement
         .set_option(data_boost_key(), OptionValue::String("true".into()))
@@ -6229,6 +6223,25 @@ fn execute_partitions_round_trip() {
     );
     // A read query reports no affected-row count.
     assert_eq!(partitioned.rows_affected, -1);
+
+    // Every descriptor really carries the Data Boost flag. The descriptor is the driver's own
+    // versioned JSON envelope (`encode_partition` in `src/connection.rs`), so decode it and look:
+    // `spanner.data_boost` must have reached the serialized partition, since `read_partition` has
+    // no other channel to learn about it. This is the only assertion in the repo that covers the
+    // client's `set_data_boost` call.
+    for token in &partitioned.partitions {
+        let descriptor: serde_json::Value = serde_json::from_slice(token)
+            .expect("a partition descriptor must be our JSON envelope");
+        assert_eq!(
+            descriptor["v"], 1,
+            "unexpected descriptor version: {descriptor}"
+        );
+        assert_eq!(
+            descriptor["partition"]["inner"]["Query"]["dataBoostEnabled"],
+            serde_json::Value::Bool(true),
+            "spanner.data_boost=true must be baked into the descriptor: {descriptor}"
+        );
+    }
 
     // Read every partition back through the connection and union the ids.
     let mut seen: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
@@ -6838,11 +6851,14 @@ fn connection_cancel_is_sticky_until_the_next_operation() {
 }
 
 /// Request priority and request/transaction tags (`spanner.request.priority` /
-/// `spanner.request.tag` / `spanner.transaction.tag`): the options round-trip through
-/// `get_option`, statements inherit the connection's values and can override the priority and
-/// request tag, bad values are rejected, and a query plus DML run end-to-end with all three set
-/// (the emulator accepts and ignores priorities/tags, so this proves the wiring sends valid
-/// requests rather than asserting on scheduler behaviour).
+/// `spanner.request.tag` / `spanner.transaction.tag`): the option keys route through the real ADBC
+/// surface onto `RequestConfig`, statements inherit the connection's values and can override them,
+/// the transaction tag is connection-level only, and a query plus DML run end-to-end with all
+/// three set (the emulator accepts and ignores priorities/tags, so this proves the wiring sends
+/// valid requests rather than asserting on scheduler behaviour).
+///
+/// The value grammar — accepted priorities, rejected ones, verbatim tags, empty-string unsets,
+/// inherit-then-override — is unit-tested offline in `src/request.rs` and not repeated here.
 #[test]
 fn request_priority_and_tags() {
     use adbc_core::error::Status;
@@ -6856,20 +6872,11 @@ fn request_priority_and_tags() {
     let conn_key = |k: &str| OptionConnection::Other(k.into());
     let stmt_key = |k: &str| OptionStatement::Other(k.into());
 
-    // Unset options read back as NotFound.
-    for key in [
-        OPTION_REQUEST_PRIORITY,
-        OPTION_REQUEST_TAG,
-        OPTION_TRANSACTION_TAG,
-    ] {
-        let error = connection
-            .get_option_string(conn_key(key))
-            .expect_err("unset option must be NotFound");
-        assert_eq!(error.status, Status::NotFound, "{key}");
-    }
-
-    // Set all three at connection level; the priority is exact lowercase (like every option value)
-    // and reported canonically.
+    // The `Optionable` key routing: all three keys reach `RequestConfig` through the real ADBC
+    // surface and read back, a statement inherits the connection's values, and the statement-level
+    // overrides the wire assertions below rely on take effect. The value grammar itself — exact
+    // lowercase priorities, unknown priorities rejected, tags verbatim, empty-string unsets,
+    // inherit-then-override — is unit-tested offline in `src/request.rs`.
     connection
         .set_option(
             conn_key(OPTION_REQUEST_PRIORITY),
@@ -6896,41 +6903,11 @@ fn request_priority_and_tags() {
     );
     assert_eq!(
         connection
-            .get_option_string(conn_key(OPTION_REQUEST_TAG))
-            .unwrap(),
-        "adbc-test-request"
-    );
-    assert_eq!(
-        connection
             .get_option_string(conn_key(OPTION_TRANSACTION_TAG))
             .unwrap(),
         "adbc-test-txn"
     );
-
-    // A bad priority is rejected with InvalidArguments and leaves the stored value untouched.
-    let error = connection
-        .set_option(
-            conn_key(OPTION_REQUEST_PRIORITY),
-            OptionValue::String("urgent".into()),
-        )
-        .expect_err("bad priority must be rejected");
-    assert_eq!(error.status, Status::InvalidArguments);
-    assert_eq!(
-        connection
-            .get_option_string(conn_key(OPTION_REQUEST_PRIORITY))
-            .unwrap(),
-        "medium"
-    );
-
-    // Statements inherit the connection's effective values, and may override or unset them.
     let mut statement = connection.new_statement().expect("new statement");
-    assert_eq!(
-        statement
-            .get_option_string(stmt_key(OPTION_REQUEST_PRIORITY))
-            .unwrap(),
-        "medium",
-        "the statement must inherit the connection's priority"
-    );
     assert_eq!(
         statement
             .get_option_string(stmt_key(OPTION_REQUEST_TAG))
@@ -6950,29 +6927,6 @@ fn request_priority_and_tags() {
             OptionValue::String(String::new()),
         )
         .expect("unset the inherited request tag with an empty value");
-    assert_eq!(
-        statement
-            .get_option_string(stmt_key(OPTION_REQUEST_PRIORITY))
-            .unwrap(),
-        "high"
-    );
-    let error = statement
-        .get_option_string(stmt_key(OPTION_REQUEST_TAG))
-        .expect_err("the unset request tag must be NotFound");
-    assert_eq!(error.status, Status::NotFound);
-    // The statement-level override does not leak back to the connection.
-    assert_eq!(
-        connection
-            .get_option_string(conn_key(OPTION_REQUEST_PRIORITY))
-            .unwrap(),
-        "medium"
-    );
-    assert_eq!(
-        connection
-            .get_option_string(conn_key(OPTION_REQUEST_TAG))
-            .unwrap(),
-        "adbc-test-request"
-    );
 
     // End-to-end with all three options set on the connection: DDL + DML (a tagged read/write
     // transaction) + a query (a tagged read) all succeed, and the results are correct.
@@ -7016,20 +6970,6 @@ fn request_priority_and_tags() {
     );
     assert_eq!(count_rows(connection, "AdbcReqOpts"), 3);
 
-    // Unsetting at the connection level round-trips back to NotFound.
-    for key in [
-        OPTION_REQUEST_PRIORITY,
-        OPTION_REQUEST_TAG,
-        OPTION_TRANSACTION_TAG,
-    ] {
-        connection
-            .set_option(conn_key(key), OptionValue::String(String::new()))
-            .expect("unset with an empty value");
-        let error = connection
-            .get_option_string(conn_key(key))
-            .expect_err("an unset option must be NotFound");
-        assert_eq!(error.status, Status::NotFound, "{key}");
-    }
     // The transaction tag is connection-level only: a statement rejects it.
     let error = statement
         .set_option(
@@ -7314,11 +7254,14 @@ fn zero_row_schema_fidelity() {
     }
 }
 
-/// RPC timeouts (`spanner.rpc.timeout_seconds.{query,update,fetch}`): round-trip through the
-/// string **and** double getters at connection and statement level, statement inheritance and
-/// override, validation of bad values, generous deadlines leaving real operations untouched, and —
-/// the point of the feature — a deadline that actually fires against a live RPC surfacing ADBC
+/// RPC timeouts (`spanner.rpc.timeout_seconds.{query,update,fetch}`): the option keys route through
+/// the real ADBC surface onto `RpcTimeouts`, generous deadlines leave real operations untouched,
+/// and — the point of the feature — a deadline that actually fires against a live RPC surfaces ADBC
 /// `Timeout` rather than blocking until `cancel`.
+///
+/// The grammar itself (parsing, validation, `0`-disables, empty-string-unsets, inheritance) is
+/// unit-tested offline in `src/timeout/tests.rs`; re-asserting it here only bought emulator
+/// wall-clock.
 ///
 /// The DDL path's deadline is proved in `tests/mock_spanner.rs` rather than here; see the comment
 /// at the DDL step below for why the emulator cannot assert it without racing.
@@ -7342,19 +7285,11 @@ fn rpc_timeouts() {
         OPTION_RPC_TIMEOUT_FETCH,
     ];
 
-    // Unset options read back as NotFound, through the string and double getters alike.
-    for key in ALL {
-        let error = connection
-            .get_option_string(conn_key(key))
-            .expect_err("unset option must be NotFound");
-        assert_eq!(error.status, Status::NotFound, "{key}");
-        let error = connection
-            .get_option_double(conn_key(key))
-            .expect_err("unset option must be NotFound via the double getter too");
-        assert_eq!(error.status, Status::NotFound, "{key}");
-    }
-
-    // Set via a numeric string, an integer and a double; all round-trip through both getters.
+    // The `Optionable` key routing: every key reaches `RpcTimeouts` through the real ADBC
+    // surface, from each of the three `OptionValue` shapes, and reads back through the string and
+    // double getters alike; a statement inherits the connection's value. The parsing, validation,
+    // `0`-disables, empty-string-unsets and inherit-then-override semantics are covered offline in
+    // `src/timeout/tests.rs`, so they are not re-asserted over the network here.
     connection
         .set_option(
             conn_key(OPTION_RPC_TIMEOUT_QUERY),
@@ -7378,104 +7313,19 @@ fn rpc_timeouts() {
     );
     assert_eq!(
         connection
-            .get_option_double(conn_key(OPTION_RPC_TIMEOUT_QUERY))
-            .unwrap(),
-        2.5
-    );
-    assert_eq!(
-        connection
-            .get_option_string(conn_key(OPTION_RPC_TIMEOUT_UPDATE))
-            .unwrap(),
-        "30"
-    );
-    assert_eq!(
-        connection
-            .get_option_double(conn_key(OPTION_RPC_TIMEOUT_UPDATE))
-            .unwrap(),
-        30.0
-    );
-    assert_eq!(
-        connection
             .get_option_double(conn_key(OPTION_RPC_TIMEOUT_FETCH))
             .unwrap(),
         0.75
     );
-
-    // Bad values are rejected with InvalidArguments and leave the stored value untouched.
-    for bad in [
-        OptionValue::String("-1".into()),
-        OptionValue::String("abc".into()),
-        OptionValue::Double(f64::NAN),
-        OptionValue::Double(f64::INFINITY),
-        OptionValue::Int(-3),
-    ] {
-        let error = connection
-            .set_option(conn_key(OPTION_RPC_TIMEOUT_QUERY), bad)
-            .expect_err("bad timeout value must be rejected");
-        assert_eq!(error.status, Status::InvalidArguments);
-    }
-    assert_eq!(
-        connection
-            .get_option_string(conn_key(OPTION_RPC_TIMEOUT_QUERY))
-            .unwrap(),
-        "2.5"
-    );
-
-    // Statements inherit the connection's values at creation, and may override or unset each
-    // independently without leaking back.
-    let mut statement = connection.new_statement().expect("new statement");
-    assert_eq!(
-        statement
-            .get_option_double(stmt_key(OPTION_RPC_TIMEOUT_QUERY))
-            .unwrap(),
-        2.5,
-        "the statement must inherit the connection's query timeout"
-    );
-    assert_eq!(
-        statement
-            .get_option_string(stmt_key(OPTION_RPC_TIMEOUT_UPDATE))
-            .unwrap(),
-        "30"
-    );
-    statement
-        .set_option(
-            stmt_key(OPTION_RPC_TIMEOUT_QUERY),
-            OptionValue::Double(1.25),
-        )
-        .expect("override the query timeout on the statement");
-    statement
-        .set_option(
-            stmt_key(OPTION_RPC_TIMEOUT_FETCH),
-            OptionValue::String(String::new()),
-        )
-        .expect("unset the inherited fetch timeout with an empty value");
-    assert_eq!(
-        statement
-            .get_option_string(stmt_key(OPTION_RPC_TIMEOUT_QUERY))
-            .unwrap(),
-        "1.25"
-    );
-    let error = statement
-        .get_option_string(stmt_key(OPTION_RPC_TIMEOUT_FETCH))
-        .expect_err("the unset fetch timeout must be NotFound");
-    assert_eq!(error.status, Status::NotFound);
-    assert_eq!(
-        connection
-            .get_option_string(conn_key(OPTION_RPC_TIMEOUT_QUERY))
-            .unwrap(),
-        "2.5",
-        "statement-level overrides must not leak back to the connection"
-    );
-    // `0` disables the deadline but still round-trips.
-    statement
-        .set_option(stmt_key(OPTION_RPC_TIMEOUT_UPDATE), OptionValue::Int(0))
-        .expect("zero disables");
+    let statement = connection.new_statement().expect("new statement");
     assert_eq!(
         statement
             .get_option_double(stmt_key(OPTION_RPC_TIMEOUT_UPDATE))
             .unwrap(),
-        0.0
+        30.0,
+        "the statement must inherit the connection's update timeout"
     );
+    drop(statement);
 
     // End-to-end with generous deadlines on the connection: DDL (now the update deadline, covering
     // its long-running-operation poll loop), DML (the update deadline) and a multi-chunk streamed
