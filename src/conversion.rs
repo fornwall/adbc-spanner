@@ -57,13 +57,16 @@ use std::time::Duration;
 
 use adbc_core::error::{Result, Status};
 use adbc_core::options::OptionValue;
-use arrow_array::builder::{BinaryBuilder, BooleanBuilder, PrimitiveBuilder, StringBuilder};
+use arrow_array::builder::{
+    BinaryBuilder, BooleanBuilder, GenericByteBuilder, PrimitiveBuilder, StringBuilder,
+};
 use arrow_array::types::{
-    ArrowPrimitiveType, Date32Type, Decimal128Type, Float32Type, Float64Type, Int64Type,
+    ArrowPrimitiveType, ByteArrayType, Date32Type, Decimal128Type, Float32Type, Float64Type,
+    Int64Type, TimestampMicrosecondType,
 };
 use arrow_array::{
     ArrayRef, ListArray, PrimitiveArray, RecordBatch, RecordBatchReader, StructArray,
-    TimestampMicrosecondArray, TimestampNanosecondArray,
+    TimestampNanosecondArray,
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
@@ -290,15 +293,13 @@ pub(crate) async fn stream_query(
         batch_size,
         fetch_timeout,
     };
-    let (chunks, task) = spawn_prefetch(&runtime, cancel.clone(), source);
-    Ok(SpannerBatchReader {
+    Ok(SpannerBatchReader::new(
         runtime,
         cancel,
         schema,
-        first: Some(first),
-        chunks: Some(chunks),
-        task,
-    })
+        Some(first),
+        source,
+    ))
 }
 
 /// The prefetch task's view of a Spanner [`ResultSet`]: chunks of up to `batch_size` rows (plus
@@ -346,6 +347,28 @@ pub(crate) struct SpannerBatchReader {
     chunks: Option<crate::runtime::ChunkReceiver<Row>>,
     /// The background prefetch task, so `Drop` can abort a fetch still in flight.
     task: tokio::task::JoinHandle<()>,
+}
+
+impl SpannerBatchReader {
+    /// Wrap an already-settled schema and first chunk plus the still-undrained `source`, whose
+    /// remaining chunks a freshly spawned prefetch task pulls ahead of the consumer.
+    fn new<S: ChunkSource<Row = Row>>(
+        runtime: SharedRuntime,
+        cancel: CancelSignal,
+        schema: SchemaRef,
+        first: Option<Vec<Row>>,
+        source: S,
+    ) -> Self {
+        let (chunks, task) = spawn_prefetch(&runtime, cancel.clone(), source);
+        Self {
+            runtime,
+            cancel,
+            schema,
+            first,
+            chunks: Some(chunks),
+            task,
+        }
+    }
 }
 
 impl Drop for SpannerBatchReader {
@@ -465,15 +488,9 @@ pub(crate) async fn stream_bound_query(
         batch_size,
         fetch_timeout,
     };
-    let (chunks, task) = spawn_prefetch(&runtime, cancel.clone(), source);
-    Ok(SpannerBatchReader {
-        runtime,
-        cancel,
-        schema,
-        first,
-        chunks: Some(chunks),
-        task,
-    })
+    Ok(SpannerBatchReader::new(
+        runtime, cancel, schema, first, source,
+    ))
 }
 
 /// The prefetch task's view of a bound (parameterized) query: the successive per-bound-row result
@@ -815,8 +832,53 @@ fn decode_error(spanner_type: &str, value: &Value) -> adbc_core::error::Error {
     )
 }
 
-/// Build a primitive Arrow array from one Spanner value per row: SQL NULLs become null slots, and
-/// a present value that `parse` cannot decode is an error (see [`decode_error`]), never a null.
+/// An Arrow builder that can append a null slot — the one operation [`build_with`] needs besides
+/// the caller's per-value append. (Arrow's own [`ArrayBuilder`](arrow_array::builder::ArrayBuilder)
+/// trait has no `append_null`.)
+trait NullableBuilder {
+    fn append_null(&mut self);
+}
+
+impl NullableBuilder for BooleanBuilder {
+    fn append_null(&mut self) {
+        BooleanBuilder::append_null(self);
+    }
+}
+
+impl<T: ArrowPrimitiveType> NullableBuilder for PrimitiveBuilder<T> {
+    fn append_null(&mut self) {
+        PrimitiveBuilder::append_null(self);
+    }
+}
+
+impl<T: ByteArrayType> NullableBuilder for GenericByteBuilder<T> {
+    fn append_null(&mut self) {
+        GenericByteBuilder::append_null(self);
+    }
+}
+
+/// Fill `builder` from one Spanner value per row: SQL NULLs become null slots and every present
+/// value goes to `append`, whose error (see [`decode_error`]) is how an undecodable value fails
+/// loudly instead of turning into a silent null.
+#[inline]
+fn build_with<B: NullableBuilder>(
+    values: &[Option<&Value>],
+    mut builder: B,
+    mut append: impl FnMut(&mut B, &Value) -> Result<()>,
+) -> Result<B> {
+    for &value in values {
+        match present(value) {
+            None => builder.append_null(),
+            Some(v) => append(&mut builder, v)?,
+        }
+    }
+    Ok(builder)
+}
+
+/// Build a primitive Arrow array from one Spanner value per row, with [`build_with`]'s null and
+/// strict-decode semantics. Open-codes that loop rather than calling it: routing the (cheap)
+/// per-value primitive appends through a closure measured ~8% slower on the `dates_date32` and
+/// `nested_array_int64_struct` chunks of `benches/conversion.rs`.
 fn build_primitive<T: ArrowPrimitiveType>(
     values: &[Option<&Value>],
     spanner_type: &str,
@@ -835,23 +897,23 @@ fn build_primitive<T: ArrowPrimitiveType>(
 /// Build an Arrow array of the given `data_type` from one Spanner value per row.
 ///
 /// SQL NULLs map to null slots. A present value that cannot be decoded as the column's type is an
-/// **error**, not a null — every typed arm goes through [`build_primitive`]/[`decode_error`], so a
+/// **error**, not a null — every arm goes through [`build_primitive`]/[`build_with`], so a
 /// wire-format surprise cannot silently masquerade as a SQL NULL.
 ///
 /// `pub(crate)` (rather than private) only so `crate::bench_support` can expose it to `benches/`.
 pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Result<ArrayRef> {
     Ok(match data_type {
-        DataType::Boolean => {
-            let mut builder = BooleanBuilder::with_capacity(values.len());
-            for &value in values {
-                match present(value) {
-                    None => builder.append_null(),
-                    Some(v) => builder
-                        .append_value(v.try_as_bool().ok_or_else(|| decode_error("BOOL", v))?),
-                }
-            }
-            Arc::new(builder.finish())
-        }
+        DataType::Boolean => Arc::new(
+            build_with(
+                values,
+                BooleanBuilder::with_capacity(values.len()),
+                |builder, v| {
+                    builder.append_value(v.try_as_bool().ok_or_else(|| decode_error("BOOL", v))?);
+                    Ok(())
+                },
+            )?
+            .finish(),
+        ),
         DataType::Int64 => Arc::new(build_primitive::<Int64Type>(values, "INT64", parse_int64)?),
         DataType::Float64 => Arc::new(build_primitive::<Float64Type>(
             values, "FLOAT64", parse_f64,
@@ -866,49 +928,41 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
             // A present value errors if it is not a timestamp string at all, or — since Arrow
             // stores nanoseconds as an `i64` — if it is a valid instant outside the representable
             // range.
-            let mut builder = TimestampNanosecondArray::builder(values.len());
-            for &value in values {
-                match present(value) {
-                    None => builder.append_null(),
-                    Some(v) => {
-                        let s = v
-                            .try_as_string()
-                            .ok_or_else(|| decode_error("TIMESTAMP", v))?;
-                        builder.append_value(parse_timestamp_nanos(s).ok_or_else(|| {
-                            if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
-                                invalid_argument(format!(
-                                    "TIMESTAMP value {s:?} is outside the range representable as \
-                                     an Arrow Timestamp(Nanosecond) (~1677-09-21 to 2262-04-11); \
-                                     set {}={} to read it at microsecond precision instead",
-                                    crate::OPTION_MAX_TIMESTAMP_PRECISION,
-                                    TimestampPrecision::MICROSECONDS,
-                                ))
-                            } else {
-                                decode_error("TIMESTAMP", v)
-                            }
-                        })?)
-                    }
-                }
-            }
-            Arc::new(builder.finish().with_timezone_opt(tz.clone()))
+            let array = build_with(
+                values,
+                TimestampNanosecondArray::builder(values.len()),
+                |builder, v| {
+                    let s = v
+                        .try_as_string()
+                        .ok_or_else(|| decode_error("TIMESTAMP", v))?;
+                    builder.append_value(parse_timestamp_nanos(s).ok_or_else(|| {
+                        if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
+                            invalid_argument(format!(
+                                "TIMESTAMP value {s:?} is outside the range representable as an \
+                                 Arrow Timestamp(Nanosecond) (~1677-09-21 to 2262-04-11); set \
+                                 {}={} to read it at microsecond precision instead",
+                                crate::OPTION_MAX_TIMESTAMP_PRECISION,
+                                TimestampPrecision::MICROSECONDS,
+                            ))
+                        } else {
+                            decode_error("TIMESTAMP", v)
+                        }
+                    })?);
+                    Ok(())
+                },
+            )?
+            .finish();
+            Arc::new(array.with_timezone_opt(tz.clone()))
         }
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
             // The `microseconds` mode of `spanner.max_timestamp_precision`. Every instant Spanner
             // can store (0001-01-01 to 9999-12-31) fits an i64 of epoch microseconds, so this arm
             // has no out-of-range case; sub-microsecond wire digits are truncated toward negative
             // infinity (see `parse_timestamp_micros`). Undecodable strings still error loudly.
-            let mut builder = TimestampMicrosecondArray::builder(values.len());
-            for &value in values {
-                match present(value) {
-                    None => builder.append_null(),
-                    Some(v) => builder.append_value(
-                        v.try_as_string()
-                            .and_then(parse_timestamp_micros)
-                            .ok_or_else(|| decode_error("TIMESTAMP", v))?,
-                    ),
-                }
-            }
-            Arc::new(builder.finish().with_timezone_opt(tz.clone()))
+            let array = build_primitive::<TimestampMicrosecondType>(values, "TIMESTAMP", |v| {
+                v.try_as_string().and_then(parse_timestamp_micros)
+            })?;
+            Arc::new(array.with_timezone_opt(tz.clone()))
         }
         DataType::Decimal128(precision, scale) => {
             let array = build_primitive::<Decimal128Type>(values, "NUMERIC", |v| {
@@ -924,42 +978,36 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
         // `decode_vec` *appends* into it, so it is cleared per cell — avoiding a heap
         // alloc/free per cell before `append_value` copies the bytes into the builder.
         DataType::Binary => {
-            let mut builder = BinaryBuilder::new();
             let mut scratch = Vec::new();
-            for &value in values {
-                match present(value) {
-                    None => builder.append_null(),
-                    Some(v) => {
-                        let s = v.try_as_string().ok_or_else(|| decode_error("BYTES", v))?;
-                        scratch.clear();
-                        base64::engine::general_purpose::STANDARD
-                            .decode_vec(s, &mut scratch)
-                            .map_err(|_| decode_error("BYTES", v))?;
-                        builder.append_value(&scratch);
-                    }
-                }
-            }
-            Arc::new(builder.finish())
+            Arc::new(
+                build_with(values, BinaryBuilder::new(), |builder, v| {
+                    let s = v.try_as_string().ok_or_else(|| decode_error("BYTES", v))?;
+                    scratch.clear();
+                    base64::engine::general_purpose::STANDARD
+                        .decode_vec(s, &mut scratch)
+                        .map_err(|_| decode_error("BYTES", v))?;
+                    builder.append_value(&scratch);
+                    Ok(())
+                })?
+                .finish(),
+            )
         }
         DataType::List(field) => build_list(field, values)?,
         DataType::Struct(fields) => build_struct(fields, values)?,
         // Utf8 and every fallback (JSON, …): keep strings verbatim, render anything else (numbers,
         // bools, nested values) as JSON text.
-        _ => {
-            let mut builder = StringBuilder::new();
-            for &value in values {
-                match present(value) {
-                    None => builder.append_null(),
-                    // Append the string slice directly (no per-value owned String); only the
-                    // JSON-render fallback allocates, and only for non-string values.
-                    Some(x) => match x.try_as_string() {
-                        Some(s) => builder.append_value(s),
-                        None => builder.append_value(value_to_json(x).to_string()),
-                    },
+        _ => Arc::new(
+            build_with(values, StringBuilder::new(), |builder, v| {
+                // Append the string slice directly (no per-value owned String); only the
+                // JSON-render fallback allocates, and only for non-string values.
+                match v.try_as_string() {
+                    Some(s) => builder.append_value(s),
+                    None => builder.append_value(value_to_json(v).to_string()),
                 }
-            }
-            Arc::new(builder.finish())
-        }
+                Ok(())
+            })?
+            .finish(),
+        ),
     })
 }
 
@@ -1260,7 +1308,7 @@ fn value_to_json(value: &Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Array, StringArray};
+    use arrow_array::{Array, StringArray, TimestampMicrosecondArray};
     use google_cloud_spanner::value::ToValue;
 
     /// The `arrow.json` extension name attached to a Field's metadata, if any.
