@@ -129,6 +129,9 @@ fn partitioned_dml_rejects_what_it_cannot_express() {
 
 #[test]
 fn execute_schema_guard_rejects_ddl_and_dml() {
+    // The arguments `execute_schema` passes to the shared guard.
+    let check_schema =
+        |sql: &str| check_query_only(sql, "execute_schema", "planned in a read-only schema probe");
     // Queries — plain, CTE, parenthesised, statement-hinted — pass through to the PLAN probe.
     for sql in [
         "SELECT 1",
@@ -137,11 +140,11 @@ fn execute_schema_guard_rejects_ddl_and_dml() {
         "@{USE_ADDITIONAL_PARALLELISM=true} SELECT 1",
         "GRAPH g MATCH (n) RETURN n.id",
     ] {
-        check_schema_query(sql).unwrap_or_else(|e| panic!("query should pass: {sql}: {e}"));
+        check_schema(sql).unwrap_or_else(|e| panic!("query should pass: {sql}: {e}"));
     }
     // DDL is rejected up front with the same `InvalidArguments` as DML — both are the "not a
     // query" class.
-    let error = check_schema_query("CREATE TABLE t (id INT64) PRIMARY KEY (id)").unwrap_err();
+    let error = check_schema("CREATE TABLE t (id INT64) PRIMARY KEY (id)").unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     // DML — in any spelling, hinted, or with THEN RETURN — gets a clear `InvalidArguments`
     // instead of Spanner's raw read-only-transaction error from the PLAN probe.
@@ -153,7 +156,7 @@ fn execute_schema_guard_rejects_ddl_and_dml() {
         "@{PDML_MAX_PARALLELISM=1} DELETE FROM t WHERE true",
         "INSERT INTO t (id) VALUES (1) THEN RETURN id",
     ] {
-        let error = check_schema_query(sql).unwrap_err();
+        let error = check_schema(sql).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments, "{sql}");
         assert!(
             error.message.contains("only supports queries"),
@@ -165,6 +168,14 @@ fn execute_schema_guard_rejects_ddl_and_dml() {
 
 #[test]
 fn execute_partitions_guard_rejects_ddl_and_dml() {
+    // The arguments `execute_partitions` passes to the shared guard.
+    let check_partitions = |sql: &str| {
+        check_query_only(
+            sql,
+            "execute_partitions",
+            "partitioned in a batch read-only transaction",
+        )
+    };
     // Queries — plain, CTE, parenthesised, statement-hinted — pass through to partitioning.
     for sql in [
         "SELECT 1",
@@ -173,11 +184,11 @@ fn execute_partitions_guard_rejects_ddl_and_dml() {
         "@{USE_ADDITIONAL_PARALLELISM=true} SELECT 1",
         "GRAPH g MATCH (n) RETURN n.id",
     ] {
-        check_partition_query(sql).unwrap_or_else(|e| panic!("query should pass: {sql}: {e}"));
+        check_partitions(sql).unwrap_or_else(|e| panic!("query should pass: {sql}: {e}"));
     }
     // DDL is rejected up front with the same `InvalidArguments` as DML — both are the "not a
     // query" class.
-    let error = check_partition_query("CREATE TABLE t (id INT64) PRIMARY KEY (id)").unwrap_err();
+    let error = check_partitions("CREATE TABLE t (id INT64) PRIMARY KEY (id)").unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     assert!(
         error.message.contains("execute_partitions"),
@@ -194,7 +205,7 @@ fn execute_partitions_guard_rejects_ddl_and_dml() {
         "@{PDML_MAX_PARALLELISM=1} DELETE FROM t WHERE true",
         "INSERT INTO t (id) VALUES (1) THEN RETURN id",
     ] {
-        let error = check_partition_query(sql).unwrap_err();
+        let error = check_partitions(sql).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments, "{sql}");
         assert!(
             error
@@ -314,27 +325,26 @@ fn bind_by_name_option_parses_as_a_boolean_naming_the_option() {
 
 #[test]
 fn rows_per_batch_option_accepts_positive_ints_and_strings() {
-    assert_eq!(rows_per_batch_option(OptionValue::Int(1)).unwrap(), 1);
-    assert_eq!(
-        rows_per_batch_option(OptionValue::String("8192".into())).unwrap(),
-        8192
-    );
+    let parse = |value| crate::options::positive_usize(value, "option spanner.rows_per_batch");
+    assert_eq!(parse(OptionValue::Int(1)).unwrap(), 1);
+    assert_eq!(parse(OptionValue::String("8192".into())).unwrap(), 8192);
 }
 
 #[test]
 fn rows_per_batch_option_rejects_zero_negative_and_malformed() {
+    let parse = |value| crate::options::positive_usize(value, "option spanner.rows_per_batch");
     // Zero is explicitly invalid (a batch must hold at least one row).
-    let error = rows_per_batch_option(OptionValue::Int(0)).unwrap_err();
+    let error = parse(OptionValue::Int(0)).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     // Negatives fail the `usize::try_from` / positivity filter.
-    let error = rows_per_batch_option(OptionValue::Int(-8192)).unwrap_err();
+    let error = parse(OptionValue::Int(-8192)).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     // Strings must parse to a positive integer.
     for bad in ["0", "-1", "abc", "1.5", ""] {
-        let error = rows_per_batch_option(OptionValue::String(bad.into())).unwrap_err();
+        let error = parse(OptionValue::String(bad.into())).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
     }
     // A non-int, non-string value kind is rejected.
-    let error = rows_per_batch_option(OptionValue::Double(3.0)).unwrap_err();
+    let error = parse(OptionValue::Double(3.0)).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
 }

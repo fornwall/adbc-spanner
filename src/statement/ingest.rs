@@ -418,8 +418,18 @@ impl SpannerStatement {
         let mutations = self
             .build_range_mutations(target, start, end)
             .map_err(|e| note_rows_already_committed(e, prior_total))?;
-        match self.write_mutation_chunk(mutations) {
-            Ok(count) => Ok(count),
+        // A commit reports no affected-row count, but each insert mutation is exactly one row.
+        let count = mutations.len() as i64;
+        // `WriteOnlyTransaction::write` carries the client's replay protection: on success the
+        // mutations were applied exactly once, retrying internally on `ABORTED`.
+        match write_mutations_txn(
+            &self.runtime,
+            &self.client,
+            &self.cancel.current(),
+            &self.config,
+            mutations,
+        ) {
+            Ok(()) => Ok(count),
             Err(error) if end - start > 1 && is_mutation_limit_exceeded(&error) => {
                 let mid = start + (end - start) / 2;
                 let left = self.write_mutation_range(target, start, mid, prior_total)?;
@@ -428,26 +438,6 @@ impl SpannerStatement {
             }
             Err(error) => Err(note_rows_already_committed(error, prior_total)),
         }
-    }
-
-    /// Commit one ingest chunk in its own write-only transaction, returning its row count (`0` for
-    /// an empty chunk, which sends nothing).
-    ///
-    /// Delegates to the shared [`write_mutations_txn`] commit (also the mutations-only
-    /// manual-commit path): `WriteOnlyTransaction::write` carries the client's replay protection —
-    /// on success the mutations were applied exactly once, retrying internally on `ABORTED`. A
-    /// commit reports no affected-row count, but each insert mutation is exactly one row, so the
-    /// chunk length is the count.
-    fn write_mutation_chunk(&self, mutations: Vec<Mutation>) -> Result<i64> {
-        let count = mutations.len() as i64;
-        write_mutations_txn(
-            &self.runtime,
-            &self.client,
-            &self.cancel.current(),
-            &self.config,
-            mutations,
-        )?;
-        Ok(count)
     }
 
     /// Apply one ingest chunk through Spanner's **BatchWrite** RPC (the

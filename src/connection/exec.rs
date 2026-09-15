@@ -123,50 +123,19 @@ pub(super) fn isolation_to_adbc_string(isolation: &IsolationLevel) -> &'static s
     }
 }
 
-/// Apply DML `statements` atomically in one read/write transaction via Spanner's `ExecuteBatchDml`
-/// (a single RPC), returning the total affected-row count.
-///
-/// The runner may retry the closure on abort, so the (cloned) statement list is replayed on each
-/// attempt. This is the autocommit DML path: the batch is a complete transaction of its own,
-/// applied immediately. Batches that belong to a manual transaction (and may carry buffered
-/// mutations) go through [`run_batch_txn`] instead.
-///
-/// `last_statement` optimization: an autocommit batch is by construction the transaction's *entire*
-/// content, so flagging it as the transaction's last request
-/// (`ExecuteBatchDmlRequest.last_statements`) lets Spanner release the transaction in the same
-/// round-trip. Mutation-carrying / manual-commit batches go through [`run_batch_txn`] with the flag
-/// off — their commit still applies buffered mutations, so the batch is *not* the last request.
-pub(crate) fn run_batch_dml(
-    runtime: &SharedRuntime,
-    client: &DatabaseClient,
-    cancel: &CancelSignal,
-    config: &SharedConfig,
-    statements: Vec<SpannerSql>,
-) -> Result<i64> {
-    // Every autocommit batch is the whole transaction — nothing follows it before the commit —
-    // so it is always the transaction's last request (see the doc comment above).
-    let last_statements = true;
-    run_batch_txn(
-        runtime,
-        client,
-        cancel,
-        config,
-        statements,
-        Vec::new(),
-        last_statements,
-    )
-}
-
 /// Apply DML `statements` and buffered `mutations` atomically in **one** read/write transaction,
 /// returning the DML statements' total affected-row count (mutations report no count).
 ///
-/// The statements run via `ExecuteBatchDml`; the mutations are buffered on the transaction and
-/// applied by Spanner as part of its commit — i.e. *after* every statement has executed, whatever
-/// order they were issued in. The runner may retry the closure on abort, so both (cloned) lists
-/// are replayed on each attempt. This is the manual-transaction commit path; the DML-only wrapper
-/// is [`run_batch_dml`], whose doc also covers `last_statements`. Callers must pass `false` unless
-/// the batch is genuinely the whole transaction — the manual-commit path buffers `mutations` that
-/// Spanner applies *at* commit, so the batch is never the last request there.
+/// The statements run via `ExecuteBatchDml` (a single RPC); the mutations are buffered on the
+/// transaction and applied by Spanner as part of its commit — i.e. *after* every statement has
+/// executed, whatever order they were issued in. The runner may retry the closure on abort, so both
+/// (cloned) lists are replayed on each attempt.
+///
+/// `last_statements` flags the batch as the transaction's last request
+/// (`ExecuteBatchDmlRequest.last_statements`), letting Spanner release the transaction in the same
+/// round-trip. Only the autocommit DML path may pass `true`: that batch is by construction the
+/// transaction's entire content. The manual-commit path must pass `false` — its commit still
+/// applies the buffered `mutations`, so the batch is *not* the last request.
 ///
 /// `spanner.rpc.timeout_seconds.update` is an overall deadline on the whole transaction (including
 /// the runner's abort retries); expiry fails with
@@ -236,7 +205,7 @@ pub(crate) fn run_batch_txn(
 
 /// Commit `mutations` alone — no DML — in one **write-only** transaction
 /// (`WriteOnlyTransaction::write`): the mutations-only manual-commit path, and (via the
-/// statement's `write_mutation_chunk`) each chunk of an autocommit bulk ingest.
+/// statement's `write_mutation_range`) each chunk of an autocommit bulk ingest.
 ///
 /// Unlike the read/write runner — whose commit, replayed after an *ambiguous* transport failure,
 /// can apply the batch twice — `write` is replay-protected: it begins the transaction with a

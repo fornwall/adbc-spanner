@@ -366,12 +366,16 @@ impl SpannerStatement {
                 return Ok(None);
             }
         }
-        let count = crate::connection::run_batch_dml(
+        // An autocommit batch is the transaction's entire content, so it carries no buffered
+        // mutations and is always its last request (see `last_statements` on `run_batch_txn`).
+        let count = crate::connection::run_batch_txn(
             &self.runtime,
             &self.client,
             &self.cancel.current(),
             &self.config,
             statements,
+            Vec::new(),
+            true,
         )?;
         Ok(Some(count))
     }
@@ -1099,7 +1103,8 @@ impl Optionable for SpannerStatement {
                     crate::options::bool_option(value, "option adbc.statement.bind_by_name")?;
             }
             OptionStatement::Other(k) if k == crate::OPTION_ROWS_PER_BATCH => {
-                self.rows_per_batch = rows_per_batch_option(value)?;
+                self.rows_per_batch =
+                    crate::options::positive_usize(value, "option spanner.rows_per_batch")?;
             }
             OptionStatement::Other(k) if k == crate::OPTION_DATA_BOOST => {
                 self.data_boost = bool_option(value, "option spanner.data_boost")?;
@@ -1290,8 +1295,12 @@ impl Statement for SpannerStatement {
         // Mint a fresh cancel signal for this operation (see `CancelSlot`).
         self.cancel.begin_operation();
         let sql = self.sql()?;
-        check_schema_query(&sql)?;
-        // Query path only (`check_schema_query` rejected DDL/DML): strip any trailing terminators,
+        check_query_only(
+            &sql,
+            "execute_schema",
+            "planned in a read-only schema probe",
+        )?;
+        // Query path only (`check_query_only` rejected DDL/DML): strip any trailing terminators,
         // exactly as `execute` does — the PLAN probe runs through the same ExecuteSql surface,
         // which rejects a trailing `;`.
         let sql = crate::sql::strip_trailing_terminators(&sql);
@@ -1320,8 +1329,12 @@ impl Statement for SpannerStatement {
         // Mint a fresh cancel signal for this operation (see `CancelSlot`).
         self.cancel.begin_operation();
         let sql = self.sql()?;
-        check_partition_query(&sql)?;
-        // Query path only (`check_partition_query` rejected DDL/DML): strip any trailing
+        check_query_only(
+            &sql,
+            "execute_partitions",
+            "partitioned in a batch read-only transaction",
+        )?;
+        // Query path only (`check_query_only` rejected DDL/DML): strip any trailing
         // terminators, exactly as `execute` does.
         let sql = crate::sql::strip_trailing_terminators(&sql);
         // Same read-your-writes hazard as `execute`, so reject it in a DML-kind manual
@@ -1455,22 +1468,6 @@ fn check_query_only(sql: &str, entry_point: &str, dml_rationale: &str) -> Result
     Ok(())
 }
 
-/// Guard for `execute_schema`: only queries can be planned (the PLAN probe runs in a single-use
-/// read-only transaction).
-fn check_schema_query(sql: &str) -> Result<()> {
-    check_query_only(sql, "execute_schema", "planned in a read-only schema probe")
-}
-
-/// Guard for `execute_partitions`: only queries can be partitioned (`partition_query` runs in a
-/// batch read-only transaction).
-fn check_partition_query(sql: &str) -> Result<()> {
-    check_query_only(
-        sql,
-        "execute_partitions",
-        "partitioned in a batch read-only transaction",
-    )
-}
-
 /// Guard for `;`-separated **multi-statement** batches on the DML paths: `ExecuteBatchDml`
 /// executes DML only, so a batch mixing DML with queries or DDL can neither run atomically nor be
 /// split across Spanner's execution surfaces. Reject it up front, naming the offending statement —
@@ -1580,12 +1577,6 @@ fn dml_partitioned_option(value: OptionValue) -> Result<bool> {
         value,
         &format!("option {}", crate::OPTION_DML_PARTITIONED),
     )
-}
-
-/// Parse the positive `spanner.rows_per_batch` option, accepted as either an integer or a numeric
-/// string.
-fn rows_per_batch_option(value: OptionValue) -> Result<usize> {
-    crate::options::positive_usize(value, "option spanner.rows_per_batch")
 }
 
 #[cfg(test)]

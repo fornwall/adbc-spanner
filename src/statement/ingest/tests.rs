@@ -65,7 +65,7 @@ fn ingest_chunks_never_starve_on_an_oversized_row() {
 #[test]
 fn ingest_of_zero_rows_emits_no_chunks() {
     // Bound batches holding no rows at all (e.g. a stream of zero-row batches) must produce no
-    // commit chunk — the trailing `write_mutation_chunk` guards the empty case, so nothing is
+    // commit chunk — the trailing `write_mutations_txn` guards the empty case, so nothing is
     // sent to Spanner.
     assert_eq!(chunk_lengths(0, 10, 100), Vec::<usize>::new());
 }
