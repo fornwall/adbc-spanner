@@ -646,4 +646,54 @@ mod tests {
         );
         assert_eq!(string(connection.backoff_multiplier).as_deref(), Some("3"));
     }
+
+    /// The three backoff knobs are opaque `f64`s at the option layer, so out-of-range values reach
+    /// the gax builder; [`ExponentialBackoffBuilder::clamp`] is what keeps building the policy
+    /// infallible. Nothing pinned that, and a switch to `build()` would turn a value the option
+    /// layer accepts into a failure (or a panic) at the first retried RPC.
+    #[test]
+    fn backoff_knobs_are_clamped_into_the_gax_recommended_ranges() {
+        let rendered = |config: &RetryConfig| format!("{:?}", config.backoff_policy_arg().unwrap());
+
+        // Everything below the floor: initial delay >= 1ms, maximum delay >= 1s, multiplier >= 1.0.
+        let mut low = RetryConfig::default();
+        set_backoff_initial_seconds(&mut low, s("0.0005")).unwrap();
+        set_backoff_max_seconds(&mut low, s("0.1")).unwrap();
+        set_backoff_multiplier(&mut low, OptionValue::Double(0.5)).unwrap();
+        assert_eq!(
+            rendered(&low),
+            "BackoffPolicyArg(ExponentialBackoff { initial_delay: 1ms, maximum_delay: 1s, \
+             scaling: 1.0 })"
+        );
+
+        // Everything above the ceiling: maximum delay <= 24h, multiplier <= 32.0.
+        let mut high = RetryConfig::default();
+        set_backoff_max_seconds(&mut high, s("200000")).unwrap();
+        set_backoff_multiplier(&mut high, s("100")).unwrap();
+        assert_eq!(
+            rendered(&high),
+            "BackoffPolicyArg(ExponentialBackoff { initial_delay: 1s, maximum_delay: 86400s, \
+             scaling: 32.0 })"
+        );
+
+        // An initial delay past the maximum is an empty range, which `build()` rejects outright;
+        // clamping collapses it onto the maximum instead.
+        let mut inverted = RetryConfig::default();
+        set_backoff_initial_seconds(&mut inverted, s("30")).unwrap();
+        set_backoff_max_seconds(&mut inverted, s("5")).unwrap();
+        assert_eq!(
+            rendered(&inverted),
+            "BackoffPolicyArg(ExponentialBackoff { initial_delay: 5s, maximum_delay: 5s, \
+             scaling: 2.0 })"
+        );
+
+        // Setting one knob leaves the other two at the client's own defaults (1s / 60s / x2).
+        let mut one = RetryConfig::default();
+        set_backoff_multiplier(&mut one, s("3")).unwrap();
+        assert_eq!(
+            rendered(&one),
+            "BackoffPolicyArg(ExponentialBackoff { initial_delay: 1s, maximum_delay: 60s, \
+             scaling: 3.0 })"
+        );
+    }
 }
