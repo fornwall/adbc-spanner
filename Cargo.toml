@@ -5,7 +5,7 @@
 # staleable `fuzz/Cargo.lock`. `default-members` keeps the default build/test/clippy scope to
 # this crate alone, so `cargo build`/`cargo test`/`cargo clippy` never pull in `libfuzzer-sys`
 # or need nightly; the fuzz member is built only by `cargo fuzz` (or an explicit `-p`). See
-# TEST-13 in REVIEW.md and the CLAUDE.md "Fuzzing" note.
+# the CLAUDE.md "Fuzzing" note.
 [workspace]
 members = ["fuzz"]
 default-members = ["."]

@@ -245,7 +245,7 @@ and **each is independently a crates.io publish blocker** — the crate cannot b
    `apache/arrow-adbc` `main` git revision — all three must share the *same* rev. The one reason
    left is `InfoCode::Other(u32)` (arrow-adbc PR #4510), the catch-all variant that lets an
    unrecognized `get_info` code reach `Connection::get_info` at all, which is what makes this
-   driver's omit-unrecognized-codes behaviour (required by adbc.h) expressible; UP-9 in REVIEW.md.
+   driver's omit-unrecognized-codes behaviour (required by adbc.h) expressible.
    It is merged upstream but not in the 0.23 crates.io release, so this is a plain
    `main`-tracking git pin (the fork it used to need is gone).
    The **four FFI fixes this pin used to exist for** — an idempotent `release_ffi_error`,
@@ -369,7 +369,7 @@ is cross-compiled, off the universal Apple toolchain) and installs NASM only on 
 `fuzz/` holds the `cargo-fuzz` targets (`sql`, `values`, `like`, `options`, `keyword`, `params`,
 `partition`, `staleness`, `directed_read`, `uri`), each a `libfuzzer-sys` harness over a
 `#[cfg(feature = "fuzzing")] pub mod fuzzing` wrapper in `src/lib.rs`. Run one with `cargo +nightly fuzz run <target>`; CI runs them nightly via
-`.github/workflows/fuzz.yml` (see the TEST-9 gaps in REVIEW.md for targets still worth adding).
+`.github/workflows/fuzz.yml`.
 
 The workflow's matrix is **derived** from the `[[bin]]` targets in `fuzz/Cargo.toml` (its `discover`
 job parses them into a `fromJson` matrix) rather than hardcoded — a hardcoded list is how
