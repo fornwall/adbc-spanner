@@ -28,7 +28,7 @@
 //! and DML round-trip goes through the `adbc-spanner` driver being tested.
 
 use std::cell::RefCell;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use adbc_core::error::Status;
 use adbc_core::options::{
@@ -368,7 +368,7 @@ fn manual_transaction_kinds_round_trip() {
     let Some(mut fx) = fixture() else {
         return;
     };
-    let database = &fx.database;
+    let database = fx.database;
     let connection = &mut fx.connection;
     // A second connection, kept in autocommit, playing the "concurrent writer".
     let mut writer = connect_with_retry(database);
@@ -4035,14 +4035,7 @@ fn prop_bind_round_trip() {
     ensure_database_once(&target);
     let _serial = serial_guard();
 
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let connection = RefCell::new(connect_with_retry(&database));
+    let connection = RefCell::new(connect_with_retry(shared_database(&target)));
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
     // Finite floats only: NaN/Inf don't compare with `==` and take a separate string wire path.
     let float = any::<f64>().prop_filter("finite", |f| f.is_finite());
@@ -4212,14 +4205,7 @@ fn prop_temporal_round_trip() {
     ensure_database_once(&target);
     let _serial = serial_guard();
 
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let connection = RefCell::new(connect_with_retry(&database));
+    let connection = RefCell::new(connect_with_retry(shared_database(&target)));
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
 
     proptest!(prop_config_with(PROP_TEMPORAL_CASES), |(
@@ -5088,16 +5074,48 @@ fn connect_with_retry(database: &SpannerDatabase) -> SpannerConnection {
     panic!("create connection failed after retries: {last_err:?}");
 }
 
+/// The one driver and database this whole test binary shares, built on first use.
+///
+/// A `SpannerDriver` owns a multi-threaded Tokio runtime and every `SpannerDatabase` built from it
+/// owns a gRPC channel pool, so a driver per test meant ~60 runtimes and a few hundred TCP
+/// connections per run — for a suite that mostly serializes on [`serial_guard`] anyway. One of
+/// each is enough: `Database::new_connection` takes `&self`, so every test still gets its own
+/// `SpannerConnection` (its own transaction state, options and statements) off the shared stack.
+/// This mirrors `shared_driver()` in `src/ffi/database.rs`, which gives a whole *process* loading
+/// the cdylib one driver and one runtime.
+///
+/// Sharing the database is only safe because no test here mutates a database-level option: every
+/// one of them is set at construction (the URI) and `SpannerDatabase::set_option` would reset the
+/// cached client stack under the other tests. The few tests that *do* need their own database
+/// options — the connection-URI round-trip and the opt-in keyfile / impersonation auth tests —
+/// build their own driver, and must keep doing so.
+fn shared_database(target: &TestTarget) -> &'static SpannerDatabase {
+    // The driver is kept alive next to the database purely for symmetry: its only state is the
+    // Tokio runtime, which the database holds its own `Arc` to.
+    static SHARED: OnceLock<(SpannerDriver, SpannerDatabase)> = OnceLock::new();
+    &SHARED
+        .get_or_init(|| {
+            let mut driver = SpannerDriver::try_new().expect("create driver");
+            let database = driver
+                .new_database_with_opts([(
+                    OptionDatabase::Uri,
+                    OptionValue::String(target.database_uri()),
+                )])
+                .expect("create database");
+            (driver, database)
+        })
+        .1
+}
+
 /// Everything a test needs to talk to the target database, kept alive together for the whole test
-/// body: the resolved [`TestTarget`], the driver → database → connection chain, and (for the
+/// body: the resolved [`TestTarget`], a connection off the [`shared_database`], and (for the
 /// schema-mutating tests) the [`serial_guard`].
 ///
-/// The fields are declared in drop order — connection, then database, then driver, and the serial
-/// guard last — so a test never releases the guard while its own connection is still tearing down.
+/// The fields are declared in drop order — connection first, serial guard last — so a test never
+/// releases the guard while its own connection is still tearing down.
 struct Fixture {
     connection: SpannerConnection,
-    database: SpannerDatabase,
-    _driver: SpannerDriver,
+    database: &'static SpannerDatabase,
     target: TestTarget,
     _serial: Option<std::sync::MutexGuard<'static, ()>>,
 }
@@ -5130,18 +5148,11 @@ fn build_fixture(serial: bool) -> Option<Fixture> {
     // covered by the guard.
     let _serial = serial.then(serial_guard);
 
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let connection = connect_with_retry(&database);
+    let database = shared_database(&target);
+    let connection = connect_with_retry(database);
     Some(Fixture {
         connection,
         database,
-        _driver: driver,
         target,
         _serial,
     })
@@ -6381,14 +6392,7 @@ fn readonly_connection_rejects_writes() {
 
     use adbc_core::error::Status;
 
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let mut connection = connect_with_retry(shared_database(&target));
 
     // --- round-trip: the option defaults to false, and set values read back ---
     assert_eq!(
@@ -6557,14 +6561,7 @@ fn readonly_toggle_from_another_thread_locks_existing_statement() {
     use adbc_core::error::Status;
     use std::sync::mpsc;
 
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let mut connection = connect_with_retry(shared_database(&target));
 
     // Create the statement while the connection is still writable (the default), and confirm it can
     // write — the `WHERE false` DML is a real no-op commit that returns a count of 0.
