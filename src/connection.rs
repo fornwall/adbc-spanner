@@ -88,7 +88,7 @@ use google_cloud_spanner::builder::{BatchDmlBuilder, TransactionRunnerBuilder};
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::model::transaction_options::IsolationLevel;
 use google_cloud_spanner::mutation::Mutation;
-use google_cloud_spanner::statement::Statement as SpannerSql;
+use google_cloud_spanner::statement::{Statement as SpannerSql, StatementBuilder};
 use google_cloud_spanner::transaction::{MultiUseReadOnlyTransaction, ReadWriteTransaction};
 
 use crate::conversion::{TimestampPrecision, result_set_to_batch, stream_query};
@@ -1111,6 +1111,32 @@ pub(crate) fn table_exists(
     )
 }
 
+/// A Spanner statement builder for a **driver-internal metadata read**: the `INFORMATION_SCHEMA`
+/// queries and full-table aggregate scans of [`get_objects`](crate::objects::collect_objects),
+/// [`get_statistics`](crate::statistics::collect_statistics) and
+/// [`SpannerConnection::get_table_schema`].
+///
+/// These are the heaviest queries the driver issues on its own, so they honour the connection's
+/// retry bounds (`spanner.retry.*` — an unbounded retry of a `COUNT(*)` over every table is a real
+/// hazard), its directed-read replica selection (`spanner.directed_read`; legal here because every
+/// one of them runs in a read-only transaction) and its request **priority**. They stay untagged —
+/// see [`apply_priority_to_statement`](crate::request::RequestConfig::apply_priority_to_statement).
+/// The commit-side knobs (`spanner.commit.max_delay`, `spanner.commit_stats`) do not apply: these
+/// paths never commit.
+#[must_use]
+pub(crate) fn metadata_sql_builder(
+    config: &SharedConfig,
+    sql: impl Into<String>,
+) -> StatementBuilder {
+    config.retry.apply_to_statement(
+        config.directed_read.apply_to_statement(
+            config
+                .request
+                .apply_priority_to_statement(SpannerSql::builder(sql)),
+        ),
+    )
+}
+
 /// Extract column `index` of an `INFORMATION_SCHEMA` batch as a [`StringArray`]. Shared with the
 /// collectors in [`crate::objects`] and [`crate::statistics`].
 pub(crate) fn str_col(batch: &RecordBatch, index: usize) -> Result<&StringArray> {
@@ -1423,8 +1449,7 @@ impl Connection for SpannerConnection {
             &self.runtime,
             &self.client,
             &self.cancel.current(),
-            self.config.timeouts.query_timeout(),
-            &self.config.read_staleness,
+            &self.config,
             depth,
             &crate::objects::ObjectFilters {
                 db_schema,
@@ -1463,6 +1488,7 @@ impl Connection for SpannerConnection {
         // The reported schema honours the connection's timestamp precision, so it matches what a
         // query on this connection would actually stream.
         let precision = self.config.timestamp_precision;
+        let statement = metadata_sql_builder(&self.config, sql).build();
         // A metadata read, so the connection's query timeout bounds it.
         let result = block_on_cancellable(
             &self.runtime,
@@ -1473,7 +1499,7 @@ impl Connection for SpannerConnection {
                 async move {
                     let transaction = crate::staleness::single_use(&client, bound);
                     let result_set = transaction
-                        .execute_query(SpannerSql::builder(sql).build())
+                        .execute_query(statement)
                         .await
                         .map_err(from_spanner)?;
                     result_set_to_batch(result_set, precision).await
@@ -1556,8 +1582,7 @@ impl Connection for SpannerConnection {
             &self.runtime,
             &self.client,
             &self.cancel.current(),
-            self.config.timeouts.query_timeout(),
-            &self.config.read_staleness,
+            &self.config,
             db_schema,
             table_name,
         )?;
@@ -2043,5 +2068,68 @@ mod tests {
             first, again,
             "decode → encode of an encoder's output must be byte-stable"
         );
+    }
+
+    /// A config with every knob `metadata_sql_builder` cares about set — plus the tags, which it
+    /// must *not* forward.
+    fn configured() -> SharedConfig {
+        let mut config = SharedConfig::default();
+        config
+            .request
+            .set_priority(OptionValue::String("low".into()))
+            .unwrap();
+        config
+            .request
+            .set_request_tag(OptionValue::String("user-request-tag".into()))
+            .unwrap();
+        config
+            .request
+            .set_transaction_tag(OptionValue::String("user-txn-tag".into()))
+            .unwrap();
+        config
+            .directed_read
+            .set(OptionValue::String("include:eu-west1:read_only".into()))
+            .unwrap();
+        config.retry.set_max_attempts(OptionValue::Int(3)).unwrap();
+        config
+    }
+
+    /// The built request is the only inspection surface the client crate offers (its `Statement`
+    /// fields are `pub(crate)`), so these assert on its `Debug` rendering.
+    #[test]
+    fn metadata_statements_carry_priority_replicas_and_retry_bounds() {
+        let built = format!(
+            "{:?}",
+            metadata_sql_builder(&configured(), "SELECT 1").build()
+        );
+        assert!(built.contains("priority: Low"), "{built}");
+        assert!(built.contains("location: \"eu-west1\""), "{built}");
+        assert!(built.contains("maximum_attempts: 3"), "{built}");
+    }
+
+    /// Tags stay off driver-internal metadata reads: they attribute the *user's* statements in
+    /// Spanner's introspection tables.
+    #[test]
+    fn metadata_statements_are_never_tagged() {
+        let built = format!(
+            "{:?}",
+            metadata_sql_builder(&configured(), "SELECT 1").build()
+        );
+        assert!(!built.contains("user-request-tag"), "{built}");
+        assert!(!built.contains("user-txn-tag"), "{built}");
+        assert!(built.contains("request_tag: \"\""), "{built}");
+        assert!(built.contains("transaction_tag: \"\""), "{built}");
+    }
+
+    /// An unconfigured connection still sends a bare statement — nothing is forced on by default.
+    #[test]
+    fn unconfigured_metadata_statements_stay_bare() {
+        let built = format!(
+            "{:?}",
+            metadata_sql_builder(&SharedConfig::default(), "SELECT 1").build()
+        );
+        assert!(built.contains("request_options: None"), "{built}");
+        assert!(built.contains("directed_read_options: None"), "{built}");
+        assert!(built.contains("retry_policy: None"), "{built}");
     }
 }

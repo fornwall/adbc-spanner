@@ -11,8 +11,9 @@
 //!
 //! - [`OPTION_REQUEST_PRIORITY`](crate::OPTION_REQUEST_PRIORITY) (`spanner.request.priority`) —
 //!   `low` / `medium` / `high` (exact lowercase). Applied to every query/DML statement and
-//!   `ExecuteBatchDml` batch the driver builds, to the `BatchWrite` ingest request, and — as the
-//!   commit priority — to every read/write transaction runner. Connection and statement level.
+//!   `ExecuteBatchDml` batch the driver builds (including its internal metadata reads), to the
+//!   `BatchWrite` ingest request, and — as the commit priority — to every read/write transaction
+//!   runner. Connection and statement level.
 //! - [`OPTION_REQUEST_TAG`](crate::OPTION_REQUEST_TAG) (`spanner.request.tag`) — a free-form
 //!   per-request tag, applied to every statement and `ExecuteBatchDml` batch the driver builds.
 //!   Not applied to `BatchWrite`, which ignores request tags server-side. Connection and statement
@@ -41,8 +42,10 @@
 //! Like the read-staleness options, the connection's values become the default for statements it
 //! creates (which may override them), setting an empty string unsets a value, and every option
 //! round-trips through `get_option`. Driver-internal metadata queries (`get_objects`,
-//! `get_table_schema` probes, …) are deliberately left untagged — the options cover the user's own
-//! statements.
+//! `get_statistics`, `get_table_schema`) do carry the **priority** — a user who deprioritized their
+//! workload meant the driver's own full-table scans too — but are deliberately left **untagged**:
+//! tags attribute the user's own statements in Spanner's introspection tables (see
+//! [`RequestConfig::apply_priority_to_statement`]).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -293,6 +296,24 @@ impl RequestConfig {
             builder = builder.set_request_tag(tag.as_str());
         }
         builder
+    }
+
+    /// Apply **only** the priority to a statement builder, for the driver's own internal metadata
+    /// reads (`get_objects`, `get_statistics`, `get_table_schema`).
+    ///
+    /// The tags are deliberately left off: a request/transaction tag exists to attribute a *user*
+    /// statement in Spanner's introspection tables, so tagging a query the user never wrote would
+    /// corrupt that attribution. The priority is the opposite — a connection set to `low` wants its
+    /// heavy `COUNT(*)`-per-table scans deprioritized too, which is precisely what the option is for.
+    #[must_use]
+    pub(crate) fn apply_priority_to_statement(
+        &self,
+        builder: StatementBuilder,
+    ) -> StatementBuilder {
+        match self.priority {
+            Some(priority) => builder.set_priority(priority.to_client()),
+            None => builder,
+        }
     }
 
     /// Apply the priority and request tag to an `ExecuteBatchDml` batch builder. The batch request

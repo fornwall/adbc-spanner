@@ -9,7 +9,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use adbc_core::error::{Result, Status};
 use adbc_core::options::ObjectDepth;
@@ -25,12 +24,12 @@ use futures_util::try_join;
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::MultiUseReadOnlyTransaction;
 
-use crate::connection::{LikeMatcher, str_col};
+use crate::connection::{LikeMatcher, metadata_sql_builder, str_col};
 use crate::conversion::result_set_to_batch;
 use crate::error::{err, from_spanner};
 use crate::nested::{arrow_err, field, list_item, list_of, list_of_nullable, struct_fields};
+use crate::options::SharedConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
-use crate::staleness::ReadStaleness;
 use crate::timeout::with_timeout;
 
 /// A column of a table, as returned by `get_objects`.
@@ -156,8 +155,7 @@ pub(crate) fn collect_objects(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
     cancel: &CancelSignal,
-    timeout: Option<Duration>,
-    read_staleness: &ReadStaleness,
+    config: &SharedConfig,
     depth: ObjectDepth,
     filters: &ObjectFilters<'_>,
 ) -> Result<Vec<DbSchema>> {
@@ -181,6 +179,7 @@ pub(crate) fn collect_objects(
     );
     let populate_columns = matches!(depth, ObjectDepth::All | ObjectDepth::Columns);
     let client = client.clone();
+    let timeout = config.timeouts.query_timeout();
 
     // Each present ADBC pattern filter is also pushed down into the corresponding
     // INFORMATION_SCHEMA query as a bound-parameter `LIKE` predicate (never interpolated into
@@ -189,6 +188,7 @@ pub(crate) fn collect_objects(
     // where GoogleSQL `LIKE` and the ADBC pattern contract could disagree cannot change the
     // result (see [`sql_like_pattern`] for the one known divergence, the escape character).
     let schemata_stmt = filtered_query(
+        config,
         "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA",
         None,
         &[("SCHEMA_NAME", db_schema)],
@@ -196,6 +196,7 @@ pub(crate) fn collect_objects(
     );
     let tables_stmt = populate_tables.then(|| {
         filtered_query(
+            config,
             "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES",
             None,
             &[("TABLE_SCHEMA", db_schema), ("TABLE_NAME", table_name)],
@@ -204,6 +205,7 @@ pub(crate) fn collect_objects(
     });
     let columns_stmt = populate_columns.then(|| {
         filtered_query(
+            config,
             "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, \
              IS_NULLABLE, SPANNER_TYPE \
              FROM INFORMATION_SCHEMA.COLUMNS",
@@ -224,6 +226,7 @@ pub(crate) fn collect_objects(
     // ordering CONSTRAINT_COLUMN_USAGE does not preserve.
     let constraints_stmt = populate_columns.then(|| {
         filtered_query(
+            config,
             "SELECT TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE \
              FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc",
             Some(HIDE_HIDDEN_COLUMN_CONSTRAINTS),
@@ -236,7 +239,8 @@ pub(crate) fn collect_objects(
     // that the filters exclude, and resolving `constraint_column_usage` needs the referenced
     // constraint's own key-column rows.
     let key_columns_stmt = populate_columns.then(|| {
-        SpannerSql::builder(
+        metadata_sql_builder(
+            config,
             "SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, TABLE_SCHEMA, TABLE_NAME, \
              COLUMN_NAME, CAST(ORDINAL_POSITION AS STRING), \
              CAST(POSITION_IN_UNIQUE_CONSTRAINT AS STRING) \
@@ -246,7 +250,8 @@ pub(crate) fn collect_objects(
         .build()
     });
     let referential_stmt = populate_columns.then(|| {
-        SpannerSql::builder(
+        metadata_sql_builder(
+            config,
             "SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, UNIQUE_CONSTRAINT_SCHEMA, \
              UNIQUE_CONSTRAINT_NAME \
              FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS",
@@ -257,7 +262,7 @@ pub(crate) fn collect_objects(
     // The whole metadata fetch shares one multi-use read-only transaction, so honour the
     // connection's read staleness (pinned to a legal multi-use equivalent) as `get_table_schema`
     // and the statistics scans do.
-    let bound = read_staleness.multi_use_timestamp_bound()?;
+    let bound = config.read_staleness.multi_use_timestamp_bound()?;
     let batches = block_on_cancellable(
         runtime,
         cancel,
@@ -462,13 +467,14 @@ fn filtered_sql(
 /// text: it is user-controlled data (the Snowflake ADBC driver shipped a SQL injection,
 /// apache/arrow-adbc#1338, by string-formatting these very patterns).
 fn filtered_query(
+    config: &SharedConfig,
     base: &str,
     base_predicate: Option<&str>,
     filters: &[(&str, Option<&str>)],
     order_by: Option<&str>,
 ) -> SpannerSql {
     let (sql, params) = filtered_sql(base, base_predicate, filters, order_by);
-    let mut builder = SpannerSql::builder(sql);
+    let mut builder = metadata_sql_builder(config, sql);
     for (name, value) in &params {
         builder = builder.add_param(name.as_str(), value);
     }
@@ -989,6 +995,42 @@ fn build_usage_struct(usage_fields: &Fields, usages: &[&Usage]) -> Result<ArrayR
 mod tests {
     use super::*;
     use arrow_array::{Array, ListArray};
+
+    /// The pushed-down `INFORMATION_SCHEMA` queries keep their bound `LIKE` parameters *and* pick
+    /// up the connection's metadata-read config (priority / replicas / retry bounds, no tags).
+    #[test]
+    fn filtered_queries_carry_the_connection_config() {
+        let mut config = SharedConfig::default();
+        config
+            .request
+            .set_priority(adbc_core::options::OptionValue::String("low".into()))
+            .unwrap();
+        config
+            .request
+            .set_request_tag(adbc_core::options::OptionValue::String("user-tag".into()))
+            .unwrap();
+        config
+            .directed_read
+            .set(adbc_core::options::OptionValue::String(
+                "exclude::read_write".into(),
+            ))
+            .unwrap();
+        let built = format!(
+            "{:?}",
+            filtered_query(
+                &config,
+                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES",
+                None,
+                &[("TABLE_NAME", Some("User%"))],
+                None,
+            )
+        );
+        assert!(built.contains("priority: Low"), "{built}");
+        assert!(built.contains("ExcludeReplicas"), "{built}");
+        assert!(!built.contains("user-tag"), "{built}");
+        // The filter is still a bound parameter, never interpolated into the SQL text.
+        assert!(built.contains("User%"), "{built}");
+    }
 
     fn sample() -> Vec<DbSchema> {
         vec![DbSchema {

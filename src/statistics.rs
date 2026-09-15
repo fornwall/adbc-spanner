@@ -15,7 +15,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use adbc_core::error::{Error, Result, Status};
 use arrow_array::{
@@ -25,16 +24,16 @@ use arrow_array::{
 use arrow_schema::{DataType, Fields, SchemaRef};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use google_cloud_spanner::client::DatabaseClient;
-use google_cloud_spanner::statement::Statement as SpannerSql;
+use google_cloud_spanner::statement::StatementBuilder;
 use google_cloud_spanner::transaction::MultiUseReadOnlyTransaction;
 
-use crate::connection::{LikeMatcher, str_col};
+use crate::connection::{LikeMatcher, metadata_sql_builder, str_col};
 use crate::conversion::result_set_to_batch;
 use crate::error::{err, from_spanner};
 use crate::nested::{arrow_err, dense_union, field, list_item, list_of, struct_fields};
+use crate::options::SharedConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
 use crate::sql::{qualified_table, quote_ident};
-use crate::staleness::ReadStaleness;
 use crate::timeout::with_timeout;
 
 /// The `int64` branch of the `statistic_value` union (see `STATISTIC_VALUE_SCHEMA`).
@@ -87,18 +86,18 @@ pub(crate) fn collect_statistics(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
     cancel: &CancelSignal,
-    timeout: Option<Duration>,
-    read_staleness: &ReadStaleness,
+    config: &SharedConfig,
     db_schema: Option<&str>,
     table_name: Option<&str>,
 ) -> Result<Vec<SchemaStatistics>> {
+    let timeout = config.timeouts.query_timeout();
     // Build ONE multi-use read-only transaction so the INFORMATION_SCHEMA discovery *and* every
     // per-table aggregate scan observe a single, consistent snapshot (SPAN-5): a table created
     // between discovery and its scan can no longer fail the call, and all counts are taken at one
     // timestamp. Mirrors `collect_objects`, including honouring `spanner.read.staleness` (pinned to
     // its multi-use-legal equivalent) so a stale read still reads from one pinned timestamp.
     // Building it issues no RPC — the begin is inline on the first query below.
-    let bound = read_staleness.multi_use_timestamp_bound()?;
+    let bound = config.read_staleness.multi_use_timestamp_bound()?;
     let txn = {
         let client = client.clone();
         Arc::new(block_on_cancellable(runtime, cancel, async move {
@@ -121,8 +120,11 @@ pub(crate) fn collect_statistics(
             with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async move {
                 let tables = query_txn(
                     &txn,
-                    "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
-                     WHERE TABLE_TYPE = 'BASE TABLE'",
+                    metadata_sql_builder(
+                        config,
+                        "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
+                         WHERE TABLE_TYPE = 'BASE TABLE'",
+                    ),
                 )
                 .await?;
                 // Hidden columns are skipped for the same reason `get_objects` omits them
@@ -132,10 +134,13 @@ pub(crate) fn collect_statistics(
                 // just the row count.
                 let columns = query_txn(
                     &txn,
-                    "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, SPANNER_TYPE \
-                     FROM INFORMATION_SCHEMA.COLUMNS \
-                     WHERE NOT CAST(IS_HIDDEN AS BOOL) \
-                     ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION",
+                    metadata_sql_builder(
+                        config,
+                        "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, SPANNER_TYPE \
+                         FROM INFORMATION_SCHEMA.COLUMNS \
+                         WHERE NOT CAST(IS_HIDDEN AS BOOL) \
+                         ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION",
+                    ),
                 )
                 .await?;
                 Ok::<_, Error>((tables, columns))
@@ -210,8 +215,8 @@ pub(crate) fn collect_statistics(
         with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async {
             stream::iter(prepared.iter().map(|p| {
                 let txn = txn.clone();
-                let sql = p.sql.clone();
-                async move { query_txn(&txn, &sql).await }
+                let statement = metadata_sql_builder(config, p.sql.as_str());
+                async move { query_txn(&txn, statement).await }
             }))
             .buffered(STATISTICS_SCAN_CONCURRENCY)
             .try_collect()
@@ -243,11 +248,16 @@ pub(crate) fn collect_statistics(
 /// Run one metadata/aggregate query on the shared multi-use read-only transaction and materialise
 /// its result batch. Every read in [`collect_statistics`] — the `INFORMATION_SCHEMA` discovery and
 /// each per-table aggregate scan — goes through this one transaction, so they all observe a single
-/// consistent snapshot. The results are only INT64 counts or string metadata, never a TIMESTAMP
+/// consistent snapshot, and each builder comes from
+/// [`metadata_sql_builder`](crate::connection::metadata_sql_builder) so it carries the connection's
+/// retry bounds, replica selection and request priority. The results are only INT64 counts or string metadata, never a TIMESTAMP
 /// column, so the default timestamp precision is fine.
-async fn query_txn(txn: &MultiUseReadOnlyTransaction, sql: &str) -> Result<RecordBatch> {
+async fn query_txn(
+    txn: &MultiUseReadOnlyTransaction,
+    statement: StatementBuilder,
+) -> Result<RecordBatch> {
     let result_set = txn
-        .execute_query(SpannerSql::builder(sql).build())
+        .execute_query(statement.build())
         .await
         .map_err(from_spanner)?;
     let (_schema, batch) =
