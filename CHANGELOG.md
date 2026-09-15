@@ -10,6 +10,10 @@ Releases are cut with [`cargo-release`](https://github.com/crate-ci/cargo-releas
 
 ## [Unreleased]
 
+### Changed
+
+- MSRV raised to 1.98.1; the pinned dev/CI toolchain (`rust-toolchain.toml`) moves with it.
+
 ### Removed
 
 - **Breaking:** the `spanner.partition.max_count` statement option (`OPTION_MAX_PARTITIONS`, Python

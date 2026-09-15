@@ -11,6 +11,6 @@
 # newer language/library feature fails here instead of downstream. (fuzz.yml is the one exception
 # — fuzzing needs nightly.)
 [toolchain]
-channel = "1.97.0"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
