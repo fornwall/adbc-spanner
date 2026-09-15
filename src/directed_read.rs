@@ -304,7 +304,7 @@ mod tests {
 
     /// The mode, replica type and flag keywords are exact lowercase, like every option value in
     /// the driver (ADBC option values are exact-match canonical strings): case variants are
-    /// rejected with `InvalidArguments` (COR-7).
+    /// rejected with `InvalidArguments`.
     #[test]
     fn rejects_case_variants_of_keywords() {
         for bad in [

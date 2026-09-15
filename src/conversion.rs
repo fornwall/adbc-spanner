@@ -30,7 +30,7 @@
 //! [`Type::struct_type`](google_cloud_spanner::value::Type::struct_type).) Both Spanner and Arrow
 //! address struct fields **positionally**, so a Spanner `STRUCT`'s duplicate or empty field names —
 //! both legal, e.g. `STRUCT(1 AS x, 2 AS x)` or an unnamed `SELECT`ed expression — are carried over
-//! verbatim, each field keeping its own value (CONV-6).
+//! verbatim, each field keeping its own value.
 //!
 //! `JSON` columns keep `Utf8` storage (the value bytes are the JSON text) but carry the canonical
 //! `arrow.json` extension type as field metadata (`ARROW:extension:name` = `arrow.json`), so Arrow
@@ -87,8 +87,8 @@ const LIST_ITEM: &str = "item";
 
 /// Maximum nesting depth the server-provided `STRUCT`/`ARRAY` type walk ([`arrow_type`]) will
 /// descend before failing loudly. Defense-in-depth against a hostile endpoint returning
-/// pathological `STRUCT<STRUCT<…>>` metadata (SEC-5): the transport already bounds decode recursion
-/// (prost's `RECURSION_LIMIT = 100`, on by default — UP-8), but this cap makes the guarantee local
+/// pathological `STRUCT<STRUCT<…>>` metadata: the transport already bounds decode recursion
+/// (prost's `RECURSION_LIMIT = 100`, on by default), but this cap makes the guarantee local
 /// to the driver's own recursion rather than resting on the transport. `100` matches prost's limit;
 /// no legitimate result type nests remotely this deep.
 const MAX_TYPE_NESTING_DEPTH: usize = 100;
@@ -450,7 +450,7 @@ pub(crate) trait BoundStatementSource: Send {
 /// [`spawn_prefetch`], so the fetch (and, when the current result set drains, the execution of the
 /// next bound row's statement) overlaps the consumer's processing of the previous chunk, and rows
 /// are converted to Arrow in bounded chunks of `batch_size` (plus the [`CHUNK_BYTE_BUDGET`]) rather
-/// than fully materialised (PERF-1). The `transaction` (`Arc`-shared: in a manual transaction the
+/// than fully materialised. The `transaction` (`Arc`-shared: in a manual transaction the
 /// connection's shared snapshot, in autocommit a dedicated one) is owned by the source, hence by the
 /// prefetch task, keeping the snapshot alive for as long as chunks are pulled; Spanner read-only
 /// transactions need no commit/rollback, so dropping it is cleanup enough.
@@ -686,8 +686,8 @@ fn json_extension_metadata() -> HashMap<String, String> {
 /// `ARRAY`/`STRUCT` maps the same as a top-level column.
 fn arrow_type(ty: &Type, precision: TimestampPrecision, depth: usize) -> Result<DataType> {
     // Defense-in-depth: cap the recursion so a hostile endpoint's pathological nested STRUCT/ARRAY
-    // metadata fails loudly rather than exhausting the stack (SEC-5; the transport also bounds this
-    // via prost's decode recursion limit — UP-8).
+    // metadata fails loudly rather than exhausting the stack (the transport also bounds this via
+    // prost's decode recursion limit).
     if depth > MAX_TYPE_NESTING_DEPTH {
         return Err(err(
             format!(
@@ -1056,7 +1056,7 @@ fn build_list(field: &FieldRef, values: &[Option<&Value>]) -> Result<ArrayRef> {
 /// whose elements match the struct type's field order — and fields are addressed by index only.
 /// That is the sole encoding accepted here, and it is what makes Spanner's duplicate and empty
 /// field names decode correctly: a name-keyed lookup would collapse two same-named fields onto one
-/// value (CONV-6), and a keyed `google.protobuf.Struct` wire value could not carry them apart in
+/// value, and a keyed `google.protobuf.Struct` wire value could not carry them apart in
 /// the first place, being a map.
 ///
 /// [`build_array`]'s strict-decode policy applies here too: a present value that is not a wire list
@@ -1446,7 +1446,7 @@ mod tests {
         use google_cloud_spanner::model;
 
         // A hostile endpoint could return `STRUCT<STRUCT<…>>` metadata nested far deeper than any
-        // legitimate result type. The type walk caps its recursion (SEC-5), so it must return a
+        // legitimate result type. The type walk caps its recursion, so it must return a
         // clean error rather than exhausting the stack. Build the nested type bottom-up (iterative,
         // so *constructing* it doesn't recurse) well past MAX_TYPE_NESTING_DEPTH.
         let mut ty = model::Type::new().set_code(model::TypeCode::Int64);

@@ -10,7 +10,7 @@
 //! Each helper takes a `what` label naming the offending option. That label is always the option's
 //! **full key** (e.g. `"option spanner.emulator"`, not a short name like `"max_partitions"`): a
 //! caller reading the error needs the exact string they must fix, and a key spelled anywhere else
-//! can drift from the one actually dispatched on (IDIO-7). Callers whose key is an enum derive it —
+//! can drift from the one actually dispatched on. Callers whose key is an enum derive it —
 //! `format!("option {}", key.as_ref())`. [`f64_option`] is the exception: it takes the bare option
 //! key and prefixes `option ` itself.
 
@@ -34,14 +34,13 @@ use crate::timeout::RpcTimeouts;
 
 /// Parse a boolean option, accepted as exactly the string `true` or `false` (lowercase — the
 /// ADBC canonical spellings, matching `adbc_core`'s own `TryFrom<OptionValue> for bool` and the
-/// reference C++ drivers; no case folding, no alternative spellings — COR-7). Anything else —
+/// reference C++ drivers; no case folding, no alternative spellings). Anything else —
 /// including an int-typed value — is rejected with `InvalidArguments`.
 ///
 /// Int-typed sets are deliberately rejected rather than coerced: no surveyed ADBC driver accepts
 /// `SetOptionInt` for a boolean option (the C++ framework's `Option::AsBool`, Go's driverbase and
 /// `adbc_core`'s `TryFrom<OptionValue> for bool` all reject it), and accepting one would break the
-/// spec's set/get type symmetry, since the getters serve the canonical `"true"`/`"false"` string
-/// (COR-4).
+/// spec's set/get type symmetry, since the getters serve the canonical `"true"`/`"false"` string.
 pub(crate) fn bool_option(value: OptionValue, what: &str) -> Result<bool> {
     match value {
         OptionValue::String(s) => match s.as_str() {
@@ -291,7 +290,7 @@ pub(crate) use impl_typed_option_getters;
 /// [`run_batch_dml`](crate::connection::run_batch_dml) /
 /// [`run_batch_txn`](crate::connection::run_batch_txn) /
 /// [`write_mutations_txn`](crate::connection::write_mutations_txn) helpers. Bundled, adding an
-/// option touches this struct and the macro, and no signature at all (IDIO-2).
+/// option touches this struct and the macro, and no signature at all.
 #[derive(Debug, Clone)]
 pub(crate) struct SharedConfig {
     /// The standard `adbc.connection.readonly` flag: a connection that has it set rejects all
@@ -576,7 +575,7 @@ mod tests {
 
     #[test]
     fn bool_option_accepts_exact_true_false_and_rejects_int_typed_values() {
-        // The string forms are exactly "true"/"false" (COR-7): lenient spellings (case variants,
+        // The string forms are exactly "true"/"false": lenient spellings (case variants,
         // 1/0, yes/no) are rejected with an error naming the option and the expected spellings.
         assert!(bool_option(OptionValue::String("true".into()), "option o").unwrap());
         assert!(!bool_option(OptionValue::String("false".into()), "option o").unwrap());
@@ -590,7 +589,7 @@ mod tests {
                 error.message
             );
         }
-        // An int-typed set is rejected too (COR-4): the getters serve the canonical
+        // An int-typed set is rejected too: the getters serve the canonical
         // "true"/"false" string, so accepting SetOptionInt(k, 1) would break the spec's set/get
         // type symmetry — and no surveyed ADBC driver accepts an int set for a boolean option.
         for i in [0, 1, -1] {

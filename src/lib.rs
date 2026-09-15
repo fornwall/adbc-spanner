@@ -296,7 +296,7 @@ pub mod fuzzing {
 
     /// Parse a `spanner.read.staleness` option value, exercising the read-bound grammar
     /// (`parse_read_bound` → `parse_duration` / RFC 3339) and the client `TimestampBound` mapping.
-    /// This is the parser whose missing coverage let COR-1's panic through; pure/offline, so it
+    /// This is the parser whose missing coverage let a panic through; pure/offline, so it
     /// must never panic — malformed input is a clean error, not a crash.
     pub fn parse_read_staleness(value: &str) {
         use adbc_core::options::OptionValue;

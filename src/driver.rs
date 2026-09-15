@@ -389,7 +389,7 @@ impl Optionable for SpannerDatabase {
         // The two secret-holding options are **write-only**: `spanner.auth.keyfile_json` is a full
         // service-account private key and `spanner.auth.access_token` a live bearer token, so
         // reading either back is always `NotFound` — whether set or not — and tooling that dumps
-        // connection options can never print a usable credential (SEC-1). This mirrors the `Debug`
+        // connection options can never print a usable credential. This mirrors the `Debug`
         // redaction of the same fields; `spanner.auth.keyfile` (a filesystem path, not a secret)
         // stays readable.
         if let OptionDatabase::Other(name) = &key

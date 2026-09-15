@@ -410,7 +410,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_priorities() {
-        // Case variants of valid priorities are rejected too: values are exact lowercase (COR-7).
+        // Case variants of valid priorities are rejected too: values are exact lowercase.
         for bad in [
             "urgent",
             "0",
@@ -549,10 +549,10 @@ mod tests {
         assert_eq!(config.commit_stats_string(), "false");
 
         // Accepts exactly the strings "true"/"false"; lenient spellings ("1", "yes", "TRUE", …)
-        // are rejected (COR-7).
+        // are rejected.
         config.set_commit_stats(s("true")).unwrap();
         assert_eq!(config.commit_stats_string(), "true");
-        // An int-typed set is rejected (COR-4) and leaves the stored value untouched.
+        // An int-typed set is rejected and leaves the stored value untouched.
         let error = config.set_commit_stats(OptionValue::Int(1)).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
         assert_eq!(config.commit_stats_string(), "true");
@@ -582,12 +582,12 @@ mod tests {
         // Default is off, always reported as an effective boolean.
         assert_eq!(config.exclude_txn_from_change_streams_string(), "false");
 
-        // Accepts exactly the strings "true"/"false"; lenient spellings are rejected (COR-7).
+        // Accepts exactly the strings "true"/"false"; lenient spellings are rejected.
         config
             .set_exclude_txn_from_change_streams(s("true"))
             .unwrap();
         assert_eq!(config.exclude_txn_from_change_streams_string(), "true");
-        // An int-typed set is rejected (COR-4) and leaves the stored value untouched.
+        // An int-typed set is rejected and leaves the stored value untouched.
         let error = config
             .set_exclude_txn_from_change_streams(OptionValue::Int(1))
             .unwrap_err();

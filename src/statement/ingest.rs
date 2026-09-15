@@ -371,7 +371,7 @@ impl SpannerStatement {
     /// cloned on the happy path solely to keep a copy around for a retry that usually never happens.
     ///
     /// A conversion failure here (e.g. an out-of-range date) on a *later* chunk is annotated by the
-    /// autocommit callers with the earlier chunks' committed-row count (COR-6), like a commit
+    /// autocommit callers with the earlier chunks' committed-row count, like a commit
     /// failure, so the `run_ingest` "reports their exact count" contract holds for build errors too.
     fn build_range_mutations(
         &self,
@@ -501,7 +501,7 @@ impl SpannerStatement {
     /// `AlreadyExists`, its details reach `Error::details`, and the append/create remaps fire,
     /// exactly as on the write-only path). Because a non-atomic batch may have applied some groups
     /// before the failing one — or before a mid-stream transport error — any error is annotated via
-    /// [`note_rows_already_committed`] (COR-5), folding this chunk's `applied` groups (one row each)
+    /// [`note_rows_already_committed`], folding this chunk's `applied` groups (one row each)
     /// into `prior_total` so the count covers earlier chunks *and* this chunk's committed rows.
     ///
     /// The request does carry `spanner.request.priority` and `spanner.transaction.tag`
@@ -630,10 +630,10 @@ pub(super) fn ingest_batch_write_option(value: OptionValue) -> Result<bool> {
 /// [`SpannerStatement::run_ingest_mutations`]), so a mid-ingest failure leaves the earlier chunks'
 /// rows in the table. On the write-only path a chunk is atomic, so `committed` is just the earlier
 /// chunks; on the non-atomic BatchWrite path it also includes the failing chunk's groups that did
-/// apply (COR-5). Either way that count is known exactly, and reporting it tells the caller what
+/// apply. Either way that count is known exactly, and reporting it tells the caller what
 /// state the table was left in instead of making them guess.
 ///
-/// A [`Status::Timeout`]/[`Status::Cancelled`] failure is the exception (CON-5): cancel/timeout
+/// A [`Status::Timeout`]/[`Status::Cancelled`] failure is the exception: cancel/timeout
 /// *drops* the in-flight `Commit` future, which may still land server-side, so the **failing
 /// chunk's own** outcome is unknown — a caller-driven retry could duplicate its rows. There the
 /// exact count still covers the earlier work, but the annotation also flags the ambiguity rather

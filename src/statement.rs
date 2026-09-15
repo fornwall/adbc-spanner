@@ -633,7 +633,7 @@ impl SpannerStatement {
                 // Zero total bound rows (e.g. a DBAPI `executemany` with an empty parameter set):
                 // there is nothing to run, but returning an empty schema would disagree with every
                 // non-empty execution. Advertise the query's real schema via the PLAN probe and
-                // return a zero-row reader (COR-9).
+                // return a zero-row reader.
                 let schema = self.plan_query_schema(sql)?;
                 let empty: Vec<std::result::Result<RecordBatch, ArrowError>> = Vec::new();
                 return Ok(Box::new(RecordBatchIterator::new(empty, schema)));
@@ -727,7 +727,7 @@ impl SpannerStatement {
         self.ensure_query_allowed()?;
         // Parameterized query: run once per bound row. The attempt consumes the bound rows on
         // every exit path — following the DML/ingest/partition convention (see `clear_bound`), a
-        // failed bound query must not leave stale rows for a later, unrelated `execute` (COR-12).
+        // failed bound query must not leave stale rows for a later, unrelated `execute`.
         if !self.bound.is_empty() {
             let result = self.execute_bound_query(&sql);
             self.clear_bound();
@@ -1525,7 +1525,7 @@ impl Statement for SpannerStatement {
 }
 
 /// Parse a plain string statement option, naming `key` in the error (the `driver.rs`
-/// `string_value` pattern: the label is the option's own key, so it can never drift — IDIO-7).
+/// `string_value` pattern: the label is the option's own key, so it can never drift).
 fn string_option(key: &OptionStatement, value: OptionValue) -> Result<String> {
     crate::options::string_option(value, &format!("option {}", key.as_ref()))
 }
@@ -1548,7 +1548,7 @@ fn undeclared_parameter_types(
 /// message instead. (This also covers `THEN RETURN` DML — it does produce rows, but Spanner cannot
 /// run it read-only.) `dml_rationale` completes "DML (INSERT/UPDATE/DELETE) cannot be …" with the
 /// entry point's read-only operation. Both DDL and DML are the same "not a query" class — the
-/// caller passed the wrong kind of statement — so both reject with `InvalidArguments` (SPEC-6).
+/// caller passed the wrong kind of statement — so both reject with `InvalidArguments`.
 fn check_query_only(sql: &str, entry_point: &str, dml_rationale: &str) -> Result<()> {
     if crate::sql::is_ddl(sql) {
         return Err(invalid_argument(format!(
