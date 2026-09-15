@@ -115,6 +115,15 @@ impl SpannerConnection {
         }
     }
 
+    /// The ADBC catalog this connection reports: the database id, i.e. the `<d>` of
+    /// `projects/<p>/instances/<i>/databases/<d>` (or the whole configured path, if it is not in
+    /// that form). A connection reaches exactly one database, so this is its only catalog — it is
+    /// what `get_objects` / `get_statistics` name, what `adbc.connection.catalog` reports, and the
+    /// only value a catalog argument may carry.
+    pub(crate) fn catalog(&self) -> &str {
+        crate::metadata::database_catalog(&self.database)
+    }
+
     /// Apply the buffered work of a manual transaction: DML statements and ingest mutations
     /// atomically in one transaction. A read-only (or empty) transaction has nothing to apply —
     /// its snapshot ends by being dropped when the caller clears the state.
@@ -236,14 +245,15 @@ impl Optionable for SpannerConnection {
                     return Err(unknown_option("connection", key.as_ref()));
                 }
             }
-            // Spanner has no settable current catalog/schema; both are fixed at `""`, so setting
-            // `""` is a conformant no-op and anything else is `NotImplemented` (see
-            // `check_unnamed_catalog_or_schema`).
+            // Neither is settable in Spanner: the connection is pinned to one database (its
+            // catalog) and there is no session schema to select. Setting the value `get_option`
+            // reports is a conformant no-op; anything else is `NotImplemented` (see
+            // `check_fixed_catalog_or_schema`).
             OptionConnection::CurrentCatalog => {
-                check_unnamed_catalog_or_schema(value, "current catalog")?;
+                check_fixed_catalog_or_schema(value, "current catalog", self.catalog())?;
             }
             OptionConnection::CurrentSchema => {
-                check_unnamed_catalog_or_schema(value, "current schema")?;
+                check_fixed_catalog_or_schema(value, "current schema", "")?;
             }
             other => {
                 return Err(unknown_option("connection", other.as_ref()));
@@ -269,9 +279,10 @@ impl Optionable for SpannerConnection {
             // Every other `spanner.*` option the connection and statement report identically —
             // including `spanner.commit_stats.mutation_count` — goes through the shared table.
             OptionConnection::Other(k) => self.shared_option_string(k),
-            // A Spanner database has a single, unnamed catalog and default schema — both the empty
-            // string in INFORMATION_SCHEMA — so the "current" values are reported as "".
-            OptionConnection::CurrentCatalog | OptionConnection::CurrentSchema => Ok(String::new()),
+            // The connection's one catalog is its database (see `catalog`); its default schema is
+            // the unnamed one, `""` in INFORMATION_SCHEMA.
+            OptionConnection::CurrentCatalog => Ok(self.catalog().to_string()),
+            OptionConnection::CurrentSchema => Ok(String::new()),
             other => Err(option_not_set(other.as_ref())),
         }
     }
@@ -317,8 +328,8 @@ impl Connection for SpannerConnection {
 
     /// Catalog/schema/table/column introspection, sourced from Spanner `INFORMATION_SCHEMA`.
     ///
-    /// A Spanner database is a single, unnamed catalog (`""`). Name arguments are ADBC `LIKE`
-    /// patterns (`%`/`_`); `depth` bounds how far the hierarchy is populated.
+    /// A Spanner database is a single catalog, reported under its database id. Name arguments are
+    /// ADBC `LIKE` patterns (`%`/`_`); `depth` bounds how far the hierarchy is populated.
     fn get_objects(
         &self,
         depth: ObjectDepth,
@@ -331,8 +342,8 @@ impl Connection for SpannerConnection {
         // Mint a fresh cancel signal for this operation (see `CancelSlot`).
         self.cancel.begin_operation();
         let out_schema = adbc_core::schemas::GET_OBJECTS_SCHEMA.clone();
-        // Spanner has a single catalog (""); a catalog filter that excludes it yields no rows.
-        if catalog.is_some_and(|c| !like_match(c, "")) {
+        // A catalog filter that does not match this connection's one catalog yields no rows.
+        if catalog.is_some_and(|c| !like_match(c, self.catalog())) {
             return Ok(Box::new(RecordBatchIterator::new(Vec::new(), out_schema)));
         }
         let schemas = crate::objects::collect_objects(
@@ -348,7 +359,7 @@ impl Connection for SpannerConnection {
                 column_name,
             },
         )?;
-        let batch = crate::objects::build(depth, schemas)?;
+        let batch = crate::objects::build(depth, self.catalog(), schemas)?;
         Ok(Box::new(RecordBatchIterator::new(
             vec![Ok(batch)],
             out_schema,
@@ -358,9 +369,9 @@ impl Connection for SpannerConnection {
     /// Return the Arrow schema of a table.
     ///
     /// Implemented by running a zero-row `SELECT * FROM <table> LIMIT 0` and mapping the result-set
-    /// column metadata to Arrow (the same mapping used for query results). Spanner has a single,
-    /// unnamed (`""`) catalog, so `catalog` must be `None` or `Some("")`; any other catalog fails
-    /// with [`Status::NotFound`].
+    /// column metadata to Arrow (the same mapping used for query results). `catalog` must be
+    /// `None` or this connection's one catalog — its database id, the same name `get_objects`
+    /// reports; any other catalog fails with [`Status::NotFound`].
     fn get_table_schema(
         &self,
         catalog: Option<&str>,
@@ -369,7 +380,7 @@ impl Connection for SpannerConnection {
     ) -> Result<Schema> {
         // Mint a fresh cancel signal for this operation (see `CancelSlot`).
         self.cancel.begin_operation();
-        check_lookup_catalog(catalog)?;
+        check_lookup_catalog(catalog, self.catalog())?;
         let table = qualified_table(db_schema, table_name);
         let sql = format!("SELECT * FROM {table} LIMIT 0");
         let client = self.client.clone();
@@ -459,8 +470,8 @@ impl Connection for SpannerConnection {
         // Mint a fresh cancel signal for this operation (see `CancelSlot`).
         self.cancel.begin_operation();
         let out_schema = adbc_core::schemas::GET_STATISTICS_SCHEMA.clone();
-        // Spanner is a single unnamed catalog (""); a catalog filter that excludes it yields nothing.
-        if catalog.is_some_and(|c| !like_match(c, "")) {
+        // A catalog filter that does not match this connection's one catalog yields nothing.
+        if catalog.is_some_and(|c| !like_match(c, self.catalog())) {
             return Ok(Box::new(RecordBatchIterator::new(Vec::new(), out_schema)));
         }
         // `approximate` is deliberately ignored: Spanner has no cheaper source of statistics, and
@@ -474,7 +485,7 @@ impl Connection for SpannerConnection {
             db_schema,
             table_name,
         )?;
-        let batch = crate::statistics::build(schemas, out_schema.clone())?;
+        let batch = crate::statistics::build(self.catalog(), schemas, out_schema.clone())?;
         Ok(Box::new(RecordBatchIterator::new(
             vec![Ok(batch)],
             out_schema,
@@ -630,21 +641,20 @@ pub(crate) fn decode_partition(descriptor: &[u8]) -> Result<Partition> {
     serde_json::from_value(payload).map_err(invalid)
 }
 
-/// Validate a `current_catalog` / `current_schema` set request. Spanner has a single, unnamed (`""`)
-/// catalog, and — although it supports named schemas — no settable session/current schema to select
-/// one. Both "current" values are therefore fixed at `""` (as `get_option` reports), so the only
-/// conformant value is the empty string, accepted as a no-op; any other value is rejected with
-/// `NotImplemented` (matching the C++ PostgreSQL driver), and a non-string value with
-/// `InvalidArguments`. `what` names the option in the error.
-fn check_unnamed_catalog_or_schema(value: OptionValue, what: &str) -> Result<()> {
+/// Validate a `current_catalog` / `current_schema` set request. A connection is pinned to one
+/// database (its catalog) and Spanner has no settable session schema, so both "current" values are
+/// fixed at what `get_option` reports — passed here as `fixed`. That value is accepted as a no-op;
+/// any other is rejected with `NotImplemented` (matching the C++ PostgreSQL driver), and a
+/// non-string value with `InvalidArguments`. `what` names the option in the error.
+fn check_fixed_catalog_or_schema(value: OptionValue, what: &str, fixed: &str) -> Result<()> {
     let OptionValue::String(s) = value else {
         return Err(invalid_argument(format!("expected a string {what} value")));
     };
-    if s.is_empty() {
+    if s == fixed {
         Ok(())
     } else {
         Err(unsupported(format!(
-            "setting the {what} to {s:?}: Spanner has no settable {what}; only \"\" is valid"
+            "setting the {what} to {s:?}: Spanner has no settable {what}; only {fixed:?} is valid"
         )))
     }
 }

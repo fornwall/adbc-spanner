@@ -133,8 +133,8 @@ pub struct SpannerStatement {
     /// Named schema qualifying the ingest target table (`adbc.ingest.target_db_schema`), if set.
     /// `None` (or empty) targets Spanner's default, unnamed schema.
     target_db_schema: Option<String>,
-    /// Ingest target catalog (`adbc.ingest.target_catalog`), if set. Spanner has a single, unnamed
-    /// (`""`) catalog, so only the empty catalog is accepted; stored solely so the option
+    /// Ingest target catalog (`adbc.ingest.target_catalog`), if set. A connection has exactly one
+    /// catalog — its database — so only that name is accepted; stored solely so the option
     /// round-trips through `get_option`.
     target_catalog: Option<String>,
     /// Ingest mode (`adbc.ingest.mode`), parsed once in `set_option` so the ingest paths match it
@@ -205,6 +205,12 @@ impl SpannerStatement {
             data_boost: false,
             cancel: Arc::new(CancelSlot::new()),
         }
+    }
+
+    /// The one ADBC catalog this statement can reach: its connection's database id — the same name
+    /// `get_objects` reports.
+    fn catalog(&self) -> &str {
+        crate::metadata::database_catalog(&self.database)
     }
 
     /// A Spanner statement builder for `sql` with this statement's request priority / request tag
@@ -1064,8 +1070,11 @@ impl Optionable for SpannerStatement {
                 self.target_db_schema = Some(string_option(&key, value)?);
             }
             OptionStatement::TargetCatalog => {
-                // Spanner exposes a single, unnamed catalog, so only the empty catalog is accepted.
-                self.target_catalog = Some(check_target_catalog(string_option(&key, value)?)?);
+                // A connection reaches one database, so its catalog is the only legal target.
+                self.target_catalog = Some(check_target_catalog(
+                    string_option(&key, value)?,
+                    self.catalog(),
+                )?);
             }
             OptionStatement::Temporary => {
                 // Spanner has no temporary tables. The spec default (`false`) is a no-op so

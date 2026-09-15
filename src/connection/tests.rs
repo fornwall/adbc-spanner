@@ -6,7 +6,7 @@ use adbc_core::options::OptionValue;
 use google_cloud_spanner::model::transaction_options::IsolationLevel;
 
 use super::{
-    PARTITION_DESCRIPTOR_VERSION, check_unnamed_catalog_or_schema, decode_partition,
+    PARTITION_DESCRIPTOR_VERSION, check_fixed_catalog_or_schema, decode_partition,
     encode_partition, isolation_to_adbc_string, parse_isolation_level,
 };
 
@@ -116,21 +116,30 @@ fn promoted_isolation_level_round_trips_to_effective_level() {
 }
 
 #[test]
-fn setting_current_catalog_or_schema_accepts_only_the_empty_string() {
+fn setting_current_catalog_or_schema_accepts_only_the_reported_value() {
     let set = |s: &str| {
-        check_unnamed_catalog_or_schema(OptionValue::String(s.to_string()), "current catalog")
+        check_fixed_catalog_or_schema(
+            OptionValue::String(s.to_string()),
+            "current catalog",
+            "adbc-test",
+        )
     };
-    // The "current" catalog/schema is fixed at `""` (no settable session catalog/schema), so
-    // setting it to `""` is a no-op success.
-    assert!(set("").is_ok());
-    // Any other value has no switchable current catalog/schema to select; setting it is
-    // unsupported → NotImplemented (aligned with the C++ PostgreSQL driver's `set` on this class).
+    // The current catalog is the connection's database, and the current schema the unnamed one:
+    // setting either to the value `get_option` reports is a no-op success.
+    assert!(set("adbc-test").is_ok());
+    assert!(
+        check_fixed_catalog_or_schema(OptionValue::String(String::new()), "current schema", "")
+            .is_ok()
+    );
+    // Neither is switchable, so any other value is unsupported → NotImplemented (aligned with the
+    // C++ PostgreSQL driver's `set` on this class). The one legal value is named in the error.
     let err = set("foo").unwrap_err();
     assert_eq!(err.status, Status::NotImplemented);
     assert!(err.message.contains("\"foo\""), "{}", err.message);
+    assert!(err.message.contains("\"adbc-test\""), "{}", err.message);
     // A non-string option value is a malformed argument, rejected as InvalidArguments.
     assert_eq!(
-        check_unnamed_catalog_or_schema(OptionValue::Int(1), "current schema")
+        check_fixed_catalog_or_schema(OptionValue::Int(1), "current schema", "")
             .unwrap_err()
             .status,
         Status::InvalidArguments

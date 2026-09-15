@@ -1,7 +1,8 @@
 //! Building the result of [`Connection::get_statistics`](adbc_core::Connection::get_statistics).
 //!
 //! The ADBC `get_statistics` result is nested `catalog → list<db_schema → list<statistic>>` (a
-//! Spanner database is a single, unnamed catalog). Each statistic carries a dictionary key, a
+//! Spanner database is a single catalog, reported under the database id). Each statistic carries a
+//! dictionary key, a
 //! dense-union value, and an is-approximate flag.
 //!
 //! Spanner has no statistics catalog, but the count-style statistics can be computed exactly with a
@@ -332,8 +333,13 @@ fn is_groupable(spanner_type: &str) -> bool {
         || t == "INTERVAL")
 }
 
-/// Build the single-catalog `get_statistics` record batch from per-schema statistics.
-pub(crate) fn build(schemas: Vec<SchemaStatistics>, out_schema: SchemaRef) -> Result<RecordBatch> {
+/// Build the single-catalog `get_statistics` record batch from per-schema statistics. `catalog` is
+/// the name reported for that catalog (the connection's database id).
+pub(crate) fn build(
+    catalog: &str,
+    schemas: Vec<SchemaStatistics>,
+    out_schema: SchemaRef,
+) -> Result<RecordBatch> {
     let top_fields = out_schema.fields();
 
     let db_schemas_field = field(top_fields, "catalog_db_schemas")?;
@@ -363,7 +369,7 @@ pub(crate) fn build(schemas: Vec<SchemaStatistics>, out_schema: SchemaRef) -> Re
     );
     let catalog_db_schemas = list_of(db_schema_item, &[schemas.len()], db_schema_struct)?;
 
-    let catalog_name: ArrayRef = Arc::new(StringArray::from(vec![""]));
+    let catalog_name: ArrayRef = Arc::new(StringArray::from(vec![catalog]));
     RecordBatch::try_new(out_schema, vec![catalog_name, catalog_db_schemas]).map_err(arrow_err)
 }
 
@@ -430,6 +436,9 @@ mod tests {
     use adbc_core::schemas::GET_STATISTICS_SCHEMA;
     use arrow_array::{ListArray, UnionArray};
 
+    /// The catalog name `build` reports: a connection's database id.
+    const CATALOG: &str = "adbc-test";
+
     /// The statistic structs of the one catalog's one db schema, unwrapped from the nested
     /// `catalog → list<db_schema → list<statistic>>` result [`build`] produces.
     fn only_schema_statistics(batch: &RecordBatch) -> StructArray {
@@ -477,7 +486,7 @@ mod tests {
                 },
             ],
         }];
-        let batch = build(schemas, GET_STATISTICS_SCHEMA.clone()).unwrap();
+        let batch = build(CATALOG, schemas, GET_STATISTICS_SCHEMA.clone()).unwrap();
         assert_eq!(batch.schema(), GET_STATISTICS_SCHEMA.clone());
         assert_eq!(batch.num_rows(), 1); // one catalog
 
@@ -654,7 +663,7 @@ mod tests {
 
     #[test]
     fn empty_is_valid() {
-        let batch = build(Vec::new(), GET_STATISTICS_SCHEMA.clone()).unwrap();
+        let batch = build(CATALOG, Vec::new(), GET_STATISTICS_SCHEMA.clone()).unwrap();
         assert_eq!(batch.schema(), GET_STATISTICS_SCHEMA.clone());
         assert_eq!(batch.num_rows(), 1);
     }

@@ -4717,3 +4717,85 @@ fn get_statistics_shares_one_read_only_transaction() {
         );
     }
 }
+
+/// The ADBC catalog level carries the **database id**, and every catalog argument round-trips
+/// against it.
+///
+/// `""` used to be both the reported value and the only accepted filter, which made the level
+/// carry no information — adbc.h defines `""` in a *filter* as "only objects **without** a
+/// catalog", so reporting it as a *value* said nothing. `get_objects` at `Catalogs` depth issues
+/// no RPC at all (it short-circuits before `INFORMATION_SCHEMA`), so the whole round trip is
+/// checkable against the mock server without scripting a single query.
+#[test]
+fn the_catalog_level_reports_the_database_id_and_filters_round_trip() {
+    use adbc_core::options::ObjectDepth;
+
+    let _watchdog = watchdog!();
+    let server = MockServer::start(|_mock| {});
+    let mut connection = server.connect();
+
+    let catalogs = |connection: &SpannerConnection, filter: Option<&str>| -> Vec<String> {
+        let reader = connection
+            .get_objects(ObjectDepth::Catalogs, filter, None, None, None, None)
+            .expect("get_objects at Catalogs depth");
+        reader
+            .collect::<Result<Vec<_>, _>>()
+            .expect("drain get_objects")
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_string::<i32>()
+                    .iter()
+                    .map(|name| name.expect("catalog_name is never null").to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+
+    // Reported: the `<d>` of projects/<p>/instances/<i>/databases/<d>, not "".
+    assert_eq!(catalogs(&connection, None), ["mock-db"]);
+    // Round trip: filtering by the reported name — exactly, or through a LIKE pattern — finds it.
+    assert_eq!(catalogs(&connection, Some("mock-db")), ["mock-db"]);
+    assert_eq!(catalogs(&connection, Some("mock%")), ["mock-db"]);
+    // Any other catalog matches nothing, including adbc.h's "objects with no catalog".
+    assert!(catalogs(&connection, Some("other-db")).is_empty());
+    assert!(catalogs(&connection, Some("")).is_empty());
+
+    // The same name is the connection's current catalog, and the only value it accepts.
+    assert_eq!(
+        connection
+            .get_option_string(OptionConnection::CurrentCatalog)
+            .expect("read the current catalog"),
+        "mock-db"
+    );
+    connection
+        .set_option(
+            OptionConnection::CurrentCatalog,
+            OptionValue::String("mock-db".into()),
+        )
+        .expect("setting the current catalog to its own value is a no-op");
+    let rejected = connection
+        .set_option(
+            OptionConnection::CurrentCatalog,
+            OptionValue::String("other-db".into()),
+        )
+        .expect_err("no other catalog is reachable");
+    assert_eq!(rejected.status, AdbcStatus::NotImplemented);
+
+    // And the only catalog a bulk ingest may target.
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::TargetCatalog,
+            OptionValue::String("mock-db".into()),
+        )
+        .expect("ingest into the connection's own catalog");
+    let rejected = statement
+        .set_option(
+            OptionStatement::TargetCatalog,
+            OptionValue::String(String::new()),
+        )
+        .expect_err("\"\" is no longer a catalog this connection has");
+    assert_eq!(rejected.status, AdbcStatus::NotImplemented);
+}

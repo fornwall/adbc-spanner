@@ -528,15 +528,16 @@ impl SpannerStatement {
     }
 }
 
-/// Validate the `adbc.ingest.target_catalog` option. Spanner has a single, unnamed (`""`) catalog,
-/// so only the empty catalog is accepted; any other name is rejected as unsupported.
-pub(super) fn check_target_catalog(catalog: String) -> Result<String> {
-    if catalog.is_empty() {
+/// Validate the `adbc.ingest.target_catalog` option against the statement's one catalog, `own` (its
+/// connection's database id). Ingest cannot cross databases, so any other name — `""` included, the
+/// adbc.h spelling for "no catalog" — is rejected as unsupported.
+pub(super) fn check_target_catalog(catalog: String, own: &str) -> Result<String> {
+    if catalog == own {
         Ok(catalog)
     } else {
         Err(unsupported(format!(
-            "ingest target catalog {catalog:?}: Spanner has only the default, unnamed catalog; \
-             set adbc.ingest.target_catalog to \"\" or leave it unset"
+            "ingest target catalog {catalog:?}: this connection can only write to {own:?}; \
+             set adbc.ingest.target_catalog to that or leave it unset"
         )))
     }
 }

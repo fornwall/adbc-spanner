@@ -16,14 +16,27 @@ use crate::options::SharedConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
 use crate::timeout::with_timeout;
 
-/// Validate a lookup's `catalog` argument. Spanner has a single, unnamed (`""`) catalog, so `None`
-/// and `Some("")` are accepted; any other catalog does not exist — nothing can be found in it — so
-/// the lookup fails with [`Status::NotFound`] (matching how a missing table is reported).
-pub(crate) fn check_lookup_catalog(catalog: Option<&str>) -> Result<()> {
+/// The ADBC catalog name for a Spanner database path: the database id, i.e. the `<d>` of
+/// `projects/<p>/instances/<i>/databases/<d>`, or the whole string if it is not in that form. A
+/// connection reaches exactly one database, so this is its only catalog.
+pub(crate) fn database_catalog(database: &str) -> &str {
+    database.rsplit_once('/').map_or(database, |(_, id)| id)
+}
+
+/// Validate a lookup's `catalog` argument against the one catalog the connection has, `reported`
+/// (its database id — what `get_objects` names). `None` means "do not filter"; the reported name
+/// matches exactly (a lookup catalog is not a pattern). Any other catalog does not exist on this
+/// connection — nothing can be found in it — so the lookup fails with [`Status::NotFound`]
+/// (matching how a missing table is reported). Note `Some("")` is adbc.h's "objects with no
+/// catalog", which a Spanner database never has.
+pub(crate) fn check_lookup_catalog(catalog: Option<&str>, reported: &str) -> Result<()> {
     match catalog {
-        None | Some("") => Ok(()),
+        None => Ok(()),
+        Some(name) if name == reported => Ok(()),
         Some(other) => Err(err(
-            format!("catalog {other:?} not found: Spanner has only the default, unnamed catalog"),
+            format!(
+                "catalog {other:?} not found: this connection has only the catalog {reported:?}"
+            ),
             Status::NotFound,
         )),
     }

@@ -2,7 +2,8 @@
 //!
 //! The ADBC `get_objects` result is a deeply nested structure:
 //! `catalog → list<db_schema → list<table → list<column>>>`. We populate it from Spanner's
-//! `INFORMATION_SCHEMA` (a Spanner database is a single, unnamed catalog). Levels strictly below
+//! `INFORMATION_SCHEMA`. A Spanner database is a single catalog, reported under the database id
+//! (the `<d>` of `projects/<p>/instances/<i>/databases/<d>`). Levels strictly below
 //! the requested [`ObjectDepth`] are left null via [`new_null_array`]; a list at or above the
 //! requested depth is always a valid (possibly **empty**) list — per the ADBC spec, a filter that
 //! matches nothing must still yield the parent skeleton with empty lists, never NULL.
@@ -164,7 +165,7 @@ pub(crate) fn collect_objects(
         column_name,
         ..
     } = *filters;
-    // At catalog depth the result is just the single unnamed catalog with a null db_schemas
+    // At catalog depth the result is just the single catalog with a null db_schemas
     // list — `build` ignores the collected schemas entirely — so skip INFORMATION_SCHEMA
     // (and any RPC) altogether. The remaining depths each fetch only what they populate:
     // Schemas queries SCHEMATA only; Tables adds TABLES; All/Columns add COLUMNS and the
@@ -763,8 +764,14 @@ fn foreign_key_usages<'a>(
         .collect()
 }
 
-/// Build the single-catalog `get_objects` record batch.
-pub(crate) fn build(depth: ObjectDepth, schemas: Vec<DbSchema>) -> Result<RecordBatch> {
+/// Build the single-catalog `get_objects` record batch. `catalog` is the name reported for that
+/// catalog (the connection's database id) — also the `fk_catalog` of every foreign-key usage, since
+/// a foreign key cannot cross databases.
+pub(crate) fn build(
+    depth: ObjectDepth,
+    catalog: &str,
+    schemas: Vec<DbSchema>,
+) -> Result<RecordBatch> {
     let out_schema = GET_OBJECTS_SCHEMA.clone();
     let top_fields = out_schema.fields();
 
@@ -824,7 +831,8 @@ pub(crate) fn build(depth: ObjectDepth, schemas: Vec<DbSchema>) -> Result<Record
                 let constraint_fields = struct_fields(&cons_item)?;
                 let constraints: Vec<&Constraint> =
                     tables.iter().flat_map(|t| t.constraints.iter()).collect();
-                let constraint_struct = build_constraint_struct(&constraint_fields, &constraints)?;
+                let constraint_struct =
+                    build_constraint_struct(&constraint_fields, catalog, &constraints)?;
                 let lengths: Vec<usize> = tables.iter().map(|t| t.constraints.len()).collect();
                 list_of(cons_item, &lengths, constraint_struct)?
             };
@@ -852,7 +860,7 @@ pub(crate) fn build(depth: ObjectDepth, schemas: Vec<DbSchema>) -> Result<Record
         list_of(db_schema_item, &[schemas.len()], db_schema_struct)?
     };
 
-    let catalog_name: ArrayRef = Arc::new(StringArray::from(vec![""]));
+    let catalog_name: ArrayRef = Arc::new(StringArray::from(vec![catalog]));
     RecordBatch::try_new(out_schema, vec![catalog_name, catalog_db_schemas]).map_err(arrow_err)
 }
 
@@ -890,6 +898,7 @@ fn build_column_struct(column_fields: &Fields, columns: &[&Column]) -> Result<Ar
 /// (`constraint_column_usage`).
 fn build_constraint_struct(
     constraint_fields: &Fields,
+    catalog: &str,
     constraints: &[&Constraint],
 ) -> Result<ArrayRef> {
     let n = constraints.len();
@@ -913,7 +922,7 @@ fn build_constraint_struct(
     let usage_item = list_item(&usage_field)?;
     let usage_fields = struct_fields(&usage_item)?;
     let flat_usages: Vec<&Usage> = constraints.iter().flat_map(|c| c.usages.iter()).collect();
-    let usage_struct = build_usage_struct(&usage_fields, &flat_usages)?;
+    let usage_struct = build_usage_struct(&usage_fields, catalog, &flat_usages)?;
     let usage_lengths: Vec<usize> = constraints.iter().map(|c| c.usages.len()).collect();
     let usage_valid: Vec<bool> = constraints
         .iter()
@@ -947,16 +956,16 @@ fn build_constraint_struct(
 }
 
 /// Build the foreign-key `constraint_column_usage` struct array (one entry per referenced column):
-/// `fk_table` / `fk_column_name` from the parent side, `fk_db_schema` the parent schema, and an
-/// empty `fk_catalog` (Spanner has a single unnamed catalog).
-fn build_usage_struct(usage_fields: &Fields, usages: &[&Usage]) -> Result<ArrayRef> {
+/// `fk_table` / `fk_column_name` from the parent side, `fk_db_schema` the parent schema, and
+/// `fk_catalog` the connection's catalog (a foreign key cannot cross databases).
+fn build_usage_struct(usage_fields: &Fields, catalog: &str, usages: &[&Usage]) -> Result<ArrayRef> {
     let n = usages.len();
     let arrays: Vec<ArrayRef> = usage_fields
         .iter()
         .map(|f| match f.name().as_str() {
-            "fk_catalog" => {
-                Arc::new(StringArray::from_iter_values(usages.iter().map(|_| ""))) as ArrayRef
-            }
+            "fk_catalog" => Arc::new(StringArray::from_iter_values(
+                usages.iter().map(|_| catalog),
+            )) as ArrayRef,
             "fk_db_schema" => Arc::new(StringArray::from_iter_values(
                 usages.iter().map(|u| u.db_schema.as_str()),
             )) as ArrayRef,
@@ -1133,9 +1142,12 @@ mod tests {
         }]
     }
 
+    /// The catalog name `build` reports: a connection's database id.
+    const CATALOG: &str = "adbc-test";
+
     #[test]
     fn build_full_depth_matches_schema() {
-        let batch = build(ObjectDepth::All, sample()).unwrap();
+        let batch = build(ObjectDepth::All, CATALOG, sample()).unwrap();
         assert_eq!(batch.schema(), GET_OBJECTS_SCHEMA.clone());
         assert_eq!(batch.num_rows(), 1);
         let schemas = batch
@@ -1150,7 +1162,7 @@ mod tests {
 
     #[test]
     fn columns_carry_xdbc_type_name_and_nullability() {
-        let batch = build(ObjectDepth::All, sample()).unwrap();
+        let batch = build(ObjectDepth::All, CATALOG, sample()).unwrap();
         let list = |a: &dyn Array| a.as_any().downcast_ref::<ListArray>().unwrap().value(0);
         let strukt = |a: ArrayRef| a.as_any().downcast_ref::<StructArray>().unwrap().clone();
         let child = |s: &StructArray, name: &str| s.column_by_name(name).unwrap().clone();
@@ -1213,7 +1225,7 @@ mod tests {
 
     #[test]
     fn build_catalogs_depth_leaves_schemas_null() {
-        let batch = build(ObjectDepth::Catalogs, sample()).unwrap();
+        let batch = build(ObjectDepth::Catalogs, CATALOG, sample()).unwrap();
         let schemas = batch
             .column(1)
             .as_any()
@@ -1227,16 +1239,16 @@ mod tests {
         // `collect_objects` short-circuits at catalog depth and hands `build` an empty Vec
         // without ever querying INFORMATION_SCHEMA. That is only sound if the output is
         // identical to what building from real collected schemas would produce.
-        let from_empty = build(ObjectDepth::Catalogs, Vec::new()).unwrap();
-        let from_sample = build(ObjectDepth::Catalogs, sample()).unwrap();
+        let from_empty = build(ObjectDepth::Catalogs, CATALOG, Vec::new()).unwrap();
+        let from_sample = build(ObjectDepth::Catalogs, CATALOG, sample()).unwrap();
         assert_eq!(from_empty, from_sample);
-        assert_eq!(from_empty.num_rows(), 1, "single unnamed catalog");
+        assert_eq!(from_empty.num_rows(), 1, "one catalog: the database");
         let name = from_empty
             .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        assert_eq!(name.value(0), "");
+        assert_eq!(name.value(0), CATALOG);
     }
 
     /// ADBC depth rule: NULL is reserved for list levels strictly BELOW the requested depth. A
@@ -1256,7 +1268,7 @@ mod tests {
             ObjectDepth::Columns,
             ObjectDepth::All,
         ] {
-            let batch = build(depth, Vec::new()).unwrap();
+            let batch = build(depth, CATALOG, Vec::new()).unwrap();
             assert_eq!(batch.num_rows(), 1, "single catalog at {depth:?}");
             let schemas = schemas_list(&batch);
             assert!(
@@ -1281,7 +1293,7 @@ mod tests {
                 name: String::new(),
                 tables: Vec::new(),
             }];
-            let batch = build(depth, schemas).unwrap();
+            let batch = build(depth, CATALOG, schemas).unwrap();
             let schemas = schemas_list(&batch);
             assert!(schemas.is_valid(0));
             assert_eq!(
@@ -1317,7 +1329,7 @@ mod tests {
                     constraints: Vec::new(),
                 }],
             }];
-            let batch = build(depth, schemas).unwrap();
+            let batch = build(depth, CATALOG, schemas).unwrap();
             let schemas = schemas_list(&batch);
             for name in ["table_columns", "table_constraints"] {
                 let list = table_child_list(&schemas, name);
@@ -1331,7 +1343,7 @@ mod tests {
     fn schemas_depth_leaves_tables_null() {
         // Strictly below the requested depth: at Schemas depth each schema's db_schema_tables is
         // NULL (not an empty list) — the level was not requested.
-        let batch = build(ObjectDepth::Schemas, sample()).unwrap();
+        let batch = build(ObjectDepth::Schemas, CATALOG, sample()).unwrap();
         let schemas = schemas_list(&batch);
         assert!(schemas.is_valid(0));
         let tables = tables_list(&schemas);
@@ -1345,7 +1357,7 @@ mod tests {
     fn tables_depth_leaves_columns_and_constraints_null() {
         // Strictly below the requested depth: at Tables depth each table's table_columns and
         // table_constraints are NULL (not empty lists) — the column level was not requested.
-        let batch = build(ObjectDepth::Tables, sample()).unwrap();
+        let batch = build(ObjectDepth::Tables, CATALOG, sample()).unwrap();
         let schemas = schemas_list(&batch);
         for name in ["table_columns", "table_constraints"] {
             let list = table_child_list(&schemas, name);
@@ -1429,7 +1441,7 @@ mod tests {
     fn constraint_column_usage_is_null_for_non_foreign_keys() {
         // The sample has one PRIMARY KEY (no usages) and one FOREIGN KEY (one usage). The usage
         // list must be NULL for the primary key and a non-null single-element list for the FK.
-        let batch = build(ObjectDepth::All, sample()).unwrap();
+        let batch = build(ObjectDepth::All, CATALOG, sample()).unwrap();
         let list = |a: &dyn Array| a.as_any().downcast_ref::<ListArray>().unwrap().value(0);
         let strukt = |a: ArrayRef| a.as_any().downcast_ref::<StructArray>().unwrap().clone();
         let child = |s: &StructArray, name: &str| s.column_by_name(name).unwrap().clone();

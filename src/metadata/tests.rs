@@ -8,7 +8,7 @@ use adbc_core::options::OptionValue;
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 
-use super::{check_lookup_catalog, like_match, metadata_sql_builder, str_col};
+use super::{check_lookup_catalog, database_catalog, like_match, metadata_sql_builder, str_col};
 use crate::options::SharedConfig;
 
 #[test]
@@ -52,14 +52,28 @@ fn like_matching_multibyte_utf8() {
 }
 
 #[test]
-fn lookup_catalog_accepts_only_the_default_empty_catalog() {
-    // Spanner's single catalog is the empty string; `None` means "don't filter".
-    assert!(check_lookup_catalog(None).is_ok());
-    assert!(check_lookup_catalog(Some("")).is_ok());
-    // Any named catalog does not exist, so a lookup in it is NotFound.
-    let err = check_lookup_catalog(Some("main")).unwrap_err();
-    assert_eq!(err.status, Status::NotFound);
-    assert!(err.message.contains("\"main\""), "{}", err.message);
+fn database_catalog_is_the_database_id() {
+    assert_eq!(
+        database_catalog("projects/p/instances/i/databases/adbc-test"),
+        "adbc-test"
+    );
+    // A path that is not in the canonical form is reported verbatim rather than mangled.
+    assert_eq!(database_catalog("adbc-test"), "adbc-test");
+    assert_eq!(database_catalog(""), "");
+}
+
+#[test]
+fn lookup_catalog_accepts_only_the_connections_own_catalog() {
+    // `None` means "don't filter"; the connection's one catalog — its database id — matches.
+    assert!(check_lookup_catalog(None, "adbc-test").is_ok());
+    assert!(check_lookup_catalog(Some("adbc-test"), "adbc-test").is_ok());
+    // Any other catalog does not exist here, so a lookup in it is NotFound. `""` included: it is
+    // adbc.h's "objects with no catalog", and every Spanner object has one.
+    for absent in ["main", ""] {
+        let err = check_lookup_catalog(Some(absent), "adbc-test").unwrap_err();
+        assert_eq!(err.status, Status::NotFound);
+        assert!(err.message.contains("adbc-test"), "{}", err.message);
+    }
 }
 
 #[test]

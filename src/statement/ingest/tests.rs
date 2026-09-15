@@ -181,12 +181,17 @@ fn mutation_limit_predicate_matches_only_the_too_many_mutations_error() {
 }
 
 #[test]
-fn accepts_only_the_empty_ingest_catalog() {
-    // Spanner's single, unnamed catalog is accepted and preserved for round-tripping.
-    assert_eq!(check_target_catalog(String::new()).unwrap(), "");
-    // Any named catalog is rejected as unsupported.
-    let error = check_target_catalog("main".to_string()).unwrap_err();
-    assert_eq!(error.status, Status::NotImplemented);
+fn accepts_only_the_connections_own_ingest_catalog() {
+    // The connection's one catalog — its database — is accepted and preserved for round-tripping.
+    assert_eq!(
+        check_target_catalog("adbc-test".to_string(), "adbc-test").unwrap(),
+        "adbc-test"
+    );
+    // Any other catalog is rejected as unsupported, `""` (adbc.h's "no catalog") included.
+    for other in ["main", ""] {
+        let error = check_target_catalog(other.to_string(), "adbc-test").unwrap_err();
+        assert_eq!(error.status, Status::NotImplemented);
+    }
 }
 
 #[test]

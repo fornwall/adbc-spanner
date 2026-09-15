@@ -213,11 +213,25 @@ course — an Arrow result:
 | ADBC call | Question it answers | How this driver implements it |
 | --- | --- | --- |
 | `get_info` | "What driver/vendor is this, what version?" | Static metadata ([`src/info.rs`](../src/info.rs)). A code the driver does not recognise (an XDBC-range or vendor-specific one) is *omitted* from the result rather than erroring, as `adbc.h` requires. |
-| `get_objects` | "What catalogs / schemas / tables / columns / constraints exist?" | Queries Spanner's `INFORMATION_SCHEMA` ([`src/objects.rs`](../src/objects.rs)). |
+| `get_objects` | "What catalogs / schemas / tables / columns / constraints exist?" | Queries Spanner's `INFORMATION_SCHEMA` ([`src/objects.rs`](../src/objects.rs)). See [Catalogs](#catalogs) for what the catalog level holds. |
 | `get_table_schema` | "What is the Arrow schema of table X?" | Reads the table's columns and maps them to an Arrow schema. |
 | `get_table_types` | "What kinds of table exist?" | A fixed, typed result set: `BASE TABLE` and `VIEW`. |
 | `get_statistics` | "Row counts, distinct counts, null counts." | One aggregate scan per table for exact values — Spanner has no cheaper source, so an `approximate=true` request gets the same exact numbers ([`src/statistics.rs`](../src/statistics.rs)). |
 | `get_statistic_names` | "What non-standard statistics exist?" | None — an empty (but correctly typed) result set. |
+
+#### Catalogs
+
+A connection reaches exactly **one** Spanner database, so it has exactly one catalog, reported
+under the **database id** — the `<d>` of `projects/<p>/instances/<i>/databases/<d>`. That is the
+`catalog_name` of `get_objects` and `get_statistics`, the `fk_catalog` of every foreign-key usage,
+and what `adbc.connection.catalog` reports; a catalog argument (a `LIKE` pattern for `get_objects` /
+`get_statistics`, an exact name for `get_table_schema` and `adbc.ingest.target_catalog`) must match
+it, so what the driver reports is what you can filter by.
+
+The empty string is **not** that name: `adbc.h` defines `""` in a catalog *filter* as "only objects
+**without** a catalog", which no Spanner object is, so `""` now matches nothing. Up to 0.7 the
+driver both reported and accepted only `""`, which left the ADBC catalog level carrying no
+information at all.
 | `get_parameter_schema` | "What parameters does this statement take?" | If data is already bound, its Arrow schema *is* the answer. Otherwise the `@name` parameters are read out of the SQL and typed by a PLAN-only probe; one the probe cannot type is reported as `Null`, ADBC's "type unknown". |
 
 ### 4.7 Parameters and bulk ingest — `bind`
