@@ -12,80 +12,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use adbc_core::CancelHandle;
 use adbc_core::error::{Error, Result, Status};
-use tokio::runtime::{Handle, Runtime};
+use tokio::runtime::Runtime;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::error::err;
 
 /// A reference-counted handle to the driver's Tokio runtime.
-///
-/// A newtype rather than a bare `Arc<Runtime>` for one reason: dropping a `Runtime` *blocks* while
-/// it joins its worker threads, which panics ("Cannot drop a runtime in a context where blocking is
-/// not allowed") if the last handle happens to be dropped on a Tokio worker thread — reachable from
-/// safe application code, since a streamed reader (or, over the C ABI, the boxed reader behind a
-/// stream's release callback) may be the last owner and be released from an async context. The
-/// [`Drop`] below turns that case into [`Runtime::shutdown_background`], which never blocks.
-#[derive(Clone, Debug)]
-pub(crate) struct SharedRuntime(Option<Arc<Runtime>>);
-
-impl SharedRuntime {
-    fn new(runtime: Runtime) -> Self {
-        Self(Some(Arc::new(runtime)))
-    }
-}
-
-impl std::ops::Deref for SharedRuntime {
-    type Target = Runtime;
-
-    fn deref(&self) -> &Runtime {
-        // Only `Drop` ever takes the `Option`, and it does so as the handle dies.
-        self.0.as_ref().expect("runtime handle already dropped")
-    }
-}
-
-impl Drop for SharedRuntime {
-    fn drop(&mut self) {
-        let Some(handle) = self.0.take() else { return };
-        // `into_inner` yields the runtime only for the *last* handle — the only one that would
-        // block. Off a runtime thread the ordinary blocking drop is still the better shutdown.
-        if let Some(runtime) = Arc::into_inner(handle)
-            && Handle::try_current().is_ok()
-        {
-            runtime.shutdown_background();
-        }
-    }
-}
-
-/// The error a blocking bridge returns instead of panicking when the caller is already inside a
-/// Tokio runtime, where `block_on` would panic ("Cannot block the current thread from within a
-/// runtime").
-fn in_runtime_err() -> Error {
-    err(
-        "the driver's ADBC methods are synchronous and block the calling thread, but this call \
-         was made from inside a Tokio runtime thread; wrap it in `tokio::task::spawn_blocking` \
-         (or call the driver from a dedicated thread)",
-        // The call itself is well-formed; it is the caller's thread that cannot service it — the
-        // same "right call, wrong state" shape the transaction-mode guards report.
-        Status::InvalidState,
-    )
-}
-
-/// The single blocking bridge from a synchronous ADBC method into the async Spanner client: every
-/// `block_on` in the driver goes through here (or [`block_on_cancellable`], which wraps it), so the
-/// async-context check is made in exactly one place.
-pub(crate) fn block_on<T>(runtime: &Runtime, future: impl Future<Output = Result<T>>) -> Result<T> {
-    if Handle::try_current().is_ok() {
-        return Err(in_runtime_err());
-    }
-    // Box the operation future onto the heap. `block_on` polls it on the *calling* thread's stack
-    // (in ADBC the application's own thread, whose stack size the driver cannot control), and these
-    // operations compose deep client/timeout/retry/conversion futures whose debug-build state
-    // machines sit right at the default 2 MiB stack — held inline in this frame they overflowed it
-    // on some paths (driver-manager conformance, query/DML round-trips). The heap indirection keeps
-    // the frame flat, at one allocation per bridged call — negligible against the RPC it wraps.
-    runtime.block_on(Box::pin(future))
-}
+pub(crate) type SharedRuntime = Arc<Runtime>;
 
 /// A **sticky, per-operation** cancellation signal shared between one operation (and any streamed
 /// reader it produces) and the `cancel()` call aimed at it.
@@ -237,7 +171,14 @@ pub(crate) fn block_on_cancellable<T>(
     cancel: &CancelSignal,
     future: impl Future<Output = Result<T>>,
 ) -> Result<T> {
-    block_on(runtime, async move {
+    // Box the operation future onto the heap. `block_on` polls it on the *calling* thread's stack
+    // (in ADBC the application's own thread, whose stack size the driver cannot control), and these
+    // operations compose deep client/timeout/retry/conversion futures whose debug-build state
+    // machines sit right at the default 2 MiB stack — held inline in this frame they overflowed it
+    // on some paths (driver-manager conformance, query/DML round-trips). The heap indirection keeps
+    // the frame flat, at one allocation per bridged call — negligible against the RPC it wraps.
+    let future = Box::pin(future);
+    runtime.block_on(async move {
         tokio::select! {
             // Check/register the cancellation waiter before polling the operation.
             biased;
@@ -337,7 +278,7 @@ pub(crate) fn new_runtime() -> Result<SharedRuntime> {
                 Status::Internal,
             )
         })?;
-    Ok(SharedRuntime::new(runtime))
+    Ok(Arc::new(runtime))
 }
 
 #[cfg(test)]
@@ -418,34 +359,6 @@ mod tests {
         let cancelled: Result<i32> =
             block_on_cancellable(&runtime, &slot.current(), async { Ok(3) });
         assert_eq!(cancelled.unwrap_err().status, Status::Cancelled);
-    }
-
-    // Entering the blocking bridge from a runtime thread must report a clean, actionable error
-    // rather than panicking inside `Runtime::block_on`.
-    #[tokio::test]
-    async fn blocking_from_an_async_context_errors_instead_of_panicking() {
-        let runtime = new_runtime().unwrap();
-        let plain: Result<i32> = block_on(&runtime, async { Ok(1) });
-        assert_eq!(plain.unwrap_err().status, Status::InvalidState);
-        let cancellable: Result<i32> =
-            block_on_cancellable(&runtime, &CancelSignal::new(), async { Ok(2) });
-        let error = cancellable.unwrap_err();
-        assert_eq!(error.status, Status::InvalidState);
-        assert!(
-            error.message.contains("spawn_blocking"),
-            "{}",
-            error.message
-        );
-    }
-
-    // The last handle being dropped on a runtime thread must not panic in `Runtime::drop`; this is
-    // reachable from a streamed reader released on an async thread (including over the C ABI).
-    #[tokio::test]
-    async fn dropping_the_last_handle_in_an_async_context_does_not_panic() {
-        let runtime = new_runtime().unwrap();
-        let second = runtime.clone();
-        drop(runtime); // not the last handle: a plain refcount decrement
-        drop(second); // the last one — shuts down in the background instead of blocking
     }
 
     /// One step of a [`ScriptedSource`]: a ready chunk (or error), or a fetch that never completes.
