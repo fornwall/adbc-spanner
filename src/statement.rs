@@ -1058,7 +1058,17 @@ impl SpannerStatement {
     /// `THEN RETURN` is incompatible with manual transaction mode: buffered DML only executes at
     /// `commit`, and `ExecuteBatchDml` — the commit path — rejects `THEN RETURN` outright, so the
     /// returned rows would be silently unobtainable. It is rejected up front instead.
+    ///
+    /// The `adbc.connection.readonly` guard lives here rather than at the two entry points
+    /// ([`Statement::execute`] and [`Statement::execute_update`]), so the one rejection covers
+    /// every DML route — plain, `THEN RETURN` and partitioned alike — and cannot drift between
+    /// them.
     fn run_dml(&self, sql: &str) -> Result<DmlOutcome> {
+        if self.config.is_read_only() {
+            return Err(invalid_state(
+                "cannot execute DML: the connection is read-only",
+            ));
+        }
         if self.dml_partitioned {
             return Ok(DmlOutcome::Plain(Some(self.run_partitioned_dml(sql)?)));
         }
@@ -1730,13 +1740,21 @@ impl Optionable for SpannerStatement {
                 // Spanner has no temporary tables. The spec default (`false`) is accepted as a
                 // no-op so generic clients that always set the option keep working; `true` is
                 // rejected as unsupported.
-                check_ingest_temporary(value)?;
+                check_unsupported_true(
+                    value,
+                    "option adbc.ingest.temporary",
+                    "temporary ingest target tables: Spanner has no temporary tables",
+                )?;
             }
             OptionStatement::Incremental => {
                 // Incremental `execute_partitions` is not implemented. The spec default
                 // (`false`) is accepted as a no-op so generic clients that always set the option
                 // keep working; `true` is rejected as unsupported (the `Temporary` pattern).
-                check_exec_incremental(value)?;
+                check_unsupported_true(
+                    value,
+                    "option adbc.statement.exec.incremental",
+                    "incremental statement execution (adbc.statement.exec.incremental)",
+                )?;
             }
             OptionStatement::IngestMode => {
                 // Append into an existing table, or create it (keyless, from the ingest data's
@@ -1785,10 +1803,10 @@ impl Optionable for SpannerStatement {
             OptionStatement::TargetTable => self.target_table.clone(),
             OptionStatement::TargetDbSchema => self.target_db_schema.clone(),
             OptionStatement::TargetCatalog => self.target_catalog.clone(),
-            // Only the spec default (`false`) is ever accepted (see `check_ingest_temporary`), so
+            // Only the spec default (`false`) is ever accepted (see `check_unsupported_true`), so
             // the driver's state is always `false` — report exactly that.
             OptionStatement::Temporary => Some(false.to_string()),
-            // Same shape: only `false` is ever accepted (see `check_exec_incremental`).
+            // Same shape: only `false` is ever accepted (see `check_unsupported_true`).
             OptionStatement::Incremental => Some(false.to_string()),
             // Reported in the spec's canonical `adbc.ingest.mode.*` spelling; unset reports the
             // effective default, `create`.
@@ -1895,11 +1913,6 @@ impl Statement for SpannerStatement {
         // DML with a `THEN RETURN` clause returns its rows; plain DML yields an empty result (the
         // query interface has nowhere to report the affected-row count, so it is discarded).
         if crate::sql::is_dml(&sql) {
-            if self.config.is_read_only() {
-                return Err(invalid_state(
-                    "cannot execute DML: the connection is read-only",
-                ));
-            }
             let result = self.run_dml(&sql);
             self.clear_bound();
             return match result? {
@@ -1957,11 +1970,6 @@ impl Statement for SpannerStatement {
             let reader = self.execute_query_reader(&sql)?;
             drain_discarding_rows(reader)?;
             return Ok(None);
-        }
-        if self.config.is_read_only() {
-            return Err(invalid_state(
-                "cannot execute DML: the connection is read-only",
-            ));
         }
         let result = self.run_dml(&sql);
         self.clear_bound();
@@ -2287,27 +2295,16 @@ fn ingest_mode_option(key: &OptionStatement, value: OptionValue) -> Result<Inges
     }
 }
 
-/// Validate the `adbc.ingest.temporary` option. Spanner has no temporary tables, so only the spec
-/// default (`false`, in any of the shared boolean spellings) is accepted — as a no-op; `true` is
-/// rejected as unsupported.
-fn check_ingest_temporary(value: OptionValue) -> Result<()> {
-    if bool_option(value, "option adbc.ingest.temporary")? {
-        Err(not_implemented(
-            "temporary ingest target tables: Spanner has no temporary tables",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-/// Validate the `adbc.statement.exec.incremental` option. Incremental `execute_partitions` is not
-/// implemented, so only the spec default (`false`, DISABLED, in any of the shared boolean
-/// spellings) is accepted — as a no-op; `true` is rejected as unsupported.
-fn check_exec_incremental(value: OptionValue) -> Result<()> {
-    if bool_option(value, "option adbc.statement.exec.incremental")? {
-        Err(not_implemented(
-            "incremental statement execution (adbc.statement.exec.incremental)",
-        ))
+/// Validate an option whose only supported value is the spec default `false` (in any of the shared
+/// boolean spellings), accepted as a no-op; `true` is rejected as unsupported. `what` names the
+/// option for the boolean coercion error, `unsupported` the feature `true` would ask for.
+///
+/// Shared by `adbc.ingest.temporary` (Spanner has no temporary tables) and
+/// `adbc.statement.exec.incremental` (incremental `execute_partitions` is not implemented), so the
+/// two validators cannot drift apart.
+fn check_unsupported_true(value: OptionValue, what: &str, unsupported: &str) -> Result<()> {
+    if bool_option(value, what)? {
+        Err(not_implemented(unsupported))
     } else {
         Ok(())
     }
@@ -2675,6 +2672,13 @@ mod tests {
 
     #[test]
     fn ingest_temporary_accepts_false_and_rejects_true() {
+        let check_ingest_temporary = |value| {
+            check_unsupported_true(
+                value,
+                "option adbc.ingest.temporary",
+                "temporary ingest target tables: Spanner has no temporary tables",
+            )
+        };
         // The spec default (`false`, as the exact string) is a no-op.
         check_ingest_temporary(OptionValue::String("false".into())).unwrap();
         // Spanner has no temporary tables: a truthy value is rejected as unimplemented.
@@ -2694,6 +2698,13 @@ mod tests {
 
     #[test]
     fn exec_incremental_accepts_false_and_rejects_true() {
+        let check_exec_incremental = |value| {
+            check_unsupported_true(
+                value,
+                "option adbc.statement.exec.incremental",
+                "incremental statement execution (adbc.statement.exec.incremental)",
+            )
+        };
         // The spec default (`false`, as the exact string) is a no-op.
         check_exec_incremental(OptionValue::String("false".into())).unwrap();
         // Incremental execution is not implemented: a truthy value is rejected as such.
