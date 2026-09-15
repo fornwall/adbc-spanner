@@ -83,6 +83,7 @@ pub(crate) fn not_found(message: impl Into<String>) -> Error {
 /// [`ArrowError`](arrow_schema::ArrowError), so the driver boxes its own [`Error`] inside
 /// `ArrowError::ExternalError` and the export layer walks back down to it to recover the ADBC
 /// status — which is what lets a cancelled read report `ECANCELED` rather than a generic errno.
+#[cfg(feature = "ffi")]
 pub(crate) fn chain<'a>(
     source: &'a (dyn std::error::Error + 'static),
 ) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
