@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use adbc_core::error::Status as AdbcStatus;
 use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, OptionValue};
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
-use adbc_spanner::{SpannerConnection, SpannerDriver};
+use adbc_spanner::{SpannerConnection, SpannerDriver, SpannerStatement};
 use arrow_array::cast::AsArray;
 use arrow_array::{Date32Array, Int64Array, RecordBatch, RecordBatchReader, StringArray};
 use arrow_schema::{ArrowError, DataType, Field, Schema};
@@ -199,6 +199,32 @@ impl Drop for Watchdog {
     fn drop(&mut self) {
         self.disarmed.store(true, Ordering::SeqCst);
     }
+}
+
+/// Arm a [`Watchdog`] for the enclosing test, naming it after that test's own function.
+///
+/// Every test in this file needs one, and spelling the function name out again in the call was
+/// both noise and a thing that could go stale (a renamed test kept aborting under the old name).
+/// The name is recovered from a nested marker function's `type_name`, which is a `&'static str`,
+/// so the [`Watchdog`] API is unchanged. The default limit is two minutes; pass a `Duration` for
+/// a test that legitimately needs longer.
+macro_rules! watchdog {
+    () => {
+        watchdog!(Duration::from_secs(120))
+    };
+    ($limit:expr) => {{
+        fn marker() {}
+        fn name_of<T>(_: T) -> &'static str {
+            std::any::type_name::<T>()
+        }
+        // `type_name` of a nested fn item is `<crate>::<enclosing fn>::marker`.
+        let path = name_of(marker);
+        let enclosing = path
+            .strip_suffix("::marker")
+            .and_then(|path| path.rsplit("::").next())
+            .unwrap_or(path);
+        Watchdog::arm($limit, enclosing)
+    }};
 }
 
 /// A TCP gate in front of a [`MockServer`], used to make the driver's **admin** (DDL) endpoint
@@ -469,6 +495,29 @@ fn ingest_batch(n: usize) -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(column)]).expect("build ingest batch")
 }
 
+/// A new statement set up as an `append` bulk ingest into `MockTable` — the
+/// `new_statement` + `adbc.ingest.target_table` + `adbc.ingest.mode` triple every ingest test here
+/// repeats.
+///
+/// `append` targets a (notionally) pre-existing table, so the driver builds no admin/DDL client —
+/// which is what lets these tests run against a mock that serves only data-plane RPCs.
+fn append_ingest_statement(connection: &mut SpannerConnection) -> SpannerStatement {
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String("MockTable".into()),
+        )
+        .expect("set target table");
+    statement
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String("append".into()),
+        )
+        .expect("set ingest mode append");
+    statement
+}
+
 /// Spanner's per-commit mutation-limit rejection: an `INVALID_ARGUMENT` carrying the stable "too
 /// many mutations" phrasing the driver's `is_mutation_limit_exceeded` keys off.
 fn too_many_mutations_status() -> tonic::Status {
@@ -522,6 +571,59 @@ fn batch_write_groups_ok(indexes: Vec<i32>) -> v1::BatchWriteResponse {
     }
 }
 
+/// Every `ExecuteBatchDmlRequest` a scripted mock server saw, in order — what [`serve_batch_dml`]
+/// records for the DML wire assertions.
+type BatchDmlRequests = Arc<Mutex<Vec<v1::ExecuteBatchDmlRequest>>>;
+
+/// Serve `ExecuteBatchDml` with the canned success nearly every DML test needs, recording each
+/// request into `record` for wire assertions.
+///
+/// The response is one `ResultSet` per statement in the batch, each reporting one affected row,
+/// under an `OK` batch status — and, when the batch begins its read/write transaction *inline*
+/// (the selector is `Begin`), the created transaction's id echoed back on the first result set's
+/// metadata. That echo is not decoration: the client refuses to continue without it, so a mock
+/// that omits it fails the commit with "Transaction ID was not returned by Spanner" rather than
+/// whatever the test meant to assert.
+fn serve_batch_dml(mock: &mut MockSpanner, record: BatchDmlRequests) {
+    mock.expect_execute_batch_dml().returning(move |request| {
+        let request = request.into_inner();
+        let inline_begin = matches!(
+            request
+                .transaction
+                .as_ref()
+                .and_then(|t| t.selector.as_ref()),
+            Some(v1::transaction_selector::Selector::Begin(_))
+        );
+        let statements = request.statements.len().max(1);
+        record.lock().unwrap().push(request);
+        let result_sets = (0..statements)
+            .map(|i| v1::ResultSet {
+                metadata: Some(v1::ResultSetMetadata {
+                    transaction: (i == 0 && inline_begin).then(|| v1::Transaction {
+                        id: b"dml-txn".to_vec(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                stats: Some(v1::ResultSetStats {
+                    row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .collect();
+        Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
+            result_sets,
+            status: Some(spanner_grpc_mock::google::rpc::Status {
+                code: 0,
+                message: "OK".into(),
+                details: vec![],
+            }),
+            ..Default::default()
+        }))
+    });
+}
+
 /// Serve `BeginTransaction` (the write-only ingest path begins a read/write transaction before each
 /// `Commit`), returning a fixed transaction id.
 fn serve_begin_transaction(mock: &mut MockSpanner) {
@@ -541,7 +643,7 @@ fn serve_begin_transaction(mock: &mut MockSpanner) {
 /// `ExecuteStreamingSql`, PartialResultSet → Arrow conversion) against the mock server.
 #[test]
 fn mock_server_round_trips_a_query() {
-    let _watchdog = Watchdog::arm(Duration::from_secs(120), "mock_server_round_trips_a_query");
+    let _watchdog = watchdog!();
 
     let seen_sql: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let record_sql = seen_sql.clone();
@@ -596,10 +698,7 @@ fn mock_server_round_trips_a_query() {
 /// (no RPC) and the guarded query never reaches the wire.
 #[test]
 fn query_while_dml_buffered_in_manual_txn_is_rejected() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "query_while_dml_buffered_in_manual_txn_is_rejected",
-    );
+    let _watchdog = watchdog!();
 
     let server = MockServer::start(move |mock| {
         // Served for every *allowed* query — including the manual-mode ones, which begin the
@@ -700,10 +799,7 @@ fn query_while_dml_buffered_in_manual_txn_is_rejected() {
 /// always runs immediately through the admin API, which this data-plane mock does not serve.)
 #[test]
 fn manual_transaction_queries_share_one_read_only_transaction() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "manual_transaction_queries_share_one_read_only_transaction",
-    );
+    let _watchdog = watchdog!();
 
     let selectors: Arc<Mutex<Vec<Option<v1::TransactionSelector>>>> =
         Arc::new(Mutex::new(Vec::new()));
@@ -812,10 +908,7 @@ fn manual_transaction_queries_share_one_read_only_transaction() {
 /// attached), drained and discarded the same way.
 #[test]
 fn execute_update_routes_a_query_to_the_read_only_path() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "execute_update_routes_a_query_to_the_read_only_path",
-    );
+    let _watchdog = watchdog!();
 
     // Record every ExecuteStreamingSql request (SQL + params) the mock receives.
     type SeenQuery = (String, Vec<String>);
@@ -892,10 +985,7 @@ fn execute_update_routes_a_query_to_the_read_only_path() {
 /// re-applies stale rows to a later, unrelated execution.
 #[test]
 fn execute_partitions_rejects_multiple_bound_rows_and_consumes_them() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "execute_partitions_rejects_multiple_bound_rows_and_consumes_them",
-    );
+    let _watchdog = watchdog!();
 
     // Nothing is scripted: any RPC would hit the UNIMPLEMENTED catch-alls and fail with a
     // different status/message, so the InvalidArguments asserted below proves the rejection
@@ -945,10 +1035,7 @@ fn execute_partitions_rejects_multiple_bound_rows_and_consumes_them() {
 /// column is named `c`).
 #[test]
 fn failed_bound_query_still_consumes_bound_rows() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "failed_bound_query_still_consumes_bound_rows",
-    );
+    let _watchdog = watchdog!();
 
     let server = MockServer::start(|mock| {
         mock.expect_execute_streaming_sql().returning(|_| {
@@ -1012,10 +1099,7 @@ fn failed_bound_query_still_consumes_bound_rows() {
 /// needs no commit RPC.)
 #[test]
 fn execute_update_query_in_manual_mode_buffers_nothing() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "execute_update_query_in_manual_mode_buffers_nothing",
-    );
+    let _watchdog = watchdog!();
 
     let server = MockServer::start(move |mock| {
         // Served for the immediate read-only queries (the manual-mode one begins the shared
@@ -1090,7 +1174,8 @@ fn execute_update_query_in_manual_mode_buffers_nothing() {
 }
 
 /// (a) `ABORTED` (with a `google.rpc.RetryInfo` detail) on `ExecuteStreamingSql` surfaces as a
-/// clean ADBC error with the numeric gRPC code preserved in `vendor_code` (ABORTED = 10).
+/// clean ADBC error: the numeric gRPC code preserved in `vendor_code` (ABORTED = 10), the server's
+/// message kept, and the `RetryInfo` detail forwarded into `Error::details`.
 ///
 /// `ExecuteStreamingSql` is the right RPC to fault: an `ABORTED` *commit* is retried by the
 /// client's transaction runner by design (Spanner's abort-and-replay protocol), so it would
@@ -1098,11 +1183,25 @@ fn execute_update_query_in_manual_mode_buffers_nothing() {
 /// hand the caller the error, and the caller's own retry logic needs `vendor_code` 10 to
 /// recognise it (see `from_spanner` in `src/error.rs`).
 ///
-/// The mock attaches the `RetryInfo` detail Spanner really sends; that the detail itself reaches
-/// `Error::details` is asserted by [`aborted_retry_info_detail_reaches_adbc_error_details`].
+/// The detail half is what the `from_spanner` unit tests in `src/error.rs` cannot reach: they
+/// construct gax errors directly, so the gRPC `grpc-status-details-bin` trailer, the client's
+/// `google.rpc.Status` decode and `details_for_adbc`'s mapping are only exercised here, over a real
+/// wire. The assertion pins the exact contract `from_spanner` documents: key = the lowercased
+/// fully-qualified proto type name (`google.rpc.retryinfo`), value = the detail's ProtoJSON, whose
+/// `retryDelay` round-trips the 50 ms the mock sent (`0.05s`).
+///
+/// **Fidelity note.** This drives the driver's public `adbc_core` traits (`Connection` /
+/// `Statement`), *not* the C-ABI FFI — that is simply as far as this harness reaches. The detail is
+/// retrievable across the C boundary too: the ADBC C detail transport re-reads
+/// `ErrorGetDetail`/`ErrorGetDetailCount` only when `vendor_code ==
+/// ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA` (`i32::MIN`), and the driver's own export layer
+/// (`src/ffi/error.rs`) always stamps that sentinel on the 1.1.0 layout. What it costs there is the
+/// numeric gRPC code the sentinel displaces (`ABORTED` = 10), which that layer hands back as one
+/// further detail keyed `adbc.spanner.vendor_code` — covered by the unit tests in
+/// `src/ffi/error/tests.rs`.
 #[test]
-fn aborted_surfaces_vendor_code_10() {
-    let _watchdog = Watchdog::arm(Duration::from_secs(120), "aborted_surfaces_vendor_code_10");
+fn aborted_surfaces_vendor_code_and_retry_info_detail() {
+    let _watchdog = watchdog!();
 
     let server = MockServer::start(|mock| {
         mock.expect_execute_streaming_sql().returning(|_| {
@@ -1131,50 +1230,6 @@ fn aborted_surfaces_vendor_code_10() {
         "the server's status message must survive into the ADBC error, got: {}",
         error.message
     );
-}
-
-/// (a′) The companion to [`aborted_surfaces_vendor_code_10`]: the `google.rpc.RetryInfo` detail the
-/// mock attaches to its `ABORTED` status must survive **the whole real driver stack** — the gRPC
-/// `grpc-status-details-bin` trailer, the client's `google.rpc.Status` decode, and `from_spanner`'s
-/// `details_for_adbc` mapping — and land on the surfaced [`adbc_core::error::Error::details`]. This
-/// is the end-to-end complement to the `from_spanner` unit tests in `src/error.rs`, which construct
-/// gax errors directly and so never exercise the wire decode.
-///
-/// The assertion pins the exact contract `from_spanner` documents: key = the lowercased
-/// fully-qualified proto type name (`google.rpc.retryinfo`), value = the detail's ProtoJSON, whose
-/// `retryDelay` round-trips the 50 ms the mock sent (`0.05s`).
-///
-/// **Fidelity note.** This drives the driver's public `adbc_core` traits (`Connection` /
-/// `Statement`), *not* the C-ABI FFI — that is simply as far as this harness reaches. The detail is
-/// retrievable across the C boundary too: the ADBC C detail transport re-reads
-/// `ErrorGetDetail`/`ErrorGetDetailCount` only when `vendor_code ==
-/// ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA` (`i32::MIN`), and the driver's own export layer
-/// (`src/ffi/error.rs`) always stamps that sentinel on the 1.1.0 layout. What it costs there is the
-/// numeric gRPC code the sentinel displaces (`ABORTED` = 10), which that layer hands back as one
-/// further detail keyed `adbc.spanner.vendor_code` — covered by the unit tests in
-/// `src/ffi/error/tests.rs`.
-#[test]
-fn aborted_retry_info_detail_reaches_adbc_error_details() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "aborted_retry_info_detail_reaches_adbc_error_details",
-    );
-
-    let server = MockServer::start(|mock| {
-        mock.expect_execute_streaming_sql().returning(|_| {
-            Err(aborted_with_retry_info(
-                "Transaction was aborted by the mock server",
-            ))
-        });
-    });
-
-    let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
-    let error = statement
-        .execute()
-        .err()
-        .expect("an ABORTED query must fail, not hang or succeed");
 
     // The RetryInfo the mock attached must be forwarded into ADBC's structured error details.
     let details = error.details.as_ref().expect(
@@ -1214,10 +1269,7 @@ fn aborted_retry_info_detail_reaches_adbc_error_details() {
 /// survives in `vendor_code`, and the status is `Unauthorized`.
 #[test]
 fn permission_denied_surfaces_iam_guidance() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "permission_denied_surfaces_iam_guidance",
-    );
+    let _watchdog = watchdog!();
 
     let server = MockServer::start(|mock| {
         mock.expect_execute_streaming_sql().returning(|_| {
@@ -1277,10 +1329,7 @@ fn permission_denied_surfaces_iam_guidance() {
 /// hang (watchdog-enforced), message and code intact.
 #[test]
 fn unavailable_mid_stream_surfaces_a_clean_error() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "unavailable_mid_stream_surfaces_a_clean_error",
-    );
+    let _watchdog = watchdog!();
 
     let calls = Arc::new(AtomicUsize::new(0));
     let resume_tokens: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1356,10 +1405,7 @@ fn unavailable_mid_stream_surfaces_a_clean_error() {
 /// tests/resilience.rs).
 #[test]
 fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "cancel_unblocks_a_reader_hung_on_a_silent_stream",
-    );
+    let _watchdog = watchdog!();
 
     // Keep every scripted stream's sender alive so the streams never end and never error: from
     // the client's side the server has simply gone silent mid-result.
@@ -1449,10 +1495,7 @@ fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
 /// not `Timeout` (the `Watchdog` is only a backstop for a genuine hang).
 #[test]
 fn ddl_update_timeout_fires_on_a_silent_admin_endpoint() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "ddl_update_timeout_fires_on_a_silent_admin_endpoint",
-    );
+    let _watchdog = watchdog!();
     // No RPC is scripted: the DDL path never touches the data plane, and `CreateSession` (served
     // by the harness) is the only thing that must get through before the gate closes.
     let server = MockServer::start(|_mock| {});
@@ -1563,10 +1606,7 @@ fn silent_stream_reader(
 /// side: the same silent stream, with the option unset, produces nothing at all in the same window.
 #[test]
 fn fetch_timeout_fires_on_a_silent_stream() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "fetch_timeout_fires_on_a_silent_stream",
-    );
+    let _watchdog = watchdog!();
 
     let (server, _open_streams) = silent_stream_server(1);
     let mut connection = server.connect();
@@ -1633,10 +1673,7 @@ fn fetch_timeout_fires_on_a_silent_stream() {
 /// the test binary from exiting; the [`Watchdog`] is the backstop if anything else hangs.
 #[test]
 fn silent_stream_without_the_fetch_deadline_never_times_out() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "silent_stream_without_the_fetch_deadline_never_times_out",
-    );
+    let _watchdog = watchdog!();
 
     let (server, _open_streams) = silent_stream_server(1);
     let mut connection = server.connect();
@@ -1676,10 +1713,7 @@ fn silent_stream_without_the_fetch_deadline_never_times_out() {
 /// nothing else in the stack turns this silence into an error on its own.
 #[test]
 fn query_timeout_fires_on_a_stream_that_is_silent_from_the_start() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "query_timeout_fires_on_a_stream_that_is_silent_from_the_start",
-    );
+    let _watchdog = watchdog!();
 
     let (server, _open_streams) = silent_stream_server(0);
     let mut connection = server.connect();
@@ -1731,10 +1765,7 @@ fn query_timeout_fires_on_a_stream_that_is_silent_from_the_start() {
 /// `Status::Cancelled`, while the new operation (on a fresh signal) runs to completion.
 #[test]
 fn new_operation_does_not_uncancel_an_earlier_streamed_reader() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "new_operation_does_not_uncancel_an_earlier_streamed_reader",
-    );
+    let _watchdog = watchdog!();
 
     // Every query gets the same complete three-row stream; with one row per batch the first
     // reader has fetches outstanding when the cancel lands (the prefetch buffers row 2 and is
@@ -1815,10 +1846,7 @@ fn new_operation_does_not_uncancel_an_earlier_streamed_reader() {
 /// more than one `Commit` (the retries with smaller batches).
 #[test]
 fn ingest_bisects_a_chunk_that_overshoots_the_mutation_limit() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "ingest_bisects_a_chunk_that_overshoots_the_mutation_limit",
-    );
+    let _watchdog = watchdog!();
 
     // Every scripted commit records the mutation count it saw and fails-big / succeeds-small on it,
     // so the outcome is decided by chunk *size*, not call order — deterministic under the bisect.
@@ -1838,21 +1866,7 @@ fn ingest_bisects_a_chunk_that_overshoots_the_mutation_limit() {
     });
 
     let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    // `append` mode inserts into a pre-existing table, so no admin/DDL client is built (the mock
-    // serves only data-plane RPCs).
-    statement
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("MockTable".into()),
-        )
-        .expect("set target table");
-    statement
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .expect("set ingest mode append");
+    let mut statement = append_ingest_statement(&mut connection);
     statement.bind(ingest_batch(100)).expect("bind ingest data");
 
     let count = statement
@@ -1891,10 +1905,7 @@ fn ingest_bisects_a_chunk_that_overshoots_the_mutation_limit() {
 /// specific "too many mutations" error triggers a retry.
 #[test]
 fn ingest_does_not_bisect_a_non_mutation_limit_error() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "ingest_does_not_bisect_a_non_mutation_limit_error",
-    );
+    let _watchdog = watchdog!();
 
     let commits = Arc::new(AtomicUsize::new(0));
     let commits_in_mock = commits.clone();
@@ -1909,19 +1920,7 @@ fn ingest_does_not_bisect_a_non_mutation_limit_error() {
     });
 
     let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("MockTable".into()),
-        )
-        .expect("set target table");
-    statement
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .expect("set ingest mode append");
+    let mut statement = append_ingest_statement(&mut connection);
     statement.bind(ingest_batch(100)).expect("bind ingest data");
 
     let error = statement
@@ -1957,10 +1956,7 @@ fn ingest_does_not_bisect_a_non_mutation_limit_error() {
 /// conversion error.
 #[test]
 fn mutation_build_failure_on_a_later_chunk_notes_committed_rows() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "mutation_build_failure_on_a_later_chunk_notes_committed_rows",
-    );
+    let _watchdog = watchdog!();
 
     let commits = Arc::new(AtomicUsize::new(0));
     let commits_in_mock = commits.clone();
@@ -1987,19 +1983,7 @@ fn mutation_build_failure_on_a_later_chunk_notes_committed_rows() {
         .expect("build ingest batch");
 
     let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("MockTable".into()),
-        )
-        .expect("set target table");
-    statement
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .expect("set ingest mode append");
+    let mut statement = append_ingest_statement(&mut connection);
     statement.bind(batch).expect("bind ingest data");
 
     let error = statement
@@ -2033,10 +2017,7 @@ fn mutation_build_failure_on_a_later_chunk_notes_committed_rows() {
 /// intact for the assertion.
 #[test]
 fn cancelled_ingest_commit_reports_ambiguous_outcome() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "cancelled_ingest_commit_reports_ambiguous_outcome",
-    );
+    let _watchdog = watchdog!();
 
     let commits = Arc::new(AtomicUsize::new(0));
     let commits_in_mock = commits.clone();
@@ -2049,19 +2030,7 @@ fn cancelled_ingest_commit_reports_ambiguous_outcome() {
     });
 
     let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("MockTable".into()),
-        )
-        .expect("set target table");
-    statement
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .expect("set ingest mode append");
+    let mut statement = append_ingest_statement(&mut connection);
     // One row ⇒ a single, first chunk: nothing committed before it, so a naive annotation would say
     // "0 rows already committed" — the ambiguity note is the only correct thing to report.
     statement.bind(ingest_batch(1)).expect("bind ingest data");
@@ -2099,10 +2068,7 @@ fn cancelled_ingest_commit_reports_ambiguous_outcome() {
 /// remap never probed at all.
 #[test]
 fn ingest_append_keeps_the_original_error_when_the_exists_probe_fails() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "ingest_append_keeps_the_original_error_when_the_exists_probe_fails",
-    );
+    let _watchdog = watchdog!();
 
     let probes = Arc::new(AtomicUsize::new(0));
     let probes_in_mock = probes.clone();
@@ -2125,19 +2091,7 @@ fn ingest_append_keeps_the_original_error_when_the_exists_probe_fails() {
     });
 
     let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("MockTable".into()),
-        )
-        .expect("set target table");
-    statement
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .expect("set ingest mode append");
+    let mut statement = append_ingest_statement(&mut connection);
     statement.bind(ingest_batch(1)).expect("bind ingest data");
 
     let error = statement
@@ -2189,10 +2143,7 @@ fn ingest_append_keeps_the_original_error_when_the_exists_probe_fails() {
 /// (which build the details directly) cannot.
 #[test]
 fn batch_write_group_failure_forwards_status_details() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "batch_write_group_failure_forwards_status_details",
-    );
+    let _watchdog = watchdog!();
 
     let batch_writes = Arc::new(AtomicUsize::new(0));
     let writes_in_mock = batch_writes.clone();
@@ -2208,21 +2159,8 @@ fn batch_write_group_failure_forwards_status_details() {
     });
 
     let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("MockTable".into()),
-        )
-        .expect("set target table");
-    // `append` into a pre-existing table: no DDL, so no admin client is built (the mock serves only
-    // data-plane RPCs). The AlreadyExists remap keeps the status and just names the table.
-    statement
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .expect("set ingest mode append");
+    // The AlreadyExists remap keeps the status and just names the table.
+    let mut statement = append_ingest_statement(&mut connection);
     statement
         .set_option(
             OptionStatement::Other(adbc_spanner::OPTION_INGEST_BATCH_WRITE.into()),
@@ -2296,10 +2234,7 @@ fn batch_write_group_failure_forwards_status_details() {
 /// single chunk; before the fix `applied` was discarded and the count would be zero (no annotation).
 #[test]
 fn batch_write_folds_same_chunk_applied_rows_into_committed_count() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "batch_write_folds_same_chunk_applied_rows_into_committed_count",
-    );
+    let _watchdog = watchdog!();
 
     let server = MockServer::start(move |mock| {
         mock.expect_batch_write().returning(move |_| {
@@ -2314,19 +2249,7 @@ fn batch_write_folds_same_chunk_applied_rows_into_committed_count() {
     });
 
     let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("MockTable".into()),
-        )
-        .expect("set target table");
-    statement
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .expect("set ingest mode append");
+    let mut statement = append_ingest_statement(&mut connection);
     statement
         .set_option(
             OptionStatement::Other(adbc_spanner::OPTION_INGEST_BATCH_WRITE.into()),
@@ -2382,10 +2305,7 @@ fn batch_write_folds_same_chunk_applied_rows_into_committed_count() {
 /// folded in.)
 #[test]
 fn manual_ingest_conversion_failure_leaves_txn_buffer_untouched() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "manual_ingest_conversion_failure_leaves_txn_buffer_untouched",
-    );
+    let _watchdog = watchdog!();
 
     let commit_sizes: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
     let sizes_in_mock = commit_sizes.clone();
@@ -2414,19 +2334,7 @@ fn manual_ingest_conversion_failure_leaves_txn_buffer_untouched() {
         )
         .expect("enter manual transaction mode");
 
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("MockTable".into()),
-        )
-        .expect("set target table");
-    statement
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .expect("set ingest mode append");
+    let mut statement = append_ingest_statement(&mut connection);
 
     let date_schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, false)]));
     // Row 0 converts fine (1970-01-01); row 1 is out of Spanner's DATE range, so the conversion
@@ -2510,10 +2418,7 @@ fn manual_ingest_conversion_failure_leaves_txn_buffer_untouched() {
 /// [`max_commit_delay_reaches_the_wire_on_runner_commits`].
 #[test]
 fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "commit_stats_mutation_count_is_captured_from_the_commit_response",
-    );
+    let _watchdog = watchdog!();
 
     // A value the driver cannot infer from the two ingested rows — it must come from the server.
     const SCRIPTED_MUTATION_COUNT: i64 = 4242;
@@ -2545,21 +2450,8 @@ fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
     });
 
     let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("MockTable".into()),
-        )
-        .expect("set target table");
-    // `append` into a (notionally) pre-existing table: a pure write-only commit, no DDL and no
-    // table_exists probe on the success path.
-    statement
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .expect("set append ingest mode");
+    // A pure write-only commit: no table_exists probe on the success path.
+    let mut statement = append_ingest_statement(&mut connection);
     // Request commit stats: this is what makes the driver call `set_return_commit_stats(true)` and
     // capture the returned mutation count.
     statement
@@ -2639,10 +2531,7 @@ fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
 ///    *connection's* 100ms (the statement's override does not leak into it).
 #[test]
 fn max_commit_delay_reaches_the_wire_on_runner_commits() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "max_commit_delay_reaches_the_wire_on_runner_commits",
-    );
+    let _watchdog = watchdog!();
 
     const DML_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
 
@@ -2660,40 +2549,9 @@ fn max_commit_delay_reaches_the_wire_on_runner_commits() {
     let server = MockServer::start(move |mock| {
         // In case the client begins the read/write transaction explicitly rather than inline.
         serve_begin_transaction(mock);
-        // Autocommit DML and the manual commit both replay through ExecuteBatchDml; echo a
-        // transaction id back when the batch begins the transaction inline.
-        mock.expect_execute_batch_dml().returning(move |request| {
-            let request = request.into_inner();
-            let inline_begin = matches!(
-                request
-                    .transaction
-                    .as_ref()
-                    .and_then(|t| t.selector.as_ref()),
-                Some(v1::transaction_selector::Selector::Begin(_))
-            );
-            Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
-                result_sets: vec![v1::ResultSet {
-                    metadata: Some(v1::ResultSetMetadata {
-                        transaction: inline_begin.then(|| v1::Transaction {
-                            id: b"dml-txn".to_vec(),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    stats: Some(v1::ResultSetStats {
-                        row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }],
-                status: Some(spanner_grpc_mock::google::rpc::Status {
-                    code: 0,
-                    message: "OK".into(),
-                    details: vec![],
-                }),
-                ..Default::default()
-            }))
-        });
+        // Autocommit DML and the manual commit both replay through ExecuteBatchDml; the requests
+        // themselves are not asserted on here (only the commits are), so they go unrecorded.
+        serve_batch_dml(mock, BatchDmlRequests::default());
         mock.expect_commit().returning(move |request| {
             record.lock().unwrap().push(request.into_inner());
             commit_ok()
@@ -2803,10 +2661,7 @@ fn isolation_level_reaches_transaction_options_on_the_begin() {
     use adbc_core::constants::*;
     use v1::transaction_options::IsolationLevel;
 
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "isolation_level_reaches_transaction_options_on_the_begin",
-    );
+    let _watchdog = watchdog!();
 
     const DML_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
 
@@ -2816,39 +2671,7 @@ fn isolation_level_reaches_transaction_options_on_the_begin() {
     let server = MockServer::start(move |mock| {
         // In case the client begins the read/write transaction explicitly rather than inline.
         serve_begin_transaction(mock);
-        mock.expect_execute_batch_dml().returning(move |request| {
-            let request = request.into_inner();
-            let inline_begin = matches!(
-                request
-                    .transaction
-                    .as_ref()
-                    .and_then(|t| t.selector.as_ref()),
-                Some(v1::transaction_selector::Selector::Begin(_))
-            );
-            record.lock().unwrap().push(request);
-            Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
-                result_sets: vec![v1::ResultSet {
-                    metadata: Some(v1::ResultSetMetadata {
-                        transaction: inline_begin.then(|| v1::Transaction {
-                            id: b"dml-txn".to_vec(),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    stats: Some(v1::ResultSetStats {
-                        row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }],
-                status: Some(spanner_grpc_mock::google::rpc::Status {
-                    code: 0,
-                    message: "OK".into(),
-                    details: vec![],
-                }),
-                ..Default::default()
-            }))
-        });
+        serve_batch_dml(mock, record.clone());
         mock.expect_commit().returning(|_| commit_ok());
     });
 
@@ -2944,17 +2767,14 @@ fn isolation_level_reaches_transaction_options_on_the_begin() {
 ///    is inline, the `BeginTransaction` count must still be the one the write-only path issued.
 #[test]
 fn mutations_only_manual_commit_uses_the_write_only_path() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "mutations_only_manual_commit_uses_the_write_only_path",
-    );
+    let _watchdog = watchdog!();
 
     let begins: Arc<Mutex<Vec<v1::BeginTransactionRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let commits: Arc<Mutex<Vec<v1::CommitRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    let batch_dml_count = Arc::new(AtomicUsize::new(0));
+    let batch_dml: BatchDmlRequests = Arc::new(Mutex::new(Vec::new()));
     let record_begins = begins.clone();
     let record_commits = commits.clone();
-    let record_batch_dml = batch_dml_count.clone();
+    let record_batch_dml = batch_dml.clone();
     let server = MockServer::start(move |mock| {
         // The write-only path (and a runner electing an explicit begin) starts here; record the
         // request — the write-only begin is recognizable by its `mutation_key`.
@@ -2966,39 +2786,7 @@ fn mutations_only_manual_commit_uses_the_write_only_path() {
             }))
         });
         // The read/write runner's DML batch; echo a transaction id when it inline-begins.
-        mock.expect_execute_batch_dml().returning(move |request| {
-            let request = request.into_inner();
-            record_batch_dml.fetch_add(1, Ordering::SeqCst);
-            let inline_begin = matches!(
-                request
-                    .transaction
-                    .as_ref()
-                    .and_then(|t| t.selector.as_ref()),
-                Some(v1::transaction_selector::Selector::Begin(_))
-            );
-            Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
-                result_sets: vec![v1::ResultSet {
-                    metadata: Some(v1::ResultSetMetadata {
-                        transaction: inline_begin.then(|| v1::Transaction {
-                            id: b"dml-txn".to_vec(),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    stats: Some(v1::ResultSetStats {
-                        row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }],
-                status: Some(spanner_grpc_mock::google::rpc::Status {
-                    code: 0,
-                    message: "OK".into(),
-                    details: vec![],
-                }),
-                ..Default::default()
-            }))
-        });
+        serve_batch_dml(mock, record_batch_dml.clone());
         mock.expect_commit().returning(move |request| {
             record_commits.lock().unwrap().push(request.into_inner());
             commit_ok()
@@ -3013,19 +2801,7 @@ fn mutations_only_manual_commit_uses_the_write_only_path() {
         )
         .expect("enter manual transaction mode");
 
-    let mut ingest = connection.new_statement().expect("new statement");
-    ingest
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("MockTable".into()),
-        )
-        .expect("set target table");
-    ingest
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .expect("set ingest mode append");
+    let mut ingest = append_ingest_statement(&mut connection);
 
     // 1. Mutations-only: buffer a two-row ingest (`None` — manual mode buffers) and commit.
     ingest.bind(ingest_batch(2)).expect("bind ingest rows");
@@ -3052,7 +2828,7 @@ fn mutations_only_manual_commit_uses_the_write_only_path() {
         );
     }
     assert_eq!(
-        batch_dml_count.load(Ordering::SeqCst),
+        batch_dml.lock().unwrap().len(),
         0,
         "a mutations-only commit must not issue ExecuteBatchDml"
     );
@@ -3092,7 +2868,7 @@ fn mutations_only_manual_commit_uses_the_write_only_path() {
     connection.commit().expect("commit the DML transaction");
 
     assert_eq!(
-        batch_dml_count.load(Ordering::SeqCst),
+        batch_dml.lock().unwrap().len(),
         1,
         "a commit with buffered DML must run it via ExecuteBatchDml (the read/write runner)"
     );
@@ -3132,12 +2908,9 @@ fn mutations_only_manual_commit_uses_the_write_only_path() {
 /// connection still commits a query transaction (which writes nothing) and still runs queries.
 #[test]
 fn read_only_connection_rejects_the_commit_of_buffered_dml() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "read_only_connection_rejects_the_commit_of_buffered_dml",
-    );
+    let _watchdog = watchdog!();
 
-    let batch_dml: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let batch_dml: BatchDmlRequests = Arc::new(Mutex::new(Vec::new()));
     let commits = Arc::new(AtomicUsize::new(0));
     let record_batch_dml = batch_dml.clone();
     let count_commits = commits.clone();
@@ -3146,51 +2919,23 @@ fn read_only_connection_rejects_the_commit_of_buffered_dml() {
         // its shared multi-use read-only transaction).
         serve_streaming_sql_begin_aware(mock, &["v0"], None);
         serve_begin_transaction(mock);
-        mock.expect_execute_batch_dml().returning(move |request| {
-            let request = request.into_inner();
-            // The runner begins its read/write transaction inline with the batch; the client needs
-            // the created transaction's id echoed back in the first result set's metadata.
-            let inline_begin = matches!(
-                request
-                    .transaction
-                    .as_ref()
-                    .and_then(|t| t.selector.as_ref()),
-                Some(v1::transaction_selector::Selector::Begin(_))
-            );
-            record_batch_dml.lock().unwrap().extend(
-                request
-                    .statements
-                    .into_iter()
-                    .map(|statement| statement.sql),
-            );
-            Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
-                result_sets: vec![v1::ResultSet {
-                    metadata: Some(v1::ResultSetMetadata {
-                        transaction: inline_begin.then(|| v1::Transaction {
-                            id: b"dml-txn".to_vec(),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    stats: Some(v1::ResultSetStats {
-                        row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }],
-                status: Some(spanner_grpc_mock::google::rpc::Status {
-                    code: 0,
-                    message: "OK".into(),
-                    details: vec![],
-                }),
-                ..Default::default()
-            }))
-        });
+        serve_batch_dml(mock, record_batch_dml.clone());
         mock.expect_commit().returning(move |_| {
             count_commits.fetch_add(1, Ordering::SeqCst);
             commit_ok()
         });
     });
+
+    // Every DML statement that actually reached the wire, in order — the whole point of this test
+    // is which of them did.
+    let dml_sqls = || {
+        batch_dml
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|request| request.statements.iter().map(|s| s.sql.clone()))
+            .collect::<Vec<_>>()
+    };
 
     let mut connection = server.connect();
     connection
@@ -3248,9 +2993,9 @@ fn read_only_connection_rejects_the_commit_of_buffered_dml() {
     );
 
     assert!(
-        batch_dml.lock().unwrap().is_empty(),
+        dml_sqls().is_empty(),
         "no DML may reach the wire while the connection is read-only: {:?}",
-        batch_dml.lock().unwrap()
+        dml_sqls()
     );
     assert_eq!(
         commits.load(Ordering::SeqCst),
@@ -3264,7 +3009,7 @@ fn read_only_connection_rejects_the_commit_of_buffered_dml() {
         .commit()
         .expect("a writable connection commits the still-buffered DML");
     assert_eq!(
-        *batch_dml.lock().unwrap(),
+        dml_sqls(),
         ["UPDATE MockTable SET c = 'x' WHERE TRUE"],
         "the commit must replay exactly the DML buffered before the flag was set"
     );
@@ -3294,7 +3039,7 @@ fn read_only_connection_rejects_the_commit_of_buffered_dml() {
         .expect("committing a query transaction writes nothing, so read-only must allow it");
 
     assert_eq!(
-        *batch_dml.lock().unwrap(),
+        dml_sqls(),
         ["UPDATE MockTable SET c = 'x' WHERE TRUE"],
         "the rolled-back DML must never reach the wire"
     );
@@ -3355,10 +3100,7 @@ fn read_only_bound(
 fn read_staleness_reaches_the_wire_on_single_use_queries() {
     use v1::transaction_options::read_only::TimestampBound as WireBound;
 
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "read_staleness_reaches_the_wire_on_single_use_queries",
-    );
+    let _watchdog = watchdog!();
 
     // The transaction selector of every ExecuteStreamingSql request the server sees, in order.
     let selectors: Arc<Mutex<Vec<Option<v1::TransactionSelector>>>> =
@@ -3451,65 +3193,29 @@ fn read_staleness_reaches_the_wire_on_single_use_queries() {
     );
 }
 
-/// TEST-1 (wire, SPAN-4): the `execute_schema` PLAN probe must carry `spanner.read.staleness` on
-/// its single-use read-only transaction, just as `execute` does. Without the fix the probe ran a
-/// strong read (no timestamp bound), which `single_use_read_only_bound` rejects — so this is
-/// non-vacuous.
+/// TEST-1 (wire, SPAN-4): the driver's two *metadata* read paths must carry
+/// `spanner.read.staleness` just as `execute` does — asserted over one mock script, because the two
+/// need exactly the same one (a begin-aware `ExecuteStreamingSql` recording every transaction
+/// selector).
+///
+/// 1. `execute_schema`'s PLAN probe runs single-use, so the bound rides its `single_use` selector.
+/// 2. `get_objects`' metadata snapshot runs on a shared multi-use read-only transaction (pinned via
+///    `multi_use_timestamp_bound`) that the client begins *inline*, so the bound rides the first
+///    request's `transaction.begin` selector instead.
+///
+/// Neither is vacuous: before the fix both ran a strong read, i.e. read-only options with **no**
+/// timestamp bound at all, which is what `single_use_read_only_bound` / `read_only_bound` panic on.
 #[test]
-fn read_staleness_reaches_the_wire_on_execute_schema() {
-    use v1::transaction_options::read_only::TimestampBound as WireBound;
-
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "read_staleness_reaches_the_wire_on_execute_schema",
-    );
-
-    let selectors: Arc<Mutex<Vec<Option<v1::TransactionSelector>>>> =
-        Arc::new(Mutex::new(Vec::new()));
-    let server = MockServer::start({
-        let record = selectors.clone();
-        move |mock| serve_streaming_sql_begin_aware(mock, &["v1"], Some(record.clone()))
-    });
-
-    let mut connection = server.connect();
-    connection
-        .set_option(
-            OptionConnection::Other(adbc_spanner::OPTION_READ_STALENESS.into()),
-            OptionValue::String("exact:10s".into()),
-        )
-        .expect("set connection-level staleness");
-
-    let mut statement = connection.new_statement().expect("new statement");
-    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
-    statement.execute_schema().expect("execute_schema probe");
-
-    let selectors = selectors.lock().unwrap();
-    assert_eq!(selectors.len(), 1, "one PLAN probe request");
-    assert_eq!(
-        single_use_read_only_bound(selectors[0].as_ref()),
-        WireBound::ExactStaleness(prost_types::Duration {
-            seconds: 10,
-            nanos: 0,
-        }),
-        "the execute_schema PLAN probe must carry the connection's exact:10s staleness"
-    );
-}
-
-/// TEST-1 (wire, SPAN-4): the `get_objects` metadata snapshot must carry `spanner.read.staleness`
-/// on its shared multi-use read-only transaction (pinned via `multi_use_timestamp_bound`), which
-/// the client begins inline — so the first request's `transaction.begin` selector carries the
-/// bound. Without the fix it began a strong read (no timestamp bound), which `read_only_bound`
-/// rejects — so this is non-vacuous.
-#[test]
-fn read_staleness_reaches_the_wire_on_get_objects() {
+fn read_staleness_reaches_the_wire_on_metadata_reads() {
     use adbc_core::options::ObjectDepth;
     use v1::transaction_options::read_only::TimestampBound as WireBound;
 
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "read_staleness_reaches_the_wire_on_get_objects",
-    );
+    let _watchdog = watchdog!();
 
+    let expected = WireBound::ExactStaleness(prost_types::Duration {
+        seconds: 10,
+        nanos: 0,
+    });
     let selectors: Arc<Mutex<Vec<Option<v1::TransactionSelector>>>> =
         Arc::new(Mutex::new(Vec::new()));
     let server = MockServer::start({
@@ -3525,30 +3231,43 @@ fn read_staleness_reaches_the_wire_on_get_objects() {
         )
         .expect("set connection-level staleness");
 
-    // Schemas depth fires exactly the SCHEMATA query, which begins the shared read-only transaction.
+    // 1. The execute_schema PLAN probe: exactly one request, single-use.
+    let mut statement = connection.new_statement().expect("new statement");
+    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+    statement.execute_schema().expect("execute_schema probe");
+    {
+        let selectors = selectors.lock().unwrap();
+        assert_eq!(selectors.len(), 1, "one PLAN probe request");
+        assert_eq!(
+            single_use_read_only_bound(selectors[0].as_ref()),
+            expected,
+            "the execute_schema PLAN probe must carry the connection's exact:10s staleness"
+        );
+    }
+
+    // 2. get_objects: Schemas depth fires exactly the SCHEMATA query, which begins the shared
+    //    read-only transaction inline.
     let reader = connection
         .get_objects(ObjectDepth::Schemas, None, None, None, None, None)
         .expect("get_objects");
     reader
         .collect::<Result<Vec<_>, _>>()
         .expect("drain get_objects");
-
-    let selectors = selectors.lock().unwrap();
-    let begin = selectors
-        .iter()
-        .find_map(|s| match s.as_ref().and_then(|s| s.selector.as_ref()) {
-            Some(v1::transaction_selector::Selector::Begin(options)) => Some(options),
-            _ => None,
-        })
-        .expect("get_objects must begin its read-only transaction inline");
-    assert_eq!(
-        read_only_bound(begin),
-        WireBound::ExactStaleness(prost_types::Duration {
-            seconds: 10,
-            nanos: 0,
-        }),
-        "the get_objects snapshot must carry the connection's exact:10s staleness"
-    );
+    {
+        let selectors = selectors.lock().unwrap();
+        let begin = selectors
+            .iter()
+            .find_map(|s| match s.as_ref().and_then(|s| s.selector.as_ref()) {
+                Some(v1::transaction_selector::Selector::Begin(options)) => Some(options),
+                _ => None,
+            })
+            .expect("get_objects must begin its read-only transaction inline");
+        assert_eq!(
+            read_only_bound(begin),
+            expected,
+            "the get_objects snapshot must carry the connection's exact:10s staleness"
+        );
+    }
 }
 
 /// Run one two-row bound (parameterized) query with the given `spanner.read.staleness` against its
@@ -3631,10 +3350,7 @@ fn bound_query_transaction_selectors(staleness: &str) -> Vec<Option<v1::Transact
 fn bounded_staleness_is_pinned_for_multi_use_bound_queries() {
     use v1::transaction_options::read_only::TimestampBound as WireBound;
 
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "bounded_staleness_is_pinned_for_multi_use_bound_queries",
-    );
+    let _watchdog = watchdog!();
 
     let cases = [
         (
@@ -3700,10 +3416,7 @@ fn bounded_staleness_is_pinned_for_multi_use_bound_queries() {
 fn directed_read_reaches_the_wire_on_queries_but_never_on_dml() {
     use v1::directed_read_options as dro;
 
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "directed_read_reaches_the_wire_on_queries_but_never_on_dml",
-    );
+    let _watchdog = watchdog!();
 
     const QUERY_SQL: &str = "SELECT c FROM MockTable";
     const OVERRIDE_QUERY_SQL: &str = "SELECT c FROM OtherMockTable";
@@ -3747,40 +3460,7 @@ fn directed_read_reaches_the_wire_on_queries_but_never_on_dml() {
                 }
                 Ok(stream_of(vec![Ok(first)]))
             });
-        mock.expect_execute_batch_dml().returning(move |request| {
-            let request = request.into_inner();
-            let inline_begin = matches!(
-                request
-                    .transaction
-                    .as_ref()
-                    .and_then(|t| t.selector.as_ref()),
-                Some(v1::transaction_selector::Selector::Begin(_))
-            );
-            record_batch_dml.lock().unwrap().push(request);
-            let metadata = v1::ResultSetMetadata {
-                transaction: inline_begin.then(|| v1::Transaction {
-                    id: b"dml-txn".to_vec(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
-            Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
-                result_sets: vec![v1::ResultSet {
-                    metadata: Some(metadata),
-                    stats: Some(v1::ResultSetStats {
-                        row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }],
-                status: Some(spanner_grpc_mock::google::rpc::Status {
-                    code: 0,
-                    message: "OK".into(),
-                    details: vec![],
-                }),
-                ..Default::default()
-            }))
-        });
+        serve_batch_dml(mock, record_batch_dml.clone());
         mock.expect_commit().returning(|_| commit_ok());
     });
 
@@ -3911,10 +3591,7 @@ fn directed_read_reaches_the_wire_on_queries_but_never_on_dml() {
 /// a third proves the two knobs are independent (setting only one leaves the other inherited).
 #[test]
 fn query_optimizer_options_reach_the_wire_on_queries() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "query_optimizer_options_reach_the_wire_on_queries",
-    );
+    let _watchdog = watchdog!();
 
     let requests: Arc<Mutex<Vec<v1::ExecuteSqlRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let record = requests.clone();
@@ -4027,10 +3704,7 @@ fn query_optimizer_options_reach_the_wire_on_queries() {
 /// the batch is not the transaction's last request there.
 #[test]
 fn autocommit_batch_dml_is_flagged_last_statements_but_manual_commit_is_not() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "autocommit_batch_dml_is_flagged_last_statements_but_manual_commit_is_not",
-    );
+    let _watchdog = watchdog!();
 
     const BATCH_SQL: &str =
         "DELETE FROM MockTable WHERE TRUE; INSERT INTO MockTable (c) VALUES ('x')";
@@ -4041,45 +3715,7 @@ fn autocommit_batch_dml_is_flagged_last_statements_but_manual_commit_is_not() {
     let server = MockServer::start(move |mock| {
         // In case the client begins the read/write transaction explicitly rather than inline.
         serve_begin_transaction(mock);
-        mock.expect_execute_batch_dml().returning(move |request| {
-            let request = request.into_inner();
-            let inline_begin = matches!(
-                request
-                    .transaction
-                    .as_ref()
-                    .and_then(|t| t.selector.as_ref()),
-                Some(v1::transaction_selector::Selector::Begin(_))
-            );
-            let statements = request.statements.len();
-            record.lock().unwrap().push(request);
-            // One result set per statement (row count 1 each); the first echoes the begun
-            // transaction id back when the batch began the transaction inline.
-            let result_sets = (0..statements)
-                .map(|i| v1::ResultSet {
-                    metadata: Some(v1::ResultSetMetadata {
-                        transaction: (i == 0 && inline_begin).then(|| v1::Transaction {
-                            id: b"dml-txn".to_vec(),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    stats: Some(v1::ResultSetStats {
-                        row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                })
-                .collect();
-            Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
-                result_sets,
-                status: Some(spanner_grpc_mock::google::rpc::Status {
-                    code: 0,
-                    message: "OK".into(),
-                    details: vec![],
-                }),
-                ..Default::default()
-            }))
-        });
+        serve_batch_dml(mock, record.clone());
         mock.expect_commit().returning(|_| commit_ok());
     });
 
@@ -4145,40 +3781,13 @@ fn autocommit_batch_dml_is_flagged_last_statements_but_manual_commit_is_not() {
 /// asserted here too.
 #[test]
 fn batch_dml_carries_the_request_priority_and_tag() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "batch_dml_carries_the_request_priority_and_tag",
-    );
+    let _watchdog = watchdog!();
 
     let batch_dml: Arc<Mutex<Vec<v1::ExecuteBatchDmlRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let record = batch_dml.clone();
     let server = MockServer::start(move |mock| {
         serve_begin_transaction(mock);
-        mock.expect_execute_batch_dml().returning(move |request| {
-            record.lock().unwrap().push(request.into_inner());
-            Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
-                result_sets: vec![v1::ResultSet {
-                    metadata: Some(v1::ResultSetMetadata {
-                        transaction: Some(v1::Transaction {
-                            id: b"dml-txn".to_vec(),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    stats: Some(v1::ResultSetStats {
-                        row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }],
-                status: Some(spanner_grpc_mock::google::rpc::Status {
-                    code: 0,
-                    message: "OK".into(),
-                    details: vec![],
-                }),
-                ..Default::default()
-            }))
-        });
+        serve_batch_dml(mock, record.clone());
         mock.expect_commit().returning(|_| commit_ok());
     });
 
@@ -4216,20 +3825,31 @@ fn batch_dml_carries_the_request_priority_and_tag() {
     assert_eq!(options.request_tag, "etl-batch");
 }
 
-/// UP-5 (wire): the `spanner.ingest.batch_write` firehose path must carry
-/// `spanner.request.priority` and `spanner.transaction.tag` on its `BatchWrite` request — the
-/// client's `BatchWriteTransactionBuilder` gained those setters upstream
-/// (googleapis/google-cloud-rust#6073), before which a BatchWrite ingest silently ignored both.
+/// UP-5 (wire): what a `spanner.ingest.batch_write` firehose ingest must put on its `BatchWrite`
+/// request — asserted over two ingests on one connection, each a single one-row chunk, so both the
+/// unset and the set state of the change-stream flag are observed against the same mock script.
 ///
-/// The negative half is the contract's other side: `spanner.request.tag` must **not** appear.
-/// Spanner ignores per-request tags on BatchWrite (the reason the client exposes no setter for
-/// it), so the driver deliberately drops it rather than sending a tag that does nothing.
+/// 1. `spanner.request.priority` and `spanner.transaction.tag` must be carried (the client's
+///    `BatchWriteTransactionBuilder` gained those setters upstream,
+///    googleapis/google-cloud-rust#6073, before which a BatchWrite ingest silently ignored both),
+///    while `spanner.request.tag` must **not** appear: Spanner ignores per-request tags on
+///    BatchWrite — the reason the client exposes no setter for it — so the driver drops it rather
+///    than sending a tag that does nothing. With
+///    `spanner.transaction.exclude_from_change_streams` still unset, the request's
+///    `exclude_txn_from_change_streams` must go out `false`.
+/// 2. SPAN-9: setting `spanner.transaction.exclude_from_change_streams=true` on the connection must
+///    then set `exclude_txn_from_change_streams` on the next ingest's request. The BatchWrite path
+///    is the cleanest wire assertion for that flag, because it rides the `BatchWriteRequest`
+///    **directly** (`RequestConfig::apply_to_batch_write`); the runner-commit sites
+///    (`apply_to_runner`, autocommit DML) are covered by
+///    [`exclude_from_change_streams_reaches_the_wire_on_runner_commits`], which reads the
+///    inline-begin `TransactionOptions` off the `ExecuteBatchDml` request instead.
+///
+/// Step 1 being the negative half is what makes step 2 meaningful: a driver that hard-coded the
+/// flag either way would fail one of them.
 #[test]
-fn batch_write_carries_the_priority_and_transaction_tag_but_not_the_request_tag() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "batch_write_carries_the_priority_and_transaction_tag_but_not_the_request_tag",
-    );
+fn batch_write_carries_the_request_options_and_change_stream_exclusion() {
+    let _watchdog = watchdog!();
 
     let requests: Arc<Mutex<Vec<v1::BatchWriteRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let record = requests.clone();
@@ -4252,157 +3872,82 @@ fn batch_write_carries_the_priority_and_transaction_tag_but_not_the_request_tag(
     });
 
     let mut connection = server.connect();
-    connection
-        .set_option(
-            OptionConnection::Other(adbc_spanner::OPTION_REQUEST_PRIORITY.into()),
-            OptionValue::String("high".into()),
-        )
-        .expect("set the request priority");
-    connection
-        .set_option(
-            OptionConnection::Other(adbc_spanner::OPTION_TRANSACTION_TAG.into()),
-            OptionValue::String("nightly-etl".into()),
-        )
-        .expect("set the transaction tag");
-    connection
-        .set_option(
-            OptionConnection::Other(adbc_spanner::OPTION_REQUEST_TAG.into()),
-            OptionValue::String("ignored-by-batch-write".into()),
-        )
-        .expect("set the request tag");
+    for (key, value) in [
+        (adbc_spanner::OPTION_REQUEST_PRIORITY, "high"),
+        (adbc_spanner::OPTION_TRANSACTION_TAG, "nightly-etl"),
+        (adbc_spanner::OPTION_REQUEST_TAG, "ignored-by-batch-write"),
+    ] {
+        connection
+            .set_option(
+                OptionConnection::Other(key.into()),
+                OptionValue::String(value.into()),
+            )
+            .expect("set the connection-level request option");
+    }
 
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("MockTable".into()),
-        )
-        .expect("set target table");
-    statement
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .expect("set ingest mode append");
-    statement
-        .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_INGEST_BATCH_WRITE.into()),
-            OptionValue::String("true".into()),
-        )
-        .expect("route the ingest through BatchWrite");
-    statement.bind(ingest_batch(1)).expect("bind ingest data");
-    assert_eq!(
-        statement.execute_update().expect("BatchWrite ingest"),
-        Some(1)
-    );
+    // Statements inherit the connection's values at creation (the inheritance itself is unit-tested
+    // in src/request.rs — here we only prove the values reach the wire).
+    let run_ingest = |connection: &mut SpannerConnection| {
+        let mut statement = append_ingest_statement(connection);
+        statement
+            .set_option(
+                OptionStatement::Other(adbc_spanner::OPTION_INGEST_BATCH_WRITE.into()),
+                OptionValue::String("true".into()),
+            )
+            .expect("route the ingest through BatchWrite");
+        statement.bind(ingest_batch(1)).expect("bind ingest data");
+        assert_eq!(
+            statement.execute_update().expect("BatchWrite ingest"),
+            Some(1)
+        );
+    };
 
-    let seen = requests.lock().unwrap();
-    assert_eq!(seen.len(), 1, "one chunk ⇒ one BatchWrite request");
-    let options = seen[0]
-        .request_options
-        .as_ref()
-        .expect("the BatchWrite must carry RequestOptions");
-    assert_eq!(
-        options.priority,
-        v1::request_options::Priority::High as i32,
-        "spanner.request.priority must reach the BatchWrite request"
-    );
-    assert_eq!(
-        options.transaction_tag, "nightly-etl",
-        "spanner.transaction.tag must tag the transactions the BatchWrite creates"
-    );
-    assert_eq!(
-        options.request_tag, "",
-        "spanner.request.tag must NOT be sent — Spanner ignores per-request tags on BatchWrite"
-    );
-    assert!(
-        !seen[0].exclude_txn_from_change_streams,
-        "with spanner.transaction.exclude_from_change_streams unset, the default (false) must go \
-         out — the positive is asserted by \
-         exclude_from_change_streams_reaches_the_wire_on_batch_write"
-    );
-}
+    // 1. Priority + transaction tag carried, request tag dropped, change-stream flag still false.
+    run_ingest(&mut connection);
+    {
+        let seen = requests.lock().unwrap();
+        assert_eq!(seen.len(), 1, "one chunk ⇒ one BatchWrite request");
+        let options = seen[0]
+            .request_options
+            .as_ref()
+            .expect("the BatchWrite must carry RequestOptions");
+        assert_eq!(
+            options.priority,
+            v1::request_options::Priority::High as i32,
+            "spanner.request.priority must reach the BatchWrite request"
+        );
+        assert_eq!(
+            options.transaction_tag, "nightly-etl",
+            "spanner.transaction.tag must tag the transactions the BatchWrite creates"
+        );
+        assert_eq!(
+            options.request_tag, "",
+            "spanner.request.tag must NOT be sent — Spanner ignores per-request tags on BatchWrite"
+        );
+        assert!(
+            !seen[0].exclude_txn_from_change_streams,
+            "with spanner.transaction.exclude_from_change_streams unset, the default (false) must \
+             go out"
+        );
+    }
 
-/// SPAN-9 (wire): `spanner.transaction.exclude_from_change_streams=true` must set
-/// `exclude_txn_from_change_streams` on the write it produces. This exercises the `BatchWrite`
-/// firehose path (`RequestConfig::apply_to_batch_write`), where the flag rides the
-/// `BatchWriteRequest` **directly** — the cleanest wire assertion. Its negative half (unset ⇒
-/// `false` on the wire) is covered by
-/// `batch_write_carries_the_priority_and_transaction_tag_but_not_the_request_tag` above, so this
-/// asserts only the positive.
-///
-/// The runner-commit sites (`apply_to_runner`, autocommit DML) are covered by
-/// [`exclude_from_change_streams_reaches_the_wire_on_runner_commits`], which reads the inline-begin
-/// `TransactionOptions` off the `ExecuteBatchDml` request.
-#[test]
-fn exclude_from_change_streams_reaches_the_wire_on_batch_write() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "exclude_from_change_streams_reaches_the_wire_on_batch_write",
-    );
-
-    let requests: Arc<Mutex<Vec<v1::BatchWriteRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    let record = requests.clone();
-    let server = MockServer::start(move |mock| {
-        mock.expect_batch_write().returning(move |request| {
-            record.lock().unwrap().push(request.into_inner());
-            let (tx, rx) = tokio::sync::mpsc::channel(1);
-            tx.try_send(Ok(v1::BatchWriteResponse {
-                indexes: vec![0],
-                status: Some(spanner_grpc_mock::google::rpc::Status {
-                    code: 0,
-                    message: "OK".into(),
-                    details: vec![],
-                }),
-                ..Default::default()
-            }))
-            .expect("scripted stream channel sized to fit");
-            Ok(tonic::Response::new(rx))
-        });
-    });
-
-    let mut connection = server.connect();
-    // Set the option on the connection; the statement inherits it (the inheritance is unit-tested
-    // in src/request.rs — here we only prove it reaches the wire).
+    // 2. The same ingest with the change-stream exclusion set on the connection.
     connection
         .set_option(
             OptionConnection::Other(adbc_spanner::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS.into()),
             OptionValue::String("true".into()),
         )
         .expect("exclude the transaction from change streams");
-
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("MockTable".into()),
-        )
-        .expect("set target table");
-    statement
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .expect("set ingest mode append");
-    statement
-        .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_INGEST_BATCH_WRITE.into()),
-            OptionValue::String("true".into()),
-        )
-        .expect("route the ingest through BatchWrite");
-    statement.bind(ingest_batch(1)).expect("bind ingest data");
-    assert_eq!(
-        statement.execute_update().expect("BatchWrite ingest"),
-        Some(1)
-    );
-
-    let seen = requests.lock().unwrap();
-    assert_eq!(seen.len(), 1, "one chunk ⇒ one BatchWrite request");
-    assert!(
-        seen[0].exclude_txn_from_change_streams,
-        "spanner.transaction.exclude_from_change_streams=true must set \
-         exclude_txn_from_change_streams on the BatchWrite request"
-    );
+    run_ingest(&mut connection);
+    {
+        let seen = requests.lock().unwrap();
+        assert_eq!(seen.len(), 2, "the second ingest adds a second BatchWrite");
+        assert!(
+            seen[1].exclude_txn_from_change_streams,
+            "spanner.transaction.exclude_from_change_streams=true must set \
+             exclude_txn_from_change_streams on the BatchWrite request"
+        );
+    }
 }
 
 /// SPAN-9 (wire, runner path): `spanner.transaction.exclude_from_change_streams=true` must set
@@ -4417,10 +3962,7 @@ fn exclude_from_change_streams_reaches_the_wire_on_batch_write() {
 ///    it and its inline-begin options carry `true`.
 #[test]
 fn exclude_from_change_streams_reaches_the_wire_on_runner_commits() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "exclude_from_change_streams_reaches_the_wire_on_runner_commits",
-    );
+    let _watchdog = watchdog!();
 
     const DML_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
 
@@ -4538,10 +4080,7 @@ fn exclude_from_change_streams_reaches_the_wire_on_runner_commits() {
 ///    driver is choosing not to tag it, not merely that nothing was set.
 #[test]
 fn request_priority_reaches_metadata_reads_but_tags_do_not() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "request_priority_reaches_metadata_reads_but_tags_do_not",
-    );
+    let _watchdog = watchdog!();
 
     const USER_QUERY: &str = "SELECT c FROM MockTable";
     const DML_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
@@ -4563,39 +4102,7 @@ fn request_priority_reaches_metadata_reads_but_tags_do_not() {
                     true,
                 ))]))
             });
-        mock.expect_execute_batch_dml().returning(move |request| {
-            let request = request.into_inner();
-            let inline_begin = matches!(
-                request
-                    .transaction
-                    .as_ref()
-                    .and_then(|t| t.selector.as_ref()),
-                Some(v1::transaction_selector::Selector::Begin(_))
-            );
-            rec_b.lock().unwrap().push(request);
-            Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
-                result_sets: vec![v1::ResultSet {
-                    metadata: Some(v1::ResultSetMetadata {
-                        transaction: inline_begin.then(|| v1::Transaction {
-                            id: b"dml-txn".to_vec(),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    stats: Some(v1::ResultSetStats {
-                        row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }],
-                status: Some(spanner_grpc_mock::google::rpc::Status {
-                    code: 0,
-                    message: "OK".into(),
-                    details: vec![],
-                }),
-                ..Default::default()
-            }))
-        });
+        serve_batch_dml(mock, rec_b.clone());
         mock.expect_commit().returning(move |request| {
             rec_c.lock().unwrap().push(request.into_inner());
             commit_ok()
@@ -4757,10 +4264,7 @@ fn start_counting_sessions(sessions: Arc<AtomicUsize>) -> MockServer {
 /// `CreateSession` count observed by the mock is a direct proxy for "how many stacks were built".
 #[test]
 fn connections_share_one_client_stack_until_an_option_is_set() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "connections_share_one_client_stack_until_an_option_is_set",
-    );
+    let _watchdog = watchdog!();
 
     let sessions = Arc::new(AtomicUsize::new(0));
     let server = start_counting_sessions(sessions.clone());
@@ -4837,10 +4341,7 @@ fn connections_share_one_client_stack_until_an_option_is_set() {
 /// beyond the connection's `CreateSession` is scripted.
 #[test]
 fn exec_incremental_spec_default_is_a_no_op() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "exec_incremental_spec_default_is_a_no_op",
-    );
+    let _watchdog = watchdog!();
 
     let server = MockServer::start(|_| {});
     let mut connection = server.connect();
@@ -4996,10 +4497,7 @@ fn unary_attempts(key: &str, value: OptionValue) -> usize {
 /// `N` attempts, and `1` really does disable retrying.
 #[test]
 fn retry_max_attempts_is_exact_on_unary_rpcs() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "retry_max_attempts_is_exact_on_unary_rpcs",
-    );
+    let _watchdog = watchdog!();
 
     for max_attempts in [1_i64, 2, 3] {
         let attempts = unary_attempts(
@@ -5021,10 +4519,7 @@ fn retry_max_attempts_is_exact_on_unary_rpcs() {
 /// option reaches the streaming retry loop at all rather than being ignored.
 #[test]
 fn retry_max_attempts_is_exact_on_the_streaming_path() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "retry_max_attempts_is_exact_on_the_streaming_path",
-    );
+    let _watchdog = watchdog!();
 
     for max_attempts in [1_i64, 2, 3] {
         let attempts = streaming_attempts(
@@ -5049,10 +4544,7 @@ fn retry_max_attempts_is_exact_on_the_streaming_path() {
 /// family.
 #[test]
 fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_path() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(240),
-        "retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_path",
-    );
+    let _watchdog = watchdog!(Duration::from_secs(240));
 
     // Control: with the budget **unset**, nothing bounds the unary retry loop — only the mock's
     // own cap stops it. Measuring it here rather than assuming it makes the bounded run below a
@@ -5110,10 +4602,7 @@ fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_pat
 /// fresh `single_use` selector on every request instead.
 #[test]
 fn get_statistics_shares_one_read_only_transaction() {
-    let _watchdog = Watchdog::arm(
-        Duration::from_secs(120),
-        "get_statistics_shares_one_read_only_transaction",
-    );
+    let _watchdog = watchdog!();
 
     let selectors: Arc<Mutex<Vec<Option<v1::TransactionSelector>>>> =
         Arc::new(Mutex::new(Vec::new()));
