@@ -377,6 +377,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+
       - name: Download the platform library artifacts
         uses: actions/download-artifact@v8
         with:
@@ -390,15 +392,41 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Attach the ADBC driver manifest next to the archives. It is what makes
+      # `driver="spanner"` (and `uri="spanner:///..."`, which resolves the driver from
+      # the URI scheme) work without naming a library path: drop it into one of the
+      # driver manager's search directories — `$ADBC_DRIVER_PATH`,
+      # `~/.config/adbc/drivers`, `/etc/adbc/drivers`, ... — after pointing its
+      # `Driver.shared` entry at wherever the extracted library actually lives. The
+      # checked-in manifest carries no `version` (nothing would keep a hardcoded one in
+      # step with Cargo.toml); stamp the released version in here instead. The tag is
+      # the crate version verbatim — `version-gate`, which this job needs, fails the
+      # release otherwise.
+      - name: Stamp the release version into the driver manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF#refs/tags/v}"
+          # Insert `version = '...'` right after the `name = ...` key, matching the
+          # key order of the specification's example manifest.
+          awk -v ver="$version" '
+            { print }
+            !done && /^name = / { printf "version = '\''%s'\''\n", ver; done = 1 }
+          ' spanner.toml > dist/spanner.toml
+          python3 -c "import tomllib,sys; d=tomllib.load(open('dist/spanner.toml','rb')); \
+            assert d['version'] == sys.argv[1], d.get('version'); \
+            assert d['Driver']['shared'], 'no Driver.shared'; \
+            print('manifest OK, version', d['version'])" "$version"
+
       - name: Generate SHA256SUMS
         working-directory: dist
         run: |
           set -euo pipefail
-          # One checksums file over every platform archive, so downstream
-          # consumers can pin the driver by hash instead of trusting a mutable
-          # release tag (verify with `sha256sum -c SHA256SUMS`). The glob matches
-          # only the archives, never the SHA256SUMS file itself.
-          sha256sum adbc-spanner-* > SHA256SUMS
+          # One checksums file over every published asset, so downstream consumers can
+          # pin the driver by hash instead of trusting a mutable release tag (verify
+          # with `sha256sum -c SHA256SUMS`). The globs match the platform archives and
+          # the driver manifest, never the SHA256SUMS file itself.
+          sha256sum adbc-spanner-* spanner.toml > SHA256SUMS
           echo "Published checksums:"
           cat SHA256SUMS
 
@@ -407,7 +435,7 @@ jobs:
         # assets users download — a hijacked v3 tag must not be able to replace them.
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
-          # dist/* now also includes the generated SHA256SUMS file.
+          # dist/* now also includes the driver manifest and the generated SHA256SUMS file.
           files: dist/*
           generate_release_notes: true
 
@@ -545,6 +573,47 @@ jobs:
           # package is exercised; _driver_path() raises unless the lib is bundled.
           cd "$RUNNER_TEMP"
           python -c "import adbc_driver_spanner; print(adbc_driver_spanner._driver_path()); import adbc_driver_spanner.dbapi"
+
+      # Prove that the manifest the wheel installs actually makes the driver
+      # *discoverable*: a manifest that ships but is never found is worse than none,
+      # because it looks like the feature works. Entirely offline — AdbcDatabaseInit
+      # opens no connection, so a resolution failure (NOT_FOUND from the driver
+      # manager) is the only way this can fail, and no Spanner target is needed.
+      - name: Check the installed wheel's driver manifest resolves by name and URI scheme
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Run from a directory without the source tree, so the *installed* package's
+          # manifest (pointing at the library bundled in the wheel) is what is exercised.
+          cd "$RUNNER_TEMP"
+          python - <<'PY'
+          import os
+          import tempfile
+          import tomllib
+
+          import adbc_driver_spanner
+          import adbc_driver_spanner.manifest as manifest
+
+          directory = tempfile.mkdtemp()
+          path = manifest.install(directory)
+          doc = tomllib.load(open(path, "rb"))
+          assert path.name == "spanner.toml", path
+          assert doc["manifest_version"] == 1, doc
+          # Driver.shared is used verbatim by the dynamic loader, so it has to be the
+          # absolute path of the library this wheel bundles.
+          assert doc["Driver"]["shared"] == adbc_driver_spanner._driver_path(), doc
+
+          os.environ["ADBC_DRIVER_PATH"] = directory
+          import adbc_driver_manager
+
+          # (1) Resolve by driver name.
+          adbc_driver_manager.AdbcDatabase(driver="spanner").close()
+          # (2) Resolve from the URI scheme, with no `driver` option at all.
+          adbc_driver_manager.AdbcDatabase(
+              uri="spanner:///projects/p/instances/i/databases/d"
+          ).close()
+          print(f"OK: {path} resolves driver=spanner and the spanner:// URI scheme")
+          PY
 
       - name: Upload wheels
         uses: actions/upload-artifact@v7

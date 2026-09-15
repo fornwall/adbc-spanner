@@ -45,6 +45,61 @@ with spanner.connect(
 parameters (there is no `?` placeholder in GoogleSQL), `cur.fetchone()` / `cur.fetchall()`, `conn.commit()`, and so on. The `fetch_*`
 helpers below add zero-copy Arrow output on top.
 
+## Driver manifest (`driver="spanner"`)
+
+`adbc_driver_spanner.dbapi.connect()` above needs no setup — it hands the bundled library's path
+straight to the driver manager. If you would rather go through the generic
+[`adbc_driver_manager`][adbc-dm] and name the driver (the way the PostgreSQL and SQLite drivers
+work), install an [ADBC *driver manifest*][manifests]:
+
+```sh
+python -m adbc_driver_spanner.manifest install
+# equivalently, the console script installed by the wheel:
+adbc-driver-spanner-install-manifest
+```
+
+That writes a `spanner.toml` manifest pointing at this wheel's bundled library into a directory the
+driver manager searches (`python -m adbc_driver_spanner.manifest path` prints where). Afterwards
+both of these work:
+
+```python docs-test: skip
+import adbc_driver_manager.dbapi
+
+# By driver name.
+with adbc_driver_manager.dbapi.connect(
+    driver="spanner",
+    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
+) as conn:
+    ...
+
+# By URI alone: with no `driver` option, the driver manager takes the URI *scheme*
+# as the driver name — and this driver's scheme is already `spanner`.
+with adbc_driver_manager.dbapi.connect(
+    uri="spanner:///projects/my-project/instances/my-instance/databases/my-db",
+) as conn:
+    ...
+```
+
+Notes:
+
+- **Re-run it after upgrading, reinstalling, or moving the environment.** A manifest records the
+  *absolute* path of the shared library, which the driver manager passes to the dynamic loader
+  verbatim (it is not resolved relative to the manifest). That is also why the manifest cannot just
+  be shipped inside the wheel: the path is only known once the wheel is installed.
+- Inside a virtual environment the default target is `$VIRTUAL_ENV/etc/adbc/drivers/spanner.toml`,
+  which the Python driver manager adds to its search path automatically, so the manifest stays
+  scoped to that environment. Outside a venv it goes to the user config directory
+  (`~/.config/adbc/drivers` on Linux, `~/Library/Application Support/ADBC/Drivers` on macOS,
+  `%LOCALAPPDATA%\ADBC\Drivers` on Windows).
+- Use `--dir` to install somewhere else, for example a directory on `ADBC_DRIVER_PATH`:
+  `python -m adbc_driver_spanner.manifest install --dir /etc/adbc/drivers`.
+- Users of the standalone shared library (the GitHub release archives, not the wheel) can start from
+  the [`spanner.toml`][manifest-file] in the repository and edit its `Driver.shared` paths.
+
+[adbc-dm]: https://pypi.org/project/adbc-driver-manager/
+[manifests]: https://arrow.apache.org/adbc/current/format/driver_manifests.html
+[manifest-file]: https://github.com/fornwall/adbc-spanner/blob/main/spanner.toml
+
 ## Authentication
 
 The driver supports several credential sources. When you set *no* credential option it falls back to

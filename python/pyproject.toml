@@ -41,6 +41,15 @@ dependencies = ["adbc-driver-manager>=1.0"]
 # Arrow requirement the docs talk about.
 dbapi = ["adbc-driver-manager[dbapi]>=1.0", "pyarrow>=14.0.1"]
 
+[project.scripts]
+# Writes an ADBC driver manifest (spanner.toml) pointing at the library bundled in
+# this wheel, so the driver resolves as driver="spanner" / uri="spanner:///...".
+# The manifest cannot simply be shipped as a data file: Driver.shared is handed to
+# the dynamic loader verbatim (no manifest-relative resolution in either the C or
+# the Rust driver manager), so the absolute install path must be filled in after
+# installation. See adbc_driver_spanner/manifest.py.
+adbc-driver-spanner-install-manifest = "adbc_driver_spanner.manifest:main"
+
 [project.urls]
 Homepage = "https://github.com/fornwall/adbc-spanner"
 Repository = "https://github.com/fornwall/adbc-spanner"

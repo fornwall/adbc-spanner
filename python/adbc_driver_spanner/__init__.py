@@ -8,6 +8,11 @@ which loads it over the ADBC C ABI.
 For a DBAPI 2.0 (PEP 249) connection with pandas/polars/Arrow helpers, use
 :func:`adbc_driver_spanner.dbapi.connect` instead of the low-level
 :func:`connect` here.
+
+To reach the driver through the *generic* ``adbc_driver_manager`` instead — as
+``driver="spanner"``, or by URI scheme alone from ``uri="spanner:///..."`` —
+install an ADBC driver manifest once with ``python -m
+adbc_driver_spanner.manifest install`` (see :mod:`adbc_driver_spanner.manifest`).
 """
 
 import functools
