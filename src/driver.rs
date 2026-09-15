@@ -369,7 +369,7 @@ impl Optionable for SpannerDatabase {
                 self.quota_project = (!project.is_empty()).then_some(project);
             }
             other => {
-                return Err(unknown_option("database", &option_name(other)));
+                return Err(unknown_option("database", other.as_ref()));
             }
         }
         Ok(())
@@ -414,7 +414,7 @@ impl Optionable for SpannerDatabase {
             }
             _ => None,
         };
-        value.ok_or_else(|| option_not_set(&option_name(&key)))
+        value.ok_or_else(|| option_not_set(key.as_ref()))
     }
 
     impl_typed_option_getters!();
@@ -442,12 +442,8 @@ impl Database for SpannerDatabase {
     }
 }
 
-fn option_name(key: &OptionDatabase) -> String {
-    key.as_ref().to_string()
-}
-
 fn string_value(key: &OptionDatabase, value: OptionValue) -> Result<String> {
-    crate::options::string_option(value, &format!("option {}", option_name(key)))
+    crate::options::string_option(value, &format!("option {}", key.as_ref()))
 }
 
 /// Split a comma-separated option value (delegates, scopes) into a list, trimming surrounding
@@ -470,18 +466,18 @@ fn u64_seconds_value(key: &OptionDatabase, value: OptionValue) -> Result<u64> {
         OptionValue::String(seconds) => seconds.trim().parse::<u64>().map_err(|_| {
             invalid_argument(format!(
                 "option {} expects a non-negative integer number of seconds, got {seconds:?}",
-                option_name(key)
+                key.as_ref()
             ))
         }),
         _ => Err(invalid_argument(format!(
             "option {} expects a non-negative integer number of seconds",
-            option_name(key)
+            key.as_ref()
         ))),
     }
 }
 
 fn bool_value(key: &OptionDatabase, value: OptionValue) -> Result<bool> {
-    crate::options::bool_option(value, &format!("option {}", option_name(key)))
+    crate::options::bool_option(value, &format!("option {}", key.as_ref()))
 }
 
 #[cfg(test)]

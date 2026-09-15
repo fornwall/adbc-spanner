@@ -233,7 +233,7 @@ impl Optionable for SpannerConnection {
             // `NotImplemented`.
             OptionConnection::Other(k) => {
                 if self.set_shared_option(k, value)?.is_none() {
-                    return Err(unknown_option("connection", &connection_option_name(&key)));
+                    return Err(unknown_option("connection", key.as_ref()));
                 }
             }
             // Spanner has no settable current catalog/schema; both are fixed at `""`, so setting
@@ -246,7 +246,7 @@ impl Optionable for SpannerConnection {
                 check_unnamed_catalog_or_schema(value, "current schema")?;
             }
             other => {
-                return Err(unknown_option("connection", &connection_option_name(other)));
+                return Err(unknown_option("connection", other.as_ref()));
             }
         }
         Ok(())
@@ -272,7 +272,7 @@ impl Optionable for SpannerConnection {
             // A Spanner database has a single, unnamed catalog and default schema — both the empty
             // string in INFORMATION_SCHEMA — so the "current" values are reported as "".
             OptionConnection::CurrentCatalog | OptionConnection::CurrentSchema => Ok(String::new()),
-            other => Err(option_not_set(&connection_option_name(other))),
+            other => Err(option_not_set(other.as_ref())),
         }
     }
 
@@ -647,10 +647,6 @@ fn check_unnamed_catalog_or_schema(value: OptionValue, what: &str) -> Result<()>
             "setting the {what} to {s:?}: Spanner has no settable {what}; only \"\" is valid"
         )))
     }
-}
-
-fn connection_option_name(key: &OptionConnection) -> String {
-    key.as_ref().to_string()
 }
 
 #[cfg(test)]
