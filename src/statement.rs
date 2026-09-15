@@ -43,6 +43,7 @@ use crate::conversion::{
 use crate::driver::SharedDatabaseAdmin;
 use crate::error::{
     err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
+    option_not_set, unknown_option, unsupported,
 };
 use crate::options::{
     SharedConfig, bool_option, impl_shared_option_dispatch, impl_typed_option_getters,
@@ -1175,7 +1176,8 @@ impl Optionable for SpannerStatement {
                 check_unsupported_true(
                     value,
                     "option adbc.ingest.temporary",
-                    "temporary ingest target tables: Spanner has no temporary tables",
+                    "setting adbc.ingest.temporary to true: Spanner has no temporary tables; \
+                     leave it unset or false",
                 )?;
             }
             OptionStatement::Incremental => {
@@ -1185,7 +1187,8 @@ impl Optionable for SpannerStatement {
                 check_unsupported_true(
                     value,
                     "option adbc.statement.exec.incremental",
-                    "incremental statement execution (adbc.statement.exec.incremental)",
+                    "setting adbc.statement.exec.incremental to true: incremental \
+                     execute_partitions is not implemented; leave it unset or false",
                 )?;
             }
             OptionStatement::IngestMode => {
@@ -1217,14 +1220,11 @@ impl Optionable for SpannerStatement {
             // `spanner.transaction.tag`, absent from the shared table, stays unsupported here).
             OptionStatement::Other(k) => {
                 if self.set_shared_option(k, value)?.is_none() {
-                    return Err(not_implemented(&format!("statement option {k}")));
+                    return Err(unknown_option("statement", k));
                 }
             }
             other => {
-                return Err(not_implemented(&format!(
-                    "statement option {}",
-                    other.as_ref()
-                )));
+                return Err(unknown_option("statement", other.as_ref()));
             }
         }
         Ok(())
@@ -1272,12 +1272,7 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) => return self.shared_option_string(k),
             _ => None,
         };
-        value.ok_or_else(|| {
-            err(
-                format!("option {} is not set", key.as_ref()),
-                Status::NotFound,
-            )
-        })
+        value.ok_or_else(|| option_not_set(key.as_ref()))
     }
 
     impl_typed_option_getters!();
@@ -1538,8 +1533,9 @@ impl Statement for SpannerStatement {
     fn set_substrait_plan(&mut self, _plan: impl AsRef<[u8]>) -> Result<()> {
         // Spanner has no Substrait support (it executes GoogleSQL / PostgreSQL text), so there is
         // nothing to execute a Substrait plan against.
-        Err(not_implemented(
-            "Substrait: Spanner does not support Substrait plans",
+        Err(unsupported(
+            "setting a Substrait plan: Spanner executes GoogleSQL or PostgreSQL text, not \
+             Substrait plans; use set_sql_query instead",
         ))
     }
 
@@ -1698,14 +1694,14 @@ fn drain_discarding_rows(reader: Box<dyn RecordBatchReader + Send + 'static>) ->
 
 /// Validate an option whose only supported value is the spec default `false` (in any of the shared
 /// boolean spellings), accepted as a no-op; `true` is rejected as unsupported. `what` names the
-/// option for the boolean coercion error, `unsupported` the feature `true` would ask for.
+/// option for the boolean coercion error, `rejection` is the whole message `true` is refused with.
 ///
 /// Shared by `adbc.ingest.temporary` (Spanner has no temporary tables) and
 /// `adbc.statement.exec.incremental` (incremental `execute_partitions` is not implemented), so the
 /// two validators cannot drift apart.
-fn check_unsupported_true(value: OptionValue, what: &str, unsupported: &str) -> Result<()> {
+fn check_unsupported_true(value: OptionValue, what: &str, rejection: &str) -> Result<()> {
     if bool_option(value, what)? {
-        Err(not_implemented(unsupported))
+        Err(unsupported(rejection))
     } else {
         Ok(())
     }

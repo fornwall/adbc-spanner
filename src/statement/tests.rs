@@ -9,7 +9,8 @@ fn ingest_temporary_accepts_false_and_rejects_true() {
         check_unsupported_true(
             value,
             "option adbc.ingest.temporary",
-            "temporary ingest target tables: Spanner has no temporary tables",
+            "setting adbc.ingest.temporary to true: Spanner has no temporary tables; leave it \
+             unset or false",
         )
     };
     // The spec default (`false`, as the exact string) is a no-op.
@@ -35,7 +36,8 @@ fn exec_incremental_accepts_false_and_rejects_true() {
         check_unsupported_true(
             value,
             "option adbc.statement.exec.incremental",
-            "incremental statement execution (adbc.statement.exec.incremental)",
+            "setting adbc.statement.exec.incremental to true: incremental execute_partitions is \
+             not implemented; leave it unset or false",
         )
     };
     // The spec default (`false`, as the exact string) is a no-op.

@@ -22,7 +22,7 @@ pub(crate) fn check_lookup_catalog(catalog: Option<&str>) -> Result<()> {
     match catalog {
         None | Some("") => Ok(()),
         Some(other) => Err(err(
-            format!("catalog {other:?} not found: Spanner has only the default (empty) catalog"),
+            format!("catalog {other:?} not found: Spanner has only the default, unnamed catalog"),
             Status::NotFound,
         )),
     }

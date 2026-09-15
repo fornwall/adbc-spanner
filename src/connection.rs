@@ -87,7 +87,9 @@ use google_cloud_spanner::statement::Statement as SpannerSql;
 
 use crate::conversion::{TimestampPrecision, result_set_to_batch, stream_query};
 use crate::driver::{Connected, SharedDatabaseAdmin};
-use crate::error::{err, from_spanner, invalid_argument, invalid_state, not_implemented};
+use crate::error::{
+    err, from_spanner, invalid_argument, invalid_state, option_not_set, unknown_option, unsupported,
+};
 use crate::options::{SharedConfig, impl_shared_option_dispatch, impl_typed_option_getters};
 use crate::runtime::{CancelSlot, SharedRuntime, SlotCancelHandle, block_on_cancellable};
 use crate::sql::qualified_table;
@@ -305,10 +307,7 @@ impl Optionable for SpannerConnection {
             // unrecognised key returns `None`, mapped to the same `NotImplemented` as before.
             OptionConnection::Other(k) => {
                 if self.set_shared_option(k, value)?.is_none() {
-                    return Err(not_implemented(&format!(
-                        "unsupported Spanner connection option: {}",
-                        connection_option_name(&key)
-                    )));
+                    return Err(unknown_option("connection", &connection_option_name(&key)));
                 }
             }
             // Spanner has no settable current catalog/schema (named schemas are addressed by
@@ -322,10 +321,7 @@ impl Optionable for SpannerConnection {
                 check_unnamed_catalog_or_schema(value, "current schema")?;
             }
             other => {
-                return Err(not_implemented(&format!(
-                    "unsupported Spanner connection option: {}",
-                    connection_option_name(other)
-                )));
+                return Err(unknown_option("connection", &connection_option_name(other)));
             }
         }
         Ok(())
@@ -344,12 +340,7 @@ impl Optionable for SpannerConnection {
                 .request
                 .transaction_tag_string()
                 .map(str::to_string)
-                .ok_or_else(|| {
-                    err(
-                        format!("option {} is not set", crate::OPTION_TRANSACTION_TAG),
-                        Status::NotFound,
-                    )
-                }),
+                .ok_or_else(|| option_not_set(crate::OPTION_TRANSACTION_TAG)),
             // Every other `spanner.*` option the connection and statement report identically —
             // including `spanner.commit_stats.mutation_count` — goes through the shared table, which
             // returns the same `NotFound` for an unset (or unknown) key.
@@ -358,10 +349,7 @@ impl Optionable for SpannerConnection {
             // string in INFORMATION_SCHEMA, which is what `get_objects` reports — so the "current"
             // catalog/schema are reported as "". (They can't be switched; setting them is unsupported.)
             OptionConnection::CurrentCatalog | OptionConnection::CurrentSchema => Ok(String::new()),
-            other => Err(err(
-                format!("option {} is not set", connection_option_name(other)),
-                Status::NotFound,
-            )),
+            other => Err(option_not_set(&connection_option_name(other))),
         }
     }
 
@@ -745,8 +733,8 @@ fn check_unnamed_catalog_or_schema(value: OptionValue, what: &str) -> Result<()>
     if s.is_empty() {
         Ok(())
     } else {
-        Err(not_implemented(&format!(
-            "setting the {what} to {s:?} (Spanner has no settable {what}; only \"\" is valid)"
+        Err(unsupported(format!(
+            "setting the {what} to {s:?}: Spanner has no settable {what}; only \"\" is valid"
         )))
     }
 }

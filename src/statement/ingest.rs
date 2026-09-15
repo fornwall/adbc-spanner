@@ -10,7 +10,9 @@ use google_cloud_spanner::mutation::{Mutation, MutationGroup};
 use super::{SpannerStatement, string_option};
 use crate::bind;
 use crate::connection::{TxnKind, lock_txn, write_mutations_txn};
-use crate::error::{err, from_spanner, from_status_parts, invalid_state, not_implemented};
+use crate::error::{
+    err, from_spanner, from_status_parts, invalid_state, not_implemented, unsupported,
+};
 use crate::runtime::block_on_cancellable;
 use crate::timeout::with_timeout;
 
@@ -592,8 +594,9 @@ pub(super) fn check_target_catalog(catalog: String) -> Result<String> {
     if catalog.is_empty() {
         Ok(catalog)
     } else {
-        Err(not_implemented(&format!(
-            "ingest target catalog {catalog:?}: Spanner has only the default (empty) catalog"
+        Err(unsupported(format!(
+            "ingest target catalog {catalog:?}: Spanner has only the default, unnamed catalog; \
+             set adbc.ingest.target_catalog to \"\" or leave it unset"
         )))
     }
 }

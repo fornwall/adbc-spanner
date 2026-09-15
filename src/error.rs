@@ -23,11 +23,16 @@ pub(crate) fn not_implemented(what: &str) -> Error {
 /// A `NotImplemented` error carrying `message` **verbatim** — the sibling of [`not_implemented`]
 /// for callers that have already phrased the whole sentence (typically because they name a cause
 /// after a `:` or a remedy after a `;`, which no fixed suffix can follow grammatically).
-// The callers that need it live in `driver.rs`, `connection.rs` and `statement.rs`; the helper is
-// introduced here first so they can converge on it.
-#[allow(dead_code)]
 pub(crate) fn unsupported(message: impl Into<String>) -> Error {
     err(message, Status::NotImplemented)
+}
+
+/// The `NotImplemented` error every `set_option` raises for a key it does not recognise.
+///
+/// One situation, one wording: `object_kind` is the ADBC object the key was set on (`"database"`,
+/// `"connection"`, `"statement"`) and `key` is the key exactly as the caller spelled it.
+pub(crate) fn unknown_option(object_kind: &str, key: &str) -> Error {
+    unsupported(format!("unsupported Spanner {object_kind} option: {key}"))
 }
 
 /// The `NotFound` error every option getter raises for a key it cannot answer.
@@ -37,9 +42,6 @@ pub(crate) fn unsupported(message: impl Into<String>) -> Error {
 /// those apart (an unrecognised key falls through to the same arm), so the message names **both**
 /// possibilities rather than telling the caller to set a key that a later `set_option` would
 /// reject as unknown.
-// The getters that raise this live in `options.rs` and the per-object modules; the wording is
-// introduced here first so they can all converge on it.
-#[allow(dead_code)]
 pub(crate) fn option_not_set(key: &str) -> Error {
     not_found(format!(
         "option {key} is not set or not recognized by this driver"

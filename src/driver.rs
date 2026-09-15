@@ -12,7 +12,8 @@ use google_cloud_spanner::client::{DatabaseAdmin, DatabaseClient, Spanner};
 
 use crate::connection::SpannerConnection;
 use crate::error::{
-    err, from_builder, from_spanner, invalid_argument, invalid_state, not_implemented,
+    err, from_builder, from_spanner, invalid_argument, invalid_state, option_not_set,
+    unknown_option,
 };
 use crate::options::impl_typed_option_getters;
 use crate::runtime::{SharedRuntime, new_runtime};
@@ -378,10 +379,7 @@ impl Optionable for SpannerDatabase {
                 self.quota_project = (!project.is_empty()).then_some(project);
             }
             other => {
-                return Err(not_implemented(&format!(
-                    "unsupported Spanner database option: {}",
-                    option_name(other)
-                )));
+                return Err(unknown_option("database", &option_name(other)));
             }
         }
         Ok(())
@@ -429,12 +427,7 @@ impl Optionable for SpannerDatabase {
             }
             _ => None,
         };
-        value.ok_or_else(|| {
-            err(
-                format!("option {} is not set", option_name(&key)),
-                Status::NotFound,
-            )
-        })
+        value.ok_or_else(|| option_not_set(&option_name(&key)))
     }
 
     impl_typed_option_getters!();
