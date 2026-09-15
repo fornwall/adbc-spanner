@@ -61,7 +61,7 @@ use google_cloud_spanner::statement::StatementBuilder;
 use google_cloud_wkt::Duration as WktDuration;
 
 use crate::error::invalid_argument;
-use crate::options::{non_empty_string_option, string_option};
+use crate::options::{RawParsed, bool_option_unsettable, non_empty_string_option};
 use crate::staleness::parse_duration;
 
 /// Spanner caps `max_commit_delay` at 500 milliseconds (values above are rejected server-side); we
@@ -69,8 +69,8 @@ use crate::staleness::parse_duration;
 const MAX_COMMIT_DELAY_CAP: Duration = Duration::from_millis(500);
 
 /// A parsed `spanner.request.priority` value. A driver-owned enum (rather than the client's
-/// non-exhaustive [`Priority`]) so the canonical option string can be recovered exactly for
-/// `get_option` and the parsing is unit-testable offline.
+/// non-exhaustive [`Priority`]) so the parsing is unit-testable offline; the option string
+/// `get_option` reports is the raw one kept beside it (see [`RawParsed`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestPriority {
     Low,
@@ -79,15 +79,6 @@ enum RequestPriority {
 }
 
 impl RequestPriority {
-    /// The canonical option string, for `get_option` round-trip.
-    fn as_str(self) -> &'static str {
-        match self {
-            RequestPriority::Low => "low",
-            RequestPriority::Medium => "medium",
-            RequestPriority::High => "high",
-        }
-    }
-
     /// The client's [`Priority`] for this value.
     fn to_client(self) -> Priority {
         match self {
@@ -112,6 +103,25 @@ fn parse_priority(value: &str) -> Result<RequestPriority> {
     }
 }
 
+/// Emit an `apply_to_*` method applying the request priority and request tag to one of the client's
+/// request builders — [`StatementBuilder`] and [`BatchDmlBuilder`], which take the same two setters
+/// but share no common trait, exactly as for [`apply_to_commit_builder`] below.
+macro_rules! apply_to_request_builder {
+    ($(#[$attr:meta])* $name:ident($builder:ty)) => {
+        $(#[$attr])*
+        #[must_use]
+        pub(crate) fn $name(&self, mut builder: $builder) -> $builder {
+            if let Some(priority) = self.priority.parsed() {
+                builder = builder.set_priority(priority.to_client());
+            }
+            if let Some(tag) = &self.request_tag {
+                builder = builder.set_request_tag(tag.as_str());
+            }
+            builder
+        }
+    };
+}
+
 /// Emit an `apply_to_*` method applying the commit priority, transaction tag, commit delay and
 /// commit-stats flag to one of the client's commit builders.
 ///
@@ -124,7 +134,7 @@ macro_rules! apply_to_commit_builder {
         $(#[$attr])*
         #[must_use]
         pub(crate) fn $name(&self, mut builder: $builder) -> $builder {
-            if let Some(priority) = self.priority {
+            if let Some(priority) = self.priority.parsed() {
                 builder = builder.set_commit_priority(priority.to_client());
             }
             if let Some(tag) = &self.transaction_tag {
@@ -151,15 +161,16 @@ macro_rules! apply_to_commit_builder {
 /// [`ReadStaleness`](crate::staleness::ReadStaleness) is inherited.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RequestConfig {
-    /// Parsed `spanner.request.priority`, when set (`None` leaves the client/service default).
-    priority: Option<RequestPriority>,
+    /// Parsed `spanner.request.priority`, with the raw option string kept for `get_option`
+    /// round-trip (`None` leaves the client/service default).
+    priority: RawParsed<RequestPriority>,
     /// Raw `spanner.request.tag` value, when set.
     request_tag: Option<String>,
     /// Raw `spanner.transaction.tag` value, when set (connection-level only).
     transaction_tag: Option<String>,
     /// Parsed `spanner.commit.max_delay`, with the raw option string kept for `get_option`
     /// round-trip. Applied as the commit delay wherever a read/write commit is built.
-    max_commit_delay: Option<(String, Duration)>,
+    max_commit_delay: RawParsed<Duration>,
     /// `spanner.commit_stats`: whether to request Spanner return commit statistics on the read/write
     /// commits the driver builds. `false` (the default) leaves them off.
     return_commit_stats: bool,
@@ -171,14 +182,8 @@ pub(crate) struct RequestConfig {
 impl RequestConfig {
     /// Handle a `set_option` for `spanner.request.priority`. An empty value unsets it.
     pub(crate) fn set_priority(&mut self, value: OptionValue) -> Result<()> {
-        let raw = string_option(value, crate::OPTION_REQUEST_PRIORITY)?;
-        let trimmed = raw.trim();
-        self.priority = if trimmed.is_empty() {
-            None
-        } else {
-            Some(parse_priority(trimmed)?)
-        };
-        Ok(())
+        self.priority
+            .set(value, crate::OPTION_REQUEST_PRIORITY, parse_priority)
     }
 
     /// Handle a `set_option` for `spanner.request.tag`. An empty value unsets it.
@@ -196,28 +201,18 @@ impl RequestConfig {
     /// Handle a `set_option` for `spanner.commit.max_delay`. An empty value unsets it; a malformed
     /// value or one outside `0..=500ms` is rejected with `InvalidArguments`.
     pub(crate) fn set_max_commit_delay(&mut self, value: OptionValue) -> Result<()> {
-        let raw = string_option(value, crate::OPTION_MAX_COMMIT_DELAY)?;
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            self.max_commit_delay = None;
-            return Ok(());
-        }
-        let duration = parse_max_commit_delay(trimmed)?;
-        self.max_commit_delay = Some((trimmed.to_string(), duration));
-        Ok(())
+        self.max_commit_delay.set(
+            value,
+            crate::OPTION_MAX_COMMIT_DELAY,
+            parse_max_commit_delay,
+        )
     }
 
     /// Handle a `set_option` for `spanner.commit_stats`. An empty string unsets it (back to the
     /// default of not requesting stats); otherwise a boolean string (exactly `true`/`false`).
     pub(crate) fn set_commit_stats(&mut self, value: OptionValue) -> Result<()> {
-        if let OptionValue::String(s) = &value
-            && s.trim().is_empty()
-        {
-            self.return_commit_stats = false;
-            return Ok(());
-        }
         self.return_commit_stats =
-            crate::options::bool_option(value, "option spanner.commit_stats")?;
+            bool_option_unsettable(value, &format!("option {}", crate::OPTION_COMMIT_STATS))?;
         Ok(())
     }
 
@@ -235,15 +230,9 @@ impl RequestConfig {
     /// unsets it (back to the default of *not* excluding); otherwise a boolean string (exactly
     /// `true`/`false`).
     pub(crate) fn set_exclude_txn_from_change_streams(&mut self, value: OptionValue) -> Result<()> {
-        if let OptionValue::String(s) = &value
-            && s.trim().is_empty()
-        {
-            self.exclude_txn_from_change_streams = false;
-            return Ok(());
-        }
-        self.exclude_txn_from_change_streams = crate::options::bool_option(
+        self.exclude_txn_from_change_streams = bool_option_unsettable(
             value,
-            "option spanner.transaction.exclude_from_change_streams",
+            &format!("option {}", crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS),
         )?;
         Ok(())
     }
@@ -258,9 +247,10 @@ impl RequestConfig {
         }
     }
 
-    /// The canonical `spanner.request.priority` value, for `get_option` round-trip.
-    pub(crate) fn priority_string(&self) -> Option<&'static str> {
-        self.priority.map(RequestPriority::as_str)
+    /// The `spanner.request.priority` value, for `get_option` round-trip. The parser accepts only
+    /// the canonical spellings, so the stored raw value *is* the canonical one.
+    pub(crate) fn priority_string(&self) -> Option<&str> {
+        self.priority.raw()
     }
 
     /// The raw `spanner.request.tag` value, for `get_option` round-trip.
@@ -275,27 +265,20 @@ impl RequestConfig {
 
     /// The raw `spanner.commit.max_delay` value, for `get_option` round-trip.
     pub(crate) fn max_commit_delay_string(&self) -> Option<&str> {
-        self.max_commit_delay.as_ref().map(|(raw, _)| raw.as_str())
+        self.max_commit_delay.raw()
     }
 
     /// The commit delay as the client's [`WktDuration`], when set. The conversion cannot fail — the
     /// stored value was validated to `0..=500ms` at set time.
     fn commit_delay(&self) -> Option<WktDuration> {
         self.max_commit_delay
-            .as_ref()
-            .and_then(|(_, d)| WktDuration::try_from(*d).ok())
+            .parsed()
+            .and_then(|d| WktDuration::try_from(*d).ok())
     }
 
-    /// Apply the priority and request tag to a statement builder (queries and DML alike).
-    #[must_use]
-    pub(crate) fn apply_to_statement(&self, mut builder: StatementBuilder) -> StatementBuilder {
-        if let Some(priority) = self.priority {
-            builder = builder.set_priority(priority.to_client());
-        }
-        if let Some(tag) = &self.request_tag {
-            builder = builder.set_request_tag(tag.as_str());
-        }
-        builder
+    apply_to_request_builder! {
+        /// Apply the priority and request tag to a statement builder (queries and DML alike).
+        apply_to_statement(StatementBuilder)
     }
 
     /// Apply **only** the priority to a statement builder, for the driver's own internal metadata
@@ -310,25 +293,18 @@ impl RequestConfig {
         &self,
         builder: StatementBuilder,
     ) -> StatementBuilder {
-        match self.priority {
+        match self.priority.parsed() {
             Some(priority) => builder.set_priority(priority.to_client()),
             None => builder,
         }
     }
 
-    /// Apply the priority and request tag to an `ExecuteBatchDml` batch builder. The batch request
-    /// carries a single request-level `RequestOptions`, so both apply to the batch as a whole (the
-    /// runner's commit priority, from [`Self::apply_to_runner`], still covers the transaction's
-    /// commit).
-    #[must_use]
-    pub(crate) fn apply_to_batch_dml(&self, mut builder: BatchDmlBuilder) -> BatchDmlBuilder {
-        if let Some(priority) = self.priority {
-            builder = builder.set_priority(priority.to_client());
-        }
-        if let Some(tag) = &self.request_tag {
-            builder = builder.set_request_tag(tag.as_str());
-        }
-        builder
+    apply_to_request_builder! {
+        /// Apply the priority and request tag to an `ExecuteBatchDml` batch builder. The batch
+        /// request carries a single request-level `RequestOptions`, so both apply to the batch as a
+        /// whole (the runner's commit priority, from [`Self::apply_to_runner`], still covers the
+        /// transaction's commit).
+        apply_to_batch_dml(BatchDmlBuilder)
     }
 
     /// Apply the priority and transaction tag to a `BatchWrite` builder (the
@@ -345,7 +321,7 @@ impl RequestConfig {
         &self,
         mut builder: BatchWriteTransactionBuilder,
     ) -> BatchWriteTransactionBuilder {
-        if let Some(priority) = self.priority {
+        if let Some(priority) = self.priority.parsed() {
             builder = builder.set_priority(priority.to_client());
         }
         if let Some(tag) = &self.transaction_tag {

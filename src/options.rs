@@ -58,6 +58,17 @@ pub(crate) fn bool_option(value: OptionValue, what: &str) -> Result<bool> {
     }
 }
 
+/// Parse a boolean option whose empty (or whitespace-only) string **unsets** it, i.e. resets it to
+/// `false`; every other value goes through [`bool_option`]. The shape shared by the driver's
+/// unset-able boolean options (`spanner.commit_stats`,
+/// `spanner.transaction.exclude_from_change_streams`, …).
+pub(crate) fn bool_option_unsettable(value: OptionValue, what: &str) -> Result<bool> {
+    match &value {
+        OptionValue::String(s) if s.trim().is_empty() => Ok(false),
+        _ => bool_option(value, what),
+    }
+}
+
 /// Parse a plain string option; any other value kind is rejected with `InvalidArguments`.
 pub(crate) fn string_option(value: OptionValue, what: &str) -> Result<String> {
     match value {
@@ -71,6 +82,60 @@ pub(crate) fn string_option(value: OptionValue, what: &str) -> Result<String> {
 /// callers whose grammar tolerates surrounding whitespace trim it themselves.
 pub(crate) fn non_empty_string_option(value: OptionValue, what: &str) -> Result<Option<String>> {
     Ok(Some(string_option(value, what)?).filter(|s| !s.is_empty()))
+}
+
+/// A raw option string kept beside its parsed form: `get_option` round-trips exactly what was set
+/// while the driver works from the parsed value.
+///
+/// The two halves can only move together, through [`set`](Self::set) — the invariant the sites
+/// using it (`spanner.directed_read`, `spanner.request.priority`, `spanner.commit.max_delay`) used
+/// to state in prose beside two parallel `Option` fields.
+#[derive(Debug, Clone)]
+pub(crate) struct RawParsed<T> {
+    raw: Option<String>,
+    parsed: Option<T>,
+}
+
+impl<T> Default for RawParsed<T> {
+    fn default() -> Self {
+        Self {
+            raw: None,
+            parsed: None,
+        }
+    }
+}
+
+impl<T> RawParsed<T> {
+    /// Handle a `set_option`: an empty (or whitespace-only) string unsets both halves, any other
+    /// value is trimmed, parsed by `parse` and stored with its raw text. A rejected value leaves
+    /// the previous state untouched. `what` names the option in the string-coercion error.
+    pub(crate) fn set(
+        &mut self,
+        value: OptionValue,
+        what: &str,
+        parse: impl FnOnce(&str) -> Result<T>,
+    ) -> Result<()> {
+        let raw = string_option(value, what)?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            self.raw = None;
+            self.parsed = None;
+            return Ok(());
+        }
+        self.parsed = Some(parse(trimmed)?);
+        self.raw = Some(trimmed.to_string());
+        Ok(())
+    }
+
+    /// The raw (trimmed) value as set, for `get_option` round-trip.
+    pub(crate) fn raw(&self) -> Option<&str> {
+        self.raw.as_deref()
+    }
+
+    /// The parsed value, when set.
+    pub(crate) fn parsed(&self) -> Option<&T> {
+        self.parsed.as_ref()
+    }
 }
 
 /// The accepted range of an [`f64_option`], which also fixes the wording of its rejection.
@@ -333,6 +398,10 @@ impl SharedConfig {
 /// - `shared_option_string(key)` reports a shared option's canonical string, returning the
 ///   `NotFound` error for an unset (or non-shared) key exactly as the hand-written arms did.
 ///
+/// An arm that is pure plumbing — "parse this value into that field" — names the option key once,
+/// as the arm's own pattern, and passes that same `key` to the parser as the label for its error;
+/// only the parsers whose shape is more than a coercion stay behind a named function.
+///
 /// Object-specific options (ingest/bind/batch on the statement, `transaction.tag` on the
 /// connection, catalog/schema, autocommit, …) stay as explicit arms in each caller; only the
 /// mechanical glue lives here. The referenced names (`TimestampPrecision`, `err`, `Status`,
@@ -342,6 +411,7 @@ macro_rules! impl_shared_option_dispatch {
         /// Apply one of the shared "staleness-pattern" options. `Ok(Some(()))` = handled;
         /// `Ok(None)` = `key` is not a shared option. See [`impl_shared_option_dispatch`].
         fn set_shared_option(&mut self, key: &str, value: OptionValue) -> Result<Option<()>> {
+            use crate::options::{F64Range, f64_option, non_empty_string_option};
             match key {
                 crate::OPTION_READ_STALENESS => self.config.read_staleness.set_staleness(value)?,
                 crate::OPTION_REQUEST_PRIORITY => self.config.request.set_priority(value)?,
@@ -356,30 +426,44 @@ macro_rules! impl_shared_option_dispatch {
                     .request
                     .set_exclude_txn_from_change_streams(value)?,
                 crate::OPTION_QUERY_OPTIMIZER_VERSION => {
-                    self.config.query_options.set_optimizer_version(value)?
+                    self.config.query_options.optimizer_version =
+                        non_empty_string_option(value, key)?
                 }
-                crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => self
-                    .config
-                    .query_options
-                    .set_optimizer_statistics_package(value)?,
+                crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
+                    self.config.query_options.optimizer_statistics_package =
+                        non_empty_string_option(value, key)?
+                }
                 crate::OPTION_MAX_TIMESTAMP_PRECISION => {
                     self.config.timestamp_precision = TimestampPrecision::parse_option(value)?
                 }
-                crate::OPTION_RPC_TIMEOUT_QUERY => self.config.timeouts.set_query(value)?,
-                crate::OPTION_RPC_TIMEOUT_UPDATE => self.config.timeouts.set_update(value)?,
-                crate::OPTION_RPC_TIMEOUT_FETCH => self.config.timeouts.set_fetch(value)?,
+                crate::OPTION_RPC_TIMEOUT_QUERY => {
+                    self.config.timeouts.query =
+                        f64_option(value, key, F64Range::NonNegativeSeconds)?
+                }
+                crate::OPTION_RPC_TIMEOUT_UPDATE => {
+                    self.config.timeouts.update =
+                        f64_option(value, key, F64Range::NonNegativeSeconds)?
+                }
+                crate::OPTION_RPC_TIMEOUT_FETCH => {
+                    self.config.timeouts.fetch =
+                        f64_option(value, key, F64Range::NonNegativeSeconds)?
+                }
                 crate::OPTION_RETRY_MAX_ATTEMPTS => self.config.retry.set_max_attempts(value)?,
                 crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
-                    self.config.retry.set_max_elapsed_seconds(value)?
+                    self.config.retry.max_elapsed_seconds =
+                        f64_option(value, key, F64Range::PositiveSeconds)?
                 }
                 crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS => {
-                    self.config.retry.set_backoff_initial_seconds(value)?
+                    self.config.retry.backoff_initial_seconds =
+                        f64_option(value, key, F64Range::PositiveSeconds)?
                 }
                 crate::OPTION_RETRY_BACKOFF_MAX_SECONDS => {
-                    self.config.retry.set_backoff_max_seconds(value)?
+                    self.config.retry.backoff_max_seconds =
+                        f64_option(value, key, F64Range::PositiveSeconds)?
                 }
                 crate::OPTION_RETRY_BACKOFF_MULTIPLIER => {
-                    self.config.retry.set_backoff_multiplier(value)?
+                    self.config.retry.backoff_multiplier =
+                        f64_option(value, key, F64Range::PositiveFactor)?
                 }
                 _ => return Ok(None),
             }
@@ -431,35 +515,43 @@ macro_rules! impl_shared_option_dispatch {
                     .commit_stats
                     .mutation_count()
                     .map(|n| n.to_string()),
-                crate::OPTION_QUERY_OPTIMIZER_VERSION => self
-                    .config
-                    .query_options
-                    .optimizer_version_string()
-                    .map(str::to_string),
+                crate::OPTION_QUERY_OPTIMIZER_VERSION => {
+                    self.config.query_options.optimizer_version.clone()
+                }
                 crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => self
                     .config
                     .query_options
-                    .optimizer_statistics_package_string()
-                    .map(str::to_string),
+                    .optimizer_statistics_package
+                    .clone(),
                 // Always set (there is a default mode), so the effective value is always reported.
                 crate::OPTION_MAX_TIMESTAMP_PRECISION => {
                     Some(self.config.timestamp_precision.as_str().to_string())
                 }
-                crate::OPTION_RPC_TIMEOUT_QUERY => self.config.timeouts.query_string(),
-                crate::OPTION_RPC_TIMEOUT_UPDATE => self.config.timeouts.update_string(),
-                crate::OPTION_RPC_TIMEOUT_FETCH => self.config.timeouts.fetch_string(),
-                crate::OPTION_RETRY_MAX_ATTEMPTS => self.config.retry.max_attempts_string(),
+                crate::OPTION_RPC_TIMEOUT_QUERY => {
+                    self.config.timeouts.query.map(|s| s.to_string())
+                }
+                crate::OPTION_RPC_TIMEOUT_UPDATE => {
+                    self.config.timeouts.update.map(|s| s.to_string())
+                }
+                crate::OPTION_RPC_TIMEOUT_FETCH => {
+                    self.config.timeouts.fetch.map(|s| s.to_string())
+                }
+                crate::OPTION_RETRY_MAX_ATTEMPTS => {
+                    self.config.retry.max_attempts.map(|n| n.to_string())
+                }
                 crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
-                    self.config.retry.max_elapsed_seconds_string()
+                    self.config.retry.max_elapsed_seconds.map(|s| s.to_string())
                 }
-                crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS => {
-                    self.config.retry.backoff_initial_seconds_string()
-                }
+                crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS => self
+                    .config
+                    .retry
+                    .backoff_initial_seconds
+                    .map(|s| s.to_string()),
                 crate::OPTION_RETRY_BACKOFF_MAX_SECONDS => {
-                    self.config.retry.backoff_max_seconds_string()
+                    self.config.retry.backoff_max_seconds.map(|s| s.to_string())
                 }
                 crate::OPTION_RETRY_BACKOFF_MULTIPLIER => {
-                    self.config.retry.backoff_multiplier_string()
+                    self.config.retry.backoff_multiplier.map(|m| m.to_string())
                 }
                 _ => None,
             };

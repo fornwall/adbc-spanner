@@ -52,7 +52,7 @@ use google_cloud_spanner::model::directed_read_options::{
 use google_cloud_spanner::statement::StatementBuilder;
 
 use crate::error::invalid_argument;
-use crate::options::string_option;
+use crate::options::RawParsed;
 
 /// The replica-selection mode: an ordered *include* preference or an *exclude* set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,38 +123,23 @@ impl DirectedReadSpec {
 /// it), mirroring [`ReadStaleness`](crate::staleness::ReadStaleness) and
 /// [`RequestConfig`](crate::request::RequestConfig).
 #[derive(Debug, Clone, Default)]
-pub(crate) struct DirectedRead {
-    /// Raw `spanner.directed_read` value, when set.
-    raw: Option<String>,
-    /// The parsed spec (`None` means no directed read).
-    spec: Option<DirectedReadSpec>,
-}
+pub(crate) struct DirectedRead(RawParsed<DirectedReadSpec>);
 
 impl DirectedRead {
     /// Handle a `set_option` for `spanner.directed_read`. An empty value unsets it.
     pub(crate) fn set(&mut self, value: OptionValue) -> Result<()> {
-        let raw = string_option(value, crate::OPTION_DIRECTED_READ)?;
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            self.raw = None;
-            self.spec = None;
-            return Ok(());
-        }
-        let spec = parse(trimmed)?;
-        self.raw = Some(trimmed.to_string());
-        self.spec = Some(spec);
-        Ok(())
+        self.0.set(value, crate::OPTION_DIRECTED_READ, parse)
     }
 
     /// The raw `spanner.directed_read` value, for `get_option` round-trip.
     pub(crate) fn option_string(&self) -> Option<&str> {
-        self.raw.as_deref()
+        self.0.raw()
     }
 
     /// Apply the directed-read options to a read-only query statement builder. A no-op when unset.
     #[must_use]
     pub(crate) fn apply_to_statement(&self, builder: StatementBuilder) -> StatementBuilder {
-        match &self.spec {
+        match self.0.parsed() {
             Some(spec) => builder.set_directed_read_options(spec.to_options()),
             None => builder,
         }

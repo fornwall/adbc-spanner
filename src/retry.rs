@@ -106,7 +106,6 @@ use google_cloud_spanner::retry_policy::SpannerRetryPolicy;
 use google_cloud_spanner::statement::StatementBuilder;
 
 use crate::error::invalid_argument;
-use crate::options::{F64Range, f64_option};
 
 /// Emit an `apply_to_*` method applying the retry and backoff policies to the Begin and Commit RPCs
 /// of one of the client's commit builders.
@@ -135,6 +134,25 @@ macro_rules! apply_to_commit_builder {
     };
 }
 
+/// Emit an `apply_to_*` method applying the retry and backoff policies to one of the client's
+/// request builders — the same reasoning as [`apply_to_commit_builder`], for the builders that take
+/// a single (non-commit) retry policy.
+macro_rules! apply_to_request_builder {
+    ($(#[$attr:meta])* $name:ident($builder:ty)) => {
+        $(#[$attr])*
+        #[must_use]
+        pub(crate) fn $name(&self, mut builder: $builder) -> $builder {
+            if let Some(policy) = self.retry_policy_arg() {
+                builder = builder.with_retry_policy(policy);
+            }
+            if let Some(backoff) = self.backoff_policy_arg() {
+                builder = builder.with_backoff_policy(backoff);
+            }
+            builder
+        }
+    };
+}
+
 /// The retry-tuning configuration held by a connection or statement
 /// (`spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds` and the backoff knobs
 /// `spanner.retry.backoff.{initial_seconds,max_seconds,multiplier}`).
@@ -146,95 +164,37 @@ macro_rules! apply_to_commit_builder {
 /// Values are stored exactly as configured so `get_option` / `get_option_int` /
 /// `get_option_double` round-trip them; [`retry_policy_arg`](Self::retry_policy_arg) turns them into
 /// a gax [`RetryPolicyArg`] (or `None`, leaving the client's default policy) at apply time.
+///
+/// The fields are set and read directly by
+/// [`impl_shared_option_dispatch`](crate::options::impl_shared_option_dispatch): the seconds knobs
+/// through [`f64_option`](crate::options::f64_option), the attempt count through
+/// [`parse_max_attempts`].
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RetryConfig {
     /// `spanner.retry.max_attempts`, when set: the maximum number of attempts (>= 1).
-    max_attempts: Option<u32>,
+    pub(crate) max_attempts: Option<u32>,
     /// `spanner.retry.max_elapsed_seconds`, when set: the total wall-clock retry budget, in seconds.
-    max_elapsed_seconds: Option<f64>,
+    pub(crate) max_elapsed_seconds: Option<f64>,
     /// `spanner.retry.backoff.initial_seconds`, when set: the first inter-attempt delay, in seconds.
-    backoff_initial_seconds: Option<f64>,
+    pub(crate) backoff_initial_seconds: Option<f64>,
     /// `spanner.retry.backoff.max_seconds`, when set: the ceiling on the inter-attempt delay, in
     /// seconds.
-    backoff_max_seconds: Option<f64>,
+    pub(crate) backoff_max_seconds: Option<f64>,
     /// `spanner.retry.backoff.multiplier`, when set: the per-attempt growth factor for the delay.
-    backoff_multiplier: Option<f64>,
+    pub(crate) backoff_multiplier: Option<f64>,
 }
 
 impl RetryConfig {
-    /// Handle a `set_option` for `spanner.retry.max_attempts`. An empty string unsets it.
+    /// Handle a `set_option` for `spanner.retry.max_attempts`. An empty string unsets it. The one
+    /// option here whose parse is more than a coercion, so the dispatch goes through this setter
+    /// rather than assigning the field itself.
     pub(crate) fn set_max_attempts(&mut self, value: OptionValue) -> Result<()> {
         self.max_attempts = parse_max_attempts(value)?;
         Ok(())
     }
 
-    /// Handle a `set_option` for `spanner.retry.max_elapsed_seconds`. An empty string unsets it.
-    pub(crate) fn set_max_elapsed_seconds(&mut self, value: OptionValue) -> Result<()> {
-        self.max_elapsed_seconds = f64_option(
-            value,
-            crate::OPTION_RETRY_MAX_ELAPSED_SECONDS,
-            F64Range::PositiveSeconds,
-        )?;
-        Ok(())
-    }
-
-    /// The canonical `spanner.retry.max_attempts` value, for `get_option` round-trip.
-    pub(crate) fn max_attempts_string(&self) -> Option<String> {
-        self.max_attempts.map(|n| n.to_string())
-    }
-
-    /// The canonical `spanner.retry.max_elapsed_seconds` value, for `get_option` round-trip.
-    pub(crate) fn max_elapsed_seconds_string(&self) -> Option<String> {
-        self.max_elapsed_seconds.map(|s| s.to_string())
-    }
-
-    /// Handle a `set_option` for `spanner.retry.backoff.initial_seconds`. An empty string unsets it.
-    pub(crate) fn set_backoff_initial_seconds(&mut self, value: OptionValue) -> Result<()> {
-        self.backoff_initial_seconds = f64_option(
-            value,
-            crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS,
-            F64Range::PositiveSeconds,
-        )?;
-        Ok(())
-    }
-
-    /// Handle a `set_option` for `spanner.retry.backoff.max_seconds`. An empty string unsets it.
-    pub(crate) fn set_backoff_max_seconds(&mut self, value: OptionValue) -> Result<()> {
-        self.backoff_max_seconds = f64_option(
-            value,
-            crate::OPTION_RETRY_BACKOFF_MAX_SECONDS,
-            F64Range::PositiveSeconds,
-        )?;
-        Ok(())
-    }
-
-    /// Handle a `set_option` for `spanner.retry.backoff.multiplier`. An empty string unsets it.
-    pub(crate) fn set_backoff_multiplier(&mut self, value: OptionValue) -> Result<()> {
-        self.backoff_multiplier = f64_option(
-            value,
-            crate::OPTION_RETRY_BACKOFF_MULTIPLIER,
-            F64Range::PositiveFactor,
-        )?;
-        Ok(())
-    }
-
-    /// The canonical `spanner.retry.backoff.initial_seconds` value, for `get_option` round-trip.
-    pub(crate) fn backoff_initial_seconds_string(&self) -> Option<String> {
-        self.backoff_initial_seconds.map(|s| s.to_string())
-    }
-
-    /// The canonical `spanner.retry.backoff.max_seconds` value, for `get_option` round-trip.
-    pub(crate) fn backoff_max_seconds_string(&self) -> Option<String> {
-        self.backoff_max_seconds.map(|s| s.to_string())
-    }
-
-    /// The canonical `spanner.retry.backoff.multiplier` value, for `get_option` round-trip.
-    pub(crate) fn backoff_multiplier_string(&self) -> Option<String> {
-        self.backoff_multiplier.map(|m| m.to_string())
-    }
-
     /// The effective total retry budget as a [`Duration`] (`None` when unset). Conversion cannot
-    /// fail — [`f64_option`] validated it at set time.
+    /// fail — [`f64_option`](crate::options::f64_option) validated it at set time.
     fn max_elapsed_duration(&self) -> Option<Duration> {
         self.max_elapsed_seconds
             .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
@@ -293,28 +253,14 @@ impl RetryConfig {
         Some(builder.clamp().into())
     }
 
-    /// Apply the retry and backoff policies to a statement builder (queries and DML alike).
-    #[must_use]
-    pub(crate) fn apply_to_statement(&self, mut builder: StatementBuilder) -> StatementBuilder {
-        if let Some(policy) = self.retry_policy_arg() {
-            builder = builder.with_retry_policy(policy);
-        }
-        if let Some(backoff) = self.backoff_policy_arg() {
-            builder = builder.with_backoff_policy(backoff);
-        }
-        builder
+    apply_to_request_builder! {
+        /// Apply the retry and backoff policies to a statement builder (queries and DML alike).
+        apply_to_statement(StatementBuilder)
     }
 
-    /// Apply the retry and backoff policies to an `ExecuteBatchDml` batch builder.
-    #[must_use]
-    pub(crate) fn apply_to_batch_dml(&self, mut builder: BatchDmlBuilder) -> BatchDmlBuilder {
-        if let Some(policy) = self.retry_policy_arg() {
-            builder = builder.with_retry_policy(policy);
-        }
-        if let Some(backoff) = self.backoff_policy_arg() {
-            builder = builder.with_backoff_policy(backoff);
-        }
-        builder
+    apply_to_request_builder! {
+        /// Apply the retry and backoff policies to an `ExecuteBatchDml` batch builder.
+        apply_to_batch_dml(BatchDmlBuilder)
     }
 
     apply_to_commit_builder! {
@@ -366,40 +312,83 @@ mod tests {
     use super::*;
     use adbc_core::error::Status;
 
+    use crate::options::{F64Range, f64_option};
+
     fn s(v: &str) -> OptionValue {
         OptionValue::String(v.to_string())
+    }
+
+    /// The `impl_shared_option_dispatch` arms that set these fields, as functions the tests can
+    /// call: each parses the value with the parser and range the dispatch uses, and stores it —
+    /// leaving the previous value in place when the parse is rejected.
+    fn set_max_elapsed_seconds(config: &mut RetryConfig, value: OptionValue) -> Result<()> {
+        config.max_elapsed_seconds = f64_option(
+            value,
+            crate::OPTION_RETRY_MAX_ELAPSED_SECONDS,
+            F64Range::PositiveSeconds,
+        )?;
+        Ok(())
+    }
+
+    fn set_backoff_initial_seconds(config: &mut RetryConfig, value: OptionValue) -> Result<()> {
+        config.backoff_initial_seconds = f64_option(
+            value,
+            crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS,
+            F64Range::PositiveSeconds,
+        )?;
+        Ok(())
+    }
+
+    fn set_backoff_max_seconds(config: &mut RetryConfig, value: OptionValue) -> Result<()> {
+        config.backoff_max_seconds = f64_option(
+            value,
+            crate::OPTION_RETRY_BACKOFF_MAX_SECONDS,
+            F64Range::PositiveSeconds,
+        )?;
+        Ok(())
+    }
+
+    fn set_backoff_multiplier(config: &mut RetryConfig, value: OptionValue) -> Result<()> {
+        config.backoff_multiplier = f64_option(
+            value,
+            crate::OPTION_RETRY_BACKOFF_MULTIPLIER,
+            F64Range::PositiveFactor,
+        )?;
+        Ok(())
+    }
+
+    /// The canonical `get_option` string of a stored value, as the dispatch's getter arms render
+    /// it.
+    fn string<T: std::fmt::Display>(value: Option<T>) -> Option<String> {
+        value.map(|v| v.to_string())
     }
 
     #[test]
     fn parses_attempts_from_strings_ints_and_whole_doubles() {
         let mut config = RetryConfig::default();
         config.set_max_attempts(s(" 3 ")).unwrap();
-        assert_eq!(config.max_attempts_string().as_deref(), Some("3"));
+        assert_eq!(string(config.max_attempts).as_deref(), Some("3"));
         config.set_max_attempts(OptionValue::Int(5)).unwrap();
-        assert_eq!(config.max_attempts_string().as_deref(), Some("5"));
+        assert_eq!(string(config.max_attempts).as_deref(), Some("5"));
         config.set_max_attempts(OptionValue::Double(2.0)).unwrap();
-        assert_eq!(config.max_attempts_string().as_deref(), Some("2"));
+        assert_eq!(string(config.max_attempts).as_deref(), Some("2"));
         // 1 is valid: one attempt, no retries.
         config.set_max_attempts(s("1")).unwrap();
-        assert_eq!(config.max_attempts_string().as_deref(), Some("1"));
+        assert_eq!(string(config.max_attempts).as_deref(), Some("1"));
     }
 
     #[test]
     fn parses_elapsed_from_strings_ints_and_doubles() {
         let mut config = RetryConfig::default();
-        config.set_max_elapsed_seconds(s(" 2.5 ")).unwrap();
-        assert_eq!(config.max_elapsed_seconds_string().as_deref(), Some("2.5"));
+        set_max_elapsed_seconds(&mut config, s(" 2.5 ")).unwrap();
+        assert_eq!(string(config.max_elapsed_seconds).as_deref(), Some("2.5"));
         assert_eq!(
             config.max_elapsed_duration(),
             Some(Duration::from_millis(2500))
         );
-        config
-            .set_max_elapsed_seconds(OptionValue::Int(30))
-            .unwrap();
-        assert_eq!(config.max_elapsed_seconds_string().as_deref(), Some("30"));
-        config
-            .set_max_elapsed_seconds(OptionValue::Double(0.05))
-            .unwrap();
+        set_max_elapsed_seconds(&mut config, OptionValue::Int(30)).unwrap();
+        assert_eq!(string(config.max_elapsed_seconds).as_deref(), Some("30"));
+        set_max_elapsed_seconds(&mut config, OptionValue::Double(0.05)).unwrap();
         assert_eq!(
             config.max_elapsed_duration(),
             Some(Duration::from_millis(50))
@@ -410,13 +399,13 @@ mod tests {
     fn empty_string_unsets_each_independently() {
         let mut config = RetryConfig::default();
         config.set_max_attempts(s("4")).unwrap();
-        config.set_max_elapsed_seconds(s("10")).unwrap();
+        set_max_elapsed_seconds(&mut config, s("10")).unwrap();
         config.set_max_attempts(s("")).unwrap();
-        assert_eq!(config.max_attempts_string(), None);
-        assert_eq!(config.max_elapsed_seconds_string().as_deref(), Some("10"));
+        assert_eq!(string(config.max_attempts), None);
+        assert_eq!(string(config.max_elapsed_seconds).as_deref(), Some("10"));
         // Whitespace-only counts as empty too.
-        config.set_max_elapsed_seconds(s("  ")).unwrap();
-        assert_eq!(config.max_elapsed_seconds_string(), None);
+        set_max_elapsed_seconds(&mut config, s("  ")).unwrap();
+        assert_eq!(string(config.max_elapsed_seconds), None);
     }
 
     #[test]
@@ -440,14 +429,14 @@ mod tests {
             let error = config.set_max_attempts(value.clone()).unwrap_err();
             assert_eq!(error.status, Status::InvalidArguments, "value {value:?}");
             // The stored value is left untouched.
-            assert_eq!(config.max_attempts_string().as_deref(), Some("3"));
+            assert_eq!(string(config.max_attempts).as_deref(), Some("3"));
         }
     }
 
     #[test]
     fn rejects_bad_elapsed() {
         let mut config = RetryConfig::default();
-        config.set_max_elapsed_seconds(s("5")).unwrap();
+        set_max_elapsed_seconds(&mut config, s("5")).unwrap();
         let bad = [
             OptionValue::Double(0.0), // zero budget is degenerate
             s("0"),
@@ -462,9 +451,9 @@ mod tests {
             OptionValue::Bytes(vec![1, 2]),
         ];
         for value in bad {
-            let error = config.set_max_elapsed_seconds(value.clone()).unwrap_err();
+            let error = set_max_elapsed_seconds(&mut config, value.clone()).unwrap_err();
             assert_eq!(error.status, Status::InvalidArguments, "value {value:?}");
-            assert_eq!(config.max_elapsed_seconds_string().as_deref(), Some("5"));
+            assert_eq!(string(config.max_elapsed_seconds).as_deref(), Some("5"));
         }
     }
 
@@ -476,7 +465,7 @@ mod tests {
         assert!(config.retry_policy_arg().is_some());
         config.set_max_attempts(s("")).unwrap();
         assert!(config.retry_policy_arg().is_none());
-        config.set_max_elapsed_seconds(s("10")).unwrap();
+        set_max_elapsed_seconds(&mut config, s("10")).unwrap();
         assert!(config.retry_policy_arg().is_some());
         // Both set: still a policy (the loop stops at whichever limit fires first).
         config.set_max_attempts(s("5")).unwrap();
@@ -489,23 +478,20 @@ mod tests {
     fn copied_config_inherits_then_overrides_independently() {
         let mut connection = RetryConfig::default();
         connection.set_max_attempts(s("10")).unwrap();
-        connection.set_max_elapsed_seconds(s("20")).unwrap();
+        set_max_elapsed_seconds(&mut connection, s("20")).unwrap();
 
         let mut statement = connection;
-        assert_eq!(statement.max_attempts_string().as_deref(), Some("10"));
-        assert_eq!(
-            statement.max_elapsed_seconds_string().as_deref(),
-            Some("20")
-        );
+        assert_eq!(string(statement.max_attempts).as_deref(), Some("10"));
+        assert_eq!(string(statement.max_elapsed_seconds).as_deref(), Some("20"));
 
         statement.set_max_attempts(s("2")).unwrap();
-        statement.set_max_elapsed_seconds(s("")).unwrap();
-        assert_eq!(statement.max_attempts_string().as_deref(), Some("2"));
-        assert_eq!(statement.max_elapsed_seconds_string(), None);
+        set_max_elapsed_seconds(&mut statement, s("")).unwrap();
+        assert_eq!(string(statement.max_attempts).as_deref(), Some("2"));
+        assert_eq!(string(statement.max_elapsed_seconds), None);
         // The connection is unaffected by statement-level overrides.
-        assert_eq!(connection.max_attempts_string().as_deref(), Some("10"));
+        assert_eq!(string(connection.max_attempts).as_deref(), Some("10"));
         assert_eq!(
-            connection.max_elapsed_seconds_string().as_deref(),
+            string(connection.max_elapsed_seconds).as_deref(),
             Some("20")
         );
     }
@@ -513,44 +499,40 @@ mod tests {
     #[test]
     fn parses_backoff_knobs_from_strings_ints_and_doubles() {
         let mut config = RetryConfig::default();
-        config.set_backoff_initial_seconds(s(" 0.5 ")).unwrap();
+        set_backoff_initial_seconds(&mut config, s(" 0.5 ")).unwrap();
         assert_eq!(
-            config.backoff_initial_seconds_string().as_deref(),
+            string(config.backoff_initial_seconds).as_deref(),
             Some("0.5")
         );
-        config
-            .set_backoff_max_seconds(OptionValue::Int(30))
-            .unwrap();
-        assert_eq!(config.backoff_max_seconds_string().as_deref(), Some("30"));
-        config
-            .set_backoff_multiplier(OptionValue::Double(1.5))
-            .unwrap();
-        assert_eq!(config.backoff_multiplier_string().as_deref(), Some("1.5"));
+        set_backoff_max_seconds(&mut config, OptionValue::Int(30)).unwrap();
+        assert_eq!(string(config.backoff_max_seconds).as_deref(), Some("30"));
+        set_backoff_multiplier(&mut config, OptionValue::Double(1.5)).unwrap();
+        assert_eq!(string(config.backoff_multiplier).as_deref(), Some("1.5"));
     }
 
     #[test]
     fn empty_string_unsets_each_backoff_knob_independently() {
         let mut config = RetryConfig::default();
-        config.set_backoff_initial_seconds(s("1")).unwrap();
-        config.set_backoff_max_seconds(s("10")).unwrap();
-        config.set_backoff_multiplier(s("2")).unwrap();
+        set_backoff_initial_seconds(&mut config, s("1")).unwrap();
+        set_backoff_max_seconds(&mut config, s("10")).unwrap();
+        set_backoff_multiplier(&mut config, s("2")).unwrap();
 
-        config.set_backoff_initial_seconds(s("")).unwrap();
-        assert_eq!(config.backoff_initial_seconds_string(), None);
-        assert_eq!(config.backoff_max_seconds_string().as_deref(), Some("10"));
-        assert_eq!(config.backoff_multiplier_string().as_deref(), Some("2"));
+        set_backoff_initial_seconds(&mut config, s("")).unwrap();
+        assert_eq!(string(config.backoff_initial_seconds), None);
+        assert_eq!(string(config.backoff_max_seconds).as_deref(), Some("10"));
+        assert_eq!(string(config.backoff_multiplier).as_deref(), Some("2"));
         // Whitespace-only counts as empty too.
-        config.set_backoff_max_seconds(s("  ")).unwrap();
-        assert_eq!(config.backoff_max_seconds_string(), None);
-        config.set_backoff_multiplier(s("")).unwrap();
-        assert_eq!(config.backoff_multiplier_string(), None);
+        set_backoff_max_seconds(&mut config, s("  ")).unwrap();
+        assert_eq!(string(config.backoff_max_seconds), None);
+        set_backoff_multiplier(&mut config, s("")).unwrap();
+        assert_eq!(string(config.backoff_multiplier), None);
     }
 
     #[test]
     fn rejects_bad_backoff_seconds() {
         for setter in [
-            RetryConfig::set_backoff_initial_seconds as fn(&mut RetryConfig, OptionValue) -> _,
-            RetryConfig::set_backoff_max_seconds,
+            set_backoff_initial_seconds as fn(&mut RetryConfig, OptionValue) -> _,
+            set_backoff_max_seconds,
         ] {
             let mut config = RetryConfig::default();
             setter(&mut config, s("2")).unwrap();
@@ -577,7 +559,7 @@ mod tests {
     #[test]
     fn rejects_bad_backoff_multiplier() {
         let mut config = RetryConfig::default();
-        config.set_backoff_multiplier(s("2")).unwrap();
+        set_backoff_multiplier(&mut config, s("2")).unwrap();
         let bad = [
             OptionValue::Double(0.0),
             s("0"),
@@ -590,16 +572,14 @@ mod tests {
             OptionValue::Bytes(vec![1]),
         ];
         for value in bad {
-            let error = config.set_backoff_multiplier(value.clone()).unwrap_err();
+            let error = set_backoff_multiplier(&mut config, value.clone()).unwrap_err();
             assert_eq!(error.status, Status::InvalidArguments, "value {value:?}");
             // The stored value is left untouched.
-            assert_eq!(config.backoff_multiplier_string().as_deref(), Some("2"));
+            assert_eq!(string(config.backoff_multiplier).as_deref(), Some("2"));
         }
         // Sub-1.0 multipliers are accepted (floored to 1.0 at build time), not rejected.
-        config
-            .set_backoff_multiplier(OptionValue::Double(0.5))
-            .unwrap();
-        assert_eq!(config.backoff_multiplier_string().as_deref(), Some("0.5"));
+        set_backoff_multiplier(&mut config, OptionValue::Double(0.5)).unwrap();
+        assert_eq!(string(config.backoff_multiplier).as_deref(), Some("0.5"));
     }
 
     #[test]
@@ -608,18 +588,18 @@ mod tests {
         assert!(config.backoff_policy_arg().is_none());
         // The attempt / elapsed-time limits alone do not produce a backoff policy.
         config.set_max_attempts(s("3")).unwrap();
-        config.set_max_elapsed_seconds(s("10")).unwrap();
+        set_max_elapsed_seconds(&mut config, s("10")).unwrap();
         assert!(config.backoff_policy_arg().is_none());
         // Each backoff knob on its own is enough.
-        config.set_backoff_initial_seconds(s("0.25")).unwrap();
+        set_backoff_initial_seconds(&mut config, s("0.25")).unwrap();
         assert!(config.backoff_policy_arg().is_some());
-        config.set_backoff_initial_seconds(s("")).unwrap();
+        set_backoff_initial_seconds(&mut config, s("")).unwrap();
         assert!(config.backoff_policy_arg().is_none());
-        config.set_backoff_max_seconds(s("30")).unwrap();
+        set_backoff_max_seconds(&mut config, s("30")).unwrap();
         assert!(config.backoff_policy_arg().is_some());
-        config.set_backoff_max_seconds(s("")).unwrap();
+        set_backoff_max_seconds(&mut config, s("")).unwrap();
         assert!(config.backoff_policy_arg().is_none());
-        config.set_backoff_multiplier(s("3")).unwrap();
+        set_backoff_multiplier(&mut config, s("3")).unwrap();
         assert!(config.backoff_policy_arg().is_some());
     }
 
@@ -628,7 +608,7 @@ mod tests {
     #[test]
     fn retry_and_backoff_are_independent() {
         let mut backoff_only = RetryConfig::default();
-        backoff_only.set_backoff_multiplier(s("4")).unwrap();
+        set_backoff_multiplier(&mut backoff_only, s("4")).unwrap();
         assert!(backoff_only.retry_policy_arg().is_none());
         assert!(backoff_only.backoff_policy_arg().is_some());
 
@@ -643,30 +623,27 @@ mod tests {
     #[test]
     fn copied_config_inherits_then_overrides_backoff_independently() {
         let mut connection = RetryConfig::default();
-        connection.set_backoff_initial_seconds(s("0.5")).unwrap();
-        connection.set_backoff_max_seconds(s("40")).unwrap();
-        connection.set_backoff_multiplier(s("3")).unwrap();
+        set_backoff_initial_seconds(&mut connection, s("0.5")).unwrap();
+        set_backoff_max_seconds(&mut connection, s("40")).unwrap();
+        set_backoff_multiplier(&mut connection, s("3")).unwrap();
 
         let mut statement = connection;
         assert_eq!(
-            statement.backoff_initial_seconds_string().as_deref(),
+            string(statement.backoff_initial_seconds).as_deref(),
             Some("0.5")
         );
-        assert_eq!(
-            statement.backoff_max_seconds_string().as_deref(),
-            Some("40")
-        );
-        assert_eq!(statement.backoff_multiplier_string().as_deref(), Some("3"));
+        assert_eq!(string(statement.backoff_max_seconds).as_deref(), Some("40"));
+        assert_eq!(string(statement.backoff_multiplier).as_deref(), Some("3"));
 
-        statement.set_backoff_max_seconds(s("")).unwrap();
-        statement.set_backoff_multiplier(s("2")).unwrap();
-        assert_eq!(statement.backoff_max_seconds_string(), None);
-        assert_eq!(statement.backoff_multiplier_string().as_deref(), Some("2"));
+        set_backoff_max_seconds(&mut statement, s("")).unwrap();
+        set_backoff_multiplier(&mut statement, s("2")).unwrap();
+        assert_eq!(string(statement.backoff_max_seconds), None);
+        assert_eq!(string(statement.backoff_multiplier).as_deref(), Some("2"));
         // The connection is unaffected by statement-level overrides.
         assert_eq!(
-            connection.backoff_max_seconds_string().as_deref(),
+            string(connection.backoff_max_seconds).as_deref(),
             Some("40")
         );
-        assert_eq!(connection.backoff_multiplier_string().as_deref(), Some("3"));
+        assert_eq!(string(connection.backoff_multiplier).as_deref(), Some("3"));
     }
 }

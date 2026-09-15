@@ -1,4 +1,7 @@
 use super::*;
+use adbc_core::options::OptionValue;
+
+use crate::options::{F64Range, f64_option};
 use crate::runtime::{
     CancelSignal, ChunkSource, block_on_cancellable, new_runtime, spawn_prefetch,
 };
@@ -7,20 +10,56 @@ fn s(v: &str) -> OptionValue {
     OptionValue::String(v.to_string())
 }
 
+/// The three arms of `impl_shared_option_dispatch` that set these fields, as functions the tests
+/// can call: each parses the value with `f64_option` in the non-negative-seconds range and stores
+/// it, leaving the previous value in place when the parse is rejected.
+fn set_query(config: &mut RpcTimeouts, value: OptionValue) -> Result<()> {
+    config.query = f64_option(
+        value,
+        crate::OPTION_RPC_TIMEOUT_QUERY,
+        F64Range::NonNegativeSeconds,
+    )?;
+    Ok(())
+}
+
+fn set_update(config: &mut RpcTimeouts, value: OptionValue) -> Result<()> {
+    config.update = f64_option(
+        value,
+        crate::OPTION_RPC_TIMEOUT_UPDATE,
+        F64Range::NonNegativeSeconds,
+    )?;
+    Ok(())
+}
+
+fn set_fetch(config: &mut RpcTimeouts, value: OptionValue) -> Result<()> {
+    config.fetch = f64_option(
+        value,
+        crate::OPTION_RPC_TIMEOUT_FETCH,
+        F64Range::NonNegativeSeconds,
+    )?;
+    Ok(())
+}
+
+/// The canonical `get_option` string of a stored seconds value, as the dispatch's getter arms
+/// render it.
+fn string(value: Option<f64>) -> Option<String> {
+    value.map(|s| s.to_string())
+}
+
 #[test]
 fn parses_numeric_strings_ints_and_doubles() {
     let mut config = RpcTimeouts::default();
     // Numeric strings (trimmed, fractions allowed).
-    config.set_query(s(" 2.5 ")).unwrap();
-    assert_eq!(config.query_string().as_deref(), Some("2.5"));
+    set_query(&mut config, s(" 2.5 ")).unwrap();
+    assert_eq!(string(config.query).as_deref(), Some("2.5"));
     assert_eq!(config.query_timeout(), Some(Duration::from_millis(2500)));
     // Integers.
-    config.set_update(OptionValue::Int(30)).unwrap();
-    assert_eq!(config.update_string().as_deref(), Some("30"));
+    set_update(&mut config, OptionValue::Int(30)).unwrap();
+    assert_eq!(string(config.update).as_deref(), Some("30"));
     assert_eq!(config.update_timeout(), Some(Duration::from_secs(30)));
     // Doubles (the `get_option_double` / `set_option_double` shape).
-    config.set_fetch(OptionValue::Double(0.05)).unwrap();
-    assert_eq!(config.fetch_string().as_deref(), Some("0.05"));
+    set_fetch(&mut config, OptionValue::Double(0.05)).unwrap();
+    assert_eq!(string(config.fetch).as_deref(), Some("0.05"));
     assert_eq!(config.fetch_timeout(), Some(Duration::from_millis(50)));
 }
 
@@ -28,9 +67,9 @@ fn parses_numeric_strings_ints_and_doubles() {
 fn zero_disables_but_still_round_trips() {
     let mut config = RpcTimeouts::default();
     for value in [s("0"), OptionValue::Int(0), OptionValue::Double(0.0)] {
-        config.set_query(value).unwrap();
+        set_query(&mut config, value).unwrap();
         // The stored value reports back...
-        assert_eq!(config.query_string().as_deref(), Some("0"));
+        assert_eq!(string(config.query).as_deref(), Some("0"));
         // ...but no deadline is enforced.
         assert_eq!(config.query_timeout(), None);
     }
@@ -39,21 +78,21 @@ fn zero_disables_but_still_round_trips() {
 #[test]
 fn empty_string_unsets() {
     let mut config = RpcTimeouts::default();
-    config.set_fetch(s("1.5")).unwrap();
-    assert!(config.fetch_string().is_some());
-    config.set_fetch(s("")).unwrap();
-    assert_eq!(config.fetch_string(), None);
+    set_fetch(&mut config, s("1.5")).unwrap();
+    assert!(string(config.fetch).is_some());
+    set_fetch(&mut config, s("")).unwrap();
+    assert_eq!(string(config.fetch), None);
     assert_eq!(config.fetch_timeout(), None);
     // Whitespace-only counts as empty too (values are trimmed).
-    config.set_fetch(s("2")).unwrap();
-    config.set_fetch(s("  ")).unwrap();
-    assert_eq!(config.fetch_string(), None);
+    set_fetch(&mut config, s("2")).unwrap();
+    set_fetch(&mut config, s("  ")).unwrap();
+    assert_eq!(string(config.fetch), None);
 }
 
 #[test]
 fn rejects_nan_infinities_negatives_and_garbage() {
     let mut config = RpcTimeouts::default();
-    config.set_query(s("5")).unwrap();
+    set_query(&mut config, s("5")).unwrap();
     let bad_values = [
         OptionValue::Double(f64::NAN),
         OptionValue::Double(f64::INFINITY),
@@ -71,7 +110,7 @@ fn rejects_nan_infinities_negatives_and_garbage() {
         OptionValue::Bytes(vec![1, 2, 3]),
     ];
     for value in bad_values {
-        let error = config.set_query(value.clone()).unwrap_err();
+        let error = set_query(&mut config, value.clone()).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments, "value {value:?}");
         assert!(
             error.message.contains(crate::OPTION_RPC_TIMEOUT_QUERY),
@@ -80,7 +119,7 @@ fn rejects_nan_infinities_negatives_and_garbage() {
         );
         // A rejected value leaves the stored one untouched.
         assert_eq!(
-            config.query_string().as_deref(),
+            string(config.query).as_deref(),
             Some("5"),
             "value {value:?}"
         );
@@ -90,13 +129,13 @@ fn rejects_nan_infinities_negatives_and_garbage() {
 #[test]
 fn the_three_timeouts_are_independent() {
     let mut config = RpcTimeouts::default();
-    config.set_query(s("1")).unwrap();
-    config.set_update(s("2")).unwrap();
-    config.set_fetch(s("3")).unwrap();
-    config.set_update(s("")).unwrap();
-    assert_eq!(config.query_string().as_deref(), Some("1"));
-    assert_eq!(config.update_string(), None);
-    assert_eq!(config.fetch_string().as_deref(), Some("3"));
+    set_query(&mut config, s("1")).unwrap();
+    set_update(&mut config, s("2")).unwrap();
+    set_fetch(&mut config, s("3")).unwrap();
+    set_update(&mut config, s("")).unwrap();
+    assert_eq!(string(config.query).as_deref(), Some("1"));
+    assert_eq!(string(config.update), None);
+    assert_eq!(string(config.fetch).as_deref(), Some("3"));
 }
 
 /// Statement inheritance is a plain clone of the connection's config (mirroring
@@ -105,20 +144,20 @@ fn the_three_timeouts_are_independent() {
 #[test]
 fn cloned_config_inherits_then_overrides_independently() {
     let mut connection = RpcTimeouts::default();
-    connection.set_query(s("10")).unwrap();
-    connection.set_fetch(s("20")).unwrap();
+    set_query(&mut connection, s("10")).unwrap();
+    set_fetch(&mut connection, s("20")).unwrap();
 
     let mut statement = connection;
-    assert_eq!(statement.query_string().as_deref(), Some("10"));
-    assert_eq!(statement.fetch_string().as_deref(), Some("20"));
+    assert_eq!(string(statement.query).as_deref(), Some("10"));
+    assert_eq!(string(statement.fetch).as_deref(), Some("20"));
 
-    statement.set_query(s("1.5")).unwrap();
-    statement.set_fetch(s("")).unwrap();
-    assert_eq!(statement.query_string().as_deref(), Some("1.5"));
-    assert_eq!(statement.fetch_string(), None);
+    set_query(&mut statement, s("1.5")).unwrap();
+    set_fetch(&mut statement, s("")).unwrap();
+    assert_eq!(string(statement.query).as_deref(), Some("1.5"));
+    assert_eq!(string(statement.fetch), None);
     // The connection is unaffected by statement-level overrides.
-    assert_eq!(connection.query_string().as_deref(), Some("10"));
-    assert_eq!(connection.fetch_string().as_deref(), Some("20"));
+    assert_eq!(string(connection.query).as_deref(), Some("10"));
+    assert_eq!(string(connection.fetch).as_deref(), Some("20"));
 }
 
 #[test]

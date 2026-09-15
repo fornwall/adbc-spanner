@@ -18,52 +18,27 @@
 //! every option round-trips through `get_option`. The values are opaque strings passed through to
 //! Spanner unchanged; the driver validates only that the option is a string.
 
-use adbc_core::error::Result;
-use adbc_core::options::OptionValue;
 use google_cloud_spanner::model::execute_sql_request::QueryOptions;
 use google_cloud_spanner::statement::StatementBuilder;
-
-use crate::options::non_empty_string_option;
 
 /// The query optimizer options held by a connection or statement.
 ///
 /// A connection's value is cloned into each statement it creates (which may then override either
 /// field independently), mirroring how [`RequestConfig`](crate::request::RequestConfig) and
 /// [`ReadStaleness`](crate::staleness::ReadStaleness) are inherited.
+///
+/// Both fields are set and read directly by
+/// [`impl_shared_option_dispatch`](crate::options::impl_shared_option_dispatch), which parses each
+/// with [`non_empty_string_option`](crate::options::non_empty_string_option).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct QueryOptionsConfig {
     /// Raw `spanner.query.optimizer_version` value, when set.
-    optimizer_version: Option<String>,
+    pub(crate) optimizer_version: Option<String>,
     /// Raw `spanner.query.optimizer_statistics_package` value, when set.
-    optimizer_statistics_package: Option<String>,
+    pub(crate) optimizer_statistics_package: Option<String>,
 }
 
 impl QueryOptionsConfig {
-    /// Handle a `set_option` for `spanner.query.optimizer_version`. An empty value unsets it.
-    pub(crate) fn set_optimizer_version(&mut self, value: OptionValue) -> Result<()> {
-        self.optimizer_version =
-            non_empty_string_option(value, crate::OPTION_QUERY_OPTIMIZER_VERSION)?;
-        Ok(())
-    }
-
-    /// Handle a `set_option` for `spanner.query.optimizer_statistics_package`. An empty value unsets
-    /// it.
-    pub(crate) fn set_optimizer_statistics_package(&mut self, value: OptionValue) -> Result<()> {
-        self.optimizer_statistics_package =
-            non_empty_string_option(value, crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE)?;
-        Ok(())
-    }
-
-    /// The raw `spanner.query.optimizer_version` value, for `get_option` round-trip.
-    pub(crate) fn optimizer_version_string(&self) -> Option<&str> {
-        self.optimizer_version.as_deref()
-    }
-
-    /// The raw `spanner.query.optimizer_statistics_package` value, for `get_option` round-trip.
-    pub(crate) fn optimizer_statistics_package_string(&self) -> Option<&str> {
-        self.optimizer_statistics_package.as_deref()
-    }
-
     /// Apply the optimizer options to a query statement builder. A no-op when neither is set, so an
     /// unset config leaves the request's query options empty (the service default optimizer).
     #[must_use]
