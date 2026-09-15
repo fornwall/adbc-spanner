@@ -11,7 +11,7 @@ use super::{SpannerStatement, string_option};
 use crate::bind;
 use crate::connection::{TxnKind, lock_txn, write_mutations_txn};
 use crate::error::{
-    err, from_spanner, from_status_parts, invalid_state, not_implemented, unsupported,
+    annotate, err, from_spanner, from_status_parts, invalid_state, not_implemented, unsupported,
 };
 use crate::runtime::block_on_cancellable;
 use crate::timeout::with_timeout;
@@ -104,19 +104,12 @@ impl SpannerStatement {
         // wants — name the target table (consumers key off it) instead of running the exists
         // probe, whose "incompatible schema" wording would misreport a duplicate key.
         if error.status == Status::AlreadyExists {
-            let mut named = err(
-                format!(
-                    "bulk ingest append into table {table:?} failed: {}",
-                    error.message
-                ),
-                Status::AlreadyExists,
-            );
-            // Pure annotation: this branch only names the table, so the vendor code and forwarded
-            // `google.rpc.Status` details carry through. (The probe branches below *reinterpret*
-            // the error, deriving a new status from the table's existence, so they keep neither.)
-            named.vendor_code = error.vendor_code;
-            named.details = error.details;
-            return named;
+            // Pure annotation: this branch only names the table, so `annotate` keeps the status,
+            // the vendor code and the forwarded `google.rpc.Status` details. (The probe branches
+            // below *reinterpret* the error, deriving a new status, so they keep neither.)
+            return annotate(error, |message| {
+                format!("bulk ingest append into table {table:?} failed: {message}")
+            });
         }
         match self.ingest_table_exists(table) {
             Ok(true) => err(
@@ -669,12 +662,9 @@ fn note_rows_already_committed(error: Error, committed: i64) -> Error {
              retrying could duplicate rows",
         );
     }
-    let mut annotated = err(format!("{} ({note})", error.message), error.status);
-    // Pure annotation, like the append remap's `AlreadyExists` branch: vendor code and forwarded
-    // `google.rpc.Status` details survive the rebuilt message.
-    annotated.vendor_code = error.vendor_code;
-    annotated.details = error.details;
-    annotated
+    // Pure annotation, like the append remap's `AlreadyExists` branch: status, vendor code and
+    // forwarded `google.rpc.Status` details all survive the rewritten message.
+    annotate(error, |message| format!("{message} ({note})"))
 }
 
 /// Whether `error` is Spanner's specific "this commit has too many mutations" rejection — the one
