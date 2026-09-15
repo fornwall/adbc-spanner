@@ -56,6 +56,18 @@ pub(crate) fn chain<'a>(
 /// `ABORTED` = 10) even where several codes share one ADBC status. Errors without a status
 /// (transport/serialization/etc.) fall back to [`Status::Internal`] with `vendor_code` 0.
 ///
+/// That `vendor_code` contract holds as written for Rust-native consumers and for C callers using
+/// the ADBC **1.0.0** error layout, but not for one using the **1.1.0** layout: there the field is
+/// not the driver's to spend. adbc.h reserves it as a discriminant — a 1.1.0 caller learns that an
+/// error carries structured details by reading `ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA` (`i32::MIN`)
+/// back out of it — so the export layer (`src/ffi/error.rs`) must re-stamp that sentinel over
+/// whatever numeric code was stored here. Nothing is lost, because the same layout is the one with
+/// a details vector: the code is handed back as an extra detail keyed `adbc.spanner.vendor_code`
+/// whose value is its decimal ASCII rendering (so the `ABORTED` retry loop above becomes a lookup
+/// of that key for `"10"`, reachable through `AdbcErrorGetDetail`). The entry exists only on that
+/// path and only for a non-zero code; it is deliberately not added to `details` here, where every
+/// consumer can already read `vendor_code` directly.
+///
 /// # Structured error details
 ///
 /// A `google.rpc.Status` may also carry structured *details* — e.g. `QuotaFailure` on

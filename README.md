@@ -211,6 +211,13 @@ TODO: Go over these and merge with above:
   text, not binary protobuf). These let a caller see *why* a call failed beyond the status code —
   for example `google.rpc.QuotaFailure` on `RESOURCE_EXHAUSTED`, `google.rpc.BadRequest` /
   `ErrorInfo` on `INVALID_ARGUMENT`, or `google.rpc.PreconditionFailure` on `FAILED_PRECONDITION`.
+  One caveat for C callers using the ADBC **1.1.0** error layout: there the spec reserves
+  `vendor_code` as the discriminant that marks the error as carrying details
+  (`ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA`, `INT32_MIN`), so the driver must stamp that sentinel over
+  the numeric gRPC code — and hands the code back as one more detail, keyed
+  `adbc.spanner.vendor_code` with its decimal value as text (`10` for `ABORTED`), present only when
+  there is a gRPC code to report. Rust consumers and C callers using the 1.0.0 layout read the code
+  straight from `vendor_code` as described above.
   (Spanner's `RetryInfo` on `ABORTED` is forwarded the same way, but rarely reaches a caller: the
   client's read/write transaction runner retries aborted transactions itself — consuming that
   `retryDelay` for its own backoff — so an `ABORTED` normally never surfaces from a DML/commit

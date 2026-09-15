@@ -431,6 +431,14 @@ message already names the missing permission), `FAILED_PRECONDITION` becomes `In
 `DEADLINE_EXCEEDED` becomes `Timeout`, and anything with no close ADBC equivalent falls back to
 `Internal` with the original code still in `vendor_code`.
 
+One wrinkle worth knowing if you consume the driver through the **C ABI** at ADBC revision 1.1.0:
+that revision's error struct reserves `vendor_code` for a sentinel
+(`ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA`) that tells the caller the error carries structured details,
+so the driver has to overwrite the numeric gRPC code there. It is not lost — it comes back as an
+extra detail keyed `adbc.spanner.vendor_code`, whose value is the code in decimal (`10` for
+`ABORTED`), emitted only when the failure had a gRPC status at all. Rust code and C callers on the
+older 1.0.0 error layout read the code from `vendor_code` itself.
+
 ---
 
 ## 8. Putting it together — the mental model

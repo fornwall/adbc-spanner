@@ -246,3 +246,98 @@ fn a_foreign_release_cannot_take_private_driver_with_it() {
     assert_eq!(out.vendor_code, ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA);
     unsafe { (out.release.unwrap())(&raw mut out) };
 }
+
+/// Every detail currently attached to `error`, as `(key, value)` pairs, read back the way a C
+/// caller does: through the two getter entry points rather than the driver-side box.
+fn details_of(error: &AdbcError) -> Vec<(String, Vec<u8>)> {
+    (0..unsafe { error_get_detail_count(&raw const *error) })
+        .map(|index| {
+            let detail = unsafe { error_get_detail(&raw const *error, index) };
+            let key = unsafe { std::ffi::CStr::from_ptr(detail.key) }
+                .to_string_lossy()
+                .into_owned();
+            let value = unsafe { std::slice::from_raw_parts(detail.value, detail.value_length) };
+            (key, value.to_vec())
+        })
+        .collect()
+}
+
+/// The 1.1.0 layout spends `vendor_code` on the `private_data` sentinel, so the numeric gRPC code
+/// `from_spanner` documents as recoverable there has to come back some other way: as a detail
+/// keyed `adbc.spanner.vendor_code`, appended *after* the forwarded `google.rpc.*` ones so the
+/// indices a caller already walks keep pointing at the same details.
+#[test]
+fn a_1_1_0_error_reports_its_vendor_code_as_a_detail() {
+    let mut error = Error::with_message_and_status("aborted", Status::IO);
+    error.vendor_code = 10; // gRPC ABORTED
+    error.details = Some(vec![(
+        "google.rpc.retryinfo".to_string(),
+        br#"{"@type":"type.googleapis.com/google.rpc.RetryInfo"}"#.to_vec(),
+    )]);
+    let mut out = zeroed_error();
+    unsafe { export_error(&raw mut out, error) };
+
+    assert_eq!(out.vendor_code, ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA);
+    let details = details_of(&out);
+    assert_eq!(
+        details
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        ["google.rpc.retryinfo", VENDOR_CODE_DETAIL_KEY],
+        "the forwarded detail must stay at index 0"
+    );
+    // Decimal ASCII, not raw bytes: the keys carry no `-bin` suffix, which promises text values.
+    assert_eq!(details[1].1, b"10");
+
+    unsafe { (out.release.unwrap())(&raw mut out) };
+}
+
+/// `from_spanner` stores `vendor_code` 0 for a failure that carried no gRPC status at all
+/// (transport/serialization), so an entry there would assert a code — `OK`, of all things — that
+/// never existed. The detail is emitted only for a real one.
+#[test]
+fn a_zero_vendor_code_adds_no_detail() {
+    let mut error = Error::with_message_and_status("transport failure", Status::Internal);
+    error.details = Some(vec![("k1".to_string(), b"v1".to_vec())]);
+    assert_eq!(error.vendor_code, 0, "the default is the no-status value");
+    let mut out = zeroed_error();
+    unsafe { export_error(&raw mut out, error) };
+
+    assert_eq!(
+        details_of(&out),
+        [("k1".to_string(), b"v1".to_vec())],
+        "a zero vendor code must not add a detail"
+    );
+
+    unsafe { (out.release.unwrap())(&raw mut out) };
+}
+
+/// The 1.0.0 layout is untouched by any of that: it has no details vector to put an entry in, and
+/// it does not need one — nothing overwrites `vendor_code` there, so the numeric code reaches the
+/// caller in the field `from_spanner` documents.
+#[test]
+fn a_1_0_0_error_needs_no_vendor_code_detail() {
+    let sentinel_data = 0xf00d_usize as *mut c_void;
+    let mut out = AdbcError {
+        message: null(),
+        vendor_code: 0, // not the sentinel, so: 1.0.0
+        sqlstate: [0; 5],
+        release: None,
+        private_data: sentinel_data,
+        private_driver: null(),
+    };
+    let mut error = Error::with_message_and_status("aborted", Status::IO);
+    error.vendor_code = 10; // gRPC ABORTED
+    error.details = Some(vec![("google.rpc.retryinfo".to_string(), b"{}".to_vec())]);
+    unsafe { export_error(&raw mut out, error) };
+
+    assert_eq!(out.vendor_code, 10);
+    // No detail box was written, so the caller's trailing bytes still hold what it put there.
+    assert_eq!(out.private_data, sentinel_data);
+    assert!(details_of(&out).is_empty());
+
+    let release: unsafe extern "C" fn(*mut AdbcErrorV100) =
+        unsafe { std::mem::transmute(out.release.unwrap()) };
+    unsafe { release((&raw mut out).cast::<AdbcErrorV100>()) };
+}

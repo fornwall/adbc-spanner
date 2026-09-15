@@ -1145,12 +1145,14 @@ fn aborted_surfaces_vendor_code_10() {
 /// `retryDelay` round-trips the 50 ms the mock sent (`0.05s`).
 ///
 /// **Fidelity note.** This drives the driver's public `adbc_core` traits (`Connection` /
-/// `Statement`), *not* the C-ABI FFI. Empirically the detail does **not** survive the FFI boundary:
-/// the driver stores the numeric gRPC code (`ABORTED` = 10) in `vendor_code`, but the ADBC C detail
-/// transport only re-reads `ErrorGetDetail`/`ErrorGetDetailCount` when `vendor_code ==
-/// ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA` (`i32::MIN`); with any other `vendor_code` the forwarded
-/// details are dropped in the driver-manager round-trip. So the trait boundary is the highest
-/// fidelity at which the detail is actually retrievable today.
+/// `Statement`), *not* the C-ABI FFI — that is simply as far as this harness reaches. The detail is
+/// retrievable across the C boundary too: the ADBC C detail transport re-reads
+/// `ErrorGetDetail`/`ErrorGetDetailCount` only when `vendor_code ==
+/// ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA` (`i32::MIN`), and the driver's own export layer
+/// (`src/ffi/error.rs`) always stamps that sentinel on the 1.1.0 layout. What it costs there is the
+/// numeric gRPC code the sentinel displaces (`ABORTED` = 10), which that layer hands back as one
+/// further detail keyed `adbc.spanner.vendor_code` — covered by the unit tests in
+/// `src/ffi/error/tests.rs`.
 #[test]
 fn aborted_retry_info_detail_reaches_adbc_error_details() {
     let _watchdog = Watchdog::arm(

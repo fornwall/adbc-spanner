@@ -11,7 +11,7 @@ Each finding is a checkbox — tick it when fixed (or explicitly decided against
 the item), and delete it once it is no longer relevant. IDs are stable for cross-referencing, so a
 new finding never reuses a retired ID.
 
-**Severity counts:** Medium 4 · Low 3 · Upstream 4.
+**Severity counts:** Medium 4 · Low 2 · Upstream 4.
 
 ---
 
@@ -19,11 +19,6 @@ new finding never reuses a retired ID.
 
 - [ ] **CON-1 (Medium)** — `block_on` panics (call and drop) when the driver is entered from an async context — `src/runtime.rs:169,181`, `src/conversion.rs:369,385`, `src/driver.rs:524`
   Any ADBC call or `RecordBatchReader::next` from a tokio worker thread panics ("Cannot block the current thread from within a runtime"); additionally, if a reader is the *last* `Arc<Runtime>` holder and is dropped on an async thread, `Runtime::drop` panics ("Cannot drop a runtime…"). There is no `Handle::try_current()` anywhere in the crate, no mitigation and no user-facing doc warning. The drop hazard now also has a **C-ABI surface**: `src/ffi/stream.rs:52`'s `PrivateData::drop` owns the boxed reader, so a driver manager calling the stream's release callback from a tokio worker thread drops the `SpannerBatchReader` — and possibly the last `Arc<Runtime>` — on an async thread. **Fix:** detect `tokio::runtime::Handle::try_current()` in `block_on_cancellable` (and `connect`'s plain `block_on`) and return a clean error advising `spawn_blocking`; replace the bare `SharedRuntime = Arc<Runtime>` alias (`src/runtime.rs:22`) with a newtype whose `Drop` uses `shutdown_background()` when a runtime context is detected. (Root cause is adbc_core's sync trait design — see UP-13.)
-
-## Error handling
-
-- [ ] **UP-10 (Low)** — `vendor_code` is overwritten with the `ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA` (`INT32_MIN`) sentinel for 1.1.0-layout C callers — `src/ffi/error.rs:96-101`, `src/error.rs:49-58`
-  Spec-mandated: the sentinel is the discriminant a 1.1.0 caller reads to know `private_data` is present, so the driver's own export layer re-stamps it exactly as the upstream exporter did (`rust/ffi/src/types.rs:645-651`) — replacing `adbc_ffi` did not and could not change this. The 1.0.0 path preserves the real code. Consequence: this driver's documented "key off `vendor_code == 10` (ABORTED)" contract holds only for Rust-native and 1.0.0-layout consumers, and `src/error.rs` does not say so. **Fix (no longer an upstream ask** — the driver owns both the export layer and the details map**):** add the doc note in `src/error.rs`, and optionally forward the numeric code as an entry in `details_for_adbc`, which `src/ffi/error.rs:88-95` already passes through to `private_data` verbatim.
 
 ## Performance & efficiency
 

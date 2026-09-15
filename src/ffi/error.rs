@@ -17,6 +17,16 @@ use super::guard::sanitized_cstring;
 /// live here and are freed by [`release_error`].
 type ErrorDetails = Vec<(CString, Vec<u8>)>;
 
+/// Detail key carrying the numeric gRPC code that the 1.1.0 layout's `vendor_code` sentinel
+/// displaces (see [`export_error`]).
+///
+/// It cannot collide with the keys `crate::error::details_for_adbc` emits: those are lowercased
+/// fully-qualified protobuf type names, always of the form `<package>.<message>` with a real
+/// package — `google.rpc.retryinfo` and friends — and no protobuf package is named `adbc`. The
+/// `adbc.` prefix is the same namespace the standard option keys live in, narrowed by `spanner.`
+/// to mark it as this driver's own rather than something the ADBC spec defines.
+pub(crate) const VENDOR_CODE_DETAIL_KEY: &str = "adbc.spanner.vendor_code";
+
 /// # Safety
 /// `error` must be a pointer this driver previously wrote a 1.1.0 error into.
 // Guard-exempt: must not unwind and cannot — freeing a `CString` and a details box does not
@@ -86,16 +96,31 @@ pub(crate) unsafe fn export_error(out: *mut AdbcError, error: Error) {
         // uninitialized/freed." Leaving it null for a detail-free error would break that both
         // ways -- it is how a consumer distinguishes a written error from a zeroed one -- so the
         // box is always allocated, and `release_error` is what puts the field back to null.
-        let details: ErrorDetails = error
+        let mut details: ErrorDetails = error
             .details
             .unwrap_or_default()
             .into_iter()
             .map(|(key, value)| (sanitized_cstring(&key), value))
             .collect();
+        // The `vendor_code` field is about to be overwritten with the sentinel (see below), so the
+        // numeric gRPC code `crate::error::from_spanner` documents as recoverable there would be
+        // lost to exactly the callers using the richer layout. Hand it back as a detail instead.
+        // Appended *after* the forwarded `google.rpc.*` details so the indices a caller already
+        // walks do not shift, and only when there is a code to report: zero is what `from_spanner`
+        // stores for a failure that carried no gRPC status at all, and claiming code 0 (`OK`) for
+        // one would be worse than saying nothing. The value is decimal ASCII, keeping the
+        // all-details-are-UTF-8-text invariant the missing `-bin` key suffix advertises.
+        if error.vendor_code != 0 {
+            details.push((
+                sanitized_cstring(VENDOR_CODE_DETAIL_KEY),
+                error.vendor_code.to_string().into_bytes(),
+            ));
+        }
         let value = AdbcError {
             message: sanitized_cstring(&error.message).into_raw(),
             // Re-stamp the sentinel rather than the driver's vendor code: consumers read the
             // details in `private_data` only when they see it, so the sentinel is load-bearing.
+            // The displaced code lives on as the `VENDOR_CODE_DETAIL_KEY` detail added above.
             vendor_code: ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA,
             sqlstate: error.sqlstate,
             release: Some(release_error),
