@@ -896,7 +896,7 @@ fn manual_transaction_queries_share_one_read_only_transaction() {
     connection.rollback().expect("discard the buffered insert");
 }
 
-/// COR-3 regression, autocommit half: `execute_update` on SQL that is neither DDL nor DML (a
+/// Regression, autocommit half: `execute_update` on SQL that is neither DDL nor DML (a
 /// SELECT) must execute it through the **read-only query** machinery — `ExecuteStreamingSql`, not
 /// `ExecuteBatchDml` — drain and discard the rows, and report no count (`None`). `adbc.h`
 /// sanctions running any statement without expecting a result set (`ExecuteQuery` with a NULL
@@ -978,7 +978,7 @@ fn execute_update_routes_a_query_to_the_read_only_path() {
     );
 }
 
-/// SPEC-3 regression: `execute_partitions` must reject more than one bound parameter row with
+/// Regression: `execute_partitions` must reject more than one bound parameter row with
 /// `InvalidArguments` **before any RPC** — partitioned execution has no per-row fan-out, and the
 /// old behaviour silently truncated the bound data to row 0 — and it must consume the bound rows
 /// however the call ends (the DML-path convention), so a reused statement handle never silently
@@ -1023,7 +1023,7 @@ fn execute_partitions_rejects_multiple_bound_rows_and_consumes_them() {
     );
 }
 
-/// COR-12 regression: a **failed** parameterized (bound) query must still consume its bound rows,
+/// Regression: a **failed** parameterized (bound) query must still consume its bound rows,
 /// exactly like the DML/ingest/partition paths — otherwise a reused statement handle would silently
 /// re-apply the stale bound rows to a later, unrelated execution. The old bound-query path cleared
 /// `self.bound` only on success (the error propagated out via `?` before the clear), so a query that
@@ -1081,7 +1081,7 @@ fn failed_bound_query_still_consumes_bound_rows() {
     );
 }
 
-/// COR-3 regression, manual-mode half: in a manual transaction `execute_update` on a SELECT must
+/// Regression, manual-mode half: in a manual transaction `execute_update` on a SELECT must
 /// run it immediately as a read-only query (on the transaction's shared multi-use read-only
 /// transaction, which it begins) and buffer **nothing** to commit — the old mis-routing buffered
 /// the SELECT as pending "DML", which poisoned the eventual `ExecuteBatchDml` commit (only
@@ -1484,7 +1484,7 @@ fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
 /// its long-running-operation poll loop, which sit inside the same `with_timeout`, so bounding the
 /// wrapper bounds the poll loop that used to run unbounded.
 ///
-/// Do not "simplify" this back to racing a tiny deadline against a real emulator DDL (TEST-12):
+/// Do not "simplify" this back to racing a tiny deadline against a real emulator DDL:
 /// tokio's timer wheel has ~1ms granularity, so a sub-millisecond deadline fires up to ~1ms late,
 /// while the emulator answers DDL over a warm local connection in well under that — whichever won
 /// decided the result. Here there is nothing to race. The admin endpoint is a black hole ([`GatedEndpoint`]), so the
@@ -1589,7 +1589,7 @@ fn silent_stream_reader(
     statement.execute().expect("execute settles the schema")
 }
 
-/// (c″) TEST-7: the **fetch** twin of the silent-stream tests above —
+/// (c″) The **fetch** twin of the silent-stream tests above —
 /// `spanner.rpc.timeout_seconds.fetch` bounds each *subsequent* chunk fetch of a live streamed
 /// result, set through the ordinary statement option surface and observed firing on a real gRPC
 /// stream (`src/timeout.rs`'s own `fetch_timeout_fires_inside_the_prefetch_task` exercises
@@ -1947,7 +1947,7 @@ fn ingest_does_not_bisect_a_non_mutation_limit_error() {
 }
 
 /// (d‴) **A mutation-build failure on a later chunk still reports the earlier chunks' committed
-/// rows** (COR-6). An autocommit multi-chunk ingest commits chunk by chunk, so a failure *after* an
+/// rows**. An autocommit multi-chunk ingest commits chunk by chunk, so a failure *after* an
 /// earlier chunk has landed must carry the exact already-committed count — the `run_ingest` contract
 /// — whether the failure is a rejected commit *or* a conversion error raised while building a later
 /// chunk's mutations. Here each ~3 MiB row fills its own commit chunk (the 4 MiB/chunk byte budget),
@@ -1991,7 +1991,7 @@ fn mutation_build_failure_on_a_later_chunk_notes_committed_rows() {
         .expect_err("the out-of-range DATE in the second chunk must fail the ingest");
 
     // The underlying conversion status is preserved, and the annotation reports exactly the one row
-    // the first chunk already committed (COR-6). Reverting the `note_rows_already_committed` wrapper
+    // the first chunk already committed. Reverting the `note_rows_already_committed` wrapper
     // on the build path drops the "already committed" clause and fails this assertion.
     assert_eq!(error.status, AdbcStatus::InvalidArguments, "got: {error}");
     assert!(
@@ -2008,7 +2008,7 @@ fn mutation_build_failure_on_a_later_chunk_notes_committed_rows() {
     );
 }
 
-/// (d⁗) **CON-5: a cancelled/timed-out chunk commit is ambiguous.** Cancel/timeout *drops* the
+/// (d⁗) **A cancelled/timed-out chunk commit is ambiguous.** Cancel/timeout *drops* the
 /// in-flight `Commit` future, which may still land server-side, so the failing chunk's own outcome
 /// is unknown — the "rows already committed" annotation must flag that ambiguity (and the
 /// duplicate-row risk on a caller-driven retry) instead of implying exact accounting. The mock fails
@@ -2055,7 +2055,7 @@ fn cancelled_ingest_commit_reports_ambiguous_outcome() {
     );
 }
 
-/// (d″) **A failed exists-probe must not mask the ingest error** (IDIO-9). When an `append` commit
+/// (d″) **A failed exists-probe must not mask the ingest error.** When an `append` commit
 /// fails with anything other than `AlreadyExists`, the driver probes `INFORMATION_SCHEMA.TABLES` to
 /// choose between the contract's `NotFound` (table absent) and `AlreadyExists` (schema mismatch).
 /// Here the probe *itself* fails — as it would for a principal that may write but not read
@@ -2136,7 +2136,7 @@ fn ingest_append_keeps_the_original_error_when_the_exists_probe_fails() {
 /// - and the status' **structured details** reach [`adbc_core::error::Error::details`] under the
 ///   contract `from_spanner` documents — key = lowercased proto type name, value = ProtoJSON.
 ///
-/// The details assertion is what pins COR-8: before the fix only `code` + `message` were forwarded
+/// The details assertion is the point: before the fix only `code` + `message` were forwarded
 /// on this path, so an `ErrorInfo` a caller needs to distinguish *why* a group failed was silently
 /// dropped. Driving it through the wire also exercises the client's own
 /// `prost Any → wkt::Any` decode of the embedded status, which the `src/error.rs` unit tests
@@ -2195,7 +2195,7 @@ fn batch_write_group_failure_forwards_status_details() {
         error.message
     );
 
-    // COR-8: the group status' details survive the whole stack — the client's decode of the
+    // The group status' details survive the whole stack — the client's decode of the
     // embedded `google.rpc.Status`, `from_status_parts`, and the ingest append remap.
     let details = error.details.as_ref().unwrap_or_else(|| {
         panic!(
@@ -2227,7 +2227,7 @@ fn batch_write_group_failure_forwards_status_details() {
     );
 }
 
-/// (d⁗) **BatchWrite same-chunk applied rows (COR-5).** BatchWrite applies mutation groups
+/// (d⁗) **BatchWrite same-chunk applied rows.** BatchWrite applies mutation groups
 /// non-atomically, so groups *before* a failing one within the same chunk stay committed. The error
 /// annotation must therefore report those same-chunk applied rows — not just whole earlier chunks —
 /// so the caller learns the true table state. The mock streams two OK groups then a failing one in a
@@ -2274,7 +2274,7 @@ fn batch_write_folds_same_chunk_applied_rows_into_committed_count() {
         "the append remap should name the target table; got: {}",
         error.message
     );
-    // COR-5: the two groups that applied within this same chunk are folded into the count.
+    // The two groups that applied within this same chunk are folded into the count.
     assert!(
         error
             .message
@@ -2411,7 +2411,7 @@ fn manual_ingest_conversion_failure_leaves_txn_buffer_untouched() {
 /// distinctive `mutation_count` the driver could not derive from the two ingested rows, proving it
 /// reads the server's value verbatim rather than counting rows.
 ///
-/// TEST-5 rides along here: `spanner.commit.max_delay` is the other option
+/// `spanner.commit.max_delay` rides along here: it is the other option
 /// `RequestConfig::apply_to_write_only` puts on this very `CommitRequest`, so the same scripted
 /// ingest asserts it arrives as the duration it was set to. The runner commit sites — and the
 /// negative (unset ⇒ no delay on the wire) — are covered by
@@ -2460,7 +2460,7 @@ fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
             OptionValue::String("true".into()),
         )
         .expect("enable commit stats");
-    // TEST-5: the other commit option applied at this same write-only site — it must reach the
+    // The other commit option applied at this same write-only site — it must reach the
     // CommitRequest as a 100ms `max_commit_delay` (asserted below).
     statement
         .set_option(
@@ -2492,7 +2492,7 @@ fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
             "spanner.commit_stats=true must make the driver set return_commit_stats on the \
              CommitRequest"
         );
-        // TEST-5: the delay must arrive as the duration it was set to, not merely be present.
+        // The delay must arrive as the duration it was set to, not merely be present.
         assert_eq!(
             commits[0].max_commit_delay,
             Some(prost_types::Duration {
@@ -2514,7 +2514,7 @@ fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
     );
 }
 
-/// TEST-5 (wire): `spanner.commit.max_delay` is parse/round-trip tested offline (`src/request.rs`),
+/// (wire): `spanner.commit.max_delay` is parse/round-trip tested offline (`src/request.rs`),
 /// but nothing proved the parsed duration leaves the driver. `RequestConfig::apply_to_runner` puts
 /// it on the read/write **runner** commits — autocommit DML and the manual-mode commit — which
 /// `commit_stats_mutation_count_is_captured_from_the_commit_response` (the write-only ingest site)
@@ -2636,7 +2636,7 @@ fn max_commit_delay_reaches_the_wire_on_runner_commits() {
     );
 }
 
-/// TEST-3 (wire): the standard `adbc.connection.transaction.isolation_level` option is parse- and
+/// (wire): the standard `adbc.connection.transaction.isolation_level` option is parse- and
 /// round-trip-tested offline (`src/connection.rs`), but nothing proved a level — least of all a
 /// **promoted** one — ever leaves the driver. `apply_isolation` puts the level on the read/write
 /// runner, whose transaction the client begins *inline*, so it rides the `TransactionOptions` of the
@@ -2648,8 +2648,8 @@ fn max_commit_delay_reaches_the_wire_on_runner_commits() {
 ///    assertion that a level is populated could never fail.
 /// 2. **Natively supported**: `serializable`, `repeatable_read` and `snapshot` map 1:1 onto
 ///    Spanner's own two levels — `snapshot` included, because Spanner implements `REPEATABLE_READ`
-///    *as* snapshot isolation (SPEC-7), so it is an exact match rather than a promotion.
-/// 3. **Promoted** (SPEC-4, the deliberate deviation worth pinning): each of the three spec levels
+///    *as* snapshot isolation, so it is an exact match rather than a promotion.
+/// 3. **Promoted** (the deliberate deviation worth pinning): each of the three spec levels
 ///    Spanner does not expose arrives as the weakest supported level that satisfies it —
 ///    `read_uncommitted`/`read_committed` → `REPEATABLE_READ`, `linearizable` → `SERIALIZABLE`.
 ///    Nothing on the wire is ever an unsupported level, and nothing is dropped.
@@ -2751,7 +2751,7 @@ fn isolation_level_reaches_transaction_options_on_the_begin() {
     }
 }
 
-/// SPAN-6 regression (wire): a manual transaction that buffered **only mutations** (bulk ingests,
+/// Regression (wire): a manual transaction that buffered **only mutations** (bulk ingests,
 /// no DML) must commit through the client's replay-protected **write-only** transaction —
 /// `WriteOnlyTransaction::write` begins the transaction with a `mutation_key` (the replay-
 /// protection marker) and never touches `ExecuteBatchDml` — while a transaction that buffered DML
@@ -3092,7 +3092,7 @@ fn read_only_bound(
         .expect("the read-only transaction options must carry a timestamp bound")
 }
 
-/// TEST-1 (wire): `spanner.read.staleness` must reach Spanner as the matching non-strong
+/// (wire): `spanner.read.staleness` must reach Spanner as the matching non-strong
 /// timestamp bound in the `ExecuteSqlRequest`'s single-use transaction selector — for each of the
 /// four prefix forms (`exact:`/`max:`/`read:`/`min:`). Also pins the option's two levels: the
 /// first query *inherits* the connection-level value, the second *overrides* it on the statement.
@@ -3193,7 +3193,7 @@ fn read_staleness_reaches_the_wire_on_single_use_queries() {
     );
 }
 
-/// TEST-1 (wire, SPAN-4): the driver's two *metadata* read paths must carry
+/// (wire): the driver's two *metadata* read paths must carry
 /// `spanner.read.staleness` just as `execute` does — asserted over one mock script, because the two
 /// need exactly the same one (a begin-aware `ExecuteStreamingSql` recording every transaction
 /// selector).
@@ -3339,7 +3339,7 @@ fn bound_query_transaction_selectors(staleness: &str) -> Vec<Option<v1::Transact
     seen
 }
 
-/// TEST-1 (wire, multi-use pinning): a bound query over several bound rows runs all its per-row
+/// (wire, multi-use pinning): a bound query over several bound rows runs all its per-row
 /// statements in **one** multi-use read-only transaction, and Spanner accepts the
 /// bounded-staleness kinds only on single-use transactions — so the driver must pin `max:`/`min:`
 /// to their most-stale legal equivalent when beginning it (`max:<d>` → exact staleness `<d>`,
@@ -3403,7 +3403,7 @@ fn bounded_staleness_is_pinned_for_multi_use_bound_queries() {
     }
 }
 
-/// TEST-2 (wire): `spanner.directed_read` must land on `ExecuteSqlRequest.directed_read_options`
+/// (wire): `spanner.directed_read` must land on `ExecuteSqlRequest.directed_read_options`
 /// for read-only queries, and must NOT ride along on DML — Spanner rejects directed reads on a
 /// read/write transaction with `INVALID_ARGUMENT`, so a regression here breaks every write while
 /// the option is set. Plain DML goes out as `ExecuteBatchDml`, whose request proto has no
@@ -3695,7 +3695,7 @@ fn query_optimizer_options_reach_the_wire_on_queries() {
     );
 }
 
-/// SPAN-7 (wire): every mutation-free autocommit `ExecuteBatchDml` batch is by construction the
+/// (wire): every mutation-free autocommit `ExecuteBatchDml` batch is by construction the
 /// transaction's *entire* content — nothing follows it before the commit — so the driver must
 /// flag it as the transaction's last request (`ExecuteBatchDmlRequest.last_statements = true`)
 /// for a multi-statement `;`-batch (the dbt-style `DELETE …; INSERT …` shape) just as for a
@@ -3772,7 +3772,7 @@ fn autocommit_batch_dml_is_flagged_last_statements_but_manual_commit_is_not() {
     );
 }
 
-/// SPAN-8 (wire): `spanner.request.priority` must reach the `ExecuteBatchDml` RPC itself — the
+/// (wire): `spanner.request.priority` must reach the `ExecuteBatchDml` RPC itself — the
 /// path *all* plain autocommit DML takes — and not only the transaction's commit. The client's
 /// `BatchDmlBuilder` gained the priority setter upstream (UP-4,
 /// googleapis/google-cloud-rust#6047); before it, the batch went out with
@@ -3837,7 +3837,7 @@ fn batch_dml_carries_the_request_priority_and_tag() {
 ///    than sending a tag that does nothing. With
 ///    `spanner.transaction.exclude_from_change_streams` still unset, the request's
 ///    `exclude_txn_from_change_streams` must go out `false`.
-/// 2. SPAN-9: setting `spanner.transaction.exclude_from_change_streams=true` on the connection must
+/// 2. Setting `spanner.transaction.exclude_from_change_streams=true` on the connection must
 ///    then set `exclude_txn_from_change_streams` on the next ingest's request. The BatchWrite path
 ///    is the cleanest wire assertion for that flag, because it rides the `BatchWriteRequest`
 ///    **directly** (`RequestConfig::apply_to_batch_write`); the runner-commit sites
@@ -3950,7 +3950,7 @@ fn batch_write_carries_the_request_options_and_change_stream_exclusion() {
     }
 }
 
-/// SPAN-9 (wire, runner path): `spanner.transaction.exclude_from_change_streams=true` must set
+/// (wire, runner path): `spanner.transaction.exclude_from_change_streams=true` must set
 /// `exclude_txn_from_change_streams` on the **inline-begin** `TransactionOptions` the read/write
 /// runner sends — an autocommit DML begins its transaction inline on the `ExecuteBatchDml` request,
 /// so `RequestConfig::apply_to_runner`'s flag rides that request's `Begin` selector.
@@ -4060,7 +4060,7 @@ fn exclude_from_change_streams_reaches_the_wire_on_runner_commits() {
     );
 }
 
-/// TEST-4 (wire): the request priority / tag options are round-trip-tested offline (`src/request.rs`)
+/// (wire): the request priority / tag options are round-trip-tested offline (`src/request.rs`)
 /// and covered on the batch-DML / BatchWrite paths above, but the integration test that was meant to
 /// prove they reach a **query** and a **commit** is wire-vacuous — the emulator ignores
 /// `RequestOptions` entirely, so it can neither observe the driver sending them nor a metadata read
@@ -4216,7 +4216,7 @@ fn request_priority_reaches_metadata_reads_but_tags_do_not() {
 }
 
 // ---------------------------------------------------------------------------
-// Shared client stack (SPAN-1)
+// Shared client stack
 // ---------------------------------------------------------------------------
 
 /// Like [`MockServer::start`], but with a **counting** `CreateSession` handler in place of
@@ -4255,7 +4255,7 @@ fn start_counting_sessions(sessions: Arc<AtomicUsize>) -> MockServer {
     }
 }
 
-/// **SPAN-1** — connections share one client stack. Building the Spanner client stack is
+/// Connections share one client stack. Building the Spanner client stack is
 /// expensive (a 4-channel gRPC pool, credential resolution, a `CreateSession` RPC, and a
 /// background session-maintenance task), and it is a per-*database* cost: the `SpannerDatabase`
 /// caches the stack built for its first connection and hands cheap clones (shared session +
@@ -4330,7 +4330,7 @@ fn connections_share_one_client_stack_until_an_option_is_set() {
 }
 
 // ---------------------------------------------------------------------------
-// SPEC-2: `adbc.statement.exec.incremental` accepts its spec default
+// `adbc.statement.exec.incremental` accepts its spec default
 // ---------------------------------------------------------------------------
 
 /// `adbc.statement.exec.incremental` at its spec default (DISABLED, `"false"`) must be an
@@ -4590,7 +4590,7 @@ fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_pat
     );
 }
 
-/// SPAN-5: `get_statistics` must take its `INFORMATION_SCHEMA` discovery reads *and* every
+/// `get_statistics` must take its `INFORMATION_SCHEMA` discovery reads *and* every
 /// per-table aggregate scan at ONE consistent snapshot, so a table created between discovery and
 /// its scan cannot fail the call and every count is taken at the same timestamp. The driver does
 /// this by running them all on a single multi-use read-only transaction (as `get_objects` does),

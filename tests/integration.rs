@@ -2143,7 +2143,7 @@ fn array_columns_map_to_native_arrow_lists() {
 ///
 /// A `STRUCT` may repeat a field name and leave a field unnamed — both legal in Spanner, since a
 /// `STRUCT` is positional, not a map. Every field must keep its own value: decoding by name would
-/// collapse the two `x`es onto one value (CONV-6).
+/// collapse the two `x`es onto one value.
 #[test]
 fn struct_values_map_to_native_arrow_structs() {
     let Some(mut fx) = fixture_unguarded() else {
@@ -2200,7 +2200,7 @@ fn struct_values_map_to_native_arrow_structs() {
 
     // A STRUCT may repeat a field name and leave a field unnamed — both legal in Spanner, since a
     // STRUCT is positional, not a map. Every field must keep its own value: decoding by name would
-    // collapse the two `x`es onto one value (CONV-6).
+    // collapse the two `x`es onto one value.
     let mut dup_struct_q = connection.new_statement().expect("new statement");
     dup_struct_q
         .set_sql_query("SELECT ARRAY(SELECT AS STRUCT 1 AS x, 2 AS x, 3) AS arr")
@@ -3435,7 +3435,7 @@ fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
 
     // (2c) A parameterized (bound) query with ZERO *total* bound rows — a DBAPI `executemany` with
     // an empty parameter set — has nothing to run, but must still advertise the query's real schema
-    // (via the PLAN probe), matching every non-empty execution, not a spurious empty schema (COR-9).
+    // (via the PLAN probe), matching every non-empty execution, not a spurious empty schema.
     let param_schema = Arc::new(Schema::new(vec![Field::new("p", DataType::Int64, false)]));
     // Reference schema from a NON-empty execution of the same query.
     let mut one_row_bound = connection.new_statement().expect("new statement");
@@ -3469,7 +3469,7 @@ fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
     assert_eq!(
         zero_row_reader.schema(),
         non_empty_schema,
-        "a zero-row bound query must advertise the query's real schema, not an empty one (COR-9)"
+        "a zero-row bound query must advertise the query's real schema, not an empty one"
     );
     let zero_row_batches = zero_row_reader
         .collect::<Result<Vec<_>, _>>()
@@ -5355,8 +5355,8 @@ fn get_statistics_reports_real_counts() {
     let connection = &mut fx.connection;
 
     // The UUID column pins down that UUID stays classified as groupable (distinct-countable): a
-    // misclassification either drops its DISTINCT_COUNT row or — worse, the CONV-3 failure mode —
-    // breaks the whole get_statistics call. INTERVAL (non-groupable, skipped from COUNT(DISTINCT))
+    // misclassification either drops its DISTINCT_COUNT row or — worse — breaks the whole
+    // get_statistics call. INTERVAL (non-groupable, skipped from COUNT(DISTINCT))
     // cannot get the same end-to-end coverage: the emulator rejects INTERVAL table columns
     // outright, so it is covered by the `groupable_types` unit test instead.
     run(
@@ -6278,7 +6278,7 @@ fn execute_partitions_round_trip() {
     assert_eq!(*seen.iter().next().unwrap(), 1);
     assert_eq!(*seen.iter().next_back().unwrap(), 200);
 
-    // A single bound parameter row still partitions (SPEC-3 allows exactly one): the row binds as
+    // A single bound parameter row still partitions (exactly one is allowed): the row binds as
     // `@max` and every partition honours it.
     let mut bound_stmt = connection.new_statement().expect("new statement");
     bound_stmt
@@ -7443,7 +7443,7 @@ fn rpc_timeouts() {
     // long-running-operation poll loop — but that is deliberately *not* asserted here: proving a
     // deadline fires needs an RPC slower than it, and the emulator answers DDL in well under the
     // ~1ms granularity of tokio's timer wheel, so the two are inseparable and any deadline small
-    // enough to fire is also small enough to lose (TEST-12). The DML/query cases above keep their
+    // enough to fire is also small enough to lose. The DML/query cases above keep their
     // margin (several gRPC round trips each); the DDL case is proved deterministically instead, on
     // an admin endpoint that can never answer at all, by
     // `ddl_update_timeout_fires_on_a_silent_admin_endpoint` in tests/mock_spanner.rs. The generous
