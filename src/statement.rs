@@ -155,6 +155,11 @@ pub struct SpannerStatement {
     /// [`run_ingest_mutations`](Self::run_ingest_mutations). Ignored in manual-transaction mode,
     /// where ingests buffer and commit atomically with the surrounding transaction.
     ingest_batch_write: bool,
+    /// Run the statement's DML as **Partitioned DML** (`spanner.dml.partitioned`, boolean, default
+    /// `false`) instead of in a read/write transaction — non-atomic, idempotence-requiring, and
+    /// free of the per-commit mutation limit. See [`run_partitioned_dml`](Self::run_partitioned_dml)
+    /// and [`OPTION_DML_PARTITIONED`](crate::OPTION_DML_PARTITIONED).
+    dml_partitioned: bool,
     /// How bound columns pair with the query's `@name` parameters
     /// (`adbc.statement.bind_by_name`): `false` (the default) binds positionally, `true` forces
     /// strict by-name. See [`bind::resolve_parameter_names`].
@@ -205,6 +210,7 @@ impl SpannerStatement {
             target_catalog: None,
             ingest_mode: None,
             ingest_batch_write: false,
+            dml_partitioned: false,
             bind_by_name: false,
             rows_per_batch: DEFAULT_ROWS_PER_BATCH,
             data_boost: false,
@@ -1053,6 +1059,9 @@ impl SpannerStatement {
     /// `commit`, and `ExecuteBatchDml` — the commit path — rejects `THEN RETURN` outright, so the
     /// returned rows would be silently unobtainable. It is rejected up front instead.
     fn run_dml(&self, sql: &str) -> Result<DmlOutcome> {
+        if self.dml_partitioned {
+            return Ok(DmlOutcome::Plain(Some(self.run_partitioned_dml(sql)?)));
+        }
         if !crate::sql::is_dml_returning(sql) {
             let statements = self.build_dml_statements(sql)?;
             return Ok(DmlOutcome::Plain(self.run_or_buffer(statements)?));
@@ -1084,6 +1093,56 @@ impl SpannerStatement {
             schema,
             affected,
         })
+    }
+
+    /// Run one DML statement as **Partitioned DML** (`spanner.dml.partitioned`), returning the
+    /// lower-bound affected-row count Spanner reports.
+    ///
+    /// Spanner splits the statement across partitions and applies each independently: there is no
+    /// commit, so the per-commit mutation limit that caps an ordinary read/write transaction does
+    /// not apply — but the statement is not atomic, a partition may be applied more than once
+    /// (hence the idempotence requirement), and the count is a *lower* bound. See
+    /// [`OPTION_DML_PARTITIONED`](crate::OPTION_DML_PARTITIONED).
+    ///
+    /// The statement shapes partitioned DML cannot express are rejected up front by
+    /// [`check_partitioned_dml`] rather than left to a server-side error. The statement itself is
+    /// built by [`sql_builder`](Self::sql_builder), so the request priority/tag, query optimizer
+    /// options and retry/backoff policies all ride along (the builder's own retry policy is the
+    /// transaction-level abort retry, left at the client default like every other path); the
+    /// transaction-level knobs it has no setter for — the transaction tag, the commit options and
+    /// the isolation level — do not apply.
+    fn run_partitioned_dml(&self, sql: &str) -> Result<i64> {
+        let bound_rows = self.bound.iter().map(RecordBatch::num_rows).sum();
+        check_partitioned_dml(sql, lock_txn(&self.txn).autocommit(), bound_rows)?;
+        let mut statements = self.build_dml_statements(sql)?;
+        // A bound stream of zero rows has nothing to execute, exactly as on the batch-DML path.
+        let Some(statement) = statements.pop() else {
+            return Ok(0);
+        };
+        // `RequestConfig` exposes the flag only as its round-trip string.
+        let exclude_from_change_streams =
+            self.config.request.exclude_txn_from_change_streams_string() == "true";
+        let client = self.client.clone();
+        block_on_cancellable(
+            &self.runtime,
+            &self.cancel.current(),
+            with_timeout(
+                self.config.timeouts.update_timeout(),
+                crate::OPTION_RPC_TIMEOUT_UPDATE,
+                async move {
+                    let transaction = client
+                        .partitioned_dml_transaction()
+                        .with_exclude_txn_from_change_streams(exclude_from_change_streams)
+                        .build()
+                        .await
+                        .map_err(from_spanner)?;
+                    transaction
+                        .execute_update(statement)
+                        .await
+                        .map_err(from_spanner)
+                },
+            ),
+        )
     }
 
     /// Run a parameterized query once per bound row, streaming the concatenated results.
@@ -1687,6 +1746,9 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) if k == crate::OPTION_INGEST_BATCH_WRITE => {
                 self.ingest_batch_write = ingest_batch_write_option(value)?;
             }
+            OptionStatement::Other(k) if k == crate::OPTION_DML_PARTITIONED => {
+                self.dml_partitioned = dml_partitioned_option(value)?;
+            }
             OptionStatement::Other(k) if k == crate::OPTION_BIND_BY_NAME => {
                 self.bind_by_name =
                     crate::options::bool_option(value, "option adbc.statement.bind_by_name")?;
@@ -1736,6 +1798,10 @@ impl Optionable for SpannerStatement {
             // A plain boolean; reports "true"/"false" (the default is "false", write-only txn).
             OptionStatement::Other(k) if k == crate::OPTION_INGEST_BATCH_WRITE => {
                 Some(self.ingest_batch_write.to_string())
+            }
+            // A plain boolean; reports "true"/"false" (the default is "false", read/write txn).
+            OptionStatement::Other(k) if k == crate::OPTION_DML_PARTITIONED => {
+                Some(self.dml_partitioned.to_string())
             }
             // A plain boolean; reports "true"/"false" (the default is "false", positional).
             OptionStatement::Other(k) if k == crate::OPTION_BIND_BY_NAME => {
@@ -2123,6 +2189,46 @@ fn check_all_dml_batch(statements: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Guard for the **Partitioned DML** path (`spanner.dml.partitioned`): reject up front the
+/// statement shapes Spanner's partitioned-DML mode cannot express, naming the option and the reason
+/// rather than letting a confusing server-side error surface.
+///
+/// A partitioned-DML transaction runs exactly one statement, returns no rows, and is its own
+/// transaction type — so a `;`-separated batch, a `THEN RETURN` clause, and a manual (buffer-and-
+/// commit) transaction are all refused. Several bound parameter rows are refused for the same
+/// one-statement reason: there is no per-row fan-out to run them on.
+fn check_partitioned_dml(sql: &str, autocommit: bool, bound_rows: usize) -> Result<()> {
+    if !autocommit {
+        return Err(invalid_state(
+            "option spanner.dml.partitioned is set, but the connection is in a manual transaction: \
+             partitioned DML is its own transaction type and cannot join one. Commit (or re-enable \
+             adbc.connection.autocommit) first, or unset the option",
+        ));
+    }
+    if crate::sql::is_dml_returning(sql) {
+        return Err(invalid_argument(
+            "option spanner.dml.partitioned is set, but the statement has a THEN RETURN clause: \
+             partitioned DML returns no rows. Unset the option to run it in a read/write \
+             transaction",
+        ));
+    }
+    let statements = crate::sql::split_statements(sql).len();
+    if statements > 1 {
+        return Err(invalid_argument(format!(
+            "option spanner.dml.partitioned is set, but the SQL is a `;`-separated batch of \
+             {statements} statements: partitioned DML runs exactly one statement. Execute each \
+             statement separately, or unset the option"
+        )));
+    }
+    if bound_rows > 1 {
+        return Err(invalid_argument(format!(
+            "option spanner.dml.partitioned is set, but {bound_rows} parameter rows are bound: \
+             partitioned DML runs exactly one statement. Bind a single row, or unset the option"
+        )));
+    }
+    Ok(())
+}
+
 /// Fully drain a query's streaming reader, discarding the rows. Backs `execute_update`'s
 /// query-shaped arm: the statement still executes (and any mid-stream failure still surfaces),
 /// but that entry point has no result stream to hand back. A failure is unwrapped back to the
@@ -2214,6 +2320,16 @@ fn ingest_batch_write_option(value: OptionValue) -> Result<bool> {
     match &value {
         OptionValue::String(s) if s.trim().is_empty() => Ok(false),
         _ => crate::options::bool_option(value, "option spanner.ingest.batch_write"),
+    }
+}
+
+/// Parse the `spanner.dml.partitioned` statement option, the same shape as
+/// [`ingest_batch_write_option`]: an empty/whitespace string unsets it (back to `false`, the
+/// ordinary read/write path); otherwise a boolean string (exactly `true`/`false`).
+fn dml_partitioned_option(value: OptionValue) -> Result<bool> {
+    match &value {
+        OptionValue::String(s) if s.trim().is_empty() => Ok(false),
+        _ => crate::options::bool_option(value, "option spanner.dml.partitioned"),
     }
 }
 
@@ -2612,6 +2728,78 @@ mod tests {
         }
         let error = ingest_batch_write_option(OptionValue::Int(1)).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
+    }
+
+    #[test]
+    fn dml_partitioned_option_coerces_and_unsets_on_empty() {
+        // Exactly the strings "true"/"false", with empty/whitespace unsetting it (default false).
+        assert!(dml_partitioned_option(OptionValue::String("true".into())).unwrap());
+        assert!(!dml_partitioned_option(OptionValue::String("false".into())).unwrap());
+        for empty in ["", "   "] {
+            assert!(!dml_partitioned_option(OptionValue::String(empty.into())).unwrap());
+        }
+        for bad in ["maybe", "TRUE", "1", "yes", "FALSE", "0", "no"] {
+            let error = dml_partitioned_option(OptionValue::String(bad.into())).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "{bad}");
+        }
+        let error = dml_partitioned_option(OptionValue::Int(1)).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+    }
+
+    #[test]
+    fn partitioned_dml_accepts_a_single_statement() {
+        for sql in [
+            "UPDATE Singers SET Active = true WHERE Active = false",
+            "DELETE FROM Singers WHERE SingerId > 100",
+            // A trailing terminator still splits to one statement.
+            "DELETE FROM Singers WHERE SingerId > 100;",
+        ] {
+            assert!(check_partitioned_dml(sql, true, 0).is_ok(), "{sql}");
+        }
+        // One bound parameter row is fine — it binds the single statement.
+        assert!(check_partitioned_dml("DELETE FROM Singers WHERE SingerId = @id", true, 1).is_ok());
+    }
+
+    #[test]
+    fn partitioned_dml_rejects_what_it_cannot_express() {
+        let sql = "UPDATE Singers SET Active = true WHERE Active = false";
+        // Manual transaction mode: partitioned DML cannot join a buffer-and-commit transaction.
+        let error = check_partitioned_dml(sql, false, 0).unwrap_err();
+        assert_eq!(error.status, Status::InvalidState);
+        assert!(
+            error.message.contains("spanner.dml.partitioned")
+                && error.message.contains("manual transaction"),
+            "{}",
+            error.message
+        );
+        // A `;`-separated batch: partitioned DML runs exactly one statement.
+        let error = check_partitioned_dml(&format!("{sql}; {sql}"), true, 0).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(
+            error.message.contains("spanner.dml.partitioned")
+                && error.message.contains("batch of 2 statements"),
+            "{}",
+            error.message
+        );
+        // THEN RETURN: partitioned DML returns no rows.
+        let error =
+            check_partitioned_dml(&format!("{sql} THEN RETURN SingerId"), true, 0).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(
+            error.message.contains("spanner.dml.partitioned")
+                && error.message.contains("THEN RETURN"),
+            "{}",
+            error.message
+        );
+        // Several bound parameter rows: again, only one statement can run.
+        let error = check_partitioned_dml(sql, true, 3).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(
+            error.message.contains("spanner.dml.partitioned")
+                && error.message.contains("3 parameter rows"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

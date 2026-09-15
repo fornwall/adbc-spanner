@@ -684,6 +684,39 @@ pub const OPTION_BIND_BY_NAME: &str = "adbc.statement.bind_by_name";
 /// effective value as `"true"`/`"false"`.
 pub const OPTION_INGEST_BATCH_WRITE: &str = "spanner.ingest.batch_write";
 
+/// Driver-specific **statement** option: run the statement as
+/// [Partitioned DML](https://docs.cloud.google.com/spanner/docs/dml-partitioned) — Spanner's
+/// transaction mode for large-scale `UPDATE`/`DELETE`, which splits the statement across partitions
+/// and applies each independently, so it never hits the per-commit mutation limit an ordinary
+/// read/write transaction does.
+///
+/// A boolean, default `false`. It changes two guarantees, and both are on the caller:
+///
+/// - **Not atomic.** Each partition commits on its own, so a failure can leave some partitions
+///   applied and others not, and a partition may be applied **more than once**. The statement must
+///   therefore be **idempotent** (`SET active = true`, not `SET n = n + 1`).
+/// - **The row count is a lower bound**, not an exact count — Spanner reports
+///   `row_count_lower_bound`, which undercounts when a partition was retried. `execute_update`
+///   returns it as-is.
+///
+/// Spanner also restricts what it can run: exactly **one** statement per transaction (a
+/// `;`-separated batch is rejected with `InvalidArguments`), no `THEN RETURN` (partitioned DML
+/// returns no rows — also `InvalidArguments`), and it is its own transaction type, so it cannot
+/// join a manual transaction (`InvalidState` while `adbc.connection.autocommit` is `false`).
+/// Statements that are not DML, and bulk ingests (which ship mutations), ignore the flag.
+///
+/// `spanner.request.priority`, `spanner.request.tag`, the query optimizer options,
+/// `spanner.transaction.exclude_from_change_streams`, `spanner.rpc.timeout_seconds.update`, the
+/// `spanner.retry.*` tuning and the `adbc.connection.readonly` guard all apply. The commit options
+/// do not — partitioned DML has no `Commit`, so `spanner.commit.max_delay` and
+/// `spanner.commit_stats` are inert — and neither do `spanner.transaction.tag` (no per-transaction
+/// tag on this path) nor `adbc.connection.transaction.isolation_level` (Spanner does not support
+/// `REPEATABLE_READ` for partitioned DML).
+///
+/// `""` (empty) unsets it, back to the ordinary read/write path. `get_option` round-trips the
+/// effective value as `"true"`/`"false"`.
+pub const OPTION_DML_PARTITIONED: &str = "spanner.dml.partitioned";
+
 /// Driver-specific connection **and** statement option: the **read bound** for read-only queries.
 ///
 /// The value is one of four prefixed forms — two *relative* (a duration in the past) and two
@@ -1025,6 +1058,7 @@ mod options_doc_tests {
             crate::OPTION_QUOTA_PROJECT,
             crate::OPTION_ROWS_PER_BATCH,
             crate::OPTION_DATA_BOOST,
+            crate::OPTION_DML_PARTITIONED,
             crate::OPTION_READ_STALENESS,
             crate::OPTION_REQUEST_PRIORITY,
             crate::OPTION_REQUEST_TAG,

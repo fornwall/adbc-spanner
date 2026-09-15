@@ -207,6 +207,11 @@ flowchart TD
   commits and `rollback` is never gated.
 - Re-enabling autocommit commits pending work rather than dropping it (`enter_autocommit`).
 
+**Partitioned DML is autocommit-only.** With `spanner.dml.partitioned` set, a DML statement runs in
+Spanner's own partitioned-DML transaction (§3), which cannot join a manual transaction — it is
+rejected with `InvalidState` while `adbc.connection.autocommit` is `false`. It is also non-atomic and
+its row count is a lower bound; see [docs/options.md](options.md#statement-only-options).
+
 **DDL ignores all of this.** `SpannerStatement::run_ddl` always executes immediately via the admin
 API, whatever the transaction state: it neither fixes a manual transaction's kind nor is rejected by
 one, and `rollback` cannot undo it. So **DDL issued after buffered DML executes *before* it** — the
@@ -224,8 +229,8 @@ service (`UpdateDatabaseDdl`).
 The driver's traffic reaches **eight** of them — `CreateSession`, `BeginTransaction`,
 `ExecuteStreamingSql`, `ExecuteBatchDml`, `Commit`, `Rollback`, `PartitionQuery` and `BatchWrite` —
 plus the admin `UpdateDatabaseDdl`. It never issues `ExecuteSql` (unary), `Read`, `StreamingRead`,
-`PartitionRead`, `BatchCreateSessions`, `GetSession`, `ListSessions` or `DeleteSession`, and never
-uses partitioned-DML mode. Note that only some of the eight are called *directly*: the driver never
+`PartitionRead`, `BatchCreateSessions`, `GetSession`, `ListSessions` or `DeleteSession`. Note that
+only some of the eight are called *directly*: the driver never
 writes a `BeginTransaction`, `Commit` or `Rollback` call itself — the client issues those on its
 behalf. Each is covered below.
 
@@ -275,7 +280,8 @@ behalf. Each is covered below.
   - the **batch read-only** transaction backing `execute_partitions`
     (`<client>/src/batch_read_only_transaction.rs:53`), which is why building it in
     `run_partition_query` *does* cost an RPC;
-  - partitioned DML (unused here).
+  - partitioned DML (`SpannerStatement::run_partitioned_dml`, the `spanner.dml.partitioned`
+    option).
 - **Note.** The manual-mode read-only snapshot (`SpannerStatement::manual_read_transaction`) issues
   **no RPC** when built; the begin is folded into the first query. This is why that site is
   correctly not wrapped in an RPC timeout.
@@ -543,17 +549,27 @@ behalf. Each is covered below.
   other mode, but the statement is applied per-partition, non-atomically, with no `Commit`.
 - **Batch size.** One statement per transaction; no `Commit`. The row count returned is a
   **lower bound** (`row_count_lower_bound`), not an exact count.
-- **Where we use it.** **Nowhere.** Grep finds no `partitioned_dml` / `PartitionedDml` in `src/`.
-  Every DML the driver runs goes through the read/write runner (`ExecuteBatchDml`) or is buffered for
-  it. There is no option to request partitioned DML. The client *does* expose it —
-  `DatabaseClient::partitioned_dml_transaction()` (`<client>/src/database_client.rs:148`), which
-  issues `BeginTransaction{partitioned_dml}` then `ExecuteStreamingSql`
-  (`<client>/src/partitioned_dml_transaction.rs:193-213`) — so wiring it up would be a driver change
-  only, not a client one.
-  - *Why:* partitioned DML is non-atomic and requires the statement to be idempotent, which
+- **Where we use it.** Behind the opt-in `spanner.dml.partitioned` statement option
+  (`SpannerStatement::run_partitioned_dml`), which routes the statement through
+  `DatabaseClient::partitioned_dml_transaction()` (`<client>/src/database_client.rs:391`) —
+  `BeginTransaction{partitioned_dml}` then `ExecuteStreamingSql`
+  (`<client>/src/partitioned_dml_transaction.rs:167-219`). Unset (the default), every DML still goes
+  through the read/write runner (`ExecuteBatchDml`) or is buffered for it.
+  - *Why opt-in:* partitioned DML is non-atomic and requires the statement to be idempotent, which
     contradicts the atomicity ADBC's `execute_update` implies, and its row count is a lower bound
-    rather than an exact count. A future opt-in option would be the natural way to expose it; none
-    exists today.
+    rather than an exact count. Both are the caller's call to make, so the driver never picks the
+    mode on its own.
+  - *What the driver rejects up front* (`check_partitioned_dml`), rather than letting a server-side
+    error surface: a manual transaction (`InvalidState` — partitioned DML is its own transaction
+    type and cannot join one), a `;`-separated batch or several bound parameter rows
+    (`InvalidArguments` — one statement per transaction), and a `THEN RETURN` clause
+    (`InvalidArguments` — it returns no rows).
+  - *Options that reach it:* the request priority/tag, the query optimizer options,
+    `spanner.transaction.exclude_from_change_streams`, the `spanner.retry.*` tuning, the `update`
+    RPC timeout and the `adbc.connection.readonly` guard. The commit options
+    (`spanner.commit.max_delay`, `spanner.commit_stats`), the transaction tag and the isolation
+    level do not: there is no `Commit`, no per-transaction tag on this path, and `REPEATABLE_READ`
+    is not supported for partitioned DML.
 
 ## 4. Timeout and retry coverage
 
@@ -563,7 +579,7 @@ Each RPC path is bounded by one of the three `spanner.rpc.timeout_seconds.*` cla
 | Class | Covers | Sites |
 | ----- | ------ | ----- |
 | `query` | initial `ExecuteStreamingSql` + first chunk, PLAN probes, `PartitionQuery`, `read_partition`'s first fetch, **and all driver-internal metadata reads** | `src/statement.rs`: `execute_query_reader`, `execute_bound_query` (×2), `run_partition_query`, `plan_parameter_types`, `plan_dml_parameter_types`, `execute_schema`; `src/connection.rs`: `table_exists`, `get_table_schema`, `read_partition`; `src/objects.rs`: `collect_objects`; `src/statistics.rs`: discovery + aggregate-scan phases |
-| `update` | read/write runner (incl. abort replays), write-only commit, `BatchWrite`, and `UpdateDatabaseDdl` **plus its LRO poll** | `src/connection.rs`: `run_batch_txn`, `write_mutations_txn`; `src/statement.rs`: `execute_returning_dml`, `batch_write_chunk`, `run_ddl` |
+| `update` | read/write runner (incl. abort replays), write-only commit, `BatchWrite`, partitioned DML, and `UpdateDatabaseDdl` **plus its LRO poll** | `src/connection.rs`: `run_batch_txn`, `write_mutations_txn`; `src/statement.rs`: `execute_returning_dml`, `batch_write_chunk`, `run_partitioned_dml`, `run_ddl` |
 | `fetch` | each later chunk of a streamed result (inside the prefetch task) | `src/conversion.rs`: `ResultSetChunks::next_chunk`, `BoundQueryChunks::next_chunk` |
 
 Two asymmetries worth knowing:
@@ -587,7 +603,7 @@ All quoted from [Quotas & limits](https://docs.cloud.google.com/spanner/quotas) 
 | Query statement length | 1 million characters | any SQL RPC |
 | DDL statement size for a single schema change | 10 MiB | `UpdateDatabaseDdl` |
 | Concurrent reads per session | 100 | session-scoped |
-| Concurrent partitioned DML statements per database | 20,000 | partitioned DML (unused here) |
+| Concurrent partitioned DML statements per database | 20,000 | partitioned DML (`spanner.dml.partitioned`) |
 
 From the proto comments in the pinned client (not the quotas page):
 
