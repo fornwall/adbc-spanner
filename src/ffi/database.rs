@@ -1,32 +1,35 @@
 //! `AdbcDatabase*` entry points.
 
+use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
 use adbc_core::Driver;
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::OptionDatabase;
 
-use super::abi::{AdbcDatabase, AdbcError, AdbcStatusCode};
+use super::abi::{AdbcDatabase, AdbcDriver, AdbcError, AdbcStatusCode};
 use super::handle::Staged;
-use super::options::{option_entry_points, with_state};
+use super::options::{FfiHandle, with_state};
 use crate::driver::{SpannerDatabase, SpannerDriver};
 
 pub(super) const KIND: &str = "database";
 
 pub(super) type State = Staged<OptionDatabase, SpannerDatabase>;
 
-option_entry_points! {
-    AdbcDatabase {
-        new: database_new,
-        release: database_release,
-        set_option: database_set_option,
-        set_option_bytes: database_set_option_bytes,
-        set_option_int: database_set_option_int,
-        set_option_double: database_set_option_double,
-        get_option: database_get_option,
-        get_option_bytes: database_get_option_bytes,
-        get_option_int: database_get_option_int,
-        get_option_double: database_get_option_double,
+impl FfiHandle for AdbcDatabase {
+    type State = State;
+    const KIND: &'static str = KIND;
+
+    fn private_data(&self) -> *mut c_void {
+        self.private_data
+    }
+
+    fn private_data_mut(&mut self) -> &mut *mut c_void {
+        &mut self.private_data
+    }
+
+    fn private_driver(&self) -> *const AdbcDriver {
+        self.private_driver
     }
 }
 

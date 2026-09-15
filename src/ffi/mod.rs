@@ -9,7 +9,7 @@
 //! * [`guard`] — panic containment and the pointer/string conversions every entry point needs.
 //! * [`handle`] — what lives behind `private_data`, and how a call reaches it safely.
 //! * [`options`] — the handle prologues and option entry points every object repeats, written
-//!   once and stamped out per object by a macro.
+//!   once as generic `extern "C"` functions the vtable instantiates per object.
 //! * [`database`], [`connection`], [`statement`] — the entry points themselves, one module per
 //!   ADBC object, each a thin translation onto the driver's own types.
 //!
@@ -51,13 +51,14 @@ use std::ffi::{c_int, c_void};
 use adbc_core::error::{Error, Status};
 
 use abi::{
-    ADBC_DRIVER_1_0_0_SIZE, ADBC_STATUS_OK, ADBC_VERSION_1_0_0, ADBC_VERSION_1_1_0, AdbcDriver,
-    AdbcError, AdbcStatusCode,
+    ADBC_DRIVER_1_0_0_SIZE, ADBC_STATUS_OK, ADBC_VERSION_1_0_0, ADBC_VERSION_1_1_0, AdbcConnection,
+    AdbcDatabase, AdbcDriver, AdbcError, AdbcStatement, AdbcStatusCode,
 };
 use handle::finish;
 
 /// Build the vtable. Slots the driver does not implement stay `None`, which the ABI reads as
-/// "not implemented".
+/// "not implemented". The handle prologues and the option slots are instantiations of the generic
+/// bodies in [`options`], one per exported object.
 fn vtable() -> AdbcDriver {
     AdbcDriver {
         private_data: std::ptr::null_mut(),
@@ -66,19 +67,19 @@ fn vtable() -> AdbcDriver {
 
         // --- ADBC 1.0.0 ---
         DatabaseInit: Some(database::database_init),
-        DatabaseNew: Some(database::database_new),
-        DatabaseSetOption: Some(database::database_set_option),
-        DatabaseRelease: Some(database::database_release),
+        DatabaseNew: Some(options::new_handle::<AdbcDatabase>),
+        DatabaseSetOption: Some(options::set_option_string::<AdbcDatabase>),
+        DatabaseRelease: Some(options::release_handle::<AdbcDatabase>),
         ConnectionCommit: Some(connection::connection_commit),
         ConnectionGetInfo: Some(connection::connection_get_info),
         ConnectionGetObjects: Some(connection::connection_get_objects),
         ConnectionGetTableSchema: Some(connection::connection_get_table_schema),
         ConnectionGetTableTypes: Some(connection::connection_get_table_types),
         ConnectionInit: Some(connection::connection_init),
-        ConnectionNew: Some(connection::connection_new),
-        ConnectionSetOption: Some(connection::connection_set_option),
+        ConnectionNew: Some(options::new_handle::<AdbcConnection>),
+        ConnectionSetOption: Some(options::set_option_string::<AdbcConnection>),
         ConnectionReadPartition: Some(connection::connection_read_partition),
-        ConnectionRelease: Some(connection::connection_release),
+        ConnectionRelease: Some(options::release_handle::<AdbcConnection>),
         ConnectionRollback: Some(connection::connection_rollback),
         StatementBind: Some(statement::statement_bind),
         StatementBindStream: Some(statement::statement_bind_stream),
@@ -87,8 +88,8 @@ fn vtable() -> AdbcDriver {
         StatementGetParameterSchema: Some(statement::statement_get_parameter_schema),
         StatementNew: Some(statement::statement_new),
         StatementPrepare: Some(statement::statement_prepare),
-        StatementRelease: Some(statement::statement_release),
-        StatementSetOption: Some(statement::statement_set_option),
+        StatementRelease: Some(options::release_handle::<AdbcStatement>),
+        StatementSetOption: Some(options::set_option_string::<AdbcStatement>),
         StatementSetSqlQuery: Some(statement::statement_set_sql_query),
         StatementSetSubstraitPlan: Some(statement::statement_set_substrait_plan),
 
@@ -96,32 +97,32 @@ fn vtable() -> AdbcDriver {
         ErrorGetDetailCount: Some(error::error_get_detail_count),
         ErrorGetDetail: Some(error::error_get_detail),
         ErrorFromArrayStream: Some(stream::error_from_array_stream),
-        DatabaseGetOption: Some(database::database_get_option),
-        DatabaseGetOptionBytes: Some(database::database_get_option_bytes),
-        DatabaseGetOptionDouble: Some(database::database_get_option_double),
-        DatabaseGetOptionInt: Some(database::database_get_option_int),
-        DatabaseSetOptionBytes: Some(database::database_set_option_bytes),
-        DatabaseSetOptionDouble: Some(database::database_set_option_double),
-        DatabaseSetOptionInt: Some(database::database_set_option_int),
+        DatabaseGetOption: Some(options::get_option_string::<AdbcDatabase>),
+        DatabaseGetOptionBytes: Some(options::get_option_bytes::<AdbcDatabase>),
+        DatabaseGetOptionDouble: Some(options::get_option_double::<AdbcDatabase>),
+        DatabaseGetOptionInt: Some(options::get_option_int::<AdbcDatabase>),
+        DatabaseSetOptionBytes: Some(options::set_option_bytes::<AdbcDatabase>),
+        DatabaseSetOptionDouble: Some(options::set_option_double::<AdbcDatabase>),
+        DatabaseSetOptionInt: Some(options::set_option_int::<AdbcDatabase>),
         ConnectionCancel: Some(connection::connection_cancel),
-        ConnectionGetOption: Some(connection::connection_get_option),
-        ConnectionGetOptionBytes: Some(connection::connection_get_option_bytes),
-        ConnectionGetOptionDouble: Some(connection::connection_get_option_double),
-        ConnectionGetOptionInt: Some(connection::connection_get_option_int),
+        ConnectionGetOption: Some(options::get_option_string::<AdbcConnection>),
+        ConnectionGetOptionBytes: Some(options::get_option_bytes::<AdbcConnection>),
+        ConnectionGetOptionDouble: Some(options::get_option_double::<AdbcConnection>),
+        ConnectionGetOptionInt: Some(options::get_option_int::<AdbcConnection>),
         ConnectionGetStatistics: Some(connection::connection_get_statistics),
         ConnectionGetStatisticNames: Some(connection::connection_get_statistic_names),
-        ConnectionSetOptionBytes: Some(connection::connection_set_option_bytes),
-        ConnectionSetOptionDouble: Some(connection::connection_set_option_double),
-        ConnectionSetOptionInt: Some(connection::connection_set_option_int),
+        ConnectionSetOptionBytes: Some(options::set_option_bytes::<AdbcConnection>),
+        ConnectionSetOptionDouble: Some(options::set_option_double::<AdbcConnection>),
+        ConnectionSetOptionInt: Some(options::set_option_int::<AdbcConnection>),
         StatementCancel: Some(statement::statement_cancel),
         StatementExecuteSchema: Some(statement::statement_execute_schema),
-        StatementGetOption: Some(statement::statement_get_option),
-        StatementGetOptionBytes: Some(statement::statement_get_option_bytes),
-        StatementGetOptionDouble: Some(statement::statement_get_option_double),
-        StatementGetOptionInt: Some(statement::statement_get_option_int),
-        StatementSetOptionBytes: Some(statement::statement_set_option_bytes),
-        StatementSetOptionDouble: Some(statement::statement_set_option_double),
-        StatementSetOptionInt: Some(statement::statement_set_option_int),
+        StatementGetOption: Some(options::get_option_string::<AdbcStatement>),
+        StatementGetOptionBytes: Some(options::get_option_bytes::<AdbcStatement>),
+        StatementGetOptionDouble: Some(options::get_option_double::<AdbcStatement>),
+        StatementGetOptionInt: Some(options::get_option_int::<AdbcStatement>),
+        StatementSetOptionBytes: Some(options::set_option_bytes::<AdbcStatement>),
+        StatementSetOptionDouble: Some(options::set_option_double::<AdbcStatement>),
+        StatementSetOptionInt: Some(options::set_option_int::<AdbcStatement>),
     }
 }
 

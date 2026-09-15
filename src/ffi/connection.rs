@@ -1,7 +1,7 @@
 //! `AdbcConnection*` entry points.
 
 use std::collections::HashSet;
-use std::ffi::{c_char, c_int};
+use std::ffi::{c_char, c_int, c_void};
 
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection};
@@ -10,12 +10,12 @@ use arrow_array::RecordBatchReader;
 use arrow_array::ffi::FFI_ArrowSchema;
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 
-use super::abi::{AdbcConnection, AdbcDatabase, AdbcError, AdbcStatusCode};
+use super::abi::{AdbcConnection, AdbcDatabase, AdbcDriver, AdbcError, AdbcStatusCode};
 use super::guard::{
     byte_slice, optional_str, optional_str_list, required_output, required_str, write_out,
 };
 use super::handle::{Staged, install_cancel_handle};
-use super::options::{driver_of, option_entry_points, slot_of, with_state};
+use super::options::{FfiHandle, driver_of, slot_of, with_state};
 use crate::connection::SpannerConnection;
 use crate::error::invalid_argument;
 
@@ -23,18 +23,20 @@ pub(super) const KIND: &str = "connection";
 
 pub(super) type State = Staged<OptionConnection, SpannerConnection>;
 
-option_entry_points! {
-    AdbcConnection {
-        new: connection_new,
-        release: connection_release,
-        set_option: connection_set_option,
-        set_option_bytes: connection_set_option_bytes,
-        set_option_int: connection_set_option_int,
-        set_option_double: connection_set_option_double,
-        get_option: connection_get_option,
-        get_option_bytes: connection_get_option_bytes,
-        get_option_int: connection_get_option_int,
-        get_option_double: connection_get_option_double,
+impl FfiHandle for AdbcConnection {
+    type State = State;
+    const KIND: &'static str = KIND;
+
+    fn private_data(&self) -> *mut c_void {
+        self.private_data
+    }
+
+    fn private_data_mut(&mut self) -> &mut *mut c_void {
+        &mut self.private_data
+    }
+
+    fn private_driver(&self) -> *const AdbcDriver {
+        self.private_driver
     }
 }
 

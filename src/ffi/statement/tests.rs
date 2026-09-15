@@ -15,6 +15,10 @@ use arrow_array::ffi::to_ffi;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatchIterator};
 
 use super::*;
+use crate::ffi::options::{
+    get_option_bytes, get_option_double, get_option_int, get_option_string, release_handle,
+    set_option_bytes, set_option_double, set_option_int, set_option_string,
+};
 use crate::ffi::test_support::null;
 
 const TARGET_TABLE: &str = "adbc.ingest.target_table";
@@ -39,7 +43,7 @@ fn rejects_a_null_statement_handle() {
         AdbcStatusCode::from(Status::InvalidArguments)
     );
     assert_eq!(
-        unsafe { statement_release(null(), null()) },
+        unsafe { release_handle::<AdbcStatement>(null(), null()) },
         AdbcStatusCode::from(Status::InvalidArguments)
     );
     // Everything that goes through `with_state` treats a null handle as an uninitialized one,
@@ -64,31 +68,31 @@ fn every_entry_point_refuses_a_released_handle() {
             statement_set_sql_query(s, name.as_ptr(), null())
         }),
         ("set_option", unsafe {
-            statement_set_option(s, name.as_ptr(), name.as_ptr(), null())
+            set_option_string(s, name.as_ptr(), name.as_ptr(), null())
         }),
         ("set_option_int", unsafe {
-            statement_set_option_int(s, name.as_ptr(), 1, null())
+            set_option_int(s, name.as_ptr(), 1, null())
         }),
         ("set_option_double", unsafe {
-            statement_set_option_double(s, name.as_ptr(), 1.0, null())
+            set_option_double(s, name.as_ptr(), 1.0, null())
         }),
         ("set_option_bytes", unsafe {
-            statement_set_option_bytes(s, name.as_ptr(), b"x".as_ptr(), 1, null())
+            set_option_bytes(s, name.as_ptr(), b"x".as_ptr(), 1, null())
         }),
         ("set_substrait_plan", unsafe {
             statement_set_substrait_plan(s, b"x".as_ptr(), 1, null())
         }),
         ("get_option", unsafe {
-            statement_get_option(s, name.as_ptr(), null(), &raw mut length, null())
+            get_option_string(s, name.as_ptr(), null(), &raw mut length, null())
         }),
         ("get_option_bytes", unsafe {
-            statement_get_option_bytes(s, name.as_ptr(), null(), &raw mut length, null())
+            get_option_bytes(s, name.as_ptr(), null(), &raw mut length, null())
         }),
         ("get_option_int", unsafe {
-            statement_get_option_int(s, name.as_ptr(), &raw mut integer, null())
+            get_option_int(s, name.as_ptr(), &raw mut integer, null())
         }),
         ("get_option_double", unsafe {
-            statement_get_option_double(s, name.as_ptr(), &raw mut double, null())
+            get_option_double(s, name.as_ptr(), &raw mut double, null())
         }),
         ("execute_query", unsafe {
             statement_execute_query(s, null(), null(), null())

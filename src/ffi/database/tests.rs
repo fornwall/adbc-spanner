@@ -5,19 +5,23 @@ use crate::ffi::abi::{
     ADBC_STATUS_INVALID_ARGUMENT, ADBC_STATUS_INVALID_STATE, ADBC_STATUS_NOT_FOUND,
     ADBC_STATUS_NOT_IMPLEMENTED, ADBC_STATUS_OK,
 };
+use crate::ffi::options::{
+    get_option_int, get_option_string, new_handle, release_handle, set_option_int,
+    set_option_string,
+};
 use crate::ffi::test_support::{null, release_error, zeroed_error};
 
 /// The database path every test below points at. Nothing here connects, so it need not exist.
 const DATABASE: &str = "projects/a-project/instances/an-instance/databases/a-database";
 
-fn new_handle() -> AdbcDatabase {
+fn pending() -> AdbcDatabase {
     let mut database = AdbcDatabase {
         private_data: null(),
         private_driver: null(),
     };
     let mut error = zeroed_error();
     assert_eq!(
-        unsafe { database_new(&raw mut database, &raw mut error) },
+        unsafe { new_handle(&raw mut database, &raw mut error) },
         ADBC_STATUS_OK
     );
     database
@@ -28,7 +32,7 @@ fn set(database: &mut AdbcDatabase, key: &str, value: &str) -> AdbcStatusCode {
     let value = CString::new(value).unwrap();
     let mut error = zeroed_error();
     let status = unsafe {
-        database_set_option(
+        set_option_string(
             &raw mut *database,
             key.as_ptr(),
             value.as_ptr(),
@@ -45,7 +49,7 @@ fn get(database: &mut AdbcDatabase, key: &str) -> std::result::Result<String, Ad
     let mut length = 0_usize;
     // First pass asks for the size, as the ADBC GetOption protocol requires.
     let status = unsafe {
-        database_get_option(
+        get_option_string(
             &raw mut *database,
             key.as_ptr(),
             null(),
@@ -59,7 +63,7 @@ fn get(database: &mut AdbcDatabase, key: &str) -> std::result::Result<String, Ad
     }
     let mut buffer = vec![0_i8; length];
     let status = unsafe {
-        database_get_option(
+        get_option_string(
             &raw mut *database,
             key.as_ptr(),
             buffer.as_mut_ptr(),
@@ -81,7 +85,7 @@ fn get(database: &mut AdbcDatabase, key: &str) -> std::result::Result<String, Ad
 /// own setters — the Spanner client stack is built later, on the first connection — so nothing
 /// here reaches the network.
 fn initialized() -> AdbcDatabase {
-    let mut database = new_handle();
+    let mut database = pending();
     for (key, value) in [
         (
             adbc_core::constants::ADBC_OPTION_URI,
@@ -100,9 +104,9 @@ fn initialized() -> AdbcDatabase {
     database
 }
 
-fn release_handle(database: &mut AdbcDatabase) -> AdbcStatusCode {
+fn release(database: &mut AdbcDatabase) -> AdbcStatusCode {
     let mut error = zeroed_error();
-    let status = unsafe { database_release(&raw mut *database, &raw mut error) };
+    let status = unsafe { release_handle(&raw mut *database, &raw mut error) };
     release_error(&mut error);
     status
 }
@@ -112,23 +116,23 @@ fn release_handle(database: &mut AdbcDatabase) -> AdbcStatusCode {
 /// leak it silently; the refusal leaves that object reachable, so it can still be released.
 #[test]
 fn a_second_new_on_a_populated_handle_is_refused() {
-    let mut database = new_handle();
+    let mut database = pending();
     let first = database.private_data;
     let mut error = zeroed_error();
     assert_eq!(
-        unsafe { database_new(&raw mut database, &raw mut error) },
+        unsafe { new_handle(&raw mut database, &raw mut error) },
         ADBC_STATUS_INVALID_STATE
     );
     release_error(&mut error);
     assert_eq!(database.private_data, first);
-    assert_eq!(release_handle(&mut database), ADBC_STATUS_OK);
+    assert_eq!(release(&mut database), ADBC_STATUS_OK);
 }
 
 /// The buffer collapses repeats, so setting the URI twice must leave exactly the later one for
 /// `Init` to replay.
 #[test]
 fn setting_the_same_option_twice_keeps_the_later_value() {
-    let mut database = new_handle();
+    let mut database = pending();
     assert_eq!(
         set(
             &mut database,
@@ -164,14 +168,14 @@ fn setting_the_same_option_twice_keeps_the_later_value() {
         get(&mut database, adbc_core::constants::ADBC_OPTION_URI).unwrap(),
         "projects/p/instances/i/databases/second"
     );
-    assert_eq!(release_handle(&mut database), ADBC_STATUS_OK);
+    assert_eq!(release(&mut database), ADBC_STATUS_OK);
 }
 
 /// A failed `Init` must keep the buffered options so the offending one can be corrected and
 /// `Init` retried, rather than silently reinitializing from an empty buffer.
 #[test]
 fn a_failed_init_keeps_the_buffered_options_for_a_retry() {
-    let mut database = new_handle();
+    let mut database = pending();
     assert_eq!(
         set(
             &mut database,
@@ -214,7 +218,7 @@ fn a_failed_init_keeps_the_buffered_options_for_a_retry() {
         get(&mut database, crate::OPTION_ENDPOINT).unwrap(),
         "http://127.0.0.1:1"
     );
-    assert_eq!(release_handle(&mut database), ADBC_STATUS_OK);
+    assert_eq!(release(&mut database), ADBC_STATUS_OK);
 }
 
 #[test]
@@ -226,15 +230,15 @@ fn initializing_twice_is_an_invalid_state() {
         ADBC_STATUS_INVALID_STATE
     );
     release_error(&mut error);
-    assert_eq!(release_handle(&mut database), ADBC_STATUS_OK);
+    assert_eq!(release(&mut database), ADBC_STATUS_OK);
 }
 
 #[test]
 fn a_released_handle_rejects_every_call_including_a_second_release() {
     let mut database = initialized();
-    assert_eq!(release_handle(&mut database), ADBC_STATUS_OK);
+    assert_eq!(release(&mut database), ADBC_STATUS_OK);
     assert!(database.private_data.is_null());
-    assert_eq!(release_handle(&mut database), ADBC_STATUS_INVALID_STATE);
+    assert_eq!(release(&mut database), ADBC_STATUS_INVALID_STATE);
     assert_eq!(
         set(&mut database, crate::OPTION_ENDPOINT, "http://127.0.0.1:2"),
         ADBC_STATUS_INVALID_STATE
@@ -249,16 +253,16 @@ fn a_released_handle_rejects_every_call_including_a_second_release() {
 fn null_handles_and_keys_are_rejected() {
     let mut error = zeroed_error();
     assert_eq!(
-        unsafe { database_new(null(), &raw mut error) },
+        unsafe { new_handle::<AdbcDatabase>(null(), &raw mut error) },
         ADBC_STATUS_INVALID_ARGUMENT
     );
     release_error(&mut error);
 
-    let mut database = new_handle();
+    let mut database = pending();
     let value = CString::new("x").unwrap();
     let mut error = zeroed_error();
     assert_eq!(
-        unsafe { database_set_option(&raw mut database, null(), value.as_ptr(), &raw mut error) },
+        unsafe { set_option_string(&raw mut database, null(), value.as_ptr(), &raw mut error) },
         ADBC_STATUS_INVALID_ARGUMENT
     );
     release_error(&mut error);
@@ -267,11 +271,11 @@ fn null_handles_and_keys_are_rejected() {
     let key = CString::new(adbc_core::constants::ADBC_OPTION_URI).unwrap();
     let mut error = zeroed_error();
     assert_eq!(
-        unsafe { database_set_option(&raw mut database, key.as_ptr(), null(), &raw mut error) },
+        unsafe { set_option_string(&raw mut database, key.as_ptr(), null(), &raw mut error) },
         ADBC_STATUS_INVALID_ARGUMENT
     );
     release_error(&mut error);
-    assert_eq!(release_handle(&mut database), ADBC_STATUS_OK);
+    assert_eq!(release(&mut database), ADBC_STATUS_OK);
 }
 
 /// Typed getters exist, but every database option this driver has is a string, so the typed
@@ -284,7 +288,7 @@ fn typed_getters_reject_string_options() {
     let mut error = zeroed_error();
     assert_ne!(
         unsafe {
-            database_get_option_int(
+            get_option_int(
                 &raw mut database,
                 key.as_ptr(),
                 &raw mut value,
@@ -294,7 +298,7 @@ fn typed_getters_reject_string_options() {
         ADBC_STATUS_OK
     );
     release_error(&mut error);
-    assert_eq!(release_handle(&mut database), ADBC_STATUS_OK);
+    assert_eq!(release(&mut database), ADBC_STATUS_OK);
 }
 
 /// Nothing about a pre-`Init` set is validated — not the key, not the value's type. The typed
@@ -302,10 +306,10 @@ fn typed_getters_reject_string_options() {
 /// validation when `Init` replays the buffer.
 #[test]
 fn a_typed_set_is_validated_by_the_live_database() {
-    let mut database = new_handle();
+    let mut database = pending();
     let key = CString::new(adbc_core::constants::ADBC_OPTION_URI).unwrap();
     assert_eq!(
-        unsafe { database_set_option_int(&raw mut database, key.as_ptr(), 1, null()) },
+        unsafe { set_option_int(&raw mut database, key.as_ptr(), 1, null()) },
         ADBC_STATUS_OK
     );
 
@@ -330,7 +334,7 @@ fn a_typed_set_is_validated_by_the_live_database() {
         ADBC_STATUS_OK
     );
     release_error(&mut error);
-    assert_eq!(release_handle(&mut database), ADBC_STATUS_OK);
+    assert_eq!(release(&mut database), ADBC_STATUS_OK);
 }
 
 /// adbc.h would rather have `SetOption` answer `ADBC_STATUS_NOT_IMPLEMENTED` for a key it does
@@ -341,7 +345,7 @@ fn a_typed_set_is_validated_by_the_live_database() {
 /// `new_database_with_opts` — naming the key, so the caller can still find the mistake.
 #[test]
 fn a_typo_before_init_is_reported_when_init_replays_it() {
-    let mut database = new_handle();
+    let mut database = pending();
     assert_eq!(
         set(&mut database, "spanner.endpoin", "http://127.0.0.1:1"),
         ADBC_STATUS_OK
@@ -363,7 +367,7 @@ fn a_typo_before_init_is_reported_when_init_replays_it() {
         .expect("the refusal must name the offending key");
     release_error(&mut error);
     assert!(message.contains("spanner.endpoin"), "{message}");
-    assert_eq!(release_handle(&mut database), ADBC_STATUS_OK);
+    assert_eq!(release(&mut database), ADBC_STATUS_OK);
 }
 
 /// The `Init` boundary moves *when* a key is classified, not *whether* it is: before `Init` every
@@ -390,14 +394,14 @@ fn a_pre_init_set_accepts_every_key_the_live_database_classifies() {
     ];
     let mut unknown = 0;
     for key in &keys {
-        let mut pending = new_handle();
+        let mut database = pending();
         assert_eq!(
-            set(&mut pending, key.as_ref(), ""),
+            set(&mut database, key.as_ref(), ""),
             ADBC_STATUS_OK,
             "{}: a pre-init set buffers every key",
             key.as_ref()
         );
-        assert_eq!(release_handle(&mut pending), ADBC_STATUS_OK);
+        assert_eq!(release(&mut database), ADBC_STATUS_OK);
         // Only the live database refuses a key outright; a bad *value* (here, `""` for a key that
         // wants a URI or a boolean) is a different, non-`NOT_IMPLEMENTED` failure.
         if set(&mut live, key.as_ref(), "") == ADBC_STATUS_NOT_IMPLEMENTED {
@@ -408,5 +412,5 @@ fn a_pre_init_set_accepts_every_key_the_live_database_classifies() {
         unknown, 3,
         "username, password and the made-up key are the ones the live database does not know"
     );
-    assert_eq!(release_handle(&mut live), ADBC_STATUS_OK);
+    assert_eq!(release(&mut live), ADBC_STATUS_OK);
 }

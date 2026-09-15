@@ -2,10 +2,10 @@
 //!
 //! A database, a connection and a statement all expose the same handle prologues (`New`,
 //! `Release`) and the same eight option entry points (string/bytes/int/double setters and
-//! getters). Their bodies live here, generic over [`FfiHandle`] — the link between an ABI struct
-//! and the state behind its `private_data` — and over [`OptionTarget`] — how options reach that
-//! state. [`option_entry_points!`] stamps out the `extern "C"` wrappers under the names the
-//! vtable expects, so each object module keeps only what is genuinely its own.
+//! getters). They live here as generic `extern "C"` functions, over [`FfiHandle`] — the link
+//! between an ABI struct and the state behind its `private_data` — and over [`OptionTarget`] —
+//! how options reach that state. The vtable names the instantiation each slot needs, so each
+//! object module keeps only what is genuinely its own.
 
 use std::ffi::{c_char, c_void};
 use std::sync::MutexGuard;
@@ -23,8 +23,8 @@ use crate::error::{invalid_state, not_found};
 
 /// How an entry point reaches the driver object behind one of the three exported ABI structs.
 ///
-/// Implemented by [`option_entry_points!`] for `AdbcDatabase`, `AdbcConnection` and
-/// `AdbcStatement`, whose first field is the `private_data` slot in every case.
+/// Implemented by `AdbcDatabase`, `AdbcConnection` and `AdbcStatement`, whose first field is the
+/// `private_data` slot in every case.
 pub(super) trait FfiHandle {
     /// What lives behind `private_data`.
     type State: OptionTarget + Send;
@@ -158,37 +158,41 @@ pub(super) fn already_populated(kind: &str) -> adbc_core::error::Error {
     ))
 }
 
-/// The shared body of `AdbcDatabaseNew`/`AdbcConnectionNew`: populate the caller's handle with a
-/// freshly built pre-init state.
+/// `AdbcDatabaseNew`/`AdbcConnectionNew`: populate the caller's handle with a freshly built
+/// pre-init state. A statement has no pre-`Init` phase, so it is built from its connection by
+/// [`super::statement::statement_new`] instead.
 ///
 /// # Safety
 /// `handle` must be null or point to a valid ABI struct.
-// Guard-exempt: no driver state exists yet and nothing here can unwind — the state constructors
-// passed in allocate nothing, the `Exported` box's allocation aborts rather than panics on
-// failure, and the rest is plain pointer writes.
-pub(super) unsafe fn new_handle<H: FfiHandle>(
+// Guard-exempt: no driver state exists yet and nothing here can unwind — the default state
+// allocates nothing, the `Exported` box's allocation aborts rather than panics on failure, and
+// the rest is plain pointer writes.
+pub(super) unsafe extern "C" fn new_handle<H: FfiHandle>(
     handle: *mut H,
     error: *mut AdbcError,
-    state: impl FnOnce() -> H::State,
-) -> AdbcStatusCode {
+) -> AdbcStatusCode
+where
+    H::State: Default,
+{
     match unsafe { checked(handle) } {
         Ok(handle) if !handle.private_data().is_null() => {
             super::handle::finish(Err(already_populated(H::KIND)), error)
         }
         Ok(handle) => {
-            *handle.private_data_mut() = Exported::into_private_data(state());
+            *handle.private_data_mut() = Exported::into_private_data(H::State::default());
             ADBC_STATUS_OK
         }
         Err(failure) => super::handle::finish(Err(failure), error),
     }
 }
 
-/// The shared body of every `*Release`: drop the state and null the slot, so a second release is
-/// an error rather than a double free.
+/// Every `*Release`: drop the state and null the slot, so a second release is an error rather
+/// than a double free.
 ///
 /// # Safety
-/// `handle` must be null or point to a valid ABI struct.
-pub(super) unsafe fn release_handle<H: FfiHandle>(
+/// `handle` must be null or point to a valid ABI struct, and no other call on the object may be
+/// in flight.
+pub(super) unsafe extern "C" fn release_handle<H: FfiHandle>(
     handle: *mut H,
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
@@ -220,7 +224,7 @@ unsafe fn parse_key<H: FfiHandle>(key: *const c_char) -> Result<KeyOf<H>> {
 ///
 /// # Safety
 /// `handle` and `key` must be null or valid for the call.
-pub(super) unsafe fn set_option<H: FfiHandle>(
+unsafe fn set_option<H: FfiHandle>(
     handle: *mut H,
     key: *const c_char,
     value: OptionValue,
@@ -236,7 +240,7 @@ pub(super) unsafe fn set_option<H: FfiHandle>(
 
 /// # Safety
 /// `handle`, `key` and `value` must be null or valid for the call.
-pub(super) unsafe fn set_option_string<H: FfiHandle>(
+pub(super) unsafe extern "C" fn set_option_string<H: FfiHandle>(
     handle: *mut H,
     key: *const c_char,
     value: *const c_char,
@@ -254,7 +258,7 @@ pub(super) unsafe fn set_option_string<H: FfiHandle>(
 /// # Safety
 /// `handle` and `key` must be null or valid for the call, and `value` null or point to `length`
 /// initialized bytes.
-pub(super) unsafe fn set_option_bytes<H: FfiHandle>(
+pub(super) unsafe extern "C" fn set_option_bytes<H: FfiHandle>(
     handle: *mut H,
     key: *const c_char,
     value: *const u8,
@@ -269,8 +273,30 @@ pub(super) unsafe fn set_option_bytes<H: FfiHandle>(
 }
 
 /// # Safety
+/// `handle` and `key` must be null or valid for the call.
+pub(super) unsafe extern "C" fn set_option_int<H: FfiHandle>(
+    handle: *mut H,
+    key: *const c_char,
+    value: i64,
+    error: *mut AdbcError,
+) -> AdbcStatusCode {
+    unsafe { set_option(handle, key, OptionValue::Int(value), error) }
+}
+
+/// # Safety
+/// `handle` and `key` must be null or valid for the call.
+pub(super) unsafe extern "C" fn set_option_double<H: FfiHandle>(
+    handle: *mut H,
+    key: *const c_char,
+    value: f64,
+    error: *mut AdbcError,
+) -> AdbcStatusCode {
+    unsafe { set_option(handle, key, OptionValue::Double(value), error) }
+}
+
+/// # Safety
 /// `handle`, `key`, `value` and `length` must be null or valid for the call.
-pub(super) unsafe fn get_option_string<H: FfiHandle>(
+pub(super) unsafe extern "C" fn get_option_string<H: FfiHandle>(
     handle: *mut H,
     key: *const c_char,
     value: *mut c_char,
@@ -288,7 +314,7 @@ pub(super) unsafe fn get_option_string<H: FfiHandle>(
 
 /// # Safety
 /// `handle`, `key`, `value` and `length` must be null or valid for the call.
-pub(super) unsafe fn get_option_bytes<H: FfiHandle>(
+pub(super) unsafe extern "C" fn get_option_bytes<H: FfiHandle>(
     handle: *mut H,
     key: *const c_char,
     value: *mut u8,
@@ -306,7 +332,7 @@ pub(super) unsafe fn get_option_bytes<H: FfiHandle>(
 
 /// # Safety
 /// `handle`, `key` and `value` must be null or valid for the call.
-pub(super) unsafe fn get_option_int<H: FfiHandle>(
+pub(super) unsafe extern "C" fn get_option_int<H: FfiHandle>(
     handle: *mut H,
     key: *const c_char,
     value: *mut i64,
@@ -323,7 +349,7 @@ pub(super) unsafe fn get_option_int<H: FfiHandle>(
 
 /// # Safety
 /// `handle`, `key` and `value` must be null or valid for the call.
-pub(super) unsafe fn get_option_double<H: FfiHandle>(
+pub(super) unsafe extern "C" fn get_option_double<H: FfiHandle>(
     handle: *mut H,
     key: *const c_char,
     value: *mut f64,
@@ -337,177 +363,3 @@ pub(super) unsafe fn get_option_double<H: FfiHandle>(
         })
     }
 }
-
-/// Stamp out one exported object's [`FfiHandle`] impl and its repeated entry points: `Release`,
-/// the string/bytes/int/double option setters and getters, and — for the objects with a pre-init
-/// phase — `New`. Everything delegates to the generic bodies above; the names are passed
-/// explicitly because `macro_rules!` cannot concatenate identifiers.
-///
-/// `new` is optional: a statement has no pre-`Init` phase, so it is created by
-/// [`super::statement::statement_new`] from the connection it belongs to rather than from a
-/// zero-argument constructor.
-///
-/// The invoking module must define `State` (what lives behind `private_data`) and `KIND` (the
-/// object's name in diagnostics); the generated impl refers to both.
-macro_rules! option_entry_points {
-    (
-        $handle:ty {
-            $(new: $new:ident,)?
-            release: $release:ident,
-            set_option: $set_option:ident,
-            set_option_bytes: $set_option_bytes:ident,
-            set_option_int: $set_option_int:ident,
-            set_option_double: $set_option_double:ident,
-            get_option: $get_option:ident,
-            get_option_bytes: $get_option_bytes:ident,
-            get_option_int: $get_option_int:ident,
-            get_option_double: $get_option_double:ident,
-            $(,)?
-        }
-    ) => {
-        impl $crate::ffi::options::FfiHandle for $handle {
-            type State = State;
-            const KIND: &'static str = KIND;
-
-            fn private_data(&self) -> *mut std::ffi::c_void {
-                self.private_data
-            }
-
-            fn private_data_mut(&mut self) -> &mut *mut std::ffi::c_void {
-                &mut self.private_data
-            }
-
-            fn private_driver(&self) -> *const $crate::ffi::abi::AdbcDriver {
-                self.private_driver
-            }
-        }
-
-        $(
-            /// # Safety
-            /// The handle must be null or point to a valid ABI struct.
-            pub(super) unsafe extern "C" fn $new(
-                handle: *mut $handle,
-                error: *mut $crate::ffi::abi::AdbcError,
-            ) -> $crate::ffi::abi::AdbcStatusCode {
-                unsafe { $crate::ffi::options::new_handle(handle, error, State::new) }
-            }
-        )?
-
-        /// # Safety
-        /// The handle must be null or point to a valid ABI struct, and no other call on the
-        /// object may be in flight.
-        pub(super) unsafe extern "C" fn $release(
-            handle: *mut $handle,
-            error: *mut $crate::ffi::abi::AdbcError,
-        ) -> $crate::ffi::abi::AdbcStatusCode {
-            unsafe { $crate::ffi::options::release_handle(handle, error) }
-        }
-
-        /// # Safety
-        /// The handle, `key` and `value` must be null or valid for the call.
-        pub(super) unsafe extern "C" fn $set_option(
-            handle: *mut $handle,
-            key: *const std::ffi::c_char,
-            value: *const std::ffi::c_char,
-            error: *mut $crate::ffi::abi::AdbcError,
-        ) -> $crate::ffi::abi::AdbcStatusCode {
-            unsafe { $crate::ffi::options::set_option_string(handle, key, value, error) }
-        }
-
-        /// # Safety
-        /// The handle and `key` must be null or valid for the call, and `value` null or point to
-        /// `length` initialized bytes.
-        pub(super) unsafe extern "C" fn $set_option_bytes(
-            handle: *mut $handle,
-            key: *const std::ffi::c_char,
-            value: *const u8,
-            length: usize,
-            error: *mut $crate::ffi::abi::AdbcError,
-        ) -> $crate::ffi::abi::AdbcStatusCode {
-            unsafe { $crate::ffi::options::set_option_bytes(handle, key, value, length, error) }
-        }
-
-        /// # Safety
-        /// The handle and `key` must be null or valid for the call.
-        pub(super) unsafe extern "C" fn $set_option_int(
-            handle: *mut $handle,
-            key: *const std::ffi::c_char,
-            value: i64,
-            error: *mut $crate::ffi::abi::AdbcError,
-        ) -> $crate::ffi::abi::AdbcStatusCode {
-            unsafe {
-                $crate::ffi::options::set_option(
-                    handle,
-                    key,
-                    adbc_core::options::OptionValue::Int(value),
-                    error,
-                )
-            }
-        }
-
-        /// # Safety
-        /// The handle and `key` must be null or valid for the call.
-        pub(super) unsafe extern "C" fn $set_option_double(
-            handle: *mut $handle,
-            key: *const std::ffi::c_char,
-            value: f64,
-            error: *mut $crate::ffi::abi::AdbcError,
-        ) -> $crate::ffi::abi::AdbcStatusCode {
-            unsafe {
-                $crate::ffi::options::set_option(
-                    handle,
-                    key,
-                    adbc_core::options::OptionValue::Double(value),
-                    error,
-                )
-            }
-        }
-
-        /// # Safety
-        /// The handle, `key`, `value` and `length` must be null or valid for the call.
-        pub(super) unsafe extern "C" fn $get_option(
-            handle: *mut $handle,
-            key: *const std::ffi::c_char,
-            value: *mut std::ffi::c_char,
-            length: *mut usize,
-            error: *mut $crate::ffi::abi::AdbcError,
-        ) -> $crate::ffi::abi::AdbcStatusCode {
-            unsafe { $crate::ffi::options::get_option_string(handle, key, value, length, error) }
-        }
-
-        /// # Safety
-        /// The handle, `key`, `value` and `length` must be null or valid for the call.
-        pub(super) unsafe extern "C" fn $get_option_bytes(
-            handle: *mut $handle,
-            key: *const std::ffi::c_char,
-            value: *mut u8,
-            length: *mut usize,
-            error: *mut $crate::ffi::abi::AdbcError,
-        ) -> $crate::ffi::abi::AdbcStatusCode {
-            unsafe { $crate::ffi::options::get_option_bytes(handle, key, value, length, error) }
-        }
-
-        /// # Safety
-        /// The handle, `key` and `value` must be null or valid for the call.
-        pub(super) unsafe extern "C" fn $get_option_int(
-            handle: *mut $handle,
-            key: *const std::ffi::c_char,
-            value: *mut i64,
-            error: *mut $crate::ffi::abi::AdbcError,
-        ) -> $crate::ffi::abi::AdbcStatusCode {
-            unsafe { $crate::ffi::options::get_option_int(handle, key, value, error) }
-        }
-
-        /// # Safety
-        /// The handle, `key` and `value` must be null or valid for the call.
-        pub(super) unsafe extern "C" fn $get_option_double(
-            handle: *mut $handle,
-            key: *const std::ffi::c_char,
-            value: *mut f64,
-            error: *mut $crate::ffi::abi::AdbcError,
-        ) -> $crate::ffi::abi::AdbcStatusCode {
-            unsafe { $crate::ffi::options::get_option_double(handle, key, value, error) }
-        }
-    };
-}
-pub(super) use option_entry_points;

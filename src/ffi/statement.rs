@@ -16,12 +16,13 @@ use arrow_array::{RecordBatch, StructArray};
 use arrow_schema::{DataType, Schema};
 
 use super::abi::{
-    ADBC_STATUS_OK, AdbcConnection, AdbcError, AdbcPartitions, AdbcStatement, AdbcStatusCode,
+    ADBC_STATUS_OK, AdbcConnection, AdbcDriver, AdbcError, AdbcPartitions, AdbcStatement,
+    AdbcStatusCode,
 };
 use super::guard::{byte_slice, catch, required_output, required_str, write_out};
 use super::handle::{Exported, finish};
 use super::import::{BoundStreamReader, validate_imported};
-use super::options::{already_populated, driver_of, option_entry_points, slot_of, with_state};
+use super::options::{FfiHandle, already_populated, driver_of, slot_of, with_state};
 use crate::error::invalid_argument;
 use crate::statement::SpannerStatement;
 
@@ -29,17 +30,20 @@ pub(super) const KIND: &str = "statement";
 
 pub(super) type State = SpannerStatement;
 
-option_entry_points! {
-    AdbcStatement {
-        release: statement_release,
-        set_option: statement_set_option,
-        set_option_bytes: statement_set_option_bytes,
-        set_option_int: statement_set_option_int,
-        set_option_double: statement_set_option_double,
-        get_option: statement_get_option,
-        get_option_bytes: statement_get_option_bytes,
-        get_option_int: statement_get_option_int,
-        get_option_double: statement_get_option_double,
+impl FfiHandle for AdbcStatement {
+    type State = State;
+    const KIND: &'static str = KIND;
+
+    fn private_data(&self) -> *mut c_void {
+        self.private_data
+    }
+
+    fn private_data_mut(&mut self) -> &mut *mut c_void {
+        &mut self.private_data
+    }
+
+    fn private_driver(&self) -> *const AdbcDriver {
+        self.private_driver
     }
 }
 

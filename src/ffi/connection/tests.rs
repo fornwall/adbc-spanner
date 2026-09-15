@@ -6,7 +6,10 @@ use super::super::abi::{
     ADBC_STATUS_INVALID_ARGUMENT, ADBC_STATUS_INVALID_STATE, ADBC_STATUS_NOT_FOUND, ADBC_STATUS_OK,
 };
 use super::super::handle::dispatch;
-use super::super::options::borrow;
+use super::super::options::{
+    borrow, get_option_bytes, get_option_double, get_option_int, get_option_string, new_handle,
+    release_handle, set_option_bytes, set_option_double, set_option_int, set_option_string,
+};
 use super::*;
 use crate::ffi::test_support::{error_message, null, release_error, zeroed_error};
 
@@ -19,7 +22,7 @@ fn pending() -> AdbcConnection {
         private_driver: null(),
     };
     assert_eq!(
-        unsafe { connection_new(&raw mut connection, null()) },
+        unsafe { new_handle(&raw mut connection, null()) },
         ADBC_STATUS_OK
     );
     assert!(!connection.private_data.is_null());
@@ -28,7 +31,7 @@ fn pending() -> AdbcConnection {
 
 fn drop_pending(connection: &mut AdbcConnection) {
     assert_eq!(
-        unsafe { connection_release(&raw mut *connection, null()) },
+        unsafe { release_handle(&raw mut *connection, null()) },
         ADBC_STATUS_OK
     );
 }
@@ -48,11 +51,11 @@ fn buffered(connection: &mut AdbcConnection) -> Vec<(OptionConnection, OptionVal
 #[test]
 fn a_null_handle_is_a_bad_argument_not_a_crash() {
     assert_eq!(
-        unsafe { connection_new(null(), null()) },
+        unsafe { new_handle::<AdbcConnection>(null(), null()) },
         ADBC_STATUS_INVALID_ARGUMENT
     );
     assert_eq!(
-        unsafe { connection_release(null(), null()) },
+        unsafe { release_handle::<AdbcConnection>(null(), null()) },
         ADBC_STATUS_INVALID_ARGUMENT
     );
     // A handle whose `private_data` was never populated is not a bad pointer, it is an object
@@ -71,12 +74,12 @@ fn a_null_handle_is_a_bad_argument_not_a_crash() {
 fn releasing_twice_reports_invalid_state_rather_than_double_freeing() {
     let mut connection = pending();
     assert_eq!(
-        unsafe { connection_release(&raw mut connection, null()) },
+        unsafe { release_handle(&raw mut connection, null()) },
         ADBC_STATUS_OK
     );
     assert!(connection.private_data.is_null());
     assert_eq!(
-        unsafe { connection_release(&raw mut connection, null()) },
+        unsafe { release_handle(&raw mut connection, null()) },
         ADBC_STATUS_INVALID_STATE
     );
 }
@@ -97,22 +100,22 @@ fn options_set_before_init_are_buffered_in_order_with_last_write_winning() {
     for value in [&enabled, &disabled] {
         assert_eq!(
             unsafe {
-                connection_set_option(&raw mut connection, first.as_ptr(), value.as_ptr(), null())
+                set_option_string(&raw mut connection, first.as_ptr(), value.as_ptr(), null())
             },
             ADBC_STATUS_OK
         );
     }
     assert_eq!(
-        unsafe { connection_set_option_int(&raw mut connection, second.as_ptr(), 4096, null()) },
+        unsafe { set_option_int(&raw mut connection, second.as_ptr(), 4096, null()) },
         ADBC_STATUS_OK
     );
     assert_eq!(
-        unsafe { connection_set_option_double(&raw mut connection, third.as_ptr(), 0.5, null()) },
+        unsafe { set_option_double(&raw mut connection, third.as_ptr(), 0.5, null()) },
         ADBC_STATUS_OK
     );
     assert_eq!(
         unsafe {
-            connection_set_option_bytes(
+            set_option_bytes(
                 &raw mut connection,
                 fourth.as_ptr(),
                 b"xy".as_ptr(),
@@ -145,13 +148,11 @@ fn setters_reject_a_null_or_non_utf8_key_or_value() {
     let invalid = invalid.as_ptr().cast::<c_char>();
 
     for status in [
-        unsafe { connection_set_option(&raw mut connection, null(), value.as_ptr(), null()) },
-        unsafe { connection_set_option(&raw mut connection, key.as_ptr(), null(), null()) },
-        unsafe { connection_set_option(&raw mut connection, invalid, value.as_ptr(), null()) },
-        unsafe { connection_set_option_int(&raw mut connection, invalid, 1, null()) },
-        unsafe {
-            connection_set_option_bytes(&raw mut connection, key.as_ptr(), null(), 3, null())
-        },
+        unsafe { set_option_string(&raw mut connection, null(), value.as_ptr(), null()) },
+        unsafe { set_option_string(&raw mut connection, key.as_ptr(), null(), null()) },
+        unsafe { set_option_string(&raw mut connection, invalid, value.as_ptr(), null()) },
+        unsafe { set_option_int(&raw mut connection, invalid, 1, null()) },
+        unsafe { set_option_bytes(&raw mut connection, key.as_ptr(), null(), 3, null()) },
     ] {
         assert_eq!(status, ADBC_STATUS_INVALID_ARGUMENT);
     }
@@ -176,7 +177,7 @@ fn getters_report_a_pre_init_connection_option_as_not_found() {
 
     for status in [
         unsafe {
-            connection_get_option(
+            get_option_string(
                 &raw mut connection,
                 key.as_ptr(),
                 null(),
@@ -185,7 +186,7 @@ fn getters_report_a_pre_init_connection_option_as_not_found() {
             )
         },
         unsafe {
-            connection_get_option_bytes(
+            get_option_bytes(
                 &raw mut connection,
                 key.as_ptr(),
                 null(),
@@ -193,18 +194,14 @@ fn getters_report_a_pre_init_connection_option_as_not_found() {
                 null(),
             )
         },
-        unsafe {
-            connection_get_option_int(&raw mut connection, key.as_ptr(), &raw mut integer, null())
-        },
-        unsafe {
-            connection_get_option_double(&raw mut connection, key.as_ptr(), &raw mut double, null())
-        },
+        unsafe { get_option_int(&raw mut connection, key.as_ptr(), &raw mut integer, null()) },
+        unsafe { get_option_double(&raw mut connection, key.as_ptr(), &raw mut double, null()) },
     ] {
         assert_eq!(status, ADBC_STATUS_NOT_FOUND);
     }
     // A bad key is rejected before the state is consulted, so it wins over the missing option.
     assert_eq!(
-        unsafe { connection_get_option_int(&raw mut connection, null(), &raw mut integer, null()) },
+        unsafe { get_option_int(&raw mut connection, null(), &raw mut integer, null()) },
         ADBC_STATUS_INVALID_ARGUMENT
     );
 
@@ -489,7 +486,7 @@ fn every_key_is_buffered_before_init_whether_the_driver_knows_it_or_not() {
         let ffi_key = CString::new(key.as_ref()).unwrap();
         let value = CString::new("true").unwrap();
         let status = unsafe {
-            connection_set_option(
+            set_option_string(
                 &raw mut connection,
                 ffi_key.as_ptr(),
                 value.as_ptr(),
@@ -521,7 +518,7 @@ fn the_current_namespace_keys_buffer_before_init_and_read_back_as_not_found() {
         let mut error = zeroed_error();
         assert_eq!(
             unsafe {
-                connection_set_option(
+                set_option_string(
                     &raw mut connection,
                     ffi_key.as_ptr(),
                     value.as_ptr(),
@@ -538,7 +535,7 @@ fn the_current_namespace_keys_buffer_before_init_and_read_back_as_not_found() {
         let mut error = zeroed_error();
         assert_eq!(
             unsafe {
-                connection_get_option(
+                get_option_string(
                     &raw mut connection,
                     ffi_key.as_ptr(),
                     null(),
@@ -614,30 +611,30 @@ fn every_entry_point_refuses_a_released_handle() {
             connection_read_partition(c, b"x".as_ptr(), 1, null(), null())
         }),
         ("set_option", unsafe {
-            connection_set_option(c, name.as_ptr(), name.as_ptr(), null())
+            set_option_string(c, name.as_ptr(), name.as_ptr(), null())
         }),
         ("set_option_int", unsafe {
-            connection_set_option_int(c, name.as_ptr(), 1, null())
+            set_option_int(c, name.as_ptr(), 1, null())
         }),
         ("set_option_double", unsafe {
-            connection_set_option_double(c, name.as_ptr(), 1.0, null())
+            set_option_double(c, name.as_ptr(), 1.0, null())
         }),
         ("set_option_bytes", unsafe {
-            connection_set_option_bytes(c, name.as_ptr(), b"x".as_ptr(), 1, null())
+            set_option_bytes(c, name.as_ptr(), b"x".as_ptr(), 1, null())
         }),
         ("get_option", unsafe {
-            connection_get_option(c, name.as_ptr(), null(), &raw mut length, null())
+            get_option_string(c, name.as_ptr(), null(), &raw mut length, null())
         }),
         ("get_option_bytes", unsafe {
-            connection_get_option_bytes(c, name.as_ptr(), null(), &raw mut length, null())
+            get_option_bytes(c, name.as_ptr(), null(), &raw mut length, null())
         }),
         ("get_option_int", unsafe {
-            connection_get_option_int(c, name.as_ptr(), &raw mut integer, null())
+            get_option_int(c, name.as_ptr(), &raw mut integer, null())
         }),
         ("get_option_double", unsafe {
-            connection_get_option_double(c, name.as_ptr(), &raw mut double, null())
+            get_option_double(c, name.as_ptr(), &raw mut double, null())
         }),
-        ("release", unsafe { connection_release(c, null()) }),
+        ("release", unsafe { release_handle(c, null()) }),
     ] {
         assert_eq!(status, ADBC_STATUS_INVALID_STATE, "{label}");
     }
@@ -682,7 +679,7 @@ fn init_against_an_allocated_but_uninitialized_database_is_refused() {
         private_driver: null(),
     };
     assert_eq!(
-        unsafe { crate::ffi::database::database_new(&raw mut database, null()) },
+        unsafe { new_handle(&raw mut database, null()) },
         ADBC_STATUS_OK
     );
 
@@ -704,7 +701,7 @@ fn init_against_an_allocated_but_uninitialized_database_is_refused() {
     ));
 
     assert_eq!(
-        unsafe { crate::ffi::database::database_release(&raw mut database, null()) },
+        unsafe { release_handle(&raw mut database, null()) },
         ADBC_STATUS_OK
     );
     drop_pending(&mut connection);

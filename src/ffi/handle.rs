@@ -64,13 +64,16 @@ pub(crate) enum Staged<K, S> {
     Ready(S),
 }
 
-impl<K: PartialEq, S> Staged<K, S> {
-    pub(crate) fn new() -> Self {
+/// A fresh handle is pending with an empty option buffer, which is what `New` installs.
+impl<K: PartialEq, S> Default for Staged<K, S> {
+    fn default() -> Self {
         Self::Pending(OptionBuffer {
             entries: Vec::new(),
         })
     }
+}
 
+impl<K: PartialEq, S> Staged<K, S> {
     /// The initialized state, or the uniform refusal for an object that has none.
     pub(crate) fn ready(&mut self, kind: &str) -> Result<&mut S> {
         match self {

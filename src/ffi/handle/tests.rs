@@ -39,7 +39,7 @@ fn option_buffer_keeps_order_and_collapses_repeats() {
 
 #[test]
 fn a_pending_object_is_not_ready() {
-    let mut staged: Staged<OptionDatabase, u8> = Staged::new();
+    let mut staged: Staged<OptionDatabase, u8> = Staged::default();
     let error = staged.ready("database").unwrap_err();
     assert_eq!(error.status, Status::InvalidState);
 
