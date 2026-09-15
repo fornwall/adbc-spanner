@@ -38,7 +38,7 @@ use google_cloud_spanner::transaction::{
 };
 
 use crate::error::{from_spanner, invalid_argument};
-use crate::options::string_option;
+use crate::options::RawParsed;
 
 /// Build a single-use read-only transaction, applying an optional non-strong timestamp bound.
 /// `None` leaves the client default (a strong read).
@@ -118,44 +118,31 @@ impl ReadBound {
     }
 }
 
-/// The read-bound configuration held by a connection or statement.
-///
-/// Stores the raw option string (so `get_option` round-trips exactly what was set) alongside the
-/// parsed bound. `bound` mirrors the raw string: both are `Some` together or `None` together.
+/// The read-bound configuration held by a connection or statement: the raw
+/// `spanner.read.staleness` string (so `get_option` round-trips exactly what was set) beside the
+/// bound it parsed to.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReadStaleness {
-    /// Raw `spanner.read.staleness` value, when set.
-    staleness: Option<String>,
-    /// The parsed bound (`None` means a strong read).
-    bound: Option<ReadBound>,
+    bound: RawParsed<ReadBound>,
 }
 
 impl ReadStaleness {
     /// Handle a `set_option` for `spanner.read.staleness`. An empty value unsets it (a strong
     /// read); any non-empty value replaces the current bound.
     pub(crate) fn set_staleness(&mut self, value: OptionValue) -> Result<()> {
-        let raw = string_option(value, crate::OPTION_READ_STALENESS)?;
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            self.staleness = None;
-            self.bound = None;
-            return Ok(());
-        }
-        let bound = parse_read_bound(trimmed)?;
-        self.staleness = Some(trimmed.to_string());
-        self.bound = Some(bound);
-        Ok(())
+        self.bound
+            .set(value, crate::OPTION_READ_STALENESS, parse_read_bound)
     }
 
     /// The raw `spanner.read.staleness` value, for `get_option` round-trip.
     pub(crate) fn staleness_string(&self) -> Option<&str> {
-        self.staleness.as_deref()
+        self.bound.raw()
     }
 
     /// The client [`TimestampBound`] to apply, or `None` for a strong read.
     pub(crate) fn timestamp_bound(&self) -> Result<Option<TimestampBound>> {
         self.bound
-            .as_ref()
+            .parsed()
             .map(ReadBound::to_timestamp_bound)
             .transpose()
     }
@@ -165,7 +152,7 @@ impl ReadStaleness {
     /// equivalent first — see [`ReadBound::pinned_for_multi_use`].
     pub(crate) fn multi_use_timestamp_bound(&self) -> Result<Option<TimestampBound>> {
         self.bound
-            .as_ref()
+            .parsed()
             .map(|b| b.pinned_for_multi_use().to_timestamp_bound())
             .transpose()
     }

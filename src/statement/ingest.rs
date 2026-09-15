@@ -617,10 +617,10 @@ pub(super) fn ingest_mode_option(key: &OptionStatement, value: OptionValue) -> R
 /// booleans (`spanner.commit_stats`), an empty/whitespace string unsets it (back to `false`, the
 /// write-only-transaction path); otherwise it is a boolean string (exactly `true`/`false`).
 pub(super) fn ingest_batch_write_option(value: OptionValue) -> Result<bool> {
-    match &value {
-        OptionValue::String(s) if s.trim().is_empty() => Ok(false),
-        _ => crate::options::bool_option(value, "option spanner.ingest.batch_write"),
-    }
+    crate::options::bool_option_unsettable(
+        value,
+        &format!("option {}", crate::OPTION_INGEST_BATCH_WRITE),
+    )
 }
 
 /// Annotate a failed autocommit ingest commit with the number of rows already committed and left in

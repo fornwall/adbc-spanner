@@ -1686,10 +1686,10 @@ fn check_unsupported_true(value: OptionValue, what: &str, rejection: &str) -> Re
 /// [`ingest_batch_write_option`]: an empty/whitespace string unsets it (back to `false`, the
 /// ordinary read/write path); otherwise a boolean string (exactly `true`/`false`).
 fn dml_partitioned_option(value: OptionValue) -> Result<bool> {
-    match &value {
-        OptionValue::String(s) if s.trim().is_empty() => Ok(false),
-        _ => crate::options::bool_option(value, "option spanner.dml.partitioned"),
-    }
+    crate::options::bool_option_unsettable(
+        value,
+        &format!("option {}", crate::OPTION_DML_PARTITIONED),
+    )
 }
 
 /// Parse the positive `spanner.rows_per_batch` option, accepted as either an integer or a numeric
