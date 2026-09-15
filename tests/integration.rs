@@ -37,7 +37,7 @@ use adbc_core::options::{
 };
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_driver_manager::ManagedDriver;
-use adbc_spanner::{SpannerConnection, SpannerDatabase, SpannerDriver};
+use adbc_spanner::{SpannerConnection, SpannerDatabase, SpannerDriver, SpannerStatement};
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int16Array, Int64Array, ListArray, RecordBatch, RecordBatchIterator, RecordBatchReader,
@@ -347,11 +347,7 @@ fn connect_via_connection_uri() {
         .collect::<Result<Vec<_>, _>>()
         .expect("read batches");
     assert_eq!(batches.len(), 1);
-    let ones = batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
+    let ones = col::<Int64Array>(batches[0].column(0));
     assert_eq!(ones.value(0), 1);
 }
 
@@ -369,27 +365,13 @@ fn connect_via_connection_uri() {
 ///   it. A `;`-separated DDL batch still applies as one `UpdateDatabaseDdl` call.
 #[test]
 fn manual_transaction_kinds_round_trip() {
-    let Some(target) = test_target() else {
-        eprintln!(
-            "neither SPANNER_EMULATOR_HOST nor SPANNER_GCP_DATABASE set — \
-             skipping Spanner integration test"
-        );
+    let Some(mut fx) = fixture() else {
         return;
     };
-
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let database = &fx.database;
+    let connection = &mut fx.connection;
     // A second connection, kept in autocommit, playing the "concurrent writer".
-    let mut writer = connect_with_retry(&database);
+    let mut writer = connect_with_retry(database);
 
     // Fresh scratch state (idempotent across re-runs against a persistent database).
     let mut setup = connection.new_statement().expect("new statement");
@@ -421,7 +403,7 @@ fn manual_transaction_kinds_round_trip() {
         .expect("disable autocommit");
 
     // The first query opens the transaction's read-only snapshot.
-    assert_eq!(count_rows(&mut connection, "AdbcReadTxn"), 1);
+    assert_eq!(count_rows(connection, "AdbcReadTxn"), 1);
 
     // A second connection commits a row AFTER the snapshot was pinned...
     autocommit_insert(&mut writer, 2);
@@ -429,7 +411,7 @@ fn manual_transaction_kinds_round_trip() {
     // ...and the manual transaction must NOT see it: every query shares the pinned snapshot.
     // (The old per-query fresh snapshots would return 2 here.)
     assert_eq!(
-        count_rows(&mut connection, "AdbcReadTxn"),
+        count_rows(connection, "AdbcReadTxn"),
         1,
         "a query transaction's snapshot must not move mid-transaction"
     );
@@ -467,7 +449,7 @@ fn manual_transaction_kinds_round_trip() {
         "DDL must apply immediately, visible to other connections before any commit"
     );
     assert_eq!(
-        count_rows(&mut connection, "AdbcReadTxn"),
+        count_rows(connection, "AdbcReadTxn"),
         1,
         "immediate DDL must not disturb the query transaction's pinned snapshot"
     );
@@ -476,16 +458,16 @@ fn manual_transaction_kinds_round_trip() {
     // a fresh transaction sees the concurrently committed row.
     connection.commit().expect("commit a query transaction");
     assert_eq!(
-        count_rows_ending_txn(&mut connection, "AdbcReadTxn"),
+        count_rows_ending_txn(connection, "AdbcReadTxn"),
         2,
         "a fresh transaction must see the row committed mid-way through the previous one"
     );
 
     // Rollback ends a query transaction the same way.
-    assert_eq!(count_rows(&mut connection, "AdbcReadTxn"), 2);
+    assert_eq!(count_rows(connection, "AdbcReadTxn"), 2);
     autocommit_insert(&mut writer, 3);
     assert_eq!(
-        count_rows(&mut connection, "AdbcReadTxn"),
+        count_rows(connection, "AdbcReadTxn"),
         2,
         "still pinned to the snapshot"
     );
@@ -493,7 +475,7 @@ fn manual_transaction_kinds_round_trip() {
         .rollback()
         .expect("roll back a query transaction");
     assert_eq!(
-        count_rows_ending_txn(&mut connection, "AdbcReadTxn"),
+        count_rows_ending_txn(connection, "AdbcReadTxn"),
         3,
         "rollback must end the snapshot"
     );
@@ -534,24 +516,19 @@ fn manual_transaction_kinds_round_trip() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(
-        batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .value(0),
+        col::<Int64Array>(batches[0].column(0)).value(0),
         1,
         "the `;`-batch must have applied table and index together, before any commit"
     );
 
     // The DML transaction is still open (the DDL did not touch it): the query guard still fires,
     // and rollback discards only the buffered insert — the DDL's table survives.
-    assert_query_guarded(&mut connection, "AdbcReadTxn");
+    assert_query_guarded(connection, "AdbcReadTxn");
     connection
         .rollback()
         .expect("roll back the buffered insert");
     assert_eq!(
-        count_rows_ending_txn(&mut connection, "AdbcReadTxn"),
+        count_rows_ending_txn(connection, "AdbcReadTxn"),
         3,
         "rollback must discard the buffered DML"
     );
@@ -580,25 +557,10 @@ fn manual_transaction_kinds_round_trip() {
 
 #[test]
 fn query_and_dml_round_trip() {
-    let Some(target) = test_target() else {
-        eprintln!(
-            "neither SPANNER_EMULATOR_HOST nor SPANNER_GCP_DATABASE set — \
-             skipping Spanner integration test"
-        );
+    let Some(mut fx) = fixture() else {
         return;
     };
-
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     // The driver reports the table types Spanner supports without hitting the network.
     let table_types = connection.get_table_types().expect("get_table_types");
@@ -641,26 +603,10 @@ fn query_and_dml_round_trip() {
     assert_eq!(total_rows, 2, "expected two rows back");
 
     let batch = &batches[0];
-    let ids = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
-    let names = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    let active = batch
-        .column(2)
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .unwrap();
-    let score = batch
-        .column(3)
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .unwrap();
+    let ids = col::<Int64Array>(batch.column(0));
+    let names = col::<StringArray>(batch.column(1));
+    let active = col::<BooleanArray>(batch.column(2));
+    let score = col::<Float64Array>(batch.column(3));
 
     assert_eq!(
         (
@@ -707,11 +653,7 @@ fn query_and_dml_round_trip() {
         .expect("read back updated row")
         .collect::<Result<Vec<_>, _>>()
         .expect("collect updated row");
-    let updated_score = check_batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .unwrap();
+    let updated_score = col::<Float64Array>(check_batches[0].column(0));
     assert_eq!(
         updated_score.value(0),
         9.5,
@@ -780,18 +722,12 @@ fn query_and_dml_round_trip() {
         .unwrap();
     assert_eq!(ddl_rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     // Assert the stored value, not merely that a row exists: `Note` must round-trip exactly.
-    let ddl_note = ddl_rows[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let ddl_note = col::<StringArray>(ddl_rows[0].column(0));
     assert_eq!(ddl_note.value(0), "hello");
 
     // Drop the scratch table like every other section, so re-runs against a persistent
     // `SPANNER_GCP_DATABASE` don't accumulate leftovers.
-    let mut drop_ddl = connection.new_statement().expect("new statement");
-    drop_ddl.set_sql_query("DROP TABLE AdbcDdl").unwrap();
-    drop_ddl.execute_update().expect("drop ddl table");
+    drop_tables(connection, &["AdbcDdl"]);
 
     // --- Manual multi-statement transactions ---
 
@@ -819,13 +755,13 @@ fn query_and_dml_round_trip() {
     }
     // A query while writes are buffered is rejected up front (no read-your-writes) instead of
     // silently returning the pre-insert snapshot.
-    assert_query_guarded(&mut connection, "AdbcTxn");
+    assert_query_guarded(connection, "AdbcTxn");
 
     // Commit applies the whole batch atomically. (Still in manual mode, so the count opens a
     // query-kind transaction that must be ended before the next write.)
     connection.commit().expect("commit");
     assert_eq!(
-        count_rows_ending_txn(&mut connection, "AdbcTxn"),
+        count_rows_ending_txn(connection, "AdbcTxn"),
         2,
         "rows must be visible after commit"
     );
@@ -838,7 +774,7 @@ fn query_and_dml_round_trip() {
     assert_eq!(rolled.execute_update().expect("buffered insert"), None);
     connection.rollback().expect("rollback");
     assert_eq!(
-        count_rows_ending_txn(&mut connection, "AdbcTxn"),
+        count_rows_ending_txn(connection, "AdbcTxn"),
         2,
         "rolled-back row must not appear"
     );
@@ -863,21 +799,21 @@ fn query_and_dml_round_trip() {
     };
 
     // Buffered, then committed: the bound row appears only after commit.
-    buffer_param_insert(&mut connection, 3);
+    buffer_param_insert(connection, 3);
     // A query while the parameterized insert is buffered is likewise guarded.
-    assert_query_guarded(&mut connection, "AdbcTxn");
+    assert_query_guarded(connection, "AdbcTxn");
     connection.commit().expect("commit param");
     assert_eq!(
-        count_rows_ending_txn(&mut connection, "AdbcTxn"),
+        count_rows_ending_txn(connection, "AdbcTxn"),
         3,
         "parameterized row must be visible after commit"
     );
 
     // Buffered, then rolled back: the bound row leaves no trace.
-    buffer_param_insert(&mut connection, 4);
+    buffer_param_insert(connection, 4);
     connection.rollback().expect("rollback param");
     assert_eq!(
-        count_rows_ending_txn(&mut connection, "AdbcTxn"),
+        count_rows_ending_txn(connection, "AdbcTxn"),
         3,
         "rolled-back parameterized row must not appear"
     );
@@ -891,7 +827,7 @@ fn query_and_dml_round_trip() {
     assert_eq!(pending.execute_update().expect("buffered insert"), None);
     // The buffered row is not queryable before the toggle (guarded), and toggling autocommit back
     // on commits it.
-    assert_query_guarded(&mut connection, "AdbcTxn");
+    assert_query_guarded(connection, "AdbcTxn");
     connection
         .set_option(
             OptionConnection::AutoCommit,
@@ -899,7 +835,7 @@ fn query_and_dml_round_trip() {
         )
         .expect("enable autocommit");
     assert_eq!(
-        count_rows(&mut connection, "AdbcTxn"),
+        count_rows(connection, "AdbcTxn"),
         4,
         "re-enabling autocommit must commit the buffered DML, not discard it"
     );
@@ -921,7 +857,7 @@ fn query_and_dml_round_trip() {
         Some(1),
         "back in autocommit mode DML reports its count and applies immediately"
     );
-    assert_eq!(count_rows(&mut connection, "AdbcTxn"), 5);
+    assert_eq!(count_rows(connection, "AdbcTxn"), 5);
     assert!(
         connection.commit().is_err(),
         "commit without an active manual transaction must fail"
@@ -943,11 +879,8 @@ fn query_and_dml_round_trip() {
         s.set_sql_query(sql).unwrap();
         assert_eq!(s.execute_update().expect("buffer DML"), None);
     };
-    buffer_sql(&mut connection, "INSERT INTO AdbcTxn (Id) VALUES (7)");
-    buffer_sql(
-        &mut connection,
-        "INSERT INTO AdbcTxnNoSuchTable (Id) VALUES (7)",
-    );
+    buffer_sql(connection, "INSERT INTO AdbcTxn (Id) VALUES (7)");
+    buffer_sql(connection, "INSERT INTO AdbcTxnNoSuchTable (Id) VALUES (7)");
     assert!(
         connection.commit().is_err(),
         "committing a batch with an unknown table must fail"
@@ -956,7 +889,7 @@ fn query_and_dml_round_trip() {
     // non-empty). That the batch applied *nothing* — atomicity — is checked below: the clean
     // re-commit of `VALUES (7)` after the rollback succeeds without a duplicate-key error, which it
     // could not if the failed batch had partially applied its own `VALUES (7)`.
-    assert_query_guarded(&mut connection, "AdbcTxn");
+    assert_query_guarded(connection, "AdbcTxn");
     assert!(
         connection.commit().is_err(),
         "a retried failed commit must replay the buffer and fail again — not report success \
@@ -982,10 +915,10 @@ fn query_and_dml_round_trip() {
     );
     // Rollback discards the failed batch; after that the retry path is clean again.
     connection.rollback().expect("rollback failed batch");
-    buffer_sql(&mut connection, "INSERT INTO AdbcTxn (Id) VALUES (7)");
+    buffer_sql(connection, "INSERT INTO AdbcTxn (Id) VALUES (7)");
     connection.commit().expect("commit after rollback");
     assert_eq!(
-        count_rows(&mut connection, "AdbcTxn"),
+        count_rows(connection, "AdbcTxn"),
         6,
         "the replacement batch must commit normally after the failed one was rolled back"
     );
@@ -1030,21 +963,21 @@ fn query_and_dml_round_trip() {
             "a manual-mode ingest must buffer its mutations (return None), not commit immediately"
         );
     };
-    buffer_ingest(&mut connection, &[100, 101]);
-    buffer_sql(&mut connection, "INSERT INTO AdbcTxn (Id) VALUES (102)");
+    buffer_ingest(connection, &[100, 101]);
+    buffer_sql(connection, "INSERT INTO AdbcTxn (Id) VALUES (102)");
     // Buffered ingest mutations count as pending writes too, so a query is guarded here.
-    assert_query_guarded(&mut connection, "AdbcTxn");
+    assert_query_guarded(connection, "AdbcTxn");
     connection.commit().expect("commit ingest + DML");
     assert_eq!(
-        count_rows_ending_txn(&mut connection, "AdbcTxn"),
+        count_rows_ending_txn(connection, "AdbcTxn"),
         9,
         "commit must apply the buffered DML and the buffered ingest mutations atomically"
     );
     // A buffered ingest followed by rollback leaves no trace.
-    buffer_ingest(&mut connection, &[103]);
+    buffer_ingest(connection, &[103]);
     connection.rollback().expect("rollback buffered ingest");
     assert_eq!(
-        count_rows(&mut connection, "AdbcTxn"),
+        count_rows(connection, "AdbcTxn"),
         9,
         "rolled-back ingest mutations must not appear"
     );
@@ -1055,9 +988,7 @@ fn query_and_dml_round_trip() {
         )
         .expect("re-enable autocommit after ingest");
 
-    let mut drop_txn = connection.new_statement().expect("new statement");
-    drop_txn.set_sql_query("DROP TABLE AdbcTxn").unwrap();
-    drop_txn.execute_update().expect("drop txn table");
+    drop_tables(connection, &["AdbcTxn"]);
 
     // --- Native Arrow types for DATE / TIMESTAMP / NUMERIC ---
 
@@ -1099,24 +1030,14 @@ fn query_and_dml_round_trip() {
         .collect::<Result<Vec<_>, _>>()
         .expect("collect types");
     let tb = &types_batches[0];
-    let date = tb.column(0).as_any().downcast_ref::<Date32Array>().unwrap();
-    let ts = tb
-        .column(1)
-        .as_any()
-        .downcast_ref::<TimestampNanosecondArray>()
-        .unwrap();
-    let num = tb
-        .column(2)
-        .as_any()
-        .downcast_ref::<Decimal128Array>()
-        .unwrap();
+    let date = col::<Date32Array>(tb.column(0));
+    let ts = col::<TimestampNanosecondArray>(tb.column(1));
+    let num = col::<Decimal128Array>(tb.column(2));
     assert_eq!(date.value(0), 19737); // days from 1970-01-01 to 2024-01-15
     assert_eq!(ts.value(0), 1_705_322_096_789_012_000); // nanos since epoch
     assert_eq!(num.value(0), 1_500_000_000); // 1.5 unscaled at scale 9
 
-    let mut drop_types = connection.new_statement().expect("new statement");
-    drop_types.set_sql_query("DROP TABLE AdbcTypes").unwrap();
-    drop_types.execute_update().expect("drop types table");
+    drop_tables(connection, &["AdbcTypes"]);
 
     // --- Parameter binding and bulk ingest ---
 
@@ -1140,19 +1061,7 @@ fn query_and_dml_round_trip() {
         ],
     )
     .unwrap();
-    let mut ingest = connection.new_statement().expect("new statement");
-    ingest
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcBind".into()),
-        )
-        .unwrap();
-    ingest
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .unwrap();
+    let mut ingest = ingest_stmt(connection, "AdbcBind", "append");
     // Statement options round-trip through get_option (ingest mode reported in canonical form).
     assert_eq!(
         ingest
@@ -1192,7 +1101,7 @@ fn query_and_dml_round_trip() {
     );
     ingest.bind(rows).expect("bind ingest rows");
     assert_eq!(ingest.execute_update().expect("ingest"), Some(2));
-    assert_eq!(count_rows(&mut connection, "AdbcBind"), 2);
+    assert_eq!(count_rows(connection, "AdbcBind"), 2);
 
     // With no ingest mode set, the driver defaults to `create` (the ADBC spec default), building
     // the table from the bound data — not `append` into a pre-existing one.
@@ -1224,7 +1133,7 @@ fn query_and_dml_round_trip() {
             .expect("default-mode ingest"),
         Some(2)
     );
-    assert_eq!(count_rows(&mut connection, "AdbcDefaultMode"), 2);
+    assert_eq!(count_rows(connection, "AdbcDefaultMode"), 2);
     // A second unset-mode (create) ingest into the now-existing table must fail with AlreadyExists,
     // confirming the default is `create` rather than `append`.
     let dup_rows = RecordBatch::try_new(
@@ -1250,13 +1159,7 @@ fn query_and_dml_round_trip() {
         adbc_core::error::Status::AlreadyExists,
         "default (create) ingest onto an existing table must be AlreadyExists, got: {dup_err:?}"
     );
-    let mut drop_default = connection.new_statement().expect("new statement");
-    drop_default
-        .set_sql_query("DROP TABLE AdbcDefaultMode")
-        .unwrap();
-    drop_default
-        .execute_update()
-        .expect("drop default-mode table");
+    drop_tables(connection, &["AdbcDefaultMode"]);
 
     // Append onto a missing target table must surface as the ADBC-mandated NotFound (not a generic
     // mapped Spanner INVALID_ARGUMENT). The driver probes INFORMATION_SCHEMA on the failure path and
@@ -1266,19 +1169,7 @@ fn query_and_dml_round_trip() {
         vec![Arc::new(Int64Array::from(vec![1]))],
     )
     .unwrap();
-    let mut ingest_missing = connection.new_statement().expect("new statement");
-    ingest_missing
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcNoSuchIngestTable".into()),
-        )
-        .unwrap();
-    ingest_missing
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .unwrap();
+    let mut ingest_missing = ingest_stmt(connection, "AdbcNoSuchIngestTable", "append");
     ingest_missing
         .bind(missing_rows)
         .expect("bind rows for missing-table ingest");
@@ -1303,19 +1194,7 @@ fn query_and_dml_round_trip() {
         vec![Arc::new(Int64Array::from(vec![1]))],
     )
     .unwrap();
-    let mut ingest_mismatch = connection.new_statement().expect("new statement");
-    ingest_mismatch
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcBind".into()),
-        )
-        .unwrap();
-    ingest_mismatch
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .unwrap();
+    let mut ingest_mismatch = ingest_stmt(connection, "AdbcBind", "append");
     ingest_mismatch
         .bind(mismatch_rows)
         .expect("bind rows for schema-mismatch ingest");
@@ -1328,7 +1207,7 @@ fn query_and_dml_round_trip() {
         "append with an incompatible schema must be AlreadyExists, got: {mismatch_err:?}"
     );
     // The rejected appends changed nothing.
-    assert_eq!(count_rows(&mut connection, "AdbcBind"), 2);
+    assert_eq!(count_rows(connection, "AdbcBind"), 2);
 
     // DML issued through the query entry point (`execute`, not the Rust-only `execute_update`) must
     // run on the read/write path and succeed. Every ADBC client — the Python DBAPI, R, etc. — issues
@@ -1348,7 +1227,7 @@ fn query_and_dml_round_trip() {
         dml_rows.iter().all(|b| b.num_rows() == 0),
         "DML via execute() must yield an empty result set"
     );
-    assert_eq!(count_rows(&mut connection, "AdbcBind"), 3);
+    assert_eq!(count_rows(connection, "AdbcBind"), 3);
 
     // Bound data is consumed by the execute that uses it. A client that reuses one statement handle
     // (as the Python DBAPI does: adbc_ingest binds a stream, then the next cursor.execute is a
@@ -1367,19 +1246,7 @@ fn query_and_dml_round_trip() {
         vec![Arc::new(Int64Array::from(vec![10, 20, 30]))],
     )
     .unwrap();
-    let mut reuse = connection.new_statement().expect("new statement");
-    reuse
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcReuse".into()),
-        )
-        .unwrap();
-    reuse
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .unwrap();
+    let mut reuse = ingest_stmt(connection, "AdbcReuse", "append");
     reuse.bind(reuse_rows).expect("bind reuse rows");
     assert_eq!(reuse.execute_update().expect("ingest reuse"), Some(3));
     // Same handle, now a query: the ingest consumed the bound rows, so it runs exactly once.
@@ -1396,27 +1263,13 @@ fn query_and_dml_round_trip() {
         3,
         "stale bound rows must not replay the follow-up query"
     );
-    let mut drop_reuse = connection.new_statement().expect("new statement");
-    drop_reuse.set_sql_query("DROP TABLE AdbcReuse").unwrap();
-    drop_reuse.execute_update().expect("drop reuse table");
+    drop_tables(connection, &["AdbcReuse"]);
 
     // Bulk ingest driven through the query entry point (`execute`, not `execute_update`): an ADBC
     // FFI caller supplying a non-null stream out-pointer must get the ingest performed and an empty
     // stream back, not InvalidState ("no SQL query set") — ingest must not trigger only through
     // `execute_update`.
-    let mut ingest_via_execute = connection.new_statement().expect("new statement");
-    ingest_via_execute
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcBind".into()),
-        )
-        .unwrap();
-    ingest_via_execute
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .unwrap();
+    let mut ingest_via_execute = ingest_stmt(connection, "AdbcBind", "append");
     let ingest_via_execute_rows = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("Id", DataType::Int64, false),
@@ -1440,7 +1293,7 @@ fn query_and_dml_round_trip() {
         ingest_stream.iter().all(|b| b.num_rows() == 0),
         "ingest via execute() must yield an empty result set"
     );
-    assert_eq!(count_rows(&mut connection, "AdbcBind"), 4);
+    assert_eq!(count_rows(connection, "AdbcBind"), 4);
 
     // Statement handle reused for an ingest after a SQL query — the pattern the Python DBAPI
     // `Cursor` produces (one statement per cursor: `cur.execute("CREATE TABLE …")` sets the query,
@@ -1480,7 +1333,7 @@ fn query_and_dml_round_trip() {
     reuse_query_then_ingest
         .execute_update()
         .expect("ingest after a prior query on a reused statement");
-    assert_eq!(count_rows(&mut connection, "AdbcBind"), 5);
+    assert_eq!(count_rows(connection, "AdbcBind"), 5);
 
     // Create-mode bulk ingest: the driver builds the table from the bound Arrow schema (with a
     // synthetic UUID primary key), so no CREATE TABLE is needed first. Exercises create/append/replace.
@@ -1523,20 +1376,20 @@ fn query_and_dml_round_trip() {
         ingest_into(connection, "AdbcCreate", mode)
     };
     assert_eq!(
-        ingest_create(&mut connection, "create").expect("create"),
+        ingest_create(connection, "create").expect("create"),
         Some(2)
     ); // creates table + 2 rows
-    assert_eq!(count_rows(&mut connection, "AdbcCreate"), 2);
+    assert_eq!(count_rows(connection, "AdbcCreate"), 2);
     assert_eq!(
-        ingest_create(&mut connection, "append").expect("append"),
+        ingest_create(connection, "append").expect("append"),
         Some(2)
     ); // appends
-    assert_eq!(count_rows(&mut connection, "AdbcCreate"), 4);
+    assert_eq!(count_rows(connection, "AdbcCreate"), 4);
     assert_eq!(
-        ingest_create(&mut connection, "replace").expect("replace"),
+        ingest_create(connection, "replace").expect("replace"),
         Some(2)
     ); // drops + recreates
-    assert_eq!(count_rows(&mut connection, "AdbcCreate"), 2);
+    assert_eq!(count_rows(connection, "AdbcCreate"), 2);
     // A `SELECT *` reads back exactly the ingested columns: the created table has no `PRIMARY KEY`
     // clause, so Spanner keys it on an implicit `rowid` that no `SELECT *` returns (earlier driver
     // versions appended a visible synthetic `adbc_ingest_key` column here instead).
@@ -1573,7 +1426,7 @@ fn query_and_dml_round_trip() {
         vec!["Id", "Label"]
     );
     let (objects_columns, objects_constraints) =
-        table_columns_and_constraints(&mut connection, "AdbcCreate");
+        table_columns_and_constraints(connection, "AdbcCreate");
     assert_eq!(
         objects_columns,
         vec!["Id", "Label"],
@@ -1585,16 +1438,8 @@ fn query_and_dml_round_trip() {
     );
     // Assert the replaced values, not just the count: `replace` drops + recreates, so the table
     // holds exactly one copy of `create_rows()`, not the four rows an `append` would leave.
-    let created_ids = created[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
-    let created_labels = created[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let created_ids = col::<Int64Array>(created[0].column(0));
+    let created_labels = col::<StringArray>(created[0].column(1));
     assert_eq!(
         (0..created[0].num_rows())
             .map(|i| (created_ids.value(i), created_labels.value(i)))
@@ -1606,7 +1451,7 @@ fn query_and_dml_round_trip() {
     // emits a `CREATE TABLE` (no `IF NOT EXISTS`), Spanner rejects it because `AdbcCreate` still
     // exists, and the driver remaps the DDL failure onto `AlreadyExists` — naming the table — so
     // consumers can branch on the status (e.g. to fall back to append). Nothing may be inserted.
-    let create_on_existing = ingest_into(&mut connection, "AdbcCreate", "create")
+    let create_on_existing = ingest_into(connection, "AdbcCreate", "create")
         .expect_err("create-mode ingest onto an existing table must fail");
     assert_eq!(
         create_on_existing.status,
@@ -1618,13 +1463,11 @@ fn query_and_dml_round_trip() {
         "the error must name the target table: {create_on_existing:?}"
     );
     assert_eq!(
-        count_rows(&mut connection, "AdbcCreate"),
+        count_rows(connection, "AdbcCreate"),
         2,
         "a failed create-mode ingest must leave the table unchanged (got error: {create_on_existing:?})"
     );
-    let mut drop_created = connection.new_statement().expect("new statement");
-    drop_created.set_sql_query("DROP TABLE AdbcCreate").unwrap();
-    drop_created.execute_update().expect("drop create table");
+    drop_tables(connection, &["AdbcCreate"]);
 
     // `create_append` mode end-to-end: it creates the table from the bound Arrow schema when absent
     // (like `create`), but — unlike `create` — is a no-op-on-conflict for the table itself, so a
@@ -1638,17 +1481,17 @@ fn query_and_dml_round_trip() {
         .expect("pre-drop create_append table");
     // First ingest: table absent → created + 2 rows.
     assert_eq!(
-        ingest_into(&mut connection, "AdbcCreateAppend", "create_append").expect("create_append"),
+        ingest_into(connection, "AdbcCreateAppend", "create_append").expect("create_append"),
         Some(2)
     );
-    assert_eq!(count_rows(&mut connection, "AdbcCreateAppend"), 2);
+    assert_eq!(count_rows(connection, "AdbcCreateAppend"), 2);
     // Second ingest: table now present → append (no error, unlike `create`).
     assert_eq!(
-        ingest_into(&mut connection, "AdbcCreateAppend", "create_append")
+        ingest_into(connection, "AdbcCreateAppend", "create_append")
             .expect("create_append onto an existing table appends"),
         Some(2)
     );
-    assert_eq!(count_rows(&mut connection, "AdbcCreateAppend"), 4);
+    assert_eq!(count_rows(connection, "AdbcCreateAppend"), 4);
     // Third ingest: table present but the bound schema is incompatible. Per the ADBC contract,
     // `create_append` must error with AlreadyExists when the table exists and the schema does not
     // match (the `CREATE TABLE IF NOT EXISTS` is a no-op, then the insert fails on the unknown
@@ -1662,19 +1505,7 @@ fn query_and_dml_round_trip() {
         vec![Arc::new(Int64Array::from(vec![1]))],
     )
     .unwrap();
-    let mut ingest_ca_mismatch = connection.new_statement().expect("new statement");
-    ingest_ca_mismatch
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcCreateAppend".into()),
-        )
-        .unwrap();
-    ingest_ca_mismatch
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("create_append".into()),
-        )
-        .unwrap();
+    let mut ingest_ca_mismatch = ingest_stmt(connection, "AdbcCreateAppend", "create_append");
     ingest_ca_mismatch
         .bind(create_append_mismatch)
         .expect("bind rows for create_append schema-mismatch ingest");
@@ -1687,7 +1518,7 @@ fn query_and_dml_round_trip() {
         "create_append with an incompatible schema must be AlreadyExists, got: {ca_mismatch_err:?}"
     );
     // The rejected ingest changed nothing.
-    assert_eq!(count_rows(&mut connection, "AdbcCreateAppend"), 4);
+    assert_eq!(count_rows(connection, "AdbcCreateAppend"), 4);
     let mut read_create_append = connection.new_statement().expect("new statement");
     read_create_append
         .set_sql_query("SELECT Id, Label FROM AdbcCreateAppend ORDER BY Id")
@@ -1701,13 +1532,7 @@ fn query_and_dml_round_trip() {
         create_appended.iter().map(|b| b.num_rows()).sum::<usize>(),
         4
     );
-    let mut drop_create_appended = connection.new_statement().expect("new statement");
-    drop_create_appended
-        .set_sql_query("DROP TABLE AdbcCreateAppend")
-        .unwrap();
-    drop_create_appended
-        .execute_update()
-        .expect("drop create_append table");
+    drop_tables(connection, &["AdbcCreateAppend"]);
 
     // A user-keyed table is the `append` story: create it with your own DDL (the primary key fixes
     // Spanner's physical row layout, so it is the user's choice, not the driver's — there is
@@ -1739,24 +1564,17 @@ fn query_and_dml_round_trip() {
         s.execute_update()
     };
     assert_eq!(
-        keyed_ingest(&mut connection).expect("append into the keyed table"),
+        keyed_ingest(connection).expect("append into the keyed table"),
         Some(2)
     );
-    assert_eq!(count_rows(&mut connection, "AdbcIngestPk"), 2);
-    let dup_err =
-        keyed_ingest(&mut connection).expect_err("appending duplicate primary keys must fail");
+    assert_eq!(count_rows(connection, "AdbcIngestPk"), 2);
+    let dup_err = keyed_ingest(connection).expect_err("appending duplicate primary keys must fail");
     assert_eq!(
         dup_err.status,
         adbc_core::error::Status::AlreadyExists,
         "duplicate primary key must be AlreadyExists, got: {dup_err:?}"
     );
-    let mut drop_pk_done = connection.new_statement().expect("new statement");
-    drop_pk_done
-        .set_sql_query("DROP TABLE AdbcIngestPk")
-        .unwrap();
-    drop_pk_done
-        .execute_update()
-        .expect("drop primary-key table");
+    drop_tables(connection, &["AdbcIngestPk"]);
     // The removed `spanner.ingest.primary_key` option is now just an unknown statement option.
     let mut gone = connection.new_statement().expect("new statement");
     let gone_err = gone
@@ -1802,15 +1620,7 @@ fn query_and_dml_round_trip() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(pq_batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
-    assert_eq!(
-        pq_batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap()
-            .value(0),
-        "Bob"
-    );
+    assert_eq!(col::<StringArray>(pq_batches[0].column(0)).value(0), "Bob");
 
     // Positional binding: the bound column is *not* named after the query's `@parameter`, so the
     // driver binds the (sole) column to the (sole) parameter by position — the ADBC ordinal contract
@@ -1834,15 +1644,7 @@ fn query_and_dml_round_trip() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(pp_batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
-    assert_eq!(
-        pp_batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap()
-            .value(0),
-        "Bob"
-    );
+    assert_eq!(col::<StringArray>(pp_batches[0].column(0)).value(0), "Bob");
 
     // Parameterized DML: update by bound @Id / @Name. The bound columns are named after the
     // parameters but in a different order than they appear in the SQL (@Name before @Id), so this
@@ -1917,9 +1719,7 @@ fn query_and_dml_round_trip() {
         "the null-typed bind column must have inserted NULL"
     );
 
-    let mut drop_bind = connection.new_statement().expect("new statement");
-    drop_bind.set_sql_query("DROP TABLE AdbcBind").unwrap();
-    drop_bind.execute_update().expect("drop bind table");
+    drop_tables(connection, &["AdbcBind"]);
 
     // Preparing a statement before its query is set is an InvalidState error (ADBC precondition).
     let mut unprepared = connection.new_statement().expect("new statement");
@@ -1957,28 +1757,14 @@ fn query_and_dml_round_trip() {
         vec![Arc::new(Int64Array::from(vec![42, -42]))],
     )
     .unwrap();
-    let mut esc_ingest = connection.new_statement().expect("new statement");
-    esc_ingest
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("create".into()),
-        )
-        .unwrap();
-    esc_ingest
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("create".into()),
-        )
-        .unwrap();
+    let mut esc_ingest = ingest_stmt(connection, "create", "create");
     esc_ingest.bind(esc_rows).expect("bind reserved-word rows");
     assert_eq!(
         esc_ingest.execute_update().expect("ingest reserved"),
         Some(2)
     );
-    assert_eq!(count_rows(&mut connection, "`create`"), 2);
-    let mut drop_esc = connection.new_statement().expect("new statement");
-    drop_esc.set_sql_query("DROP TABLE `create`").unwrap();
-    drop_esc.execute_update().expect("drop reserved-word table");
+    assert_eq!(count_rows(connection, "`create`"), 2);
+    drop_tables(connection, &["`create`"]);
 
     // --- ARRAY<scalar> maps to a native Arrow List ---
 
@@ -2016,18 +1802,16 @@ fn query_and_dml_round_trip() {
         .collect::<Result<Vec<_>, _>>()
         .expect("collect arrays");
     let ab = &arr_batches[0];
-    let nums = ab.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+    let nums = col::<ListArray>(ab.column(0));
     let nums0 = nums.value(0);
-    let nums0 = nums0.as_any().downcast_ref::<Int64Array>().unwrap();
+    let nums0 = col::<Int64Array>(&nums0);
     assert_eq!(nums0.values(), &[10, 20, 30]);
-    let tags = ab.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+    let tags = col::<ListArray>(ab.column(1));
     let tags0 = tags.value(0);
-    let tags0 = tags0.as_any().downcast_ref::<StringArray>().unwrap();
+    let tags0 = col::<StringArray>(&tags0);
     assert_eq!((tags0.value(0), tags0.value(1)), ("a", "b"));
 
-    let mut drop_arr = connection.new_statement().expect("new statement");
-    drop_arr.set_sql_query("DROP TABLE AdbcArr").unwrap();
-    drop_arr.execute_update().expect("drop array table");
+    drop_tables(connection, &["AdbcArr"]);
 
     // --- STRUCT → native Arrow Struct (Spanner only returns structs inside an ARRAY) ---
 
@@ -2067,24 +1851,12 @@ fn query_and_dml_round_trip() {
     let arr_struct_batches = arr_struct_reader
         .collect::<Result<Vec<_>, _>>()
         .expect("collect array-of-struct");
-    let list = arr_struct_batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .unwrap();
+    let list = col::<ListArray>(arr_struct_batches[0].column(0));
     let inner = list.value(0);
-    let inner = inner.as_any().downcast_ref::<StructArray>().unwrap();
+    let inner = col::<StructArray>(&inner);
     assert_eq!(inner.len(), 2);
-    let a = inner
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
-    let b = inner
-        .column(1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let a = col::<Int64Array>(inner.column(0));
+    let b = col::<StringArray>(inner.column(1));
     assert_eq!((a.value(0), a.value(1)), (1, 2));
     assert_eq!((b.value(0), b.value(1)), ("x", "y"));
 
@@ -2114,21 +1886,10 @@ fn query_and_dml_round_trip() {
     let dup_struct_batches = dup_struct_reader
         .collect::<Result<Vec<_>, _>>()
         .expect("collect duplicate-field struct");
-    let dup_list = dup_struct_batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .unwrap();
+    let dup_list = col::<ListArray>(dup_struct_batches[0].column(0));
     let dup_inner = dup_list.value(0);
-    let dup_inner = dup_inner.as_any().downcast_ref::<StructArray>().unwrap();
-    let dup_col = |i: usize| {
-        dup_inner
-            .column(i)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .value(0)
-    };
+    let dup_inner = col::<StructArray>(&dup_inner);
+    let dup_col = |i: usize| col::<Int64Array>(dup_inner.column(i)).value(0);
     assert_eq!((dup_col(0), dup_col(1), dup_col(2)), (1, 2, 3));
 
     // --- Batched multi-statement DML in one execute_update (atomic DELETE; INSERT) ---
@@ -2155,11 +1916,9 @@ fn query_and_dml_round_trip() {
         )
         .unwrap();
     assert_eq!(batch.execute_update().expect("batch dml"), Some(3));
-    assert_eq!(count_rows(&mut connection, "AdbcBatch"), 2);
+    assert_eq!(count_rows(connection, "AdbcBatch"), 2);
 
-    let mut drop_batch = connection.new_statement().expect("new statement");
-    drop_batch.set_sql_query("DROP TABLE AdbcBatch").unwrap();
-    drop_batch.execute_update().expect("drop batch table");
+    drop_tables(connection, &["AdbcBatch"]);
 
     // --- execute_schema returns a query's schema without running it (incl. a top-level WITH) ---
 
@@ -2209,50 +1968,33 @@ fn query_and_dml_round_trip() {
     assert_eq!(ob.num_rows(), 1, "single catalog");
 
     // catalog_db_schemas: List<Struct{db_schema_name, db_schema_tables}> — only the "" schema.
-    let schemas = ob.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+    let schemas = col::<ListArray>(ob.column(1));
     let schemas = schemas.value(0);
-    let schemas = schemas.as_any().downcast_ref::<StructArray>().unwrap();
+    let schemas = col::<StructArray>(&schemas);
     assert_eq!(schemas.len(), 1);
 
     // db_schema_tables (field 1): List<Struct{table_name, table_type, table_columns, ...}>.
-    let tables = schemas
-        .column(1)
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .unwrap();
+    let tables = col::<ListArray>(schemas.column(1));
     let tables = tables.value(0);
-    let tables = tables.as_any().downcast_ref::<StructArray>().unwrap();
+    let tables = col::<StructArray>(&tables);
     assert_eq!(tables.len(), 1);
-    let table_name = tables
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let table_name = col::<StringArray>(tables.column(0));
     assert_eq!(table_name.value(0), "Singers");
 
     // table_columns (field 2): List<Struct{column_name, ...}> — the four Singers columns.
-    let columns = tables
-        .column(2)
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .unwrap();
+    let columns = col::<ListArray>(tables.column(2));
     let columns = columns.value(0);
-    let columns = columns.as_any().downcast_ref::<StructArray>().unwrap();
+    let columns = col::<StructArray>(&columns);
     assert_eq!(columns.len(), 4);
-    let column_name = columns
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let column_name = col::<StringArray>(columns.column(0));
     assert_eq!(column_name.value(0), "SingerId");
 
     // xdbc_type_name carries the Spanner-native type (INFORMATION_SCHEMA.COLUMNS.SPANNER_TYPE).
-    let type_name = columns
-        .column_by_name("xdbc_type_name")
-        .expect("xdbc_type_name field")
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let type_name = col::<StringArray>(
+        columns
+            .column_by_name("xdbc_type_name")
+            .expect("xdbc_type_name field"),
+    );
     let type_names: Vec<&str> = (0..type_name.len()).map(|i| type_name.value(i)).collect();
     assert_eq!(type_names, ["INT64", "STRING(MAX)", "BOOL", "FLOAT64"]);
 
@@ -2265,13 +2007,13 @@ fn query_and_dml_round_trip() {
         .expect("collect catalogs");
     let cb = &catalogs[0];
     assert_eq!(cb.num_rows(), 1, "single catalog");
-    let catalog_name = cb.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let catalog_name = col::<StringArray>(cb.column(0));
     assert_eq!(
         catalog_name.value(0),
         "",
         "Spanner's single unnamed catalog"
     );
-    let cb_schemas = cb.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+    let cb_schemas = col::<ListArray>(cb.column(1));
     assert!(
         cb_schemas.is_null(0),
         "catalog_db_schemas must be NULL at Catalogs depth"
@@ -2298,27 +2040,19 @@ fn query_and_dml_round_trip() {
         .expect("collect db schemas");
     let sb = &db_schemas[0];
     assert_eq!(sb.num_rows(), 1, "single catalog");
-    let sb_schemas = sb.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+    let sb_schemas = col::<ListArray>(sb.column(1));
     assert!(
         sb_schemas.is_valid(0),
         "catalog_db_schemas must be populated at DBSchemas depth"
     );
     let sb_schemas = sb_schemas.value(0);
-    let sb_schemas = sb_schemas.as_any().downcast_ref::<StructArray>().unwrap();
-    let schema_names = sb_schemas
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let sb_schemas = col::<StructArray>(&sb_schemas);
+    let schema_names = col::<StringArray>(sb_schemas.column(0));
     assert!(
         (0..schema_names.len()).any(|i| schema_names.value(i).is_empty()),
         "the default \"\" schema must be reported"
     );
-    let schema_tables = sb_schemas
-        .column(1)
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .unwrap();
+    let schema_tables = col::<ListArray>(sb_schemas.column(1));
     assert!(
         (0..schema_tables.len()).all(|i| schema_tables.is_null(i)),
         "db_schema_tables must be NULL at DBSchemas depth"
@@ -2334,7 +2068,7 @@ fn query_and_dml_round_trip() {
         .expect("collect table types")
         .iter()
         .flat_map(|b| {
-            let col = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            let col = col::<StringArray>(b.column(0));
             (0..col.len())
                 .map(|i| col.value(i).to_string())
                 .collect::<Vec<_>>()
@@ -2381,22 +2115,18 @@ fn query_and_dml_round_trip() {
         .expect("collect type-filtered objects");
     let nb = &no_such_type[0];
     assert_eq!(nb.num_rows(), 1, "single catalog");
-    let nb_schemas = nb.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+    let nb_schemas = col::<ListArray>(nb.column(1));
     assert!(
         nb_schemas.is_valid(0),
         "catalog_db_schemas must not be NULL at Tables depth"
     );
     let nb_schemas = nb_schemas.value(0);
-    let nb_schemas = nb_schemas.as_any().downcast_ref::<StructArray>().unwrap();
+    let nb_schemas = col::<StructArray>(&nb_schemas);
     assert!(
         !nb_schemas.is_empty(),
         "the db_schema skeleton must survive a table_type filter matching nothing"
     );
-    let nb_tables = nb_schemas
-        .column(1)
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .unwrap();
+    let nb_tables = col::<ListArray>(nb_schemas.column(1));
     for i in 0..nb_tables.len() {
         assert!(
             nb_tables.is_valid(i),
@@ -2417,21 +2147,11 @@ fn query_and_dml_round_trip() {
 /// rejection, pre-commit `NotFound`) is exercised on both.
 #[test]
 fn commit_stats_reports_mutation_count() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping commit_stats_reports_mutation_count");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let target = &fx.target;
+    let connection = &mut fx.connection;
 
     // Start from a known-empty table.
     let mut delete = connection.new_statement().expect("new statement");
@@ -2521,21 +2241,10 @@ fn commit_stats_reports_mutation_count() {
 /// with a handful of wide ones.)
 #[test]
 fn bulk_ingest_chunks_past_the_byte_budget() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping bulk_ingest_chunks_past_the_byte_budget");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     let mut ddl = connection.new_statement().expect("new statement");
     ddl.set_sql_query(
@@ -2567,19 +2276,7 @@ fn bulk_ingest_chunks_past_the_byte_budget() {
         ],
     )
     .unwrap();
-    let mut ingest = connection.new_statement().expect("new statement");
-    ingest
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcChunked".into()),
-        )
-        .unwrap();
-    ingest
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .unwrap();
+    let mut ingest = ingest_stmt(connection, "AdbcChunked", "append");
     ingest.bind(rows).expect("bind chunked ingest rows");
     assert_eq!(
         ingest.execute_update().expect("chunked ingest"),
@@ -2601,21 +2298,9 @@ fn bulk_ingest_chunks_past_the_byte_budget() {
         .unwrap();
     let mut seen = 0_usize;
     for batch in &batches {
-        let ids = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let lens = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let heads = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let ids = col::<Int64Array>(batch.column(0));
+        let lens = col::<Int64Array>(batch.column(1));
+        let heads = col::<StringArray>(batch.column(2));
         for row in 0..batch.num_rows() {
             assert_eq!(ids.value(row), seen as i64);
             assert_eq!(lens.value(row), VALUE_LEN as i64);
@@ -2625,11 +2310,7 @@ fn bulk_ingest_chunks_past_the_byte_budget() {
     }
     assert_eq!(seen, ROWS, "all ingested rows must be readable back");
 
-    let mut drop_chunked = connection.new_statement().expect("new statement");
-    drop_chunked
-        .set_sql_query("DROP TABLE AdbcChunked")
-        .unwrap();
-    drop_chunked.execute_update().expect("drop chunked table");
+    drop_tables(connection, &["AdbcChunked"]);
 }
 
 /// `spanner.ingest.batch_write`: an autocommit bulk ingest routed through Spanner's BatchWrite RPC
@@ -2639,21 +2320,10 @@ fn bulk_ingest_chunks_past_the_byte_budget() {
 /// alternate transport. The emulator implements the BatchWrite RPC.
 #[test]
 fn bulk_ingest_via_batch_write() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping bulk_ingest_via_batch_write");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     let mut ddl = connection.new_statement().expect("new statement");
     ddl.set_sql_query(
@@ -2725,16 +2395,8 @@ fn bulk_ingest_via_batch_write() {
         .unwrap();
     let mut seen = 0_usize;
     for batch in &batches {
-        let ids = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let names = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let ids = col::<Int64Array>(batch.column(0));
+        let names = col::<StringArray>(batch.column(1));
         for row in 0..batch.num_rows() {
             assert_eq!(ids.value(row), seen as i64);
             assert_eq!(names.value(row), format!("row-{seen}"));
@@ -2775,9 +2437,7 @@ fn bulk_ingest_via_batch_write() {
         "the AlreadyExists error should name the target table: {error}"
     );
 
-    let mut drop_bw = connection.new_statement().expect("new statement");
-    drop_bw.set_sql_query("DROP TABLE AdbcBatchWrite").unwrap();
-    drop_bw.execute_update().expect("drop batch-write table");
+    drop_tables(connection, &["AdbcBatchWrite"]);
 }
 
 /// `spanner.max_timestamp_precision`: a stored TIMESTAMP outside Arrow's nanosecond range
@@ -2787,21 +2447,10 @@ fn bulk_ingest_via_batch_write() {
 /// inheritance, per-statement override, and `""` reset.
 #[test]
 fn timestamp_precision_modes_round_trip() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping timestamp_precision_modes_round_trip");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     let mut ddl = connection.new_statement().expect("new statement");
     ddl.set_sql_query(
@@ -2883,11 +2532,7 @@ fn timestamp_precision_modes_round_trip() {
     let batches = reader
         .collect::<Result<Vec<_>, _>>()
         .expect("collect micros batches");
-    let ts = batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<TimestampMicrosecondArray>()
-        .unwrap();
+    let ts = col::<TimestampMicrosecondArray>(batches[0].column(0));
     assert_eq!(ts.value(0), 253_370_764_800_123_456); // .123456789 truncated to .123456
     assert_eq!(ts.value(1), -14_817_468_303_210_988); // 1500-06-15T12:34:56.789012Z
     assert!(ts.is_null(2));
@@ -2932,9 +2577,7 @@ fn timestamp_precision_modes_round_trip() {
     };
     assert!(failed, "statement-level reset must restore the loud error");
 
-    let mut drop_ts = connection.new_statement().expect("new statement");
-    drop_ts.set_sql_query("DROP TABLE AdbcTsPrecision").unwrap();
-    drop_ts.execute_update().expect("drop timestamp table");
+    drop_tables(connection, &["AdbcTsPrecision"]);
 }
 
 /// Edge cases of the bulk-ingest surface, each mapped to a bug a peer ADBC driver shipped:
@@ -2947,21 +2590,10 @@ fn timestamp_precision_modes_round_trip() {
 /// (DuckDB's ingest errors shipped table-less until duckdb/duckdb#22146).
 #[test]
 fn bulk_ingest_edge_cases() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping bulk_ingest_edge_cases");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     let mut ddl = connection.new_statement().expect("new statement");
     ddl.set_sql_query(
@@ -3006,7 +2638,7 @@ fn bulk_ingest_edge_cases() {
 
     // --- Zero-row batches in a bound stream, in FIRST, MIDDLE and LAST position. Every row from
     // the non-empty batches must land — a mid-stream empty batch must not truncate the ingest.
-    let mut zero_rows = append_stmt(&mut connection);
+    let mut zero_rows = append_stmt(connection);
     zero_rows
         .bind_stream(Box::new(RecordBatchIterator::new(
             [empty(), batch(&[1, 2]), empty(), batch(&[3]), empty()].map(Ok),
@@ -3020,11 +2652,11 @@ fn bulk_ingest_edge_cases() {
         Some(3),
         "all rows from the non-empty batches must land; empty batches contribute nothing"
     );
-    assert_eq!(count_rows(&mut connection, "AdbcEdge"), 3);
+    assert_eq!(count_rows(connection, "AdbcEdge"), 3);
 
     // A stream of only zero-row batches ingests zero rows successfully (no empty commit is sent —
     // the empty-chunk guard is unit-tested offline in src/statement.rs).
-    let mut all_empty = append_stmt(&mut connection);
+    let mut all_empty = append_stmt(connection);
     all_empty
         .bind_stream(Box::new(RecordBatchIterator::new(
             [empty(), empty()].map(Ok),
@@ -3037,7 +2669,7 @@ fn bulk_ingest_edge_cases() {
             .expect("all-empty ingest succeeds"),
         Some(0)
     );
-    assert_eq!(count_rows(&mut connection, "AdbcEdge"), 3);
+    assert_eq!(count_rows(connection, "AdbcEdge"), 3);
 
     // The same zero-row-batch stream in MANUAL transaction mode: buffered (None), all rows from
     // the non-empty batches applied on commit.
@@ -3047,7 +2679,7 @@ fn bulk_ingest_edge_cases() {
             OptionValue::String("false".into()),
         )
         .expect("disable autocommit");
-    let mut manual = append_stmt(&mut connection);
+    let mut manual = append_stmt(connection);
     manual
         .bind_stream(Box::new(RecordBatchIterator::new(
             [empty(), batch(&[4]), empty(), batch(&[5]), empty()].map(Ok),
@@ -3061,7 +2693,7 @@ fn bulk_ingest_edge_cases() {
     );
     connection.commit().expect("commit buffered ingest");
     assert_eq!(
-        count_rows(&mut connection, "AdbcEdge"),
+        count_rows(connection, "AdbcEdge"),
         5,
         "every row around the zero-row batches must land on commit"
     );
@@ -3074,19 +2706,7 @@ fn bulk_ingest_edge_cases() {
 
     // Create-mode with a zero-row FIRST batch: the created table's schema comes from that empty
     // batch, and the later rows land.
-    let mut create = connection.new_statement().expect("new statement");
-    create
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcEdgeCreate".into()),
-        )
-        .unwrap();
-    create
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("create".into()),
-        )
-        .unwrap();
+    let mut create = ingest_stmt(connection, "AdbcEdgeCreate", "create");
     create
         .bind_stream(Box::new(RecordBatchIterator::new(
             [empty(), batch(&[1])].map(Ok),
@@ -3100,13 +2720,7 @@ fn bulk_ingest_edge_cases() {
         Some(1),
         "the table schema must come from the zero-row first batch"
     );
-    let mut drop_edge_create = connection.new_statement().expect("new statement");
-    drop_edge_create
-        .set_sql_query("DROP TABLE AdbcEdgeCreate")
-        .unwrap();
-    drop_edge_create
-        .execute_update()
-        .expect("drop AdbcEdgeCreate");
+    drop_tables(connection, &["AdbcEdgeCreate"]);
 
     // --- A stream that yields ZERO batches (not merely zero-row batches): the empty-array-stream
     // shape `AdbcStatementBindStream` receives from a source with no data. The stream still declares
@@ -3120,19 +2734,7 @@ fn bulk_ingest_edge_cases() {
         )
     };
     // Create mode: the table is built from the stream's declared schema alone, with zero rows.
-    let mut create_empty = connection.new_statement().expect("new statement");
-    create_empty
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcEdgeZero".into()),
-        )
-        .unwrap();
-    create_empty
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("create".into()),
-        )
-        .unwrap();
+    let mut create_empty = ingest_stmt(connection, "AdbcEdgeZero", "create");
     create_empty
         .bind_stream(Box::new(empty_stream()))
         .expect("bind a zero-batch stream");
@@ -3144,24 +2746,12 @@ fn bulk_ingest_edge_cases() {
         "a zero-batch ingest commits zero rows"
     );
     assert_eq!(
-        count_rows(&mut connection, "AdbcEdgeZero"),
+        count_rows(connection, "AdbcEdgeZero"),
         0,
         "the table must be created (from the stream's schema) with zero rows"
     );
     // Append mode into the now-existing table: a zero-batch stream is a clean no-op.
-    let mut append_empty = connection.new_statement().expect("new statement");
-    append_empty
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcEdgeZero".into()),
-        )
-        .unwrap();
-    append_empty
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .unwrap();
+    let mut append_empty = ingest_stmt(connection, "AdbcEdgeZero", "append");
     append_empty
         .bind_stream(Box::new(empty_stream()))
         .expect("bind a zero-batch stream for append");
@@ -3171,12 +2761,8 @@ fn bulk_ingest_edge_cases() {
             .expect("append of a zero-batch stream must succeed"),
         Some(0)
     );
-    assert_eq!(count_rows(&mut connection, "AdbcEdgeZero"), 0);
-    let mut drop_edge_zero = connection.new_statement().expect("new statement");
-    drop_edge_zero
-        .set_sql_query("DROP TABLE AdbcEdgeZero")
-        .unwrap();
-    drop_edge_zero.execute_update().expect("drop AdbcEdgeZero");
+    assert_eq!(count_rows(connection, "AdbcEdgeZero"), 0);
+    drop_tables(connection, &["AdbcEdgeZero"]);
 
     // --- Bind BEFORE the ingest options: the bound data and the ingest options may arrive in
     // either order.
@@ -3199,7 +2785,7 @@ fn bulk_ingest_edge_cases() {
         Some(1),
         "binding before setting the ingest target must work"
     );
-    assert_eq!(count_rows(&mut connection, "AdbcEdge"), 6);
+    assert_eq!(count_rows(connection, "AdbcEdge"), 6);
 
     // Bound data with NO destination at all (no ingest target, no SQL): a clean InvalidState that
     // names the missing ingest option, on BOTH entry points. The failed attempts must not consume
@@ -3243,10 +2829,10 @@ fn bulk_ingest_edge_cases() {
         Some(1),
         "the failed no-destination attempts must not have consumed the bound data"
     );
-    assert_eq!(count_rows(&mut connection, "AdbcEdge"), 7);
+    assert_eq!(count_rows(connection, "AdbcEdge"), 7);
 
     // --- An ingest target with NO bound data: InvalidState on both entry points.
-    let mut nodata = append_stmt(&mut connection);
+    let mut nodata = append_stmt(connection);
     let error = nodata
         .execute_update()
         .expect_err("ingest with no bound data must fail");
@@ -3271,7 +2857,7 @@ fn bulk_ingest_edge_cases() {
 
     // --- Full reuse of ONE statement handle: ingest → DML via execute_update → ingest again.
     // Each mode switch must clear the other's state, in both directions.
-    let mut handle = append_stmt(&mut connection);
+    let mut handle = append_stmt(connection);
     handle
         .bind(batch(&[10, 11]))
         .expect("bind first reuse ingest");
@@ -3315,12 +2901,12 @@ fn bulk_ingest_edge_cases() {
         Some(2),
         "the re-set ingest target must win over the stale DML"
     );
-    assert_eq!(count_rows(&mut connection, "AdbcEdge"), 12);
+    assert_eq!(count_rows(connection, "AdbcEdge"), 12);
 
     // --- Duplicate primary key: insert mutations keep INSERT semantics, so re-ingesting an
     // existing key fails with AlreadyExists — naming the target table, and not misreported as a
     // schema mismatch.
-    let mut dup = append_stmt(&mut connection);
+    let mut dup = append_stmt(connection);
     dup.bind(batch(&[1])).expect("bind duplicate-key row");
     let error = dup
         .execute_update()
@@ -3339,14 +2925,12 @@ fn bulk_ingest_edge_cases() {
         "a duplicate key must not be misreported as a schema mismatch: {error:?}"
     );
     assert_eq!(
-        count_rows(&mut connection, "AdbcEdge"),
+        count_rows(connection, "AdbcEdge"),
         12,
         "the rejected duplicate must not change the table"
     );
 
-    let mut drop_edge = connection.new_statement().expect("new statement");
-    drop_edge.set_sql_query("DROP TABLE AdbcEdge").unwrap();
-    drop_edge.execute_update().expect("drop edge table");
+    drop_tables(connection, &["AdbcEdge"]);
 }
 
 /// An empty (zero-batch) `bind_stream` declares a schema but binds no parameter rows. It must feed
@@ -3356,23 +2940,10 @@ fn bulk_ingest_edge_cases() {
 /// was synthesised into the shared `bound` buffer as a zero-row batch.
 #[test]
 fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
-    let Some(target) = test_target() else {
-        eprintln!(
-            "no Spanner target set — skipping bulk_ingest_empty_stream_does_not_hijack_other_paths"
-        );
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     let mut ddl = connection.new_statement().expect("new statement");
     ddl.set_sql_query(
@@ -3421,7 +2992,7 @@ fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
         Some(2),
         "an empty bind_stream must not silently no-op a subsequent DELETE"
     );
-    assert_eq!(count_rows(&mut connection, "AdbcEmptyHijack"), 1);
+    assert_eq!(count_rows(connection, "AdbcEmptyHijack"), 1);
 
     // (2) Empty bind_stream then SELECT: the query must run and return the real row, not empty.
     let mut select_after_empty = connection.new_statement().expect("new statement");
@@ -3518,19 +3089,7 @@ fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
 
     // (3) Empty APPEND to a nonexistent table must still surface NotFound. An empty append ships
     // nothing, so the missing-table insert error never fires; the driver probes existence directly.
-    let mut append_missing_empty = connection.new_statement().expect("new statement");
-    append_missing_empty
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcNoSuchZeroTable".into()),
-        )
-        .unwrap();
-    append_missing_empty
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .unwrap();
+    let mut append_missing_empty = ingest_stmt(connection, "AdbcNoSuchZeroTable", "append");
     append_missing_empty
         .bind_stream(Box::new(empty_stream()))
         .expect("bind empty stream for missing-table append");
@@ -3579,19 +3138,7 @@ fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
     );
     // Confirm no table was created from a stale schema: a create-mode ingest onto AdbcStaleLeak now
     // succeeds (it does not already exist), which it could not if the leak had created it.
-    let mut stale_probe = connection.new_statement().expect("new statement");
-    stale_probe
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcStaleLeak".into()),
-        )
-        .unwrap();
-    stale_probe
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("create".into()),
-        )
-        .unwrap();
+    let mut stale_probe = ingest_stmt(connection, "AdbcStaleLeak", "create");
     stale_probe
         .bind_stream(Box::new(empty_stream()))
         .expect("bind empty stream to confirm the table was not leaked");
@@ -3612,19 +3159,7 @@ fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
             OptionValue::String("false".into()),
         )
         .expect("disable autocommit for manual empty append");
-    let mut manual_append_missing = connection.new_statement().expect("new statement");
-    manual_append_missing
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcNoSuchManualZeroTable".into()),
-        )
-        .unwrap();
-    manual_append_missing
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .unwrap();
+    let mut manual_append_missing = ingest_stmt(connection, "AdbcNoSuchManualZeroTable", "append");
     manual_append_missing
         .bind_stream(Box::new(empty_stream()))
         .expect("bind empty stream for manual missing-table append");
@@ -3658,19 +3193,7 @@ fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
         .set_sql_query("SELECT Id FROM AdbcEmptyHijack")
         .unwrap();
     drop(fix_read.execute().expect("open a read transaction"));
-    let mut create_in_read = connection.new_statement().expect("new statement");
-    create_in_read
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcEmptyReadTxn".into()),
-        )
-        .unwrap();
-    create_in_read
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("create".into()),
-        )
-        .unwrap();
+    let mut create_in_read = ingest_stmt(connection, "AdbcEmptyReadTxn", "create");
     create_in_read
         .bind_stream(Box::new(empty_stream()))
         .expect("bind empty stream for create in a read txn");
@@ -3692,19 +3215,7 @@ fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
     // The rejected create-mode ingest must NOT have created the table (the kind check runs before
     // the DDL side effect). A create-mode ingest onto a truly-absent table succeeds, so if the
     // earlier attempt had leaked the table this create would instead fail with AlreadyExists.
-    let mut probe_not_created = connection.new_statement().expect("new statement");
-    probe_not_created
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcEmptyReadTxn".into()),
-        )
-        .unwrap();
-    probe_not_created
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("create".into()),
-        )
-        .unwrap();
+    let mut probe_not_created = ingest_stmt(connection, "AdbcEmptyReadTxn", "create");
     probe_not_created
         .bind_stream(Box::new(empty_stream()))
         .expect("bind empty stream to confirm the table was not created");
@@ -3732,23 +3243,10 @@ fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
 /// status through the append-failure remap, naming the table.
 #[test]
 fn bulk_ingest_mid_chunk_failure_reports_committed_rows() {
-    let Some(target) = test_target() else {
-        eprintln!(
-            "no Spanner target set — skipping bulk_ingest_mid_chunk_failure_reports_committed_rows"
-        );
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     let mut ddl = connection.new_statement().expect("new statement");
     ddl.set_sql_query(
@@ -3783,19 +3281,7 @@ fn bulk_ingest_mid_chunk_failure_reports_committed_rows() {
     )
     .unwrap();
 
-    let mut ingest = connection.new_statement().expect("new statement");
-    ingest
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcMidFail".into()),
-        )
-        .unwrap();
-    ingest
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .unwrap();
+    let mut ingest = ingest_stmt(connection, "AdbcMidFail", "append");
     ingest.bind(rows).expect("bind mid-fail ingest rows");
     let error = ingest
         .execute_update()
@@ -3814,7 +3300,7 @@ fn bulk_ingest_mid_chunk_failure_reports_committed_rows() {
 
     // The earlier chunks' rows stayed committed (per-chunk commits are not atomic as a whole),
     // and the error reports their exact count.
-    let committed = count_rows(&mut connection, "AdbcMidFail");
+    let committed = count_rows(connection, "AdbcMidFail");
     assert!(
         committed > 0 && committed < ROWS as i64,
         "a mid-ingest failure must leave exactly the earlier chunks' rows, found {committed}"
@@ -3826,11 +3312,7 @@ fn bulk_ingest_mid_chunk_failure_reports_committed_rows() {
         "the error must report the rows already committed ({committed} found in the table): {error:?}"
     );
 
-    let mut drop_midfail = connection.new_statement().expect("new statement");
-    drop_midfail
-        .set_sql_query("DROP TABLE AdbcMidFail")
-        .unwrap();
-    drop_midfail.execute_update().expect("drop midfail table");
+    drop_tables(connection, &["AdbcMidFail"]);
 }
 
 /// Flatten a collected `get_objects` result into the table names it contains, across all
@@ -3838,30 +3320,18 @@ fn bulk_ingest_mid_chunk_failure_reports_committed_rows() {
 fn objects_table_names(batches: &[RecordBatch]) -> Vec<String> {
     let mut names = Vec::new();
     for batch in batches {
-        let schema_lists = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap();
+        let schema_lists = col::<ListArray>(batch.column(1));
         for c in 0..batch.num_rows() {
             let schemas = schema_lists.value(c);
-            let schemas = schemas.as_any().downcast_ref::<StructArray>().unwrap();
-            let table_lists = schemas
-                .column(1)
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .unwrap();
+            let schemas = col::<StructArray>(&schemas);
+            let table_lists = col::<ListArray>(schemas.column(1));
             for s in 0..schemas.len() {
                 if table_lists.is_null(s) {
                     continue;
                 }
                 let tables = table_lists.value(s);
-                let tables = tables.as_any().downcast_ref::<StructArray>().unwrap();
-                let table_names = tables
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
+                let tables = col::<StructArray>(&tables);
+                let table_names = col::<StringArray>(tables.column(0));
                 for r in 0..tables.len() {
                     names.push(table_names.value(r).to_string());
                 }
@@ -3892,30 +3362,18 @@ fn adbc_like(pattern: &str, value: &str) -> bool {
 fn objects_column_names(batches: &[RecordBatch], table: &str) -> Vec<String> {
     let mut names = Vec::new();
     for batch in batches {
-        let schema_lists = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap();
+        let schema_lists = col::<ListArray>(batch.column(1));
         for c in 0..batch.num_rows() {
             let schemas = schema_lists.value(c);
-            let schemas = schemas.as_any().downcast_ref::<StructArray>().unwrap();
-            let table_lists = schemas
-                .column(1)
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .unwrap();
+            let schemas = col::<StructArray>(&schemas);
+            let table_lists = col::<ListArray>(schemas.column(1));
             for s in 0..schemas.len() {
                 if table_lists.is_null(s) {
                     continue;
                 }
                 let tables = table_lists.value(s);
-                let tables = tables.as_any().downcast_ref::<StructArray>().unwrap();
-                let table_names = tables
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
+                let tables = col::<StructArray>(&tables);
+                let table_names = col::<StringArray>(tables.column(0));
                 let column_lists = tables
                     .column_by_name("table_columns")
                     .unwrap()
@@ -3927,12 +3385,8 @@ fn objects_column_names(batches: &[RecordBatch], table: &str) -> Vec<String> {
                         continue;
                     }
                     let columns = column_lists.value(r);
-                    let columns = columns.as_any().downcast_ref::<StructArray>().unwrap();
-                    let column_names = columns
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .unwrap();
+                    let columns = col::<StructArray>(&columns);
+                    let column_names = col::<StringArray>(columns.column(0));
                     for k in 0..columns.len() {
                         names.push(column_names.value(k).to_string());
                     }
@@ -3951,21 +3405,10 @@ fn objects_column_names(batches: &[RecordBatch], table: &str) -> Vec<String> {
 /// table falls outside the filter.
 #[test]
 fn get_objects_filter_pushdown_matches_client_filtering() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping get_objects_filter_pushdown");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     // Distinctively-named tables covering the pattern shapes: a literal underscore in a name,
     // a one-character variant (`_` wildcard bait), and a foreign key from GoFilterChild to
@@ -3998,7 +3441,7 @@ fn get_objects_filter_pushdown_matches_client_filtering() {
     };
 
     // The oracle: everything, filtered client-side per pattern by the independent matcher.
-    let unfiltered = collect(&mut connection, None, None);
+    let unfiltered = collect(connection, None, None);
     let mut all_names = objects_table_names(&unfiltered);
     all_names.sort();
 
@@ -4011,7 +3454,7 @@ fn get_objects_filter_pushdown_matches_client_filtering() {
         "GoFilterNone%", // matches nothing
     ];
     for pattern in table_patterns {
-        let mut filtered = objects_table_names(&collect(&mut connection, Some(pattern), None));
+        let mut filtered = objects_table_names(&collect(connection, Some(pattern), None));
         filtered.sort();
         let expected: Vec<String> = all_names
             .iter()
@@ -4026,8 +3469,7 @@ fn get_objects_filter_pushdown_matches_client_filtering() {
 
     // `_` stayed a wildcard through the push-down: the pattern with a literal-looking underscore
     // matches both the underscore name and the X variant (ADBC patterns have no escape syntax).
-    let mut wildcarded =
-        objects_table_names(&collect(&mut connection, Some("GoFilter_Beta"), None));
+    let mut wildcarded = objects_table_names(&collect(connection, Some("GoFilter_Beta"), None));
     wildcarded.sort();
     assert_eq!(wildcarded, ["GoFilterXBeta", "GoFilter_Beta"]);
 
@@ -4035,7 +3477,7 @@ fn get_objects_filter_pushdown_matches_client_filtering() {
     let all_columns = objects_column_names(&unfiltered, "GoFilterAlpha");
     assert_eq!(all_columns, ["Id", "NameOne", "Name_Two", "NameXTwo"]);
     for pattern in ["Name%", "Name_Two", "%Two", "Id", "Zzz%"] {
-        let filtered = collect(&mut connection, Some("GoFilterAlpha"), Some(pattern));
+        let filtered = collect(connection, Some("GoFilterAlpha"), Some(pattern));
         let expected: Vec<String> = all_columns
             .iter()
             .filter(|n| adbc_like(pattern, n))
@@ -4051,23 +3493,15 @@ fn get_objects_filter_pushdown_matches_client_filtering() {
     // Empty-vs-null skeletons survive the push-down: a table filter matching nothing keeps every
     // schema with an EMPTY (non-null) table list — the SCHEMATA query is not filtered by the
     // table pattern, only TABLES is.
-    let none = collect(&mut connection, Some("GoFilterNone%"), None);
+    let none = collect(connection, Some("GoFilterNone%"), None);
     assert!(objects_table_names(&none).is_empty());
     let batch = &none[0];
-    let schema_lists = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .unwrap();
+    let schema_lists = col::<ListArray>(batch.column(1));
     assert!(schema_lists.is_valid(0));
     let schemas = schema_lists.value(0);
-    let schemas = schemas.as_any().downcast_ref::<StructArray>().unwrap();
+    let schemas = col::<StructArray>(&schemas);
     assert!(!schemas.is_empty(), "schema skeletons must be kept");
-    let table_lists = schemas
-        .column(1)
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .unwrap();
+    let table_lists = col::<ListArray>(schemas.column(1));
     for s in 0..schemas.len() {
         assert!(
             table_lists.is_valid(s) && table_lists.value(s).is_empty(),
@@ -4076,35 +3510,26 @@ fn get_objects_filter_pushdown_matches_client_filtering() {
     }
 
     // A column filter matching nothing keeps the table with an empty, non-null column list.
-    let no_columns = collect(&mut connection, Some("GoFilterAlpha"), Some("Zzz%"));
+    let no_columns = collect(connection, Some("GoFilterAlpha"), Some("Zzz%"));
     assert_eq!(objects_table_names(&no_columns), ["GoFilterAlpha"]);
     assert!(objects_column_names(&no_columns, "GoFilterAlpha").is_empty());
 
     // Foreign keys resolve across the filter boundary: filtering to the child only, its
     // constraint_column_usage must still name the (excluded) parent's column — the
     // KEY_COLUMN_USAGE / REFERENTIAL_CONSTRAINTS queries are deliberately not filtered.
-    let child_only = collect(&mut connection, Some("GoFilterChild"), None);
+    let child_only = collect(connection, Some("GoFilterChild"), None);
     assert_eq!(objects_table_names(&child_only), ["GoFilterChild"]);
     let batch = &child_only[0];
-    let schemas = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .unwrap()
-        .value(0);
-    let schemas = schemas.as_any().downcast_ref::<StructArray>().unwrap();
+    let schemas = col::<ListArray>(batch.column(1)).value(0);
+    let schemas = col::<StructArray>(&schemas);
     let mut fk_usage = None;
-    let table_lists = schemas
-        .column(1)
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .unwrap();
+    let table_lists = col::<ListArray>(schemas.column(1));
     for s in 0..schemas.len() {
         if table_lists.is_null(s) {
             continue;
         }
         let tables = table_lists.value(s);
-        let tables = tables.as_any().downcast_ref::<StructArray>().unwrap();
+        let tables = col::<StructArray>(&tables);
         let constraint_lists = tables
             .column_by_name("table_constraints")
             .unwrap()
@@ -4113,7 +3538,7 @@ fn get_objects_filter_pushdown_matches_client_filtering() {
             .unwrap();
         for r in 0..tables.len() {
             let constraints = constraint_lists.value(r);
-            let constraints = constraints.as_any().downcast_ref::<StructArray>().unwrap();
+            let constraints = col::<StructArray>(&constraints);
             let ctype = constraints
                 .column_by_name("constraint_type")
                 .unwrap()
@@ -4130,7 +3555,7 @@ fn get_objects_filter_pushdown_matches_client_filtering() {
                 if ctype.value(k) == "FOREIGN KEY" {
                     assert!(usage_lists.is_valid(k), "FK usage list must be non-null");
                     let usage = usage_lists.value(k);
-                    let usage = usage.as_any().downcast_ref::<StructArray>().unwrap();
+                    let usage = col::<StructArray>(&usage);
                     assert_eq!(usage.len(), 1);
                     let fk_table = usage
                         .column_by_name("fk_table")
@@ -4158,14 +3583,15 @@ fn get_objects_filter_pushdown_matches_client_filtering() {
         "the FK must resolve its parent column even though the filter excludes the parent table"
     );
 
-    let mut drop_tables = connection.new_statement().expect("new statement");
-    drop_tables
-        .set_sql_query(
-            "DROP TABLE GoFilterChild; DROP TABLE GoFilterAlpha; \
-             DROP TABLE GoFilter_Beta; DROP TABLE GoFilterXBeta",
-        )
-        .unwrap();
-    drop_tables.execute_update().expect("drop filter tables");
+    drop_tables(
+        connection,
+        &[
+            "GoFilterChild",
+            "GoFilterAlpha",
+            "GoFilter_Beta",
+            "GoFilterXBeta",
+        ],
+    );
 }
 
 /// Number of generated cases per property. Each case is a full DELETE + INSERT + SELECT round trip
@@ -4322,22 +3748,14 @@ fn prop_bind_round_trip() {
         prop_assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         let b = &batches[0];
 
-        let i = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let f = b.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
-        let bo = b.column(2).as_any().downcast_ref::<BooleanArray>().unwrap();
-        let s = b.column(3).as_any().downcast_ref::<StringArray>().unwrap();
-        let by = b.column(4).as_any().downcast_ref::<BinaryArray>().unwrap();
-        let d = b.column(5).as_any().downcast_ref::<Date32Array>().unwrap();
-        let t = b
-            .column(6)
-            .as_any()
-            .downcast_ref::<TimestampNanosecondArray>()
-            .unwrap();
-        let n = b
-            .column(7)
-            .as_any()
-            .downcast_ref::<Decimal128Array>()
-            .unwrap();
+        let i = col::<Int64Array>(b.column(0));
+        let f = col::<Float64Array>(b.column(1));
+        let bo = col::<BooleanArray>(b.column(2));
+        let s = col::<StringArray>(b.column(3));
+        let by = col::<BinaryArray>(b.column(4));
+        let d = col::<Date32Array>(b.column(5));
+        let t = col::<TimestampNanosecondArray>(b.column(6));
+        let n = col::<Decimal128Array>(b.column(7));
 
         match oi {
             Some(v) => prop_assert_eq!(i.value(0), v),
@@ -4460,17 +3878,9 @@ fn prop_temporal_round_trip() {
         prop_assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         let b = &batches[0];
 
-        let d = b.column(0).as_any().downcast_ref::<Date32Array>().unwrap();
-        let t = b
-            .column(1)
-            .as_any()
-            .downcast_ref::<TimestampNanosecondArray>()
-            .unwrap();
-        let n = b
-            .column(2)
-            .as_any()
-            .downcast_ref::<Decimal128Array>()
-            .unwrap();
+        let d = col::<Date32Array>(b.column(0));
+        let t = col::<TimestampNanosecondArray>(b.column(1));
+        let n = col::<Decimal128Array>(b.column(2));
 
         match exp_days {
             Some(v) => prop_assert_eq!(d.value(0), v),
@@ -4495,22 +3905,10 @@ fn prop_temporal_round_trip() {
 /// expected to error instead; the row-count assertion is what actually guards the fix.
 #[test]
 fn ddl_execute_clears_stale_bound_rows() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping ddl_execute_clears_stale_bound_rows");
+    let Some(mut fx) = fixture() else {
         return;
     };
-
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     // Start from a clean slate so the COUNT begins at 0 even on a persistent `SPANNER_GCP_DATABASE`.
     let mut drop_stale = connection.new_statement().expect("new statement");
@@ -4542,15 +3940,13 @@ fn ddl_execute_clears_stale_bound_rows() {
 
     // The regression guard: the stale 900001/900002 rows must NOT have leaked into the INSERT.
     assert_eq!(
-        count_rows(&mut connection, "BoundLeak"),
+        count_rows(connection, "BoundLeak"),
         0,
         "stale bound rows leaked past a DDL statement into the next parameterized DML"
     );
 
     // Clean up the scratch table like every other section.
-    let mut drop_stmt = connection.new_statement().expect("new statement");
-    drop_stmt.set_sql_query("DROP TABLE BoundLeak").unwrap();
-    drop_stmt.execute_update().expect("drop BoundLeak");
+    drop_tables(connection, &["BoundLeak"]);
 }
 
 /// Locate the built `cdylib` (`libadbc_spanner.so` / `.dylib` / `.dll`) next to the test binary.
@@ -4644,12 +4040,7 @@ fn ffi_driver_manager_smoke() {
         .collect::<Result<Vec<_>, _>>()
         .expect("collect via FFI");
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
-    let value = batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap()
-        .value(0);
+    let value = col::<Int64Array>(batches[0].column(0)).value(0);
     assert_eq!(value, 1);
 }
 
@@ -4744,7 +4135,7 @@ fn conformance_via_driver_manager() {
     let unknown_codes: Vec<u32> = unknown_batches
         .iter()
         .flat_map(|b| {
-            let col = b.column(0).as_any().downcast_ref::<UInt32Array>().unwrap();
+            let col = col::<UInt32Array>(b.column(0));
             (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
         })
         .collect();
@@ -4762,7 +4153,7 @@ fn conformance_via_driver_manager() {
         .expect("collect table types")
         .iter()
         .flat_map(|b| {
-            let col = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            let col = col::<StringArray>(b.column(0));
             (0..col.len())
                 .map(|i| col.value(i).to_string())
                 .collect::<Vec<_>>()
@@ -4908,12 +4299,7 @@ fn ffi_count(connection: &mut adbc_driver_manager::ManagedConnection, table: &st
         .expect("count query")
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap()
-        .value(0)
+    col::<Int64Array>(batches[0].column(0)).value(0)
 }
 
 /// Retry-tuning options (`spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds`)
@@ -4924,25 +4310,10 @@ fn ffi_count(connection: &mut adbc_driver_manager::ManagedConnection, table: &st
 /// read-only-plus-one-row so it does not need the schema serial guard.
 #[test]
 fn retry_tuning_round_trip_and_execute() {
-    let Some(target) = test_target() else {
-        eprintln!(
-            "neither SPANNER_EMULATOR_HOST nor SPANNER_GCP_DATABASE set — \
-             skipping retry-tuning integration test"
-        );
+    let Some(mut fx) = fixture() else {
         return;
     };
-
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     // Connection-level round-trip, including the numeric accessors.
     let attempts_key = OptionConnection::Other("spanner.retry.max_attempts".into());
@@ -5017,25 +4388,10 @@ fn retry_tuning_round_trip_and_execute() {
 /// rows, then traverse an edge with `MATCH (a)-[e]->(b)` and assert the returned columns/rows.
 #[test]
 fn gql_graph_query_round_trip() {
-    let Some(target) = test_target() else {
-        eprintln!(
-            "neither SPANNER_EMULATOR_HOST nor SPANNER_GCP_DATABASE set — \
-             skipping GQL graph-query integration test"
-        );
+    let Some(mut fx) = fixture() else {
         return;
     };
-
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     // Schema: a node table `GqlAccount` and an edge table `GqlTransfer` whose (source, destination)
     // keys reference it. All DDL is idempotent so the test can re-run against a persistent target.
@@ -5124,21 +4480,9 @@ fn gql_graph_query_round_trip() {
     // guarantee without an explicit `ORDER BY`.
     let mut edges = Vec::new();
     for batch in &batches {
-        let src = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let dst = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let amount = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap();
+        let src = col::<StringArray>(batch.column(0));
+        let dst = col::<StringArray>(batch.column(1));
+        let amount = col::<Float64Array>(batch.column(2));
         for i in 0..batch.num_rows() {
             edges.push((
                 src.value(i).to_string(),
@@ -5181,25 +4525,10 @@ fn gql_graph_query_round_trip() {
 /// `get_table_schema`, `target_db_schema` on ingest).
 #[test]
 fn named_schema_round_trip() {
-    let Some(target) = test_target() else {
-        eprintln!(
-            "neither SPANNER_EMULATOR_HOST nor SPANNER_GCP_DATABASE set — \
-             skipping named-schema integration test"
-        );
+    let Some(mut fx) = fixture() else {
         return;
     };
-
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     // Idempotent setup so the test re-runs cleanly against a persistent `SPANNER_GCP_DATABASE`:
     // drop the table first (a non-empty schema cannot be dropped), then ensure the schema and
@@ -5224,7 +4553,7 @@ fn named_schema_round_trip() {
     ins.set_sql_query("INSERT INTO adbc_ns.Widget (Id, Label) VALUES (1, 'alpha'), (2, 'beta')")
         .unwrap();
     assert_eq!(ins.execute_update().expect("insert widgets"), Some(2));
-    assert_eq!(count_rows(&mut connection, "adbc_ns.Widget"), 2);
+    assert_eq!(count_rows(connection, "adbc_ns.Widget"), 2);
 
     // --- get_table_schema honours the db_schema argument: `adbc_ns.Widget` resolves to its two
     // columns, whereas the same table name in the default schema does not exist.
@@ -5258,48 +4587,28 @@ fn named_schema_round_trip() {
 
     // Locate the `adbc_ns` schema in the single (unnamed) catalog's db_schemas list.
     let ob = &objects[0];
-    let schema_list = ob.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+    let schema_list = col::<ListArray>(ob.column(1));
     let schemas = schema_list.value(0);
-    let schemas = schemas.as_any().downcast_ref::<StructArray>().unwrap();
-    let schema_names = schemas
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let schemas = col::<StructArray>(&schemas);
+    let schema_names = col::<StringArray>(schemas.column(0));
     let idx = (0..schemas.len())
         .find(|&i| schema_names.value(i) == "adbc_ns")
         .expect("adbc_ns schema present in get_objects result");
 
     // db_schema_tables (field 1): List<Struct{table_name, table_type, table_columns, ...}>. The
     // `Widget` table filter leaves exactly one table under this schema.
-    let table_lists = schemas
-        .column(1)
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .unwrap();
+    let table_lists = col::<ListArray>(schemas.column(1));
     let tables = table_lists.value(idx);
-    let tables = tables.as_any().downcast_ref::<StructArray>().unwrap();
+    let tables = col::<StructArray>(&tables);
     assert_eq!(tables.len(), 1);
-    let table_name = tables
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let table_name = col::<StringArray>(tables.column(0));
     assert_eq!(table_name.value(0), "Widget");
 
     // table_columns (field 2): the two Widget columns, in ordinal order.
-    let column_lists = tables
-        .column(2)
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .unwrap();
+    let column_lists = col::<ListArray>(tables.column(2));
     let columns = column_lists.value(0);
-    let columns = columns.as_any().downcast_ref::<StructArray>().unwrap();
-    let column_name = columns
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let columns = col::<StructArray>(&columns);
+    let column_name = col::<StringArray>(columns.column(0));
     let column_names: Vec<&str> = (0..columns.len()).map(|i| column_name.value(i)).collect();
     assert_eq!(column_names, ["Id", "Label"]);
 
@@ -5350,7 +4659,7 @@ fn named_schema_round_trip() {
         Some(2)
     );
     assert_eq!(
-        count_rows(&mut connection, "adbc_ns.Widget"),
+        count_rows(connection, "adbc_ns.Widget"),
         4,
         "the two ingested rows join the two inserted rows"
     );
@@ -5393,6 +4702,118 @@ fn connect_with_retry(database: &SpannerDatabase) -> SpannerConnection {
     panic!("create connection failed after retries: {last_err:?}");
 }
 
+/// Everything a test needs to talk to the target database, kept alive together for the whole test
+/// body: the resolved [`TestTarget`], the driver → database → connection chain, and (for the
+/// schema-mutating tests) the [`serial_guard`].
+///
+/// The fields are declared in drop order — connection, then database, then driver, and the serial
+/// guard last — so a test never releases the guard while its own connection is still tearing down.
+struct Fixture {
+    connection: SpannerConnection,
+    database: SpannerDatabase,
+    _driver: SpannerDriver,
+    target: TestTarget,
+    _serial: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+/// The standard test preamble, in one call: resolve the target, ensure the database and its tables
+/// exist, take the schema [`serial_guard`], and open driver → database → connection.
+///
+/// Returns `None` exactly when [`test_target`] does (printing the skip notice), so
+/// `let Some(mut fx) = fixture() else { return };` is this file's self-skip idiom.
+fn fixture() -> Option<Fixture> {
+    build_fixture(true)
+}
+
+/// [`fixture`] without the schema [`serial_guard`], for tests that issue no DDL and so cannot
+/// collide with another test's schema change.
+fn fixture_unguarded() -> Option<Fixture> {
+    build_fixture(false)
+}
+
+fn build_fixture(serial: bool) -> Option<Fixture> {
+    let Some(target) = test_target() else {
+        eprintln!(
+            "neither SPANNER_EMULATOR_HOST nor SPANNER_GCP_DATABASE set — \
+             skipping Spanner integration test"
+        );
+        return None;
+    };
+    ensure_database_once(&target);
+    // Taken before the connection is opened, so the whole session — not just the statements — is
+    // covered by the guard.
+    let _serial = serial.then(serial_guard);
+
+    let mut driver = SpannerDriver::try_new().expect("create driver");
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_uri()),
+        )])
+        .expect("create database");
+    let connection = connect_with_retry(&database);
+    Some(Fixture {
+        connection,
+        database,
+        _driver: driver,
+        target,
+        _serial,
+    })
+}
+
+/// Drop the named scratch tables, so a re-run against a persistent `SPANNER_GCP_DATABASE` starts
+/// from a clean slate. Issued as one `;`-separated DDL string, which the driver applies as a single
+/// `UpdateDatabaseDdl` call. The tables must exist (no `IF EXISTS`): a cleanup that silently
+/// no-ops would hide a test that never created what it claims to have.
+fn drop_tables(connection: &mut SpannerConnection, tables: &[&str]) {
+    let sql = tables
+        .iter()
+        .map(|table| format!("DROP TABLE {table}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut statement = connection.new_statement().expect("new statement");
+    statement.set_sql_query(sql).unwrap();
+    statement
+        .execute_update()
+        .unwrap_or_else(|e| panic!("drop scratch tables {tables:?}: {e:?}"));
+}
+
+/// A fresh statement set up for a bulk ingest into `table` with the given `mode` — the
+/// `new_statement` + `adbc.ingest.target_table` + `adbc.ingest.mode` triple every ingest repeats.
+fn ingest_stmt(connection: &mut SpannerConnection, table: &str, mode: &str) -> SpannerStatement {
+    let mut statement = connection.new_statement().expect("new statement");
+    statement
+        .set_option(
+            OptionStatement::TargetTable,
+            OptionValue::String(table.into()),
+        )
+        .expect("set the ingest target table");
+    statement
+        .set_option(
+            OptionStatement::IngestMode,
+            OptionValue::String(mode.into()),
+        )
+        .expect("set the ingest mode");
+    statement
+}
+
+/// Downcast an Arrow column to the concrete array type it must have, panicking with the column's
+/// real data type when it does not.
+///
+/// This is the `.as_any().downcast_ref::<T>().unwrap()` chain — which every assertion on a result
+/// batch needs and which rustfmt spreads over five lines — written once. It takes `&dyn Array`, so
+/// it serves `RecordBatch::column`, `StructArray::column` / `column_by_name` and a `ListArray`
+/// element alike.
+fn col<T: Array + 'static>(column: &dyn Array) -> &T {
+    column.as_any().downcast_ref::<T>().unwrap_or_else(|| {
+        panic!(
+            "expected the column to be a {}, but it is {:?}",
+            std::any::type_name::<T>(),
+            column.data_type()
+        )
+    })
+}
+
 /// The `column_name`s and `constraint_name`s `get_objects` reports for a single table, in the
 /// order it reports them.
 fn table_columns_and_constraints(
@@ -5406,15 +4827,15 @@ fn table_columns_and_constraints(
         .expect("collect objects");
     // catalog -> catalog_db_schemas -> db_schema_tables: one row each, the table we filtered to.
     let list_struct = |array: &dyn Array| {
-        let list = array.as_any().downcast_ref::<ListArray>().unwrap().value(0);
-        list.as_any().downcast_ref::<StructArray>().unwrap().clone()
+        let list = col::<ListArray>(array).value(0);
+        col::<StructArray>(&list).clone()
     };
     let schemas = list_struct(batches[0].column(1));
     let tables = list_struct(schemas.column(1));
     assert_eq!(tables.len(), 1, "expected exactly one {table} row");
     let names = |strukt: &StructArray, field: &str| {
         let array = strukt.column_by_name(field).unwrap();
-        let array = array.as_any().downcast_ref::<StringArray>().unwrap();
+        let array = col::<StringArray>(&array);
         (0..array.len())
             .map(|i| array.value(i).to_string())
             .collect()
@@ -5436,12 +4857,7 @@ fn count_rows(connection: &mut SpannerConnection, table: &str) -> i64 {
         .expect("count query")
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap()
-        .value(0)
+    col::<Int64Array>(batches[0].column(0)).value(0)
 }
 
 /// Count the rows in `table` inside a **manual** transaction, then end the query-kind
@@ -5476,13 +4892,9 @@ fn assert_query_guarded(connection: &mut SpannerConnection, table: &str) {
 /// Extract (table, column, key, value) tuples from a get_statistics result batch.
 fn extract_statistics(batch: &RecordBatch) -> Vec<(String, Option<String>, i16, i64)> {
     let mut out = Vec::new();
-    let db_schemas_list = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .unwrap();
+    let db_schemas_list = col::<ListArray>(batch.column(1));
     let db_schemas = db_schemas_list.value(0);
-    let db_schemas = db_schemas.as_any().downcast_ref::<StructArray>().unwrap();
+    let db_schemas = col::<StructArray>(&db_schemas);
     let stats_list = db_schemas
         .column_by_name("db_schema_statistics")
         .unwrap()
@@ -5491,7 +4903,7 @@ fn extract_statistics(batch: &RecordBatch) -> Vec<(String, Option<String>, i16, 
         .unwrap();
     for i in 0..db_schemas.len() {
         let stats = stats_list.value(i);
-        let stats = stats.as_any().downcast_ref::<StructArray>().unwrap();
+        let stats = col::<StructArray>(&stats);
         let table = stats
             .column_by_name("table_name")
             .unwrap()
@@ -5523,7 +4935,11 @@ fn extract_statistics(batch: &RecordBatch) -> Vec<(String, Option<String>, i16, 
                 Some(column.value(r).to_string())
             };
             let v = value.value(r);
-            let v = v.as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+            let v = v
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("statistic values are INT64")
+                .value(0);
             out.push((table.value(r).to_string(), col, key.value(r), v));
         }
     }
@@ -5536,21 +4952,10 @@ fn get_statistics_reports_real_counts() {
         ADBC_STATISTIC_DISTINCT_COUNT_KEY, ADBC_STATISTIC_NULL_COUNT_KEY,
         ADBC_STATISTIC_ROW_COUNT_KEY,
     };
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping get_statistics_reports_real_counts");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     // The UUID column pins down that UUID stays classified as groupable (distinct-countable): a
     // misclassification either drops its DISTINCT_COUNT row or — worse, the CONV-3 failure mode —
@@ -5558,12 +4963,12 @@ fn get_statistics_reports_real_counts() {
     // cannot get the same end-to-end coverage: the emulator rejects INTERVAL table columns
     // outright, so it is covered by the `groupable_types` unit test instead.
     run(
-        &mut connection,
+        connection,
         "DROP TABLE IF EXISTS AdbcStats; \
          CREATE TABLE AdbcStats (Id INT64, Name STRING(MAX), Tag UUID) PRIMARY KEY (Id)",
     );
     run(
-        &mut connection,
+        connection,
         "INSERT INTO AdbcStats (Id, Name, Tag) VALUES \
          (1, 'a', CAST('11111111-2222-3333-4444-555555555555' AS UUID)), \
          (2, 'a', CAST('11111111-2222-3333-4444-555555555555' AS UUID)), \
@@ -5623,9 +5028,7 @@ fn get_statistics_reports_real_counts() {
         "approximate=true must serve the same exact statistics"
     );
 
-    let mut drop = connection.new_statement().expect("new statement");
-    drop.set_sql_query("DROP TABLE AdbcStats").unwrap();
-    drop.execute_update().expect("drop stats table");
+    drop_tables(connection, &["AdbcStats"]);
 }
 
 /// JSON and FLOAT32 columns round-trip through the driver: JSON keeps `Utf8` storage but is tagged
@@ -5633,30 +5036,19 @@ fn get_statistics_reports_real_counts() {
 /// `Float32`, and NULLs in both survive.
 #[test]
 fn json_and_float32_round_trip() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping json_and_float32_round_trip");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     run(
-        &mut connection,
+        connection,
         "DROP TABLE IF EXISTS AdbcJson; \
          CREATE TABLE AdbcJson (Id INT64, Doc JSON, Ratio FLOAT32, Docs ARRAY<JSON>) \
          PRIMARY KEY (Id)",
     );
     run(
-        &mut connection,
+        connection,
         r#"INSERT INTO AdbcJson (Id, Doc, Ratio) VALUES
            (1, JSON '{"a":1,"b":"x"}', 1.5), (2, NULL, NULL)"#,
     );
@@ -5685,16 +5077,8 @@ fn json_and_float32_round_trip() {
         .expect("collect json/float32 batches");
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
     let batch = &batches[0];
-    let docs = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    let ratios = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .unwrap();
+    let docs = col::<StringArray>(batch.column(0));
+    let ratios = col::<Float32Array>(batch.column(1));
 
     // Spanner stores JSON normalized; assert on key/value fragments rather than the exact text so
     // the check is robust to whitespace/ordering differences between backends.
@@ -5768,24 +5152,16 @@ fn json_and_float32_round_trip() {
         .expect("collect bound json batches");
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
     let batch = &batches[0];
-    let doc_col = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let doc_col = col::<StringArray>(batch.column(0));
     assert!(
         doc_col.value(0).contains(r#""c":[1,2]"#),
         "unexpected bound JSON text: {:?}",
         doc_col.value(0)
     );
     assert!(doc_col.is_null(1), "bound NULL JSON must come back null");
-    let docs_col = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .unwrap();
+    let docs_col = col::<ListArray>(batch.column(1));
     let first_cell = docs_col.value(0);
-    let first_cell = first_cell.as_any().downcast_ref::<StringArray>().unwrap();
+    let first_cell = col::<StringArray>(&first_cell);
     assert_eq!(first_cell.len(), 2);
     assert!(
         first_cell.value(0).contains(r#""d":true"#),
@@ -5797,19 +5173,7 @@ fn json_and_float32_round_trip() {
 
     // --- Create-mode ingest maps tagged fields to JSON / ARRAY<JSON> columns (a STRING(MAX)
     // column would reject the JSON-typed row params the ingest itself binds).
-    let mut ingest = connection.new_statement().expect("new statement");
-    ingest
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcJsonIngest".into()),
-        )
-        .unwrap();
-    ingest
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("create".into()),
-        )
-        .unwrap();
+    let mut ingest = ingest_stmt(connection, "AdbcJsonIngest", "create");
     ingest.bind(bind_batch).expect("bind json ingest rows");
     ingest.execute_update().expect("create-mode json ingest");
     let mut cols = connection.new_statement().expect("new statement");
@@ -5825,16 +5189,8 @@ fn json_and_float32_round_trip() {
         .collect::<Result<Vec<_>, _>>()
         .expect("collect ingest column types");
     let cols_batch = &cols_batches[0];
-    let names = cols_batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    let types = cols_batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let names = col::<StringArray>(cols_batch.column(0));
+    let types = col::<StringArray>(cols_batch.column(1));
     assert_eq!(
         (names.value(0), types.value(0)),
         ("Doc", "JSON"),
@@ -5846,37 +5202,23 @@ fn json_and_float32_round_trip() {
         "tagged array ingest column"
     );
 
-    let mut drop = connection.new_statement().expect("new statement");
-    drop.set_sql_query("DROP TABLE AdbcJson; DROP TABLE AdbcJsonIngest")
-        .unwrap();
-    drop.execute_update().expect("drop json tables");
+    drop_tables(connection, &["AdbcJson", "AdbcJsonIngest"]);
 }
 
 #[test]
 fn execute_streams_in_batches() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping execute_streams_in_batches");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     run(
-        &mut connection,
+        connection,
         "DROP TABLE IF EXISTS AdbcStream; \
          CREATE TABLE AdbcStream (Id INT64) PRIMARY KEY (Id)",
     );
     run(
-        &mut connection,
+        connection,
         "INSERT INTO AdbcStream (Id) \
          SELECT n FROM UNNEST(GENERATE_ARRAY(1, 2500)) AS n",
     );
@@ -5917,20 +5259,14 @@ fn execute_streams_in_batches() {
     assert_eq!(total, 2500);
     let mut expected = 1i64;
     for batch in &batches {
-        let ids = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let ids = col::<Int64Array>(batch.column(0));
         for i in 0..ids.len() {
             assert_eq!(ids.value(i), expected);
             expected += 1;
         }
     }
 
-    let mut drop = connection.new_statement().expect("new statement");
-    drop.set_sql_query("DROP TABLE AdbcStream").unwrap();
-    drop.execute_update().expect("drop stream table");
+    drop_tables(connection, &["AdbcStream"]);
 }
 
 /// The `adbc.statement.bind_by_name` option (the ADBC SQLite reference driver's convention): the
@@ -5939,21 +5275,10 @@ fn execute_streams_in_batches() {
 /// Also covers the `get_option` round-trip (`true`/`false`, defaulting to `false`).
 #[test]
 fn bind_by_name_modes() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping bind_by_name_modes");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     let bind_by_name_key = || OptionStatement::Other(adbc_spanner::OPTION_BIND_BY_NAME.into());
     // Two Int64 columns named after the query's parameters but in SWAPPED order: `b` (=10)
@@ -6004,39 +5329,32 @@ fn bind_by_name_modes() {
             .collect::<Result<Vec<_>, _>>()
             .expect("collect bound query result");
         assert_eq!(batches.len(), 1, "one bound row -> one result batch");
-        let ints = |i: usize| {
-            batches[0]
-                .column(i)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(0)
-        };
+        let ints = |i: usize| col::<Int64Array>(batches[0].column(i)).value(0);
         Ok((ints(0), ints(1)))
     };
 
     // Default (option left unset): strictly positional — the swapped batch binds column 0 -> @a,
     // column 1 -> @b, the coincidental name matches (and their order) ignored entirely.
     assert_eq!(
-        query_pair(&mut connection, batch(["b", "a"]), None).expect("default positional binding"),
+        query_pair(connection, batch(["b", "a"]), None).expect("default positional binding"),
         (10, 20),
         "the default (bind_by_name unset) must bind positionally"
     );
     // false: the same positional binding, set explicitly.
     assert_eq!(
-        query_pair(&mut connection, batch(["b", "a"]), Some("false")).expect("positional binding"),
+        query_pair(connection, batch(["b", "a"]), Some("false")).expect("positional binding"),
         (10, 20),
         "bind_by_name=false must ignore coincidental name matches and bind positionally"
     );
     // true: strict by-name — order-independent, the swapped columns land on their namesakes.
     assert_eq!(
-        query_pair(&mut connection, batch(["b", "a"]), Some("true")).expect("by-name binding"),
+        query_pair(connection, batch(["b", "a"]), Some("true")).expect("by-name binding"),
         (20, 10),
         "bind_by_name=true must bind matching columns by name"
     );
     // true with an unmatched column: a hard InvalidArguments error naming the column, instead of a
     // silent positional fallback.
-    let error = query_pair(&mut connection, batch(["a", "x"]), Some("true"))
+    let error = query_pair(connection, batch(["a", "x"]), Some("true"))
         .expect_err("bind_by_name=true must reject an unmatched column");
     assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
     assert!(
@@ -6047,7 +5365,7 @@ fn bind_by_name_modes() {
     // The same partial match under the default (positional) binding succeeds: column 0 -> @a,
     // column 1 -> @b, names ignored.
     assert_eq!(
-        query_pair(&mut connection, batch(["a", "x"]), None).expect("default positional binding"),
+        query_pair(connection, batch(["a", "x"]), None).expect("default positional binding"),
         (10, 20),
         "a partial name match under the default binding must bind positionally"
     );
@@ -6069,30 +5387,19 @@ fn bind_by_name_modes() {
 /// per bound row.
 #[test]
 fn bound_query_streams_in_batches() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping bound_query_streams_in_batches");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     run(
-        &mut connection,
+        connection,
         "DROP TABLE IF EXISTS AdbcBoundStream; \
          CREATE TABLE AdbcBoundStream (Id INT64, Grp INT64) PRIMARY KEY (Id)",
     );
     // 1500 rows split across three groups of 500.
     run(
-        &mut connection,
+        connection,
         "INSERT INTO AdbcBoundStream (Id, Grp) \
          SELECT n, MOD(n, 3) FROM UNNEST(GENERATE_ARRAY(1, 1500)) AS n",
     );
@@ -6132,11 +5439,7 @@ fn bound_query_streams_in_batches() {
     let ids: Vec<i64> = batches
         .iter()
         .flat_map(|batch| {
-            let ids = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+            let ids = col::<Int64Array>(batch.column(0));
             (0..ids.len()).map(|i| ids.value(i)).collect::<Vec<_>>()
         })
         .collect();
@@ -6145,9 +5448,7 @@ fn bound_query_streams_in_batches() {
         .collect();
     assert_eq!(ids, expected);
 
-    let mut drop = connection.new_statement().expect("new statement");
-    drop.set_sql_query("DROP TABLE AdbcBoundStream").unwrap();
-    drop.execute_update().expect("drop bound stream table");
+    drop_tables(connection, &["AdbcBoundStream"]);
 }
 
 /// A cancel that lands while the streamed reader is *between* chunk fetches — no `block_on` parked
@@ -6156,29 +5457,18 @@ fn bound_query_streams_in_batches() {
 /// new operation resets the latch.
 #[test]
 fn cancel_between_stream_chunks_cancels_the_next_fetch() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping cancel_between_stream_chunks");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     run(
-        &mut connection,
+        connection,
         "DROP TABLE IF EXISTS AdbcCancel; \
          CREATE TABLE AdbcCancel (Id INT64) PRIMARY KEY (Id)",
     );
     run(
-        &mut connection,
+        connection,
         "INSERT INTO AdbcCancel (Id) \
          SELECT n FROM UNNEST(GENERATE_ARRAY(1, 300)) AS n",
     );
@@ -6225,9 +5515,7 @@ fn cancel_between_stream_chunks_cancels_the_next_fetch() {
     let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(total, 300);
 
-    let mut drop = connection.new_statement().expect("new statement");
-    drop.set_sql_query("DROP TABLE AdbcCancel").unwrap();
-    drop.execute_update().expect("drop cancel table");
+    drop_tables(connection, &["AdbcCancel"]);
 }
 
 /// Dropping a streamed reader mid-stream — with the background prefetch fetch still in flight —
@@ -6235,29 +5523,18 @@ fn cancel_between_stream_chunks_cancels_the_next_fetch() {
 /// connection fully usable.
 #[test]
 fn dropping_reader_mid_stream_aborts_the_prefetch() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping dropping_reader_mid_stream");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     run(
-        &mut connection,
+        connection,
         "DROP TABLE IF EXISTS AdbcReaderDrop; \
          CREATE TABLE AdbcReaderDrop (Id INT64) PRIMARY KEY (Id)",
     );
     run(
-        &mut connection,
+        connection,
         "INSERT INTO AdbcReaderDrop (Id) \
          SELECT n FROM UNNEST(GENERATE_ARRAY(1, 500)) AS n",
     );
@@ -6292,9 +5569,7 @@ fn dropping_reader_mid_stream_aborts_the_prefetch() {
     let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(total, 500);
 
-    let mut drop = connection.new_statement().expect("new statement");
-    drop.set_sql_query("DROP TABLE AdbcReaderDrop").unwrap();
-    drop.execute_update().expect("drop reader-drop table");
+    drop_tables(connection, &["AdbcReaderDrop"]);
 }
 
 /// The view-layout and remaining narrow Arrow types bind end-to-end: `Utf8View`/`BinaryView`
@@ -6302,24 +5577,13 @@ fn dropping_reader_mid_stream_aborts_the_prefetch() {
 /// (ms-at-day-boundary → DATE). Values inserted through bound parameters read back exactly.
 #[test]
 fn view_and_narrow_types_bind_round_trip() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping view_and_narrow_types_bind_round_trip");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     run(
-        &mut connection,
+        connection,
         "DROP TABLE IF EXISTS AdbcView; \
          CREATE TABLE AdbcView (Id INT64, S STRING(MAX), B BYTES(MAX), D DATE) PRIMARY KEY (Id)",
     );
@@ -6368,31 +5632,17 @@ fn view_and_narrow_types_bind_round_trip() {
         .expect("collect");
     let all = &batches[0];
     assert_eq!(all.num_rows(), 2);
-    let s = all
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let s = col::<StringArray>(all.column(0));
     assert_eq!(s.value(0), "view-hello");
     assert!(s.is_null(1));
-    let b = all
-        .column(1)
-        .as_any()
-        .downcast_ref::<BinaryArray>()
-        .unwrap();
+    let b = col::<BinaryArray>(all.column(1));
     assert_eq!(b.value(0), b"view-bytes");
     assert!(b.is_null(1));
-    let d = all
-        .column(2)
-        .as_any()
-        .downcast_ref::<Date32Array>()
-        .unwrap();
+    let d = col::<Date32Array>(all.column(2));
     assert_eq!(d.value(0), 19_737);
     assert!(d.is_null(1));
 
-    let mut drop = connection.new_statement().expect("new statement");
-    drop.set_sql_query("DROP TABLE AdbcView").unwrap();
-    drop.execute_update().expect("drop view table");
+    drop_tables(connection, &["AdbcView"]);
 }
 
 /// DML behind a leading `@{…}` statement hint is still classified as DML and routed to the
@@ -6400,26 +5650,15 @@ fn view_and_narrow_types_bind_round_trip() {
 /// `execute()` goes to a read-only single-use transaction, which Spanner rejects.
 #[test]
 fn hinted_dml_routes_to_the_read_write_path() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping hinted_dml_routes_to_the_read_write_path");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     // `AdbcHint` is created once in `ensure_database` (not here): in-body DDL would race the
     // emulator's database-wide schema-change lock against concurrent read-write transactions from
     // other parallel tests. Just clear any rows a previous run left behind.
-    run(&mut connection, "DELETE FROM AdbcHint WHERE true");
+    run(connection, "DELETE FROM AdbcHint WHERE true");
 
     // Through the query entry point (`execute`), exactly as ADBC clients issue DML.
     // `LOCK_SCANNED_RANGES` is a documented statement hint for read/write transactions, accepted
@@ -6452,26 +5691,15 @@ fn hinted_dml_routes_to_the_read_write_path() {
 /// which does not support `THEN RETURN`).
 #[test]
 fn dml_then_return_round_trip() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping dml_then_return_round_trip");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     // `AdbcReturn` is created once in `ensure_database` (not here): issuing DDL in the test body
     // would race the emulator's database-wide schema-change lock against concurrent read-write
     // transactions from other parallel tests. Just clear any rows a previous run left behind.
-    run(&mut connection, "DELETE FROM AdbcReturn WHERE true");
+    run(connection, "DELETE FROM AdbcReturn WHERE true");
 
     // execute(): the THEN RETURN rows come back as a typed Arrow result.
     let mut insert = connection.new_statement().expect("new statement");
@@ -6490,11 +5718,7 @@ fn dml_then_return_round_trip() {
         .expect("collect returned rows");
     let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(total, 2, "one returned row per inserted row");
-    let ids = batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
+    let ids = col::<Int64Array>(batches[0].column(0));
     assert_eq!((ids.value(0), ids.value(1)), (1, 2));
 
     // execute_update(): the rows are discarded, but the affected count is still reported.
@@ -6564,30 +5788,19 @@ fn dml_then_return_round_trip() {
 /// partitions must reproduce the full result set exactly once.
 #[test]
 fn execute_partitions_round_trip() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping execute_partitions_round_trip");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     run(
-        &mut connection,
+        connection,
         "DROP TABLE IF EXISTS AdbcPartition; \
          CREATE TABLE AdbcPartition (Id INT64) PRIMARY KEY (Id)",
     );
     // 200 rows, so the query has enough data for the server to (potentially) split it.
     run(
-        &mut connection,
+        connection,
         "INSERT INTO AdbcPartition (Id) \
          SELECT n FROM UNNEST(GENERATE_ARRAY(1, 200)) AS n",
     );
@@ -6633,11 +5846,7 @@ fn execute_partitions_round_trip() {
         assert_eq!(*reader.schema(), partitioned.schema);
         for batch in reader {
             let batch = batch.expect("partition batch");
-            let ids = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+            let ids = col::<Int64Array>(batch.column(0));
             for i in 0..ids.len() {
                 assert!(
                     seen.insert(ids.value(i)),
@@ -6671,11 +5880,7 @@ fn execute_partitions_round_trip() {
         let reader = connection.read_partition(token).expect("read_partition");
         for batch in reader {
             let batch = batch.expect("partition batch");
-            let ids = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+            let ids = col::<Int64Array>(batch.column(0));
             for i in 0..ids.len() {
                 assert!(seen.insert(ids.value(i)), "duplicate id {}", ids.value(i));
             }
@@ -6701,28 +5906,15 @@ fn execute_partitions_round_trip() {
         "the bound row must not survive execute_partitions on a reused statement handle"
     );
 
-    let mut drop = connection.new_statement().expect("new statement");
-    drop.set_sql_query("DROP TABLE AdbcPartition").unwrap();
-    drop.execute_update().expect("drop partition table");
+    drop_tables(connection, &["AdbcPartition"]);
 }
 
 #[test]
 fn query_with_trailing_semicolons_returns_rows() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping query_with_trailing_semicolons_returns_rows");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     // A run of trailing statement terminators on a single query (mirroring the ADBC conformance
     // case `SqlQueryTrailingSemicolons`, `SELECT current_date;;;`) is stripped by the driver on the
@@ -6736,11 +5928,7 @@ fn query_with_trailing_semicolons_returns_rows() {
         .expect("collect batches");
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 1, "expected one row back");
-    let n = batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
+    let n = col::<Int64Array>(batches[0].column(0));
     assert_eq!(n.value(0), 1);
 
     // A `;` inside a string literal is not a terminator: it is preserved, not stripped.
@@ -6752,11 +5940,7 @@ fn query_with_trailing_semicolons_returns_rows() {
     let batches = reader
         .collect::<Result<Vec<_>, _>>()
         .expect("collect batches");
-    let s = batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let s = col::<StringArray>(batches[0].column(0));
     assert_eq!(s.value(0), ";");
 
     // The same stripping applies on the `execute_schema` PLAN probe, which runs through the same
@@ -7035,21 +6219,10 @@ fn readonly_toggle_from_another_thread_locks_existing_statement() {
 fn rollback_without_a_transaction_is_invalid_state() {
     use adbc_core::error::Status;
 
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping rollback_without_a_transaction");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     // Autocommit (the default): there is no transaction to roll back.
     let error = connection
@@ -7105,21 +6278,10 @@ fn rollback_without_a_transaction_is_invalid_state() {
 /// demand instead).
 #[test]
 fn get_statistic_names_is_empty_and_correctly_typed() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping get_statistic_names");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     let mut reader = connection
         .get_statistic_names()
@@ -7151,21 +6313,10 @@ fn get_statistic_names_is_empty_and_correctly_typed() {
 fn read_partition_rejects_garbage_descriptors() {
     use adbc_core::error::Status;
 
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping read_partition_rejects_garbage_descriptors");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     let cases: [&[u8]; 4] = [
         b"",                      // empty descriptor
@@ -7197,29 +6348,18 @@ fn read_partition_rejects_garbage_descriptors() {
 /// Deterministic — the cancel is always latched *before* the operation it must affect.
 #[test]
 fn connection_cancel_is_sticky_until_the_next_operation() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping connection_cancel_is_sticky");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     run(
-        &mut connection,
+        connection,
         "DROP TABLE IF EXISTS AdbcConnCancel; \
          CREATE TABLE AdbcConnCancel (Id INT64) PRIMARY KEY (Id)",
     );
     run(
-        &mut connection,
+        connection,
         "INSERT INTO AdbcConnCancel (Id) \
          SELECT n FROM UNNEST(GENERATE_ARRAY(1, 200)) AS n",
     );
@@ -7271,7 +6411,7 @@ fn connection_cancel_is_sticky_until_the_next_operation() {
 
     // The connection-level latch must not leak into statements: they have their own signal, so a
     // statement query on this connection still runs while the connection latch is set.
-    assert_eq!(count_rows(&mut connection, "AdbcConnCancel"), 200);
+    assert_eq!(count_rows(connection, "AdbcConnCancel"), 200);
 
     // Starting the connection's next operation clears the latch: reading every partition back now
     // succeeds and reproduces the full result set (including the partition whose earlier read was
@@ -7301,9 +6441,7 @@ fn connection_cancel_is_sticky_until_the_next_operation() {
         .expect("get_table_schema after a stale cancel");
     assert_eq!(schema.fields().len(), 1);
 
-    let mut drop = connection.new_statement().expect("new statement");
-    drop.set_sql_query("DROP TABLE AdbcConnCancel").unwrap();
-    drop.execute_update().expect("drop conn-cancel table");
+    drop_tables(connection, &["AdbcConnCancel"]);
 }
 
 /// Request priority and request/transaction tags (`spanner.request.priority` /
@@ -7317,21 +6455,10 @@ fn request_priority_and_tags() {
     use adbc_core::error::Status;
     use adbc_spanner::{OPTION_REQUEST_PRIORITY, OPTION_REQUEST_TAG, OPTION_TRANSACTION_TAG};
 
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping request_priority_and_tags");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     let conn_key = |k: &str| OptionConnection::Other(k.into());
     let stmt_key = |k: &str| OptionStatement::Other(k.into());
@@ -7457,7 +6584,7 @@ fn request_priority_and_tags() {
     // End-to-end with all three options set on the connection: DDL + DML (a tagged read/write
     // transaction) + a query (a tagged read) all succeed, and the results are correct.
     run(
-        &mut connection,
+        connection,
         "DROP TABLE IF EXISTS AdbcReqOpts; \
          CREATE TABLE AdbcReqOpts (Id INT64) PRIMARY KEY (Id)",
     );
@@ -7466,7 +6593,7 @@ fn request_priority_and_tags() {
         .set_sql_query("INSERT INTO AdbcReqOpts (Id) VALUES (1), (2)")
         .unwrap();
     assert_eq!(insert.execute_update().expect("tagged insert"), Some(2));
-    assert_eq!(count_rows(&mut connection, "AdbcReqOpts"), 2);
+    assert_eq!(count_rows(connection, "AdbcReqOpts"), 2);
 
     // A query on the overriding statement (priority high, request tag unset) also runs fine.
     statement
@@ -7494,7 +6621,7 @@ fn request_priority_and_tags() {
         bound.execute_update().expect("tagged bound insert"),
         Some(1)
     );
-    assert_eq!(count_rows(&mut connection, "AdbcReqOpts"), 3);
+    assert_eq!(count_rows(connection, "AdbcReqOpts"), 3);
 
     // Unsetting at the connection level round-trips back to NotFound.
     for key in [
@@ -7519,9 +6646,7 @@ fn request_priority_and_tags() {
         .expect_err("the transaction tag must not be settable on a statement");
     assert_eq!(error.status, Status::NotImplemented);
 
-    let mut drop = connection.new_statement().expect("new statement");
-    drop.set_sql_query("DROP TABLE AdbcReqOpts").unwrap();
-    drop.execute_update().expect("drop reqopts table");
+    drop_tables(connection, &["AdbcReqOpts"]);
 }
 
 /// One expected column of the schema-fidelity projection: a GoogleSQL expression producing a value
@@ -7666,22 +6791,12 @@ fn schema_fidelity_cases() -> Vec<SchemaFidelityCase> {
 ///    read-only snapshot) reports that same schema even when every bound row matches nothing.
 #[test]
 fn zero_row_schema_fidelity() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping zero_row_schema_fidelity");
-        return;
-    };
-    ensure_database_once(&target);
     // No serial guard: this test only runs read-only queries over literals (no DDL/DML, no
     // tables), and read-only transactions do not block schema changes.
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let Some(mut fx) = fixture_unguarded() else {
+        return;
+    };
+    let connection = &mut fx.connection;
 
     let cases = schema_fidelity_cases();
     let select_list = cases
@@ -7821,21 +6936,10 @@ fn rpc_timeouts() {
         OPTION_RPC_TIMEOUT_FETCH, OPTION_RPC_TIMEOUT_QUERY, OPTION_RPC_TIMEOUT_UPDATE,
     };
 
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping rpc_timeouts");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     let conn_key = |k: &str| OptionConnection::Other(k.into());
     let stmt_key = |k: &str| OptionStatement::Other(k.into());
@@ -7990,7 +7094,7 @@ fn rpc_timeouts() {
             .expect("set a generous deadline");
     }
     run(
-        &mut connection,
+        connection,
         "DROP TABLE IF EXISTS AdbcRpcTimeout; \
          CREATE TABLE AdbcRpcTimeout (Id INT64) PRIMARY KEY (Id)",
     );
@@ -8144,9 +7248,7 @@ fn rpc_timeouts() {
         assert_eq!(error.status, Status::NotFound, "{key}");
     }
 
-    let mut drop = connection.new_statement().expect("new statement");
-    drop.set_sql_query("DROP TABLE AdbcRpcTimeout").unwrap();
-    drop.execute_update().expect("drop rpc-timeout table");
+    drop_tables(connection, &["AdbcRpcTimeout"]);
 }
 
 /// Spanner **change streams** are usable through the driver's ordinary SQL paths — no dedicated
@@ -8169,30 +7271,19 @@ fn rpc_timeouts() {
 /// mapped result *schema* plus a non-empty result instead, which is deterministic.
 #[test]
 fn change_stream_via_plain_sql() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping change_stream_via_plain_sql");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     // --- (1) DDL: create the watched table and a change stream over it, via plain SQL. ---
     run(
-        &mut connection,
+        connection,
         "DROP TABLE IF EXISTS AdbcChangeStream; \
          CREATE TABLE AdbcChangeStream (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
     );
     run(
-        &mut connection,
+        connection,
         "CREATE CHANGE STREAM AdbcChangeStreamCs FOR AdbcChangeStream",
     );
 
@@ -8214,11 +7305,7 @@ fn change_stream_via_plain_sql() {
         stream_rows, 1,
         "the change stream should be listed exactly once"
     );
-    let names = stream_batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let names = col::<StringArray>(stream_batches[0].column(0));
     assert_eq!(names.value(0), "AdbcChangeStreamCs");
 
     // The change stream must be associated with the watched table.
@@ -8237,7 +7324,7 @@ fn change_stream_via_plain_sql() {
     let watched: Vec<String> = table_batches
         .iter()
         .flat_map(|b| {
-            let col = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            let col = col::<StringArray>(b.column(0));
             (0..col.len())
                 .map(|i| col.value(i).to_string())
                 .collect::<Vec<_>>()
@@ -8251,7 +7338,7 @@ fn change_stream_via_plain_sql() {
 
     // Seed a write so the stream has data to have captured (before the tailing window).
     run(
-        &mut connection,
+        connection,
         "INSERT INTO AdbcChangeStream (Id, Name) VALUES (1, 'alpha'), (2, 'beta')",
     );
 
@@ -8313,8 +7400,8 @@ fn change_stream_via_plain_sql() {
     );
 
     // --- Cleanup: the stream must be dropped before the table it watches. ---
-    run(&mut connection, "DROP CHANGE STREAM AdbcChangeStreamCs");
-    run(&mut connection, "DROP TABLE AdbcChangeStream");
+    run(connection, "DROP CHANGE STREAM AdbcChangeStreamCs");
+    run(connection, "DROP TABLE AdbcChangeStream");
 }
 
 /// Opt-in **end-to-end auth** tests: drive the `spanner.auth.keyfile` and
@@ -8381,11 +7468,7 @@ mod auth_end_to_end {
             .collect::<Result<Vec<_>, _>>()
             .expect("read batches");
         assert_eq!(batches.len(), 1);
-        let ones = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let ones = col::<Int64Array>(batches[0].column(0));
         assert_eq!(ones.value(0), 1);
     }
 
@@ -8612,26 +7695,11 @@ fn ensure_proto_bundle_once(target: &TestTarget) {
 /// `src/conversion.rs`, which covers the same mapping without a live database.
 #[test]
 fn enum_columns_round_trip_as_int64_ordinals() {
-    let Some(target) = test_target() else {
-        eprintln!(
-            "neither SPANNER_EMULATOR_HOST nor SPANNER_GCP_DATABASE set — \
-             skipping Spanner integration test"
-        );
+    let Some(mut fx) = fixture() else {
         return;
     };
-
-    ensure_database_once(&target);
-    ensure_proto_bundle_once(&target);
-    let _serial = serial_guard();
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    ensure_proto_bundle_once(&fx.target);
+    let connection = &mut fx.connection;
 
     // (Re)create the enum-typed table so the test starts from an empty, known state. `adbc.test.Color`
     // is already registered in the shared proto bundle, so this table DDL carries no descriptors and
@@ -8762,27 +7830,12 @@ fn enum_columns_round_trip_as_int64_ordinals() {
 /// `src/conversion.rs`, which covers the same mapping without a live database.
 #[test]
 fn proto_columns_round_trip_as_binary() {
-    let Some(target) = test_target() else {
-        eprintln!(
-            "neither SPANNER_EMULATOR_HOST nor SPANNER_GCP_DATABASE set — \
-             skipping Spanner integration test"
-        );
+    let Some(mut fx) = fixture() else {
         return;
     };
-
-    ensure_database_once(&target);
-    ensure_proto_bundle_once(&target);
-    let _serial = serial_guard();
+    ensure_proto_bundle_once(&fx.target);
     use prost::Message as _;
-
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let connection = &mut fx.connection;
 
     // (Re)create the proto-typed table so the test starts from an empty, known state. `adbc.test.Point`
     // is already registered in the shared proto bundle, so this table DDL carries no descriptors and
