@@ -420,9 +420,11 @@ infinity. Those are the only two modes — there is deliberately no silently-wra
 
 > **Note:** native `STRUCT` mapping needs `Type::struct_type()`, which is on `google-cloud-rust`
 > `main` but not yet in a crates.io release. Until it ships, `Cargo.toml` pins the `google-cloud-*`
-> crates to a git revision. `adbc_core`/`adbc_ffi` are likewise pinned to an
-> [`apache/arrow-adbc`](https://github.com/apache/arrow-adbc) `main` revision carrying FFI fixes not
-> yet in the `0.23` release. Either git pin means `adbc-spanner` cannot itself be published to crates.io in the
+> crates to a git revision. `adbc_core` is likewise pinned to an
+> [`apache/arrow-adbc`](https://github.com/apache/arrow-adbc) `main` revision, for the
+> `InfoCode::Other(u32)` catch-all that is not yet in the `0.23` release (the C ABI itself is this
+> driver's own `src/ffi/` layer, so `adbc_ffi` is only a dev-dependency). Either git pin means
+> `adbc-spanner` cannot itself be published to crates.io in the
 > meantime, and downstream crates must take `adbc_core` from the same `arrow-adbc` git revision (see
 > the notes in `Cargo.toml`).
 

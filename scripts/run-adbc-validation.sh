@@ -123,13 +123,11 @@ EXCLUDED=(
   'SpannerStatementTest.SqlIngestInterval'
   'SpannerStatementTest.SqlIngestUInt64'
 
-  # --- ECANCELED through the C stream -----------------------------------------
-  # SqlQueryCancel wants get_next to return exactly ECANCELED (125), but arrow-rs's
-  # FFI_ArrowArrayStream exporter (used by adbc_ffi) can only map errors to
-  # ENOSYS/ENOMEM/EIO/EINVAL, so no Rust driver behind adbc_ffi can emit 125 today.
-  # Cancellation itself works and is sticky; covered natively by
-  # cancel_between_stream_chunks_cancels_the_next_fetch in tests/integration.rs.
-  'SpannerStatementTest.SqlQueryCancel'
+  # (SqlQueryCancel used to sit here: it wants get_next to return exactly ECANCELED,
+  #  which arrow-rs's FFI_ArrowArrayStream exporter cannot emit -- it maps every error
+  #  to ENOSYS/ENOMEM/EIO/EINVAL. The driver now exports its own Arrow C stream
+  #  (src/ffi/stream.rs), which recovers the ADBC status from the error the reader
+  #  boxed and maps Cancelled -> ECANCELED, so the case is gate-enforced.)
 )
 
 # The colon-joined --gtest_filter value for the EXCLUDED set. Prefixed with `-`

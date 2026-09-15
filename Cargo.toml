@@ -75,9 +75,10 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["ffi"]
-# Export the C ABI `AdbcSpannerInit` entrypoint so the cdylib is a driver the ADBC
-# driver manager (any language) can load. Disable for a pure-Rust rlib dependency.
-ffi = ["dep:adbc_ffi"]
+# Compile the hand-written C ABI export layer (`src/ffi/`), so the cdylib is a driver the ADBC
+# driver manager (any language) can load through `AdbcSpannerInit`. Disable for a pure-Rust rlib
+# dependency: without it the crate contains no `unsafe` at all (see `forbid` in src/lib.rs).
+ffi = []
 # Exposes internal parsing helpers under `adbc_spanner::fuzzing` for the fuzz targets.
 # Not a stable API; used only by the `fuzz/` crate. Pulls in `arbitrary` so the
 # option-fuzzing entry point can take a derived-`Arbitrary` input type.
@@ -94,35 +95,30 @@ harness = false
 # versioned crates.io release, follow the single revert checklist in CLAUDE.md "Temporary git
 # pins" — it enumerates every location (all these Cargo.toml lines, deny.toml, README.md, the
 # `publish = false` release gate) and the invariant that the three arrow-adbc crates share one rev.
-# --- adbc_core / adbc_ffi pinned to a git revision (temporary) ---
-# The abstract ADBC driver traits, and the C FFI driver exporter that generates the
-# `AdbcSpannerInit` entrypoint for the shared library. Pinned to apache/arrow-adbc `main`,
-# which carries four FFI fixes that are not yet in the latest crates.io release (0.23):
-#   1. `release_ffi_error` is idempotent — it nulls the error's message / private_data /
-#      release pointers after freeing, so a second release (which consumers do via the
-#      standard `if (error.release) error.release(&error)` idiom) is a safe no-op rather
-#      than a double-free.
-#   2. `AdbcStatementExecuteQuery` writes `rows_affected = -1` on the query path (a result
-#      stream was requested) instead of leaving the caller's out-parameter untouched
-#      (https://github.com/apache/arrow-adbc/pull/4469).
-#   3. The exporter preserves the caller's `AdbcError.private_data` on the ADBC 1.0.0 path
-#      instead of clobbering it (https://github.com/apache/arrow-adbc/pull/4473).
-#   4. `InfoCode::Other(u32)` — the exporter passes an unrecognized `get_info` code through to
-#      the driver instead of rejecting the whole call with "Unknown info code", so XDBC-range
-#      ([500, 1000)) and vendor-specific (>= 10000) codes reach `Connection::get_info` and are
-#      silently omitted from the result as `adbc.h` requires
-#      (https://github.com/apache/arrow-adbc/pull/4510).
-# Together they let the C++ `adbc_validation` suite behave correctly against this driver
-# (see adbc-validation/), including its `StatementTest.ErrorCompatibility` case. Revert to a
-# versioned crates.io release once these ship in one.
+# --- adbc_core pinned to a git revision (temporary) ---
+# The abstract ADBC driver traits. Pinned to apache/arrow-adbc `main` rather than the latest
+# crates.io release (0.23) for `InfoCode::Other(u32)` (arrow-adbc#4510), the catch-all variant
+# that lets an unrecognized `get_info` code reach `Connection::get_info` — which is what makes
+# this driver's "omit unrecognized codes" behaviour (required by adbc.h) expressible at all.
+# Revert to a versioned crates.io release once that ships in one.
+#
+# The C ABI itself is NOT taken from a crate: `src/ffi/` is this driver's own export layer, so
+# there is no `adbc_ffi` dependency here (it stays a dev-dependency, for the FFI struct
+# definitions the raw-`libloading` lifecycle test drives the library through).
 adbc_core = { git = "https://github.com/apache/arrow-adbc", rev = "32c67b092c0f7cabf2be75062f001a9e17a48cc1" }
-adbc_ffi = { git = "https://github.com/apache/arrow-adbc", rev = "32c67b092c0f7cabf2be75062f001a9e17a48cc1", optional = true }
 # Arrow types the ADBC traits are expressed in. Kept in the range the (git) adbc crates
 # allow (>=58, <60) so the RecordBatch / Schema / RecordBatchReader types unify across them.
-arrow-array = ">=58, <60"
+# The `ffi` feature supplies `FFI_ArrowArray`/`FFI_ArrowSchema`/`FFI_ArrowArrayStream`, the C
+# data interface structs `src/ffi/` moves result sets and bound parameters over.
+arrow-array = { version = ">=58, <60", features = ["ffi"] }
 arrow-schema = ">=58, <60"
-# Offset / null buffers for building Arrow List arrays (ARRAY columns).
+# Offset / null buffers for building Arrow List arrays (ARRAY columns), and `ArrayData`
+# validation for arrays that arrive over the C data interface (`src/ffi/import.rs`).
 arrow-buffer = ">=58, <60"
+arrow-data = ">=58, <60"
+# `ECANCELED`, `ETIMEDOUT` and friends: the Arrow C Stream Interface reports failures as errnos,
+# and they are platform-specific numbers (ECANCELED is 125 on Linux, 89 on macOS, 105 on MSVC).
+libc = "0.2"
 # --- google-cloud-* pinned to a git revision (temporary) ---
 # We map Spanner STRUCT columns to native Arrow Struct types, which needs
 # `Type::struct_type()` to introspect struct field names/types. That accessor
@@ -225,8 +221,15 @@ tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync"
 # Property-based round-trip testing of the driver against the emulator (integration test only).
 proptest = "1"
 # Driver manager: loads the built cdylib through the C ABI for the FFI smoke test.
-# Same git pin as adbc_core / adbc_ffi above (the three must share one revision).
+# Same git pin as adbc_core above (the three arrow-adbc crates must share one revision).
 adbc_driver_manager = { git = "https://github.com/apache/arrow-adbc", rev = "32c67b092c0f7cabf2be75062f001a9e17a48cc1" }
+# The `FFI_Adbc*` C struct definitions, so the raw-`libloading` lifecycle test in
+# tests/integration.rs can drive the cdylib's entrypoint directly, bypassing the driver manager
+# (and so `src/ffi/roundtrip.rs` can name the init-function type `ManagedDriver::load_static`
+# wants). An independent transcription of the same header `src/ffi/abi.rs` transcribes, so the
+# test cannot agree with the layer it is checking by construction.
+# Same git pin as adbc_core above (the three arrow-adbc crates must share one revision).
+adbc_ffi = { git = "https://github.com/apache/arrow-adbc", rev = "32c67b092c0f7cabf2be75062f001a9e17a48cc1" }
 # Loads the built cdylib directly (bypassing the driver manager) so the raw-FFI lifecycle test
 # can drive double-release / error-struct-reuse paths the managed wrappers never hit. Already in
 # the dependency graph via adbc_driver_manager; same version range.

@@ -49,8 +49,38 @@ SpannerDriver ──▶ SpannerDatabase ──▶ SpannerConnection ──▶ Sp
 - `src/runtime.rs` — a shared Tokio runtime; the ADBC traits are sync while the Spanner client is
   async, so every call bridges via `runtime.block_on(...)`. The runtime is created once by the
   driver and shared via `Arc` into every database/connection/statement.
-- `src/ffi.rs` — `adbc_ffi::export_driver!(AdbcSpannerInit, SpannerDriver)`; the C entrypoint of the
-  shared library. Gated behind the default `ffi` feature.
+- `src/ffi/` — the **hand-written ADBC C ABI export layer**: the whole boundary between the driver
+  and a C driver manager, and the only `unsafe` in the crate (gated behind the default `ffi`
+  feature; the pure-Rust build `forbid`s `unsafe_code`). Ported from the sibling project
+  `bigquery-adbc` (same author, Apache-2.0) — it replaces `adbc_ffi::export_driver!`, which is no
+  longer a dependency of the library at all. One module per concern:
+  - `abi.rs` — adbc.h transcribed: `#[repr(C)]` layouts, type aliases and constants, no logic,
+    with layout tests pinning sizes/offsets against the header.
+  - `error.rs` — writing a driver error into the caller's `AdbcError` at whichever ABI revision it
+    allocated (the 1.0.0 prefix vs the full 1.1.0 struct, told apart by the
+    `ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA` sentinel the caller presets in `vendor_code`), plus
+    `ErrorGetDetailCount`/`ErrorGetDetail` over the forwarded `Error.details`.
+  - `guard.rs` — panic containment (`catch`) and the pointer/string conversions every entry point
+    needs; `write_string`/`write_bytes` implement adbc.h's in/out `length` protocol.
+  - `handle.rs` — what lives behind `private_data`: an `Arc<Exported<S>>` holding per-object panic
+    poisoning (a panic disables that object, not the process), a state `Mutex` so overlapping
+    calls serialize, an **ordered** `OptionBuffer` (a `Vec` with last-write-wins per key) for
+    options set before `Init`, and a lock-free `cancel` path that takes its *own* strong reference
+    rather than borrowing the handle's — so it never forms a `&mut` to the object and can run
+    while another thread is blocked inside an operation on it.
+  - `options.rs` — the handle prologues (`New`/`Release`) and the eight option entry points
+    (string/bytes/int/double, set + get), written once generically and stamped out per object by
+    the `option_entry_points!` macro.
+  - `database.rs` / `connection.rs` / `statement.rs` — the entry points, one module per ADBC
+    object. `database.rs` also owns `shared_driver()`: **one** `SpannerDriver` — and therefore one
+    Tokio runtime — per process, built once behind a `OnceLock`, with a runtime that fails to
+    build reported as `ADBC_STATUS_INTERNAL` rather than panicking.
+  - `stream.rs` — the driver's own Arrow C stream export (see below) plus `ErrorFromArrayStream`.
+  - `import.rs` — importing bound C arrays/streams, with `ArrayData` validation at the boundary.
+  `mod.rs` builds the vtable and exports `AdbcSpannerInit` + the `AdbcDriverInit` fallback, serving
+  **both** ADBC 1.0.0 and 1.1.0 callers (a 1.0.0 caller gets exactly the prefix bytes it
+  allocated; an unknown version is `NotImplemented`, as the header's retry-at-a-lower-revision
+  rule requires).
 - `src/error.rs` — helpers to build `adbc_core` errors. `from_spanner` takes the concrete
   `google_cloud_spanner::Error`: it maps the gRPC code onto the closest ADBC status, keeps the
   numeric code in `vendor_code`, and forwards any `google.rpc.Status` details (ErrorInfo/BadRequest
@@ -197,9 +227,12 @@ This uses the **googleapis preview** client `google-cloud-spanner` (crate descri
 Client Libraries for Rust - Spanner"). Beware: `docs.rs/.../latest` and web summaries often surface
 an **older, unrelated** yoshidan-style API (`Client::new`, `client.single()`, `add_param`) — do not
 trust those. For ground truth, read the extracted source under
-`~/.cargo/git/checkouts/google-cloud-rust-*/` (the git dependency's checkout); `adbc_core` /
-`adbc_ffi` are likewise git-pinned, so their ground truth is the `arrow-adbc-*` checkout under the
-same directory (an `apache/arrow-adbc` `main` revision, a little ahead of the 0.23.0 release).
+`~/.cargo/git/checkouts/google-cloud-rust-*/` (the git dependency's checkout); `adbc_core` (and the
+dev-dependencies `adbc_ffi` / `adbc_driver_manager`) are likewise git-pinned, so their ground truth
+is the `arrow-adbc-*` checkout under the same directory (an `apache/arrow-adbc` `main` revision, a
+little ahead of the 0.23.0 release). The C ABI itself is *not* taken from a crate — `src/ffi/` is
+this driver's own export layer — so for ABI ground truth read `c/include/arrow-adbc/adbc.h` in that
+same checkout, which `src/ffi/abi.rs` transcribes.
 
 **Temporary git pins (two families).** `Cargo.toml` pins two dependency families to git revisions,
 and **each is independently a crates.io publish blocker** — the crate cannot be published until
@@ -208,43 +241,50 @@ and **each is independently a crates.io publish blocker** — the crate cannot b
 1. The whole `google-cloud-*` family (spanner, auth, lro, `wkt`, both admin crates + `gax`)
    is pinned to a `google-cloud-rust` git revision, because native `STRUCT` mapping needs
    `Type::struct_type()`, which is on `main` but not yet in a crates.io release.
-2. `adbc_core` and `adbc_ffi` (and the dev-dependency `adbc_driver_manager`) are pinned to an
-   `apache/arrow-adbc` `main` git revision — all three must share the *same* rev — carrying four FFI
-   fixes not yet in the 0.23 crates.io release: an idempotent `release_ffi_error` (no double-free on
-   the standard release-twice idiom), `AdbcStatementExecuteQuery` writing `rows_affected = -1` on
-   the query path (arrow-adbc PR #4469), the exporter preserving the caller's
-   `AdbcError.private_data` on the ADBC 1.0.0 path (arrow-adbc PR #4473 — this one lets the C++
-   `adbc_validation` `StatementTest.ErrorCompatibility` case pass; it is absent from the `EXCLUDED`
-   list in `scripts/run-adbc-validation.sh`, so that script's gate runs it and requires it to pass),
-   and `InfoCode::Other(u32)` (arrow-adbc PR #4510 — the exporter now forwards an unrecognized
-   `get_info` code to the driver instead of failing the whole call, so this driver's
-   omit-unrecognized-codes behaviour is reachable through the C ABI; UP-9 in REVIEW.md).
-   All four are now merged upstream, so this is a plain `main`-tracking git pin (the fork it used
-   to need is gone), still ahead of the 0.23 release.
+2. `adbc_core` (and the **dev-dependencies** `adbc_ffi` / `adbc_driver_manager`) are pinned to an
+   `apache/arrow-adbc` `main` git revision — all three must share the *same* rev. The one reason
+   left is `InfoCode::Other(u32)` (arrow-adbc PR #4510), the catch-all variant that lets an
+   unrecognized `get_info` code reach `Connection::get_info` at all, which is what makes this
+   driver's omit-unrecognized-codes behaviour (required by adbc.h) expressible; UP-9 in REVIEW.md.
+   It is merged upstream but not in the 0.23 crates.io release, so this is a plain
+   `main`-tracking git pin (the fork it used to need is gone).
+   The **four FFI fixes this pin used to exist for** — an idempotent `release_ffi_error`,
+   `AdbcStatementExecuteQuery` writing `rows_affected = -1` on the query path (PR #4469), the
+   exporter preserving the caller's `AdbcError.private_data` on the ADBC 1.0.0 path (PR #4473) and
+   the `get_info` passthrough at the exporter — are **moot**: `src/ffi/` is the driver's own export
+   layer and implements that behaviour directly, so nothing in the library links `adbc_ffi` any
+   more. `adbc_ffi` survives only as a dev-dependency, for the `FFI_Adbc*` struct definitions the
+   raw-`libloading` lifecycle test in `tests/integration.rs` drives the cdylib through.
    Because a git source will not unify with the crates.io `= "0.23"` release, downstream crates must
    also take `adbc_core` from this same git rev (see `README.md`).
 
-**Revert checklist — the single anchor.** The two revs are spread across ~9 `Cargo.toml` dependency
+**Revert checklist — the single anchor.** The two revs are spread across 11 `Cargo.toml` dependency
 lines plus `deny.toml` plus the docs; this list is the one place that enumerates every edit needed to
 revert a family to versioned crates.io releases. Current pinned revs:
 
 - `google-cloud-rust`: `ec54ef0ad69ecd24487c1d3b93a2e4082d820b58` (upstream `googleapis/google-cloud-rust` `main`)
 - `apache/arrow-adbc`: `32c67b092c0f7cabf2be75062f001a9e17a48cc1`
 
-**Invariant:** the three arrow-adbc crates (`adbc_core`, `adbc_ffi`, `adbc_driver_manager`) must
-always share ONE rev; the eight `google-cloud-rust` crates likewise share ONE rev. A **fourth**
+**Invariant:** the three arrow-adbc crates (`adbc_core`, plus the dev-dependencies `adbc_ffi` and
+`adbc_driver_manager`) must always share ONE rev — `adbc_ffi`'s `FFI_Adbc*` structs and
+`adbc_core`'s constants meet in the same test, and both meet the C ABI `src/ffi/abi.rs`
+transcribes; the eight `google-cloud-rust` crates likewise share ONE rev. A **fourth**
 place holds the arrow-adbc rev — `ARROW_ADBC_TAG` in `adbc-validation/CMakeLists.txt`, which pins
 the C++ side (validation library + driver manager) the cdylib is validated against. It is not a
 cargo dependency, so nothing forces it to agree, but the two sides meet over the C ABI in that
 suite: bump it together with the crates. When reverting, touch *every* location for that family in
 lockstep:
 
-- `Cargo.toml` `[dependencies]` — arrow-adbc: `adbc_core`, `adbc_ffi`; google-cloud:
+- `Cargo.toml` `[dependencies]` — arrow-adbc: `adbc_core` (only; `adbc_ffi` is no longer a
+  dependency of the library); google-cloud:
   `google-cloud-spanner`, `google-cloud-auth`, `google-cloud-lro`, `google-cloud-gax` (this last
   names `rpc::StatusDetails` so `from_spanner` can forward `google.rpc.Status` details),
   `google-cloud-wkt` (names the `Duration` type `set_max_commit_delay` takes for
   `spanner.commit.max_delay`).
-- `Cargo.toml` `[dev-dependencies]` — arrow-adbc: `adbc_driver_manager`; google-cloud:
+- `Cargo.toml` `[dev-dependencies]` — arrow-adbc: `adbc_driver_manager`, `adbc_ffi` (the
+  `FFI_Adbc*` struct definitions the raw-`libloading` lifecycle test drives the cdylib through —
+  a deliberately independent transcription of the header `src/ffi/abi.rs` transcribes, so the
+  test cannot agree with the layer it checks by construction); google-cloud:
   `google-cloud-spanner-admin-instance-v1`, `google-cloud-spanner-admin-database-v1`,
   `spanner-grpc-mock` (the mock-server harness of `tests/mock_spanner.rs`;
   note it is `publish = false` upstream and will never be on crates.io — when the family reverts
@@ -257,7 +297,11 @@ lockstep:
   string to update there — the revs live only in `Cargo.toml`).
 - `CLAUDE.md` — this section (both the "Temporary git pins" note and this checklist); once *both*
   families are versioned, also re-enable `publish` (below) and revisit the `arrow-array`/`-schema`/
-  `-buffer` `>=58, <60` range, which exists only to unify with the git `adbc_core`.
+  `-buffer`/`-data` `>=58, <60` range, which exists only to unify with the git `adbc_core`. (Those
+  are plain crates.io deps, not part of either pin; note `arrow-array` carries `features = ["ffi"]`
+  for the C data interface structs `src/ffi/` moves result sets and bound parameters over,
+  `arrow-data` supplies the `ArrayData` validation `src/ffi/import.rs` does at the boundary, and
+  `libc` supplies the platform errno values `src/ffi/stream.rs` returns.)
 - `Cargo.toml` `[package.metadata.release]` `publish = false` — flip back to `true` only after
   *both* families are off git (each is independently a publish blocker).
 
@@ -358,6 +402,35 @@ cargo build --release
 nm -D --defined-only target/release/libadbc_spanner.so | grep AdbcSpannerInit
 ```
 
+Both symbols come from the driver's **own** export layer, `src/ffi/` (see the architecture list
+above) — not from `adbc_ffi::export_driver!`, which the library no longer depends on. Owning the
+layer is what buys the behaviour a generated exporter could not give:
+
+- **Cancellation reaches the C stream as `ECANCELED`.** arrow-rs's `FFI_ArrowArrayStream` exporter
+  maps every `ArrowError` to ENOSYS/ENOMEM/EIO/EINVAL, so a cancelled read surfaced as EINVAL.
+  `src/ffi/stream.rs` exports the reader itself and walks the error's source chain
+  (`crate::error::chain`) to the `adbc_core::error::Error` the driver boxes in
+  `ArrowError::ExternalError`, mapping its status to an errno — `Cancelled` → `ECANCELED`,
+  `Timeout` → `ETIMEDOUT`, and so on. That is what unblocked `SpannerStatementTest.SqlQueryCancel`,
+  now removed from `EXCLUDED` in `scripts/run-adbc-validation.sh` and gate-enforced.
+- **`ErrorFromArrayStream` is implemented.** The generated exporter left that vtable slot `None`,
+  so a failed stream could not report a structured ADBC error (status + message + details) at all.
+- **One driver, one Tokio runtime per process.** The exporter built a fresh `SpannerDriver` via
+  `Default` on *every* `AdbcDatabaseInit` — a new multi-threaded runtime per database — and
+  `SpannerDriver::default()` *panics* when the runtime cannot be built. `shared_driver()` in
+  `src/ffi/database.rs` builds it once behind a `OnceLock` and reports a build failure as
+  `ADBC_STATUS_INTERNAL`.
+- **Pre-`Init` option order is preserved.** The exporter buffered them in a `HashMap`; this
+  driver's option precedence is last-writer-wins with `adbc.uri` expanding eagerly, so order is
+  load-bearing. `OptionBuffer` in `src/ffi/handle.rs` is an ordered `Vec` with last-write-wins per
+  key, replayed through `new_database_with_opts` so the replay means exactly what the caller's
+  call sequence did.
+- **ADBC 1.0.0 callers are served**, not rejected: `init` in `src/ffi/mod.rs` copies only the
+  1.0.0 prefix when that is what the caller allocated, and `src/ffi/error.rs` writes errors at the
+  revision the caller's `AdbcError` advertises.
+- **Panic containment is per object, not per process**, and an uninitialized or released handle is
+  refused uniformly (`InvalidState`) — see the `handle.rs` bullet above.
+
 `.github/workflows/libraries.yml` builds the library for **eight** targets on pushes to main, pull
 requests and tags: linux x86-64 glibc (`ubuntu-22.04`), linux aarch64 glibc (`ubuntu-22.04-arm`),
 macOS arm64
@@ -392,7 +465,7 @@ cargo release patch --execute  # bump + commit "Release X.Y.Z" + tag vX.Y.Z + pu
 ```
 
 **crates.io publishing is off**, via `publish = false` in the release config (the git-pinned deps —
-both the `google-cloud-*` family and `adbc_core`/`adbc_ffi` — can't be published; see the two-pin
+both the `google-cloud-*` family and `adbc_core` — can't be published; see the two-pin
 dependency note above). So `cargo release --execute`
 does **not** touch crates.io — it only versions, commits, tags and pushes. Note the dry-run still
 prints a `Publishing adbc-spanner` heading; that is just the step label, not an actual `cargo publish`,

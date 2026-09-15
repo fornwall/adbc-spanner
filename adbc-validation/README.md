@@ -41,16 +41,17 @@ packages are required. C++20 rather than C++17 because
 arrow-adbc's baseline: its validation targets ask for `cxx_std_20`, and this
 harness includes their headers.
 
-The **driver** (cdylib) links the `adbc_core` / `adbc_ffi` crates from a git pin
-(an `apache/arrow-adbc` `main` revision — see `Cargo.toml`) that carries three FFI
-fixes not yet in a crates.io release: an idempotent `AdbcError` release (no
-double-free on a second release), `AdbcStatementExecuteQuery` writing
-`rows_affected = -1` on the query path (upstream
-[apache/arrow-adbc#4469](https://github.com/apache/arrow-adbc/pull/4469)), and the
-exporter preserving the caller's `AdbcError.private_data` on the ADBC 1.0.0 path
-(upstream [apache/arrow-adbc#4473](https://github.com/apache/arrow-adbc/pull/4473)).
-The **C++** validation library and driver manager come from `ARROW_ADBC_TAG`;
-they interoperate with the driver over the C ABI.
+The **driver** (cdylib) exports the C ABI from its own hand-written layer,
+`src/ffi/` — no FFI exporter crate is involved (`adbc_ffi` is only a
+dev-dependency, for the `FFI_Adbc*` struct definitions a raw-`libloading` test in
+`tests/integration.rs` uses). It therefore owns the behaviours this suite checks
+at the boundary directly: an idempotent `AdbcError` release (no double-free on a
+second release), `rows_affected = -1` on the query path, a preserved
+`AdbcError.private_data` for ADBC 1.0.0 callers, `ErrorGetDetail*`, and
+`ErrorFromArrayStream`. It links `adbc_core` (the Rust ADBC traits) from a git pin
+— an `apache/arrow-adbc` `main` revision, see `Cargo.toml`. The **C++** validation
+library and driver manager come from `ARROW_ADBC_TAG`; they interoperate with the
+driver over the C ABI.
 
 `SpannerQuirks` (in `spanner_validation.cc`) describes Spanner's capabilities to
 the suite — named `@p` parameters, backtick identifier quoting, DDL via the admin
@@ -152,12 +153,15 @@ silently-disarmed `rust-asan` leg goes red instead of green.
   binding end-to-end (`SqlBind`, `SqlPrepareSelectParams`), query error
   handling, trailing-semicolon queries (`SELECT current_date;;;` — the driver
   strips trailing statement terminators on the query path, which Spanner's
-  single-use query API otherwise rejects), query cancellation, DML row counts
+  single-use query API otherwise rejects), query cancellation (`SqlQueryCancel`,
+  which requires the result stream's `get_next` to return exactly `ECANCELED`
+  after a cancel — see the note below), DML row counts
   (`SqlQueryRowsAffectedDelete{,Stream}`), manual-transaction rollback of
   buffered DML (`SqlQueryInsertRollback`), concurrent statements, result
   independence/invalidation, `AdbcError` compatibility
-  (the exporter preserves a 1.0.0 caller's `private_data` — apache/arrow-adbc#4473,
-  in the pinned `adbc_ffi` rev), the whole ingest **round-trip family** —
+  (`src/ffi/error.rs` writes the error at whichever revision the caller
+  allocated, so a 1.0.0 caller's `private_data` survives), the whole ingest
+  **round-trip family** —
   bool/int/float/string/binary/date/timestamp columns (including the
   large/view Arrow layouts, dictionary-encoded strings and `List` columns) plus
   the append/replace/create-append modes, multi-connection visibility and the
@@ -166,7 +170,7 @@ silently-disarmed `rust-asan` leg goes red instead of green.
   create over an existing table → error, incompatible-schema append → error).
 
 The gate runs **every case except the documented `EXCLUDED` expected-failures**
-(see the next section), and they all pass or self-skip — today **96 cases: 90
+(see the next section), and they all pass or self-skip — today **97 cases: 91
 pass, 6 self-skip**. `DatabaseTest` and `ConnectionTest` pass in full; from `StatementTest`
 everything but the `EXCLUDED` list in `scripts/run-adbc-validation.sh` runs here.
 `SpannerQuirks::supports_bulk_ingest` declares
@@ -215,9 +219,9 @@ guard — no emulator required — with:
 scripts/run-adbc-validation.sh --check-drift
 ```
 
-Today `EXCLUDED` holds **4** cases (96 non-excluded cases — 90 passing plus 6 that
+Today `EXCLUDED` holds **3** cases (97 non-excluded cases — 91 passing plus 6 that
 self-skip: `Transactions`, `SqlIngestPrimaryKey`, and the four `SqlIngestTemporary*`
-— + 4 excluded = 100 upstream cases total).
+— + 3 excluded = 100 upstream cases total).
 
 Six cases are deliberately **not** excluded because they **self-skip**, which the
 gate tolerates — so they need no expected-failure bookkeeping. Each is inapplicable
@@ -250,8 +254,8 @@ pass cleanly and are gate-enforced.
 ## The `EXCLUDED` cases, by bucket
 
 Every excluded case (runnable individually via `--full`) fails **cleanly** (no
-aborts — see the note below) or self-skips; they fall into the following two
-buckets, neither of them fixable by rewriting SQL:
+aborts — see the note below) or self-skips; all three fall into a single bucket,
+not fixable by rewriting SQL:
 
 - **Arrow types with no Spanner column mapping** — `SqlIngestUInt64`,
   `SqlIngestDuration` and `SqlIngestInterval` fail at ingest time with "cannot
@@ -266,23 +270,28 @@ buckets, neither of them fixable by rewriting SQL:
   on real Spanner, but the emulator rejects an `INTERVAL` column outright
   (`CREATE TABLE` trips a `GOOGLESQL_RET_CHECK` in `IsSupportedColumnType`), so
   it could not pass in CI even once the driver grows the mapping.
-- **`ECANCELED` through the C stream** — `SqlQueryCancel` requires the result
-  stream's `get_next` to return exactly `ECANCELED` (125) after a cancel, but
-  arrow-rs's `FFI_ArrowArrayStream` exporter (which `adbc_ffi` uses to export
-  the driver's `RecordBatchReader`) maps every error to
-  `ENOSYS`/`ENOMEM`/`EIO`/`EINVAL` — there is no `ArrowError` variant that
-  reaches 125, so no Rust driver behind `adbc_ffi` can satisfy the case today.
-  The driver's cancellation itself works and is sticky (a cancel landing
-  between two chunk fetches cancels the next one); it surfaces through the C
-  stream as `EINVAL` with the message `Cancelled: operation cancelled`. The
-  case previously "passed" only because a between-chunk cancel was silently
-  lost and the stream ran to completion. Covered natively by
-  `cancel_between_stream_chunks_cancels_the_next_fetch` in
-  `tests/integration.rs`; fixing the errno needs a status-aware stream export
-  in `adbc_ffi` (the git-pinned fork), at which point the case can be re-gated.
 
-`SqlIngestUInt8/16/32` and `SqlIngestFixedSizeBinary` were formerly part of that
-same bucket; the driver grew both mappings (unsigned widths that fit `i64` widen
+**`ECANCELED` through the C stream** (`SqlQueryCancel`) was formerly a bucket of
+its own, and is now **gate-enforced**. The case requires the result stream's
+`get_next` to return exactly `ECANCELED` (125) after a cancel. arrow-rs's
+`FFI_ArrowArrayStream` exporter maps every `ArrowError` to
+`ENOSYS`/`ENOMEM`/`EIO`/`EINVAL` — no variant reaches 125 — so while the driver
+was exported by that machinery a between-chunk cancel could only surface as
+`EINVAL`. The driver now exports its own Arrow C stream (`src/ffi/stream.rs`):
+on a reader error it walks the error's source chain to the
+`adbc_core::error::Error` the driver boxed inside `ArrowError::ExternalError`
+and maps that error's ADBC status to an errno (`Cancelled` → `ECANCELED`,
+`Timeout` → `ETIMEDOUT`, …), falling back to the Arrow-variant errno when there
+is no driver error embedded. The same layer implements the 1.1.0
+`ErrorFromArrayStream` entry point, so a failed stream can also hand back the
+structured `AdbcError` — status, message and details — that the Arrow C Stream
+Interface can only express as an errno and a string. Cancellation is also still
+covered natively by `cancel_between_stream_chunks_cancels_the_next_fetch` in
+`tests/integration.rs` (it is sticky: a cancel landing between two chunk fetches
+cancels the next one).
+
+`SqlIngestUInt8/16/32` and `SqlIngestFixedSizeBinary` were formerly part of the
+Arrow-types bucket above; the driver grew both mappings (unsigned widths that fit `i64` widen
 to `INT64`, `FixedSizeBinary` binds as `BYTES`), so all four now pass and are
 gate-enforced. `SqlIngestFloat16` likewise: Spanner has no 16-bit float, but
 every `f16` is exactly representable in `f32`, so the driver widens it into a
@@ -350,17 +359,19 @@ ids, and the `SpannerQuirks` override substitutes GoogleSQL per id
   `SqlIngestPrimaryKey` to a quirk-sanctioned self-skip) — with the six DDL/DML
   cases above, thirty newly enforced cases in all.
 
-The three `adbc_ffi` issues that previously blocked a whole swath of these — a
+The three FFI-exporter issues that previously blocked a whole swath of these — a
 non-idempotent error release (which aborted the process), a missing
 `rows_affected` on the query path, and a clobbered 1.0.0 `AdbcError.private_data` —
-are **fixed** in the git-pinned `adbc_ffi` (see the top of this file), which is
-what unblocked `SqlQueryInts` / `SqlQueryStrings` / `SqlPrepareSelectNoParams` /
-`SqlPrepareErrorNoQuery` and `ErrorCompatibility`.
+are what unblocked `SqlQueryInts` / `SqlQueryStrings` / `SqlPrepareSelectNoParams` /
+`SqlPrepareErrorNoQuery` and `ErrorCompatibility`. They were first fixed upstream in
+`adbc_ffi`; the driver's own `src/ffi/` layer now implements that behaviour
+directly, so the suite no longer depends on any exporter crate for them.
 
 ## A note on `--full` process isolation
 
 `--full` runs each test in its own process via `ctest`. This is no longer
-required for safety — the git-pinned `adbc_ffi` makes the driver's `AdbcError`
-release idempotent, so a *failed* assertion now reports cleanly instead of
+required for safety — the driver's `AdbcError` release callback is idempotent
+(`src/ffi/error.rs` clears the struct's `message`/`private_data`/`release` as it
+frees them), so a *failed* assertion now reports cleanly instead of
 double-freeing and aborting the process. Per-test isolation is kept because it
 still gives the cleanest independent pass/fail report.

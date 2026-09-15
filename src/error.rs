@@ -28,6 +28,24 @@ pub(crate) fn invalid_argument(message: impl Into<String>) -> Error {
     err(message, Status::InvalidArguments)
 }
 
+/// A `NotFound` error — the single failure `adbc.h` licenses for the option getters.
+pub(crate) fn not_found(message: impl Into<String>) -> Error {
+    err(message, Status::NotFound)
+}
+
+/// Walk an error and everything it wraps, outermost first.
+///
+/// The one consumer is the C ABI's Arrow stream export (`src/ffi/stream.rs`): a
+/// [`RecordBatchReader`](arrow_array::RecordBatchReader)'s only error channel is
+/// [`ArrowError`](arrow_schema::ArrowError), so the driver boxes its own [`Error`] inside
+/// `ArrowError::ExternalError` and the export layer walks back down to it to recover the ADBC
+/// status — which is what lets a cancelled read report `ECANCELED` rather than a generic errno.
+pub(crate) fn chain<'a>(
+    source: &'a (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
+    std::iter::successors(Some(source), |error| error.source())
+}
+
 /// Translate an error coming from the Spanner client into an ADBC error.
 ///
 /// The Spanner preview client (and its LRO poller) surface every failure as
