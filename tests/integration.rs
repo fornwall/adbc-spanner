@@ -1709,16 +1709,21 @@ fn query_and_dml_round_trip() {
         .execute_update()
         .expect("drop create_append table");
 
-    // Create-mode ingest keyed on an existing column (`spanner.ingest.primary_key`): the table is
-    // built with that column as its declared primary key, rather than left keyless.
-    let mut drop_pk = connection.new_statement().expect("new statement");
-    drop_pk
-        .set_sql_query("DROP TABLE IF EXISTS AdbcIngestPk")
+    // A user-keyed table is the `append` story: create it with your own DDL (the primary key fixes
+    // Spanner's physical row layout, so it is the user's choice, not the driver's — there is
+    // deliberately no ingest option for it), then append into it. Its declared key really is
+    // enforced: re-appending a duplicate is an insert-mutation conflict → `AlreadyExists`.
+    let mut keyed_ddl = connection.new_statement().expect("new statement");
+    keyed_ddl
+        .set_sql_query(
+            "DROP TABLE IF EXISTS AdbcIngestPk; \
+             CREATE TABLE AdbcIngestPk (Id INT64, Label STRING(MAX)) PRIMARY KEY (Id)",
+        )
         .unwrap();
-    drop_pk
+    keyed_ddl
         .execute_update()
-        .expect("pre-drop primary-key table");
-    let pk_ingest = |connection: &mut SpannerConnection, key: &str, mode: &str| {
+        .expect("create the user-keyed ingest table");
+    let keyed_ingest = |connection: &mut SpannerConnection| {
         let mut s = connection.new_statement().expect("new statement");
         s.set_option(
             OptionStatement::TargetTable,
@@ -1726,50 +1731,20 @@ fn query_and_dml_round_trip() {
         )
         .unwrap();
         s.set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_INGEST_PRIMARY_KEY.into()),
-            OptionValue::String(key.into()),
-        )
-        .unwrap();
-        s.set_option(
             OptionStatement::IngestMode,
-            OptionValue::String(mode.into()),
+            OptionValue::String("append".into()),
         )
         .unwrap();
-        // The option round-trips through get_option as the comma-joined column list.
-        assert_eq!(
-            s.get_option_string(OptionStatement::Other(
-                adbc_spanner::OPTION_INGEST_PRIMARY_KEY.into()
-            ))
-            .unwrap(),
-            key
-        );
-        s.bind(create_rows()).expect("bind primary-key ingest rows");
+        s.bind(create_rows()).expect("bind keyed ingest rows");
         s.execute_update()
     };
     assert_eq!(
-        pk_ingest(&mut connection, "Id", "create").expect("create keyed on Id"),
+        keyed_ingest(&mut connection).expect("append into the keyed table"),
         Some(2)
     );
     assert_eq!(count_rows(&mut connection, "AdbcIngestPk"), 2);
-    // Keying on an existing column is the other half: the table's columns are still exactly the
-    // data columns, but now `Id` is the real primary key (asserted by the duplicate append below).
-    let pk_schema = connection
-        .get_table_schema(None, None, "AdbcIngestPk")
-        .expect("get_table_schema for the keyed ingest table");
-    let pk_cols: Vec<&str> = pk_schema
-        .fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect();
-    assert_eq!(
-        pk_cols,
-        vec!["Id", "Label"],
-        "keying on an existing column must not add a synthetic column: {pk_cols:?}"
-    );
-    // Re-ingesting a row whose key duplicates an existing one is an insert-mutation conflict →
-    // AlreadyExists (the same PK semantics as the synthetic key), proving `Id` really is the key.
-    let dup_err = pk_ingest(&mut connection, "Id", "append")
-        .expect_err("appending duplicate primary keys must fail");
+    let dup_err =
+        keyed_ingest(&mut connection).expect_err("appending duplicate primary keys must fail");
     assert_eq!(
         dup_err.status,
         adbc_core::error::Status::AlreadyExists,
@@ -1782,37 +1757,18 @@ fn query_and_dml_round_trip() {
     drop_pk_done
         .execute_update()
         .expect("drop primary-key table");
-    // A primary_key naming a column absent from the ingest data fails up front with
-    // InvalidArguments — before any DDL is sent to Spanner.
-    let mut bad_pk = connection.new_statement().expect("new statement");
-    bad_pk
+    // The removed `spanner.ingest.primary_key` option is now just an unknown statement option.
+    let mut gone = connection.new_statement().expect("new statement");
+    let gone_err = gone
         .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcIngestBadPk".into()),
+            OptionStatement::Other("spanner.ingest.primary_key".into()),
+            OptionValue::String("Id".into()),
         )
-        .unwrap();
-    bad_pk
-        .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_INGEST_PRIMARY_KEY.into()),
-            OptionValue::String("NoSuchColumn".into()),
-        )
-        .unwrap();
-    bad_pk
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("create".into()),
-        )
-        .unwrap();
-    bad_pk
-        .bind(create_rows())
-        .expect("bind bad-primary-key rows");
-    let bad_pk_err = bad_pk
-        .execute_update()
-        .expect_err("primary_key referencing a missing column must fail");
+        .expect_err("the removed ingest primary-key option must no longer be accepted");
     assert_eq!(
-        bad_pk_err.status,
-        adbc_core::error::Status::InvalidArguments,
-        "a primary_key column absent from the data must be InvalidArguments, got: {bad_pk_err:?}"
+        gone_err.status,
+        adbc_core::error::Status::NotImplemented,
+        "a removed option must report NotImplemented like any unknown one, got: {gone_err:?}"
     );
 
     // Parameterized query: bind @Id and read the matching row back.

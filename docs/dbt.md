@@ -234,8 +234,8 @@ per row. Relevant knobs (full list in [docs/options.md](options.md#statement-opt
 - **`adbc.ingest.mode`** — `create` / `create_append` / `replace` build the table from the seed's
   Arrow schema; `append` requires it to exist.
 - **Primary key.** A create mode declares none, leaving Spanner to key the table on a hidden
-  `rowid`, unless **`spanner.ingest.primary_key`** names existing seed columns to key on, in key
-  order — what a seed config declaring a primary key would set.
+  `rowid`. A seed config that declares a primary key therefore needs the table created up front
+  (`CREATE TABLE … PRIMARY KEY (…)`, e.g. as a pre-hook) and loaded with `append`.
 - **`spanner.ingest.batch_write`** — routes each autocommit chunk through Spanner's BatchWrite RPC
   (non-atomic per row group, higher throughput) for large seeds. Chunking, insert semantics and the
   row count are preserved.

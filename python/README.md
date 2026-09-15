@@ -395,9 +395,9 @@ The `mode` selects how the target table is handled:
 
 An ingested Arrow batch carries no primary key, so the three create modes declare none: Spanner
 keys such a table on a [hidden `rowid` column][no-pk] of its own, which no `SELECT *` returns. The
-created table therefore holds exactly the columns you ingested. To give it a real key, set the
-`spanner.ingest.primary_key` statement option to one or more existing ingest columns (comma-separated
-for a composite key, in key order).
+created table therefore holds exactly the columns you ingested. A primary key fixes Spanner's
+physical row layout, so if you want one, create the table yourself with `CREATE TABLE … PRIMARY KEY
+(…)` and ingest with `mode="append"`.
 
 [no-pk]: https://cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys
 

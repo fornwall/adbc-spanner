@@ -455,18 +455,18 @@ create the `pypi` GitHub environment (Settings → Environments), ideally restri
   `HIDDEN rowid` column of its own
   (<https://cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys>),
   so the created table's columns are exactly the ingested ones — no `SELECT *`, `get_table_schema`
-  or `get_objects` shows the key. [Up to 0.7 the driver instead appended a visible synthetic
+  or `get_objects` shows the key. There is deliberately **no option to choose a key** — a primary
+  key fixes Spanner's physical row layout, so it belongs in the `CREATE TABLE` the user writes,
+  followed by an `append` ingest. [Up to 0.7 the driver instead appended a visible synthetic
   `adbc_ingest_key STRING(36) DEFAULT (GENERATE_UUID())` key, because a Spanner table used to
-  require one; that column, and every workaround for it across the two validation harnesses, is
-  gone.] Or, when `spanner.ingest.primary_key` [statement option; comma-separated existing columns,
-  `""` unsets, round-trips via `get_option`] is set, key on those existing columns in the given
-  order [`bind::create_table_sql`; a named column absent from the ingest
-  schema → `InvalidArguments`, and it is ignored by `append`]; the rows themselves ship as native
+  require one, plus a `spanner.ingest.primary_key` statement option to opt out of it; the column,
+  the option and every workaround for them across the two validation harnesses are all gone —
+  `bind::create_table_sql` now takes no key argument.] The rows themselves ship as native
   **insert mutations** — `bind::insert_mutation`, reusing
   the same `cell_value` Arrow→Spanner mapping as parameter binding — not per-row `INSERT` DML, so
   nothing is SQL-parsed/planned per row but `INSERT` semantics are kept (duplicate PK →
-  `AlreadyExists` naming the target table — reachable only once the table *has* a declared key, i.e.
-  `append` into a user table or `spanner.ingest.primary_key`; `create` mode onto an existing table
+  `AlreadyExists` naming the target table — reachable only via `append` into a user table that
+  *has* a declared key, never into a driver-created one; `create` mode onto an existing table
   likewise remaps to `AlreadyExists`); autocommit ingests are built and committed chunk by chunk via
   `DatabaseClient::write_only_transaction` under Spanner's per-commit limits — `IngestChunkBudget`
   in `src/statement.rs`, ~rows × columns mutations + an approximate byte budget — so a multi-chunk

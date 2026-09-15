@@ -48,10 +48,9 @@ Early, tested end-to-end against the Spanner emulator.
       primary key**: the ingest data carries none, and Spanner keys a keyless table on a
       [hidden `rowid` column](https://cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys)
       of its own that no `SELECT *` (and neither `get_table_schema` nor `get_objects`) returns — so the
-      created table holds exactly the columns you ingested. To key on your own data instead, set
-      `spanner.ingest.primary_key` to one or more existing ingest columns (comma-separated for a
-      composite key, in key order) — those become the primary key, and only then do duplicate rows
-      conflict; a named column absent from the data fails with `InvalidArguments`. For non-atomic,
+      created table holds exactly the columns you ingested. A primary key fixes Spanner's physical row
+      layout, so choosing one is the user's call, not the driver's: `CREATE TABLE … PRIMARY KEY (…)`
+      yourself and ingest with `append`, which is also the only way duplicate rows conflict. For non-atomic,
       high-throughput ("firehose") loads, set `spanner.ingest.batch_write=true` to route an autocommit
       ingest's per-chunk mutations through Spanner's **BatchWrite** RPC instead of a write-only
       transaction (insert/count/error semantics and chunking preserved; BatchWrite applies its mutation

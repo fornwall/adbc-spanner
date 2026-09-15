@@ -652,18 +652,16 @@ fn spanner_field_type(field: &Field) -> Result<String> {
 
 /// Build a `CREATE TABLE` statement for bulk ingest from the data's Arrow `schema`.
 ///
-/// Every data column maps to its Spanner type via [`spanner_field_type`]; the created table's
-/// columns are exactly the ingest data's, never more. `primary_key` chooses the key:
-/// - `None` (the default): **no `PRIMARY KEY` clause at all**. Spanner creates such a table with an
-///   implicit hidden `rowid` key of its own
-///   (<https://cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys>),
-///   which no `SELECT *` returns — so the ingested table reads back as exactly the Arrow schema
-///   that built it. (Arrow ingest data carries no key, and inventing one is not the driver's call;
-///   earlier versions appended a synthetic `adbc_ingest_key` UUID column, which leaked into every
-///   `SELECT *` and `get_objects` listing.)
-/// - `Some(cols)` (the `spanner.ingest.primary_key` option): those **existing** data columns become
-///   the key, in the given order. Every name must appear in `schema`, else this fails with
-///   `InvalidArguments`. (Spanner separately rejects key columns of unsupported types at DDL time.)
+/// Every data column maps to its Spanner type via [`spanner_field_type`], and the statement carries
+/// **no `PRIMARY KEY` clause**: Spanner creates such a table with an implicit hidden `rowid` key of
+/// its own
+/// (<https://cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys>),
+/// which no `SELECT *` returns — so the created table reads back as exactly the Arrow schema that
+/// built it. Arrow ingest data carries no key, and inventing one is not the driver's call: a
+/// primary key fixes Spanner's physical row layout, so choosing it belongs in the `CREATE TABLE`
+/// the user writes, followed by an `append` ingest. (Up to 0.7 this appended a synthetic
+/// `adbc_ingest_key` UUID key column, and `spanner.ingest.primary_key` existed to opt out of it;
+/// both are gone.)
 ///
 /// Pass `if_not_exists` for `create_append` mode. `db_schema` (the `adbc.ingest.target_db_schema`
 /// option) optionally qualifies the created table with a named schema.
@@ -672,7 +670,6 @@ pub(crate) fn create_table_sql(
     db_schema: Option<&str>,
     schema: &arrow_schema::Schema,
     if_not_exists: bool,
-    primary_key: Option<&[String]>,
 ) -> Result<String> {
     let mut columns: Vec<String> = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
@@ -682,31 +679,9 @@ pub(crate) fn create_table_sql(
             spanner_field_type(field)?
         ));
     }
-    // No `spanner.ingest.primary_key` means no `PRIMARY KEY` clause: Spanner supplies its own
-    // hidden `rowid` key, so the table keeps exactly the ingested columns.
-    let key = match primary_key {
-        Some(cols) => {
-            for col in cols {
-                if !schema.fields().iter().any(|f| f.name() == col) {
-                    return Err(invalid_argument(format!(
-                        "spanner.ingest.primary_key column {col:?} is not present in the ingest \
-                         data; the primary key must reference existing columns"
-                    )));
-                }
-            }
-            format!(
-                " PRIMARY KEY ({})",
-                cols.iter()
-                    .map(|c| quote_ident(c))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        }
-        None => String::new(),
-    };
     let guard = if if_not_exists { "IF NOT EXISTS " } else { "" };
     Ok(format!(
-        "CREATE TABLE {guard}{} ({}){key}",
+        "CREATE TABLE {guard}{} ({})",
         qualified_table(db_schema, table),
         columns.join(", "),
     ))
@@ -944,7 +919,7 @@ mod tests {
             ),
             Field::new("plain", DataType::Utf8, true),
         ]);
-        let sql = create_table_sql("t", None, &schema, false, None).unwrap();
+        let sql = create_table_sql("t", None, &schema, false).unwrap();
         assert!(
             sql.contains("`doc` JSON, `docs` ARRAY<JSON>, `cat` JSON, `plain` STRING(MAX)"),
             "unexpected DDL: {sql}"
@@ -988,53 +963,23 @@ mod tests {
             Field::new("idx", DataType::Int64, true),
             Field::new("name", DataType::Utf8, true),
         ]);
-        // No `spanner.ingest.primary_key`: no PRIMARY KEY clause and no extra column — Spanner
-        // adds its own hidden `rowid` key, so the table is exactly the ingest schema.
+        // No PRIMARY KEY clause and no extra column — Spanner adds its own hidden `rowid` key,
+        // so the created table is exactly the ingest schema.
         assert_eq!(
-            create_table_sql("my_table", None, &schema, false, None).unwrap(),
+            create_table_sql("my_table", None, &schema, false).unwrap(),
             "CREATE TABLE `my_table` (`idx` INT64, `name` STRING(MAX))"
         );
         assert!(
-            create_table_sql("t", None, &schema, true, None)
+            create_table_sql("t", None, &schema, true)
                 .unwrap()
                 .starts_with("CREATE TABLE IF NOT EXISTS `t`")
         );
         // A named target schema (`adbc.ingest.target_db_schema`) qualifies the created table.
         assert!(
-            create_table_sql("t", Some("app"), &schema, false, None)
+            create_table_sql("t", Some("app"), &schema, false)
                 .unwrap()
                 .starts_with("CREATE TABLE `app`.`t`")
         );
-    }
-
-    #[test]
-    fn create_table_sql_uses_existing_columns_as_primary_key() {
-        let schema = Schema::new(vec![
-            Field::new("idx", DataType::Int64, true),
-            Field::new("name", DataType::Utf8, true),
-        ]);
-        // A single existing column becomes the key.
-        assert_eq!(
-            create_table_sql("t", None, &schema, false, Some(&["idx".to_string()])).unwrap(),
-            "CREATE TABLE `t` (`idx` INT64, `name` STRING(MAX)) PRIMARY KEY (`idx`)"
-        );
-        // A composite key preserves the given column order (which drives Spanner's row layout).
-        assert_eq!(
-            create_table_sql(
-                "t",
-                None,
-                &schema,
-                false,
-                Some(&["name".to_string(), "idx".to_string()])
-            )
-            .unwrap(),
-            "CREATE TABLE `t` (`idx` INT64, `name` STRING(MAX)) PRIMARY KEY (`name`, `idx`)"
-        );
-        // A key column absent from the ingest data is rejected up front.
-        let err = create_table_sql("t", None, &schema, false, Some(&["missing".to_string()]))
-            .unwrap_err();
-        assert_eq!(err.status, adbc_core::error::Status::InvalidArguments);
-        assert!(err.message.contains("missing"));
     }
 
     #[test]

@@ -149,12 +149,6 @@ pub struct SpannerStatement {
     /// resolves to it), `append`, `create_append`, and `replace`; the create/replace modes build
     /// the table from the ingest data's Arrow schema.
     ingest_mode: Option<IngestMode>,
-    /// Primary-key columns for a create-mode bulk ingest (`spanner.ingest.primary_key`). `None`
-    /// (the default) makes the create modes emit no `PRIMARY KEY` clause, leaving Spanner to add
-    /// its own hidden `rowid` key; `Some` keys on these existing ingest columns instead (in order).
-    /// Parsed once in `set_option` (comma-separated, trimmed, empties dropped); `""` unsets. See
-    /// [`bind::create_table_sql`].
-    ingest_primary_key: Option<Vec<String>>,
     /// Route an autocommit bulk ingest's per-chunk mutations through Spanner's **BatchWrite** RPC
     /// (`spanner.ingest.batch_write`, boolean, default `false`) instead of a write-only
     /// transaction — a non-atomic, higher-throughput "firehose" transport. See
@@ -210,7 +204,6 @@ impl SpannerStatement {
             target_db_schema: None,
             target_catalog: None,
             ingest_mode: None,
-            ingest_primary_key: None,
             ingest_batch_write: false,
             bind_by_name: false,
             rows_per_batch: DEFAULT_ROWS_PER_BATCH,
@@ -324,7 +317,6 @@ impl SpannerStatement {
             db_schema,
             &schema,
             if_not_exists,
-            self.ingest_primary_key.as_deref(),
         )?);
         Ok(Some(statements))
     }
@@ -436,9 +428,8 @@ impl SpannerStatement {
     /// Shared by `execute` and `execute_update` so both entry points ingest identically: an ingest
     /// needs no SQL query, so an FFI caller reaches it through either the query out-pointer
     /// (`execute`) or the affected-rows path (`execute_update`). In the create/replace modes the
-    /// table is first built from the ingest data's Arrow schema (keyless unless
-    /// `spanner.ingest.primary_key` says otherwise) via DDL, which Spanner runs immediately before
-    /// the inserts. Returns the ingested-row count
+    /// table is first built (keyless) from the ingest data's Arrow schema via DDL, which Spanner
+    /// runs immediately before the inserts. Returns the ingested-row count
     /// (summed across chunk transactions — see [`run_ingest_mutations`](Self::run_ingest_mutations)),
     /// or `None` when the rows were buffered for a manual-transaction commit.
     ///
@@ -1689,23 +1680,9 @@ impl Optionable for SpannerStatement {
                 check_exec_incremental(value)?;
             }
             OptionStatement::IngestMode => {
-                // Append into an existing table, or create it (from the ingest data's Arrow
-                // schema, keyless unless `spanner.ingest.primary_key` says otherwise) in the
-                // create/replace modes.
+                // Append into an existing table, or create it (keyless, from the ingest data's
+                // Arrow schema) in the create/replace modes.
                 self.ingest_mode = Some(ingest_mode_option(&key, value)?);
-            }
-            OptionStatement::Other(k) if k == crate::OPTION_INGEST_PRIMARY_KEY => {
-                // Comma-separated existing column names; `""` (or all-whitespace) unsets, back
-                // to the implicit `rowid` key. Column existence and Spanner key-type validity are
-                // checked when the CREATE TABLE is built (`bind::create_table_sql`) / by Spanner at
-                // DDL time.
-                let cols: Vec<String> = string_option(&key, value)?
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-                    .collect();
-                self.ingest_primary_key = (!cols.is_empty()).then_some(cols);
             }
             OptionStatement::Other(k) if k == crate::OPTION_INGEST_BATCH_WRITE => {
                 self.ingest_batch_write = ingest_batch_write_option(value)?;
@@ -1755,10 +1732,6 @@ impl Optionable for SpannerStatement {
             // effective default, `create`.
             OptionStatement::IngestMode => {
                 Some(String::from(self.ingest_mode.unwrap_or(IngestMode::Create)))
-            }
-            // The comma-joined key columns when set; unset (the implicit key) reports NotFound.
-            OptionStatement::Other(k) if k == crate::OPTION_INGEST_PRIMARY_KEY => {
-                self.ingest_primary_key.as_ref().map(|cols| cols.join(","))
             }
             // A plain boolean; reports "true"/"false" (the default is "false", write-only txn).
             OptionStatement::Other(k) if k == crate::OPTION_INGEST_BATCH_WRITE => {

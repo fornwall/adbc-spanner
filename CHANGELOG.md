@@ -18,11 +18,11 @@ Releases are cut with [`cargo-release`](https://github.com/crate-ci/cargo-releas
   keying them on an implicit **hidden** `rowid`, so the driver emits no `PRIMARY KEY` clause and an
   ingest-created table's columns are exactly the ingested ones — no extra column in `SELECT *`,
   `get_table_schema` or `get_objects`. The synthetic key existed only because every Spanner table
-  used to need one. Set `spanner.ingest.primary_key` to key on your own columns, as before; note
-  that without it an ingested table has no user-visible key, so re-ingesting identical rows now
-  appends duplicates instead of failing with `AlreadyExists`. Tables created by earlier versions
-  keep their `adbc_ingest_key` column (a key cannot be added to or removed from an existing Spanner
-  table); `append` into them is unaffected.
+  used to need one. Note an ingest-created table now has no user-visible key, so re-ingesting
+  identical rows appends duplicates instead of failing with `AlreadyExists`; for a keyed table,
+  write the `CREATE TABLE … PRIMARY KEY (…)` yourself and ingest with `append`. Tables created by
+  earlier versions keep their `adbc_ingest_key` column (a key cannot be added to or removed from an
+  existing Spanner table); `append` into them is unaffected.
 - `get_objects` and `get_statistics` now omit Spanner's **hidden** columns — those a `SELECT *`
   does not return — and `get_objects` also omits constraints that reference only hidden columns.
   This matches `get_table_schema` (which reads `SELECT * LIMIT 0`) and keeps the implicit `rowid`
@@ -37,6 +37,13 @@ Releases are cut with [`cargo-release`](https://github.com/crate-ci/cargo-releas
 
 ### Removed
 
+- **Breaking:** the `spanner.ingest.primary_key` statement option (`OPTION_INGEST_PRIMARY_KEY`,
+  Python `StatementOptions.INGEST_PRIMARY_KEY`) is gone, together with the synthetic key it existed
+  to opt out of (above). A primary key fixes Spanner's physical row layout, so choosing one is the
+  user's call rather than a bulk-load knob: create the table with `CREATE TABLE … PRIMARY KEY (…)`
+  and ingest into it with `adbc.ingest.mode=append`, which also keeps the duplicate-key
+  `AlreadyExists` behaviour. Setting the key now fails with `NotImplemented`, like any unknown
+  statement option.
 - **Breaking:** the `spanner.partition.max_count` statement option (`OPTION_MAX_PARTITIONS`, Python
   `StatementOptions.MAX_PARTITIONS`) is gone. It plumbed into `PartitionOptions.max_partitions`,
   which Spanner's proto documents as "currently ignored by `PartitionQuery` and `PartitionRead`

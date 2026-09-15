@@ -364,8 +364,8 @@ parameter values to a statement before executing it. Two uses:
   row, so nothing is SQL-parsed per row. The standard `adbc.ingest.mode` option picks the
   behaviour: `append` to an existing table, or `create` / `create_append` / `replace`, which build
   the table via DDL from the incoming Arrow schema. Arrow data carries no primary key, so the
-  create modes declare none and let Spanner key the table on its own hidden `rowid` column — unless
-  `spanner.ingest.primary_key` names existing columns to key on instead. Because
+  create modes declare none and let Spanner key the table on its own hidden `rowid` column; for a
+  table keyed on your own columns, write the `CREATE TABLE` yourself and ingest with `append`. Because
   Spanner caps how much a single commit may write, a large ingest is committed **chunk by chunk**
   (so it is not atomic as a whole; a failure reports how many rows earlier chunks already
   committed).

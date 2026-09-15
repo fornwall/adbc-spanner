@@ -660,25 +660,6 @@ pub const OPTION_DATA_BOOST: &str = "spanner.data_boost";
 /// Accepts a boolean. `get_option` reports `true`/`false`.
 pub const OPTION_BIND_BY_NAME: &str = "adbc.statement.bind_by_name";
 
-/// Driver-specific statement option: the **primary key** for a `create`/`create_append`/`replace`
-/// bulk ingest.
-///
-/// Arrow ingest data carries no primary key, so by default the create modes emit **no
-/// `PRIMARY KEY` clause** and let Spanner key the table on the implicit hidden `rowid` it adds to
-/// a keyless table — invisible to `SELECT *`, so the created table reads back as exactly the
-/// ingested columns. Set this option to one or more **existing** ingest columns (comma-separated
-/// for a composite key) to give the table a real key instead; the column order given becomes the
-/// key order (which governs Spanner's physical row layout), and only then do duplicate rows
-/// conflict. Every named column must appear in the bound ingest data, else the create fails with
-/// `InvalidArguments`; Spanner additionally rejects key columns of unsupported types (e.g.
-/// `FLOAT64`, `JSON`, `ARRAY`). Only affects the table-creating modes — `append` ingests into an
-/// existing table whose own key governs.
-///
-/// A free-form string; `""` (or all-whitespace) unsets, back to the implicit `rowid` key. When set,
-/// `get_option` reports the comma-joined column list; when unset it reports `NotFound`, like the
-/// driver's other unset string options.
-pub const OPTION_INGEST_PRIMARY_KEY: &str = "spanner.ingest.primary_key";
-
 /// Driver-specific **statement** option: route an autocommit bulk ingest's per-chunk mutations
 /// through Spanner's **BatchWrite** RPC instead of a write-only transaction, for non-atomic,
 /// high-throughput ("firehose") loads.
@@ -1044,7 +1025,6 @@ mod options_doc_tests {
             crate::OPTION_QUOTA_PROJECT,
             crate::OPTION_ROWS_PER_BATCH,
             crate::OPTION_DATA_BOOST,
-            crate::OPTION_INGEST_PRIMARY_KEY,
             crate::OPTION_READ_STALENESS,
             crate::OPTION_REQUEST_PRIORITY,
             crate::OPTION_REQUEST_TAG,

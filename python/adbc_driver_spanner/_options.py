@@ -164,8 +164,6 @@ class StatementOptions(enum.Enum):
     RETRY_BACKOFF_MULTIPLIER = "spanner.retry.backoff.multiplier"
     #: How bound Arrow columns pair with ``@name`` parameters (``"true"`` = by name).
     BIND_BY_NAME = "adbc.statement.bind_by_name"
-    #: Primary key for the create/replace ingest modes (comma-separated columns).
-    INGEST_PRIMARY_KEY = "spanner.ingest.primary_key"
     #: ``"true"`` routes an autocommit bulk ingest's chunks through Spanner's
     #: non-atomic **BatchWrite** RPC instead of a write-only transaction.
     #: Ignored in manual-transaction mode.
