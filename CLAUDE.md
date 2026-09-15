@@ -232,8 +232,12 @@ revert a family to versioned crates.io releases. Current pinned revs:
 - `apache/arrow-adbc`: `32c67b092c0f7cabf2be75062f001a9e17a48cc1`
 
 **Invariant:** the three arrow-adbc crates (`adbc_core`, `adbc_ffi`, `adbc_driver_manager`) must
-always share ONE rev; the eight `google-cloud-rust` crates likewise share ONE rev. When reverting,
-touch *every* location for that family in lockstep:
+always share ONE rev; the eight `google-cloud-rust` crates likewise share ONE rev. A **fourth**
+place holds the arrow-adbc rev — `ARROW_ADBC_TAG` in `adbc-validation/CMakeLists.txt`, which pins
+the C++ side (validation library + driver manager) the cdylib is validated against. It is not a
+cargo dependency, so nothing forces it to agree, but the two sides meet over the C ABI in that
+suite: bump it together with the crates. When reverting, touch *every* location for that family in
+lockstep:
 
 - `Cargo.toml` `[dependencies]` — arrow-adbc: `adbc_core`, `adbc_ffi`; google-cloud:
   `google-cloud-spanner`, `google-cloud-auth`, `google-cloud-lro`, `google-cloud-gax` (this last

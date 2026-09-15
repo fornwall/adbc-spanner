@@ -8,7 +8,7 @@
 //   SPANNER_EMULATOR_HOST  (read by the driver itself) selects the emulator
 //
 // `SpannerQuirks` describes Spanner's capabilities to the suite so tests that do
-// not apply to Spanner's model (temp tables, views, float16 ingest, ...)
+// not apply to Spanner's model (temp tables, auto-increment primary keys, ...)
 // self-skip rather than fail.
 
 #include <cstdlib>
@@ -276,11 +276,11 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   }
 
   // What the driver hands back when a column of ingested Arrow data is
-  // selected: Spanner's integer type is INT64, its float types are
-  // FLOAT32/FLOAT64, strings are STRING(MAX) and binary is BYTES(MAX), so the
-  // narrower/alternate Arrow layouts widen to the canonical Arrow type of the
-  // Spanner column (`bind::spanner_column_type` on the ingest side,
-  // `src/conversion.rs` on the readback side). Nested types recurse through the
+  // selected: Spanner's integer type is INT64, its narrowest float is FLOAT32
+  // (so a half-float widens into it), strings are STRING(MAX) and binary is
+  // BYTES(MAX), so the narrower/alternate Arrow layouts widen to the canonical
+  // Arrow type of the Spanner column (`bind::spanner_column_type` on the ingest
+  // side, `src/conversion.rs` on the readback side). Nested types recurse through the
   // base class's SchemaField overload, mapping e.g. List<Int32> to List<Int64>.
   ArrowType IngestSelectRoundTripType(ArrowType ingest_type) const override {
     switch (ingest_type) {
@@ -292,6 +292,8 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
       case NANOARROW_TYPE_UINT32:
       case NANOARROW_TYPE_UINT64:
         return NANOARROW_TYPE_INT64;
+      case NANOARROW_TYPE_HALF_FLOAT:
+        return NANOARROW_TYPE_FLOAT;
       case NANOARROW_TYPE_LARGE_STRING:
       case NANOARROW_TYPE_STRING_VIEW:
         return NANOARROW_TYPE_STRING;
@@ -356,9 +358,6 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   bool supports_ingest_view_types() const override { return true; }
   bool supports_bulk_ingest_catalog() const override { return true; }
   bool supports_bulk_ingest_db_schema() const override { return true; }
-  // Spanner has no float16 type and no temporary tables, so these stay unsupported;
-  // the corresponding cases self-skip (and are not excluded).
-  bool supports_ingest_float16() const override { return false; }
 
   std::string catalog() const override { return ""; }
   std::string db_schema() const override { return ""; }

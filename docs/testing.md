@@ -168,7 +168,7 @@ ADBC_VALIDATION_SANITIZE=address ADBC_VALIDATION_RUST_SANITIZE=address \
   scripts/run-adbc-validation.sh            # + the cdylib itself, ASan-instrumented (nightly)
 ```
 
-The script builds the cdylib and a C++ harness (needs a C++17 compiler, CMake ≥ 3.20 and git) and
+The script builds the cdylib and a C++ harness (needs a C++20 compiler, CMake ≥ 3.20 and git) and
 runs the suite. [`adbc-validation.yml`](../.github/workflows/adbc-validation.yml) runs the gated
 subset as a **gating** CI job, in three legs: `plain`; `asan-ubsan` (the C++ side built with
 `-fsanitize=address,undefined`, driving the uninstrumented cdylib — its `malloc`/`free`/`memcpy`

@@ -3,11 +3,14 @@
 # manager). See README.md for how to run it.
 #
 # Everything external is fetched and built from source at a pinned arrow-adbc
-# release, so the only host requirements are a C++17 compiler, CMake and git.
+# release, so the only host requirements are a C++20 compiler, CMake and git.
 cmake_minimum_required(VERSION 3.20)
 project(adbc_spanner_validation LANGUAGES C CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+# C++20 is arrow-adbc's baseline as of apache/arrow-adbc#4610 (`feat(c): require C++20 as
+# the baseline`): its validation targets ask for `cxx_std_20`, and its headers — which this
+# harness includes — are compiled as C++20 upstream. Keep this harness on the same standard.
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Optional sanitizers for the whole C++ side of the suite (this harness + the ADBC driver
@@ -82,7 +85,7 @@ endif()
 # exists, so a stale `CMakeCache.txt` (e.g. one restored from a run on the old
 # rev) would silently keep the previous tag and rebuild against the wrong
 # arrow-adbc source. FORCE makes a rev bump here authoritative.
-set(ARROW_ADBC_TAG "3b3f123a74c767845e83e559bb889d1fa7d7616b"
+set(ARROW_ADBC_TAG "32c67b092c0f7cabf2be75062f001a9e17a48cc1"
     CACHE STRING "arrow-adbc revision (apache/arrow-adbc main, see above)" FORCE)
 
 include(FetchContent)

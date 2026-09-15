@@ -403,7 +403,9 @@ unaffected — it ships native mutations, not DML parameters — though its crea
 
 On the bind / bulk-ingest side, unsigned Arrow integers that fit `i64` losslessly —
 `UInt8`/`UInt16`/`UInt32` — widen to `INT64` like the signed widths; `UInt64` is unsupported
-(`u64::MAX` exceeds `i64::MAX`). `FixedSizeBinary` binds as `BYTES` like the other binary layouts.
+(`u64::MAX` exceeds `i64::MAX`). `Float16` widens to `FLOAT32` (Spanner has no 16-bit float, but
+every `f16` is exactly representable in `f32`). `FixedSizeBinary` binds as `BYTES` like the other
+binary layouts.
 
 `TIMESTAMP` is read at full nanosecond precision by default (matching the bind/write path). Arrow
 stores `Timestamp(Nanosecond)` as an `i64` count of nanoseconds since the Unix epoch, which spans

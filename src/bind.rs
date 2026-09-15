@@ -13,7 +13,8 @@
 //! Supported Arrow parameter types are `Int8`/`Int16`/`Int32`/`Int64` and the unsigned widths that
 //! fit `i64` losslessly, `UInt8`/`UInt16`/`UInt32` (all → Spanner `INT64`; `UInt64` is unsupported
 //! — `u64::MAX` exceeds `i64::MAX`),
-//! `Float64`, `Float32`, `Boolean`, `Utf8`/`LargeUtf8`/`Utf8View`,
+//! `Float64`, `Float32`, `Float16` (→ Spanner `FLOAT32`; every `f16` is exactly representable in
+//! `f32`), `Boolean`, `Utf8`/`LargeUtf8`/`Utf8View`,
 //! `Binary`/`LargeBinary`/`BinaryView`/`FixedSizeBinary` (all → Spanner `BYTES`),
 //! `Date32`/`Date64` (→ `DATE`), `Timestamp` at any `TimeUnit`
 //! (Second/Millisecond/Microsecond/Nanosecond, → `TIMESTAMP`), `Decimal128` (→ `NUMERIC`), and
@@ -59,9 +60,10 @@
 use adbc_core::error::Result;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    ArrowPrimitiveType, Date32Type, Date64Type, Decimal128Type, Float32Type, Float64Type, Int8Type,
-    Int16Type, Int32Type, Int64Type, TimestampMicrosecondType, TimestampMillisecondType,
-    TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type, UInt32Type,
+    ArrowPrimitiveType, Date32Type, Date64Type, Decimal128Type, Float16Type, Float32Type,
+    Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, TimestampMicrosecondType,
+    TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type,
+    UInt32Type,
 };
 use arrow_array::{Array, ArrayRef, RecordBatch, downcast_dictionary_array};
 use arrow_schema::{DataType, Field, TimeUnit};
@@ -296,6 +298,9 @@ fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
         DataType::UInt8 => primitive_binder::<UInt8Type, i64>(),
         DataType::Float64 => primitive_binder::<Float64Type, f64>(),
         DataType::Float32 => primitive_binder::<Float32Type, f64>(),
+        // Spanner has no 16-bit float, but every `f16` is exactly representable in `f32` (and so
+        // in `f64`), so a half-float widens losslessly the way the narrow integers widen to INT64.
+        DataType::Float16 => primitive_binder::<Float16Type, f64>(),
         DataType::Boolean => {
             |_, _, a, i| Ok(scalar_value(a.is_null(i), || a.as_boolean().value(i)))
         }
@@ -608,7 +613,9 @@ pub(crate) fn spanner_column_type(data_type: &DataType) -> Result<String> {
         // The unsigned widths that fit `i64` losslessly widen to INT64 too (see `scalar_binder`);
         // `UInt64` has no INT64 mapping and is rejected below.
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => "INT64".to_string(),
-        DataType::Float32 => "FLOAT32".to_string(),
+        // `Float16` has no Spanner counterpart, but widens losslessly into FLOAT32 (see
+        // `scalar_binder`), so it creates the same column as `Float32`.
+        DataType::Float16 | DataType::Float32 => "FLOAT32".to_string(),
         DataType::Float64 => "FLOAT64".to_string(),
         DataType::Boolean => "BOOL".to_string(),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "STRING(MAX)".to_string(),
@@ -781,6 +788,30 @@ mod tests {
     }
 
     #[test]
+    fn binds_half_floats_as_doubles() {
+        // Float16 has no Spanner counterpart; it widens into the FLOAT32 column
+        // `spanner_column_type` creates. The widening is exact — every `f16` is
+        // representable in `f32`/`f64` — so the bound value carries no rounding artefacts.
+        let b = batch(
+            vec![Field::new("v", DataType::Float16, true)],
+            vec![Arc::new(arrow_array::Float16Array::from(vec![
+                Some(<Float16Type as ArrowPrimitiveType>::Native::from_f32(-1.5)),
+                None,
+            ]))],
+        );
+        let stmt = bind_row(Statement::builder("SELECT @v"), &b, 0)
+            .unwrap()
+            .build();
+        let dbg = format!("{stmt:?}");
+        assert!(
+            dbg.contains("-1.5"),
+            "f16 -1.5 must widen exactly to -1.5: {dbg}"
+        );
+        // The null row still binds (typed null).
+        assert!(bind_row(Statement::builder("SELECT @v"), &b, 1).is_ok());
+    }
+
+    #[test]
     fn binds_fixed_size_binary_as_bytes() {
         // FixedSizeBinary(n) binds as Spanner BYTES, exactly like variable-width Binary.
         let values: Vec<Option<&[u8]>> = vec![Some(b"abcd"), None];
@@ -925,6 +956,8 @@ mod tests {
         assert_eq!(spanner_column_type(&DataType::Int32).unwrap(), "INT64");
         assert_eq!(spanner_column_type(&DataType::Int64).unwrap(), "INT64");
         assert_eq!(spanner_column_type(&DataType::Float32).unwrap(), "FLOAT32");
+        // `Float16` has no Spanner type of its own; it widens losslessly into FLOAT32.
+        assert_eq!(spanner_column_type(&DataType::Float16).unwrap(), "FLOAT32");
         assert_eq!(spanner_column_type(&DataType::Utf8).unwrap(), "STRING(MAX)");
         assert_eq!(
             spanner_column_type(&DataType::LargeBinary).unwrap(),

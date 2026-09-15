@@ -27,7 +27,7 @@ SPANNER_GCP_DATABASE=my-project.my-instance.my-db scripts/run-adbc-validation.sh
 
 The script builds the cdylib and the harness, creates the emulator
 instance/database when needed, and runs the suite. Requirements beyond the Rust
-toolchain: a C++17 compiler, CMake (≥ 3.20) and git. Everything else — the
+toolchain: a C++20 compiler, CMake (≥ 3.20) and git. Everything else — the
 arrow-adbc validation library, the ADBC driver manager, fmt, nanoarrow and
 GoogleTest — is fetched and built from source at a pinned arrow-adbc revision
 (`ARROW_ADBC_TAG` in `CMakeLists.txt` — an `apache/arrow-adbc` `main` revision
@@ -36,7 +36,10 @@ which routes the suite's hardcoded dialect-sensitive SQL through the
 `DriverQuirks::RewriteSql` hook, and
 [apache/arrow-adbc#4534](https://github.com/apache/arrow-adbc/pull/4534), which
 makes the `TestSqlPrepareUpdate` readbacks order-deterministic). No system
-packages are required.
+packages are required. C++20 rather than C++17 because
+[apache/arrow-adbc#4610](https://github.com/apache/arrow-adbc/pull/4610) made it
+arrow-adbc's baseline: its validation targets ask for `cxx_std_20`, and this
+harness includes their headers.
 
 The **driver** (cdylib) links the `adbc_core` / `adbc_ffi` crates from a git pin
 (an `apache/arrow-adbc` `main` revision — see `Cargo.toml`) that carries three FFI
@@ -213,11 +216,11 @@ guard — no emulator required — with:
 scripts/run-adbc-validation.sh --check-drift
 ```
 
-Today `EXCLUDED` holds **11** cases (89 non-excluded cases — 82 passing plus 7 that
-self-skip: `Transactions`, `SqlIngestFloat16`, `SqlIngestPrimaryKey`, and the four
-`SqlIngestTemporary*` — + 11 excluded = 100 upstream cases total).
+Today `EXCLUDED` holds **4** cases (96 non-excluded cases — 90 passing plus 6 that
+self-skip: `Transactions`, `SqlIngestPrimaryKey`, and the four `SqlIngestTemporary*`
+— + 4 excluded = 100 upstream cases total).
 
-Seven cases are deliberately **not** excluded because they **self-skip**, which the
+Six cases are deliberately **not** excluded because they **self-skip**, which the
 gate tolerates — so they need no expected-failure bookkeeping. Each is inapplicable
 to Spanner's model, so it can never "start passing", and a skip states the truth
 ("not applicable to Spanner") rather than implying the driver got it wrong:
@@ -227,8 +230,6 @@ to Spanner's model, so it can never "start passing", and a skip states the truth
   Spanner has none (DDL goes through the admin `UpdateDatabaseDdl` API, auto-commits
   immediately, and cannot be rolled back), so the `ddl_implicit_commit_txn` quirk
   makes the case self-skip via its own guard.
-- `SqlIngestFloat16` — Spanner has no 16-bit float type (`supports_ingest_float16`
-  is `false`).
 - `SqlIngestPrimaryKey` — the case append-ingests rows *omitting* the primary-key
   column and expects the database to auto-assign ascending key values. Spanner has
   no ordered auto-increment (a keyless insert mutation writes NULL, and a second
@@ -250,24 +251,22 @@ pass cleanly and are gate-enforced.
 ## The `EXCLUDED` cases, by bucket
 
 Every excluded case (runnable individually via `--full`) fails **cleanly** (no
-aborts — see the note below) or self-skips; they fall into the following buckets,
-none of them fixable by rewriting SQL:
+aborts — see the note below) or self-skips; they fall into the following two
+buckets, neither of them fixable by rewriting SQL:
 
-- **Insertion-order readbacks** — `SqlPrepareUpdate` / `SqlPrepareUpdateStream`
-  create `bulk_ingest` via create-mode ingest, `INSERT` more rows via bound
-  parameters, and assert the readback returns *all* rows in insertion order.
-  The `RewriteSql` overrides fix their SQL (the `INSERT` gets its required
-  column list, the readback dodges the synthetic key column), but no SQL can
-  recover insertion order from a Spanner table: rows come back in primary-key
-  order and the synthetic `adbc_ingest_key` is a random UUID. Only the final
-  row-order assertion still fails.
-- **Arrow types with no Spanner column mapping** — `SqlIngestUInt8/16/32/64`,
-  `SqlIngestDuration`, `SqlIngestInterval`, `SqlIngestFixedSizeBinary` fail at
-  ingest time with "cannot create a Spanner column for Arrow type …". UInt64
-  cannot fit INT64; UInt8/16/32 *could* widen losslessly but the driver has no
-  unsigned mapping yet; Duration/Interval(MonthDayNano)/FixedSizeBinary have no
-  bind/create mapping (Spanner INTERVAL is not wired up). Expected failures that
-  flip to gate-enforced passes as the driver grows each mapping.
+- **Arrow types with no Spanner column mapping** — `SqlIngestUInt64`,
+  `SqlIngestDuration` and `SqlIngestInterval` fail at ingest time with "cannot
+  create a Spanner column for Arrow type …". `UInt64` cannot widen to `INT64`
+  (`u64::MAX` exceeds `i64::MAX`) and its natural home, `NUMERIC`, reads back as
+  `Decimal128` — which the suite's `SchemaField` cannot express with a precision
+  and scale, so the shared `IngestSelectRoundTripType` round-trip could not be
+  declared even with driver support. `Duration` has no fixed-unit Spanner
+  counterpart at all (one `INTERVAL` column reads back as exactly one Arrow
+  type, and `ValidateIngestedTemporalData` FAILs any non-`TIMESTAMP` temporal
+  readback); `Interval(MonthDayNano)` *is* a clean 1:1 with Spanner `INTERVAL`
+  on real Spanner, but the emulator rejects an `INTERVAL` column outright
+  (`CREATE TABLE` trips a `GOOGLESQL_RET_CHECK` in `IsSupportedColumnType`), so
+  it could not pass in CI even once the driver grows the mapping.
 - **`ECANCELED` through the C stream** — `SqlQueryCancel` requires the result
   stream's `get_next` to return exactly `ECANCELED` (125) after a cancel, but
   arrow-rs's `FFI_ArrowArrayStream` exporter (which `adbc_ffi` uses to export
@@ -283,7 +282,24 @@ none of them fixable by rewriting SQL:
   `tests/integration.rs`; fixing the errno needs a status-aware stream export
   in `adbc_ffi` (the git-pinned fork), at which point the case can be re-gated.
 
-`SqlPartitionedInts` was formerly a fourth bucket ("rigid single-partition
+`SqlIngestUInt8/16/32` and `SqlIngestFixedSizeBinary` were formerly part of that
+same bucket; the driver grew both mappings (unsigned widths that fit `i64` widen
+to `INT64`, `FixedSizeBinary` binds as `BYTES`), so all four now pass and are
+gate-enforced. `SqlIngestFloat16` likewise: Spanner has no 16-bit float, but
+every `f16` is exactly representable in `f32`, so the driver widens it into a
+`FLOAT32` column and `IngestSelectRoundTripType` declares the
+`HALF_FLOAT` → `FLOAT` readback. (It used to self-skip behind the
+`supports_ingest_float16` quirk, which
+[apache/arrow-adbc#4779](https://github.com/apache/arrow-adbc/pull/4779) removed.)
+
+**Insertion-order readbacks** (`SqlPrepareUpdate` / `SqlPrepareUpdateStream`) were
+another former bucket: no SQL can recover insertion order from a Spanner table,
+whose rows come back in primary-key order behind a random-UUID synthetic key.
+[apache/arrow-adbc#4534](https://github.com/apache/arrow-adbc/pull/4534) gave both
+readbacks a deterministic `ORDER BY <col> ASC NULLS FIRST` and sorted the expected
+vectors, so with the `RewriteSql` overrides both now pass and are gate-enforced.
+
+`SqlPartitionedInts` was formerly a bucket of its own ("rigid single-partition
 assumption"): the upstream case hardcoded `ASSERT_EQ(1, num_partitions)` for
 `SELECT 42`, but Spanner's `partitionQuery` is free to return more — the emulator
 returns 2. apache/arrow-adbc#4493 relaxed it to allow `>= 1` partitions and assert
