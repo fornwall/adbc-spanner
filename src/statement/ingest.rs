@@ -58,10 +58,10 @@ impl SpannerStatement {
 
     /// Whether `table` exists in the ingest target schema (`adbc.ingest.target_db_schema`; empty =
     /// Spanner's default, unnamed schema), via the shared
-    /// [`table_exists`](crate::connection::table_exists) probe. Shared by the two ingest error
+    /// [`table_exists`](crate::metadata::table_exists) probe. Shared by the two ingest error
     /// remaps below.
     fn ingest_table_exists(&self, table: &str) -> Result<bool> {
-        crate::connection::table_exists(
+        crate::metadata::table_exists(
             &self.runtime,
             &self.client,
             &self.cancel.current(),
@@ -203,7 +203,7 @@ impl SpannerStatement {
     /// ADBC-contractual `AlreadyExists` — consumers branch on that status (e.g. to fall back to
     /// append). Spanner reports it as a generic schema-change failure ("Duplicate name in
     /// schema"), so the existence is confirmed via the shared
-    /// [`table_exists`](crate::connection::table_exists) probe and the remapped message names the
+    /// [`table_exists`](crate::metadata::table_exists) probe and the remapped message names the
     /// table. Only `create` is remapped: `create_append` guards with `IF NOT EXISTS` and `replace`
     /// drops first, so their DDL failures are never about the table already existing. If the table
     /// is absent — or the probe itself fails — the original DDL error surfaces unchanged.
@@ -349,7 +349,7 @@ impl SpannerStatement {
     /// `create_append`'s `CREATE TABLE IF NOT EXISTS` guarantees the table exists, and
     /// `create`/`replace` own existence via their own DDL. A probe that itself fails teaches nothing
     /// about the table, so — as everywhere else — the empty ingest just succeeds (see
-    /// [`table_exists`](crate::connection::table_exists)).
+    /// [`table_exists`](crate::metadata::table_exists)).
     fn check_empty_append_target(&self, table: &str, ingested: i64) -> Result<()> {
         if ingested == 0
             && matches!(self.ingest_mode, Some(IngestMode::Append))

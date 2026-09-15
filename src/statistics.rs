@@ -24,12 +24,9 @@ use arrow_array::{
 use arrow_schema::{DataType, Fields, SchemaRef};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use google_cloud_spanner::client::DatabaseClient;
-use google_cloud_spanner::statement::StatementBuilder;
-use google_cloud_spanner::transaction::MultiUseReadOnlyTransaction;
 
-use crate::conversion::result_set_to_batch;
-use crate::error::{err, from_spanner};
-use crate::metadata::{LikeMatcher, metadata_sql_builder, str_col};
+use crate::error::err;
+use crate::metadata::{LikeMatcher, metadata_sql_builder, query_txn, str_col};
 use crate::nested::{arrow_err, dense_union, field, list_item, list_of, struct_fields};
 use crate::options::SharedConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
@@ -239,26 +236,6 @@ pub(crate) fn collect_statistics(
         }
     }
     Ok(schemas)
-}
-
-/// Run one metadata/aggregate query on the shared multi-use read-only transaction and materialise
-/// its result batch. Every read in [`collect_statistics`] — the `INFORMATION_SCHEMA` discovery and
-/// each per-table aggregate scan — goes through this one transaction, so they all observe a single
-/// consistent snapshot, and each builder comes from
-/// [`metadata_sql_builder`](crate::connection::metadata_sql_builder) so it carries the connection's
-/// retry bounds, replica selection and request priority. The results are only INT64 counts or string metadata, never a TIMESTAMP
-/// column, so the default timestamp precision is fine.
-async fn query_txn(
-    txn: &MultiUseReadOnlyTransaction,
-    statement: StatementBuilder,
-) -> Result<RecordBatch> {
-    let result_set = txn
-        .execute_query(statement.build())
-        .await
-        .map_err(from_spanner)?;
-    let (_schema, batch) =
-        result_set_to_batch(result_set, crate::conversion::TimestampPrecision::default()).await?;
-    Ok(batch)
 }
 
 /// A per-table aggregate statistics query, prepared but not yet run.

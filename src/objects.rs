@@ -24,9 +24,8 @@ use futures_util::try_join;
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::MultiUseReadOnlyTransaction;
 
-use crate::conversion::result_set_to_batch;
-use crate::error::{err, from_spanner};
-use crate::metadata::{LikeMatcher, metadata_sql_builder, str_col};
+use crate::error::err;
+use crate::metadata::{LikeMatcher, metadata_sql_builder, query_txn, str_col};
 use crate::nested::{arrow_err, field, list_item, list_of, list_of_nullable, struct_fields};
 use crate::options::SharedConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
@@ -417,7 +416,7 @@ const HIDE_HIDDEN_COLUMN_CONSTRAINTS: &str = "NOT EXISTS ( \
 
 /// Escape an ADBC `LIKE` pattern for GoogleSQL `LIKE`.
 ///
-/// The ADBC pattern contract (implemented client-side by [`like_match`](crate::connection::like_match)) has no escape syntax:
+/// The ADBC pattern contract (implemented client-side by [`like_match`](crate::metadata::like_match)) has no escape syntax:
 /// `%` and `_` are always wildcards and every other character — including `\` — is a literal.
 /// GoogleSQL `LIKE` agrees on `%`/`_` and case sensitivity, but treats `\` as an escape
 /// character; doubling each backslash turns it back into a literal, making the server-side
@@ -475,18 +474,6 @@ fn filtered_query(
         builder = builder.add_param(name.as_str(), value);
     }
     builder.build()
-}
-
-/// Run one metadata statement on the shared multi-use read-only transaction and materialise the
-/// result batch.
-async fn query_txn(
-    txn: &MultiUseReadOnlyTransaction,
-    statement: SpannerSql,
-) -> Result<RecordBatch> {
-    let result_set = txn.execute_query(statement).await.map_err(from_spanner)?;
-    let (_schema, batch) =
-        result_set_to_batch(result_set, crate::conversion::TimestampPrecision::default()).await?;
-    Ok(batch)
 }
 
 /// [`query_txn`] for a depth-gated statement: `None` (depth doesn't need the query) issues no

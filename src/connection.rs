@@ -99,14 +99,14 @@ use crate::timeout::with_timeout;
 mod exec;
 mod txn;
 
+use crate::metadata::{check_lookup_catalog, metadata_sql_builder, table_exists};
 pub(crate) use exec::{apply_isolation, run_batch_dml, run_batch_txn, write_mutations_txn};
 use exec::{isolation_to_adbc_string, parse_isolation_level};
 use txn::{ManualTxn, check_commit_writable};
 pub(crate) use txn::{SharedTxn, TxnKind, TxnState, lock_txn};
-// The `INFORMATION_SCHEMA` plumbing lives in [`crate::metadata`]; re-exported here so the
-// `crate::connection::` paths other modules already use keep resolving.
-use crate::metadata::check_lookup_catalog;
-pub(crate) use crate::metadata::{like_match, metadata_sql_builder, table_exists};
+// The `INFORMATION_SCHEMA` plumbing lives in [`crate::metadata`]; re-exported only so the
+// `crate::connection::like_match` path `lib.rs` uses keeps resolving.
+pub(crate) use crate::metadata::like_match;
 
 /// An ADBC connection to a Spanner database.
 ///

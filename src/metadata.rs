@@ -8,6 +8,7 @@ use adbc_core::error::{Error, Result, Status};
 use arrow_array::{RecordBatch, StringArray};
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::{Statement as SpannerSql, StatementBuilder};
+use google_cloud_spanner::transaction::MultiUseReadOnlyTransaction;
 
 use crate::conversion::{TimestampPrecision, result_set_to_batch};
 use crate::error::{err, from_spanner};
@@ -104,6 +105,27 @@ pub(crate) fn metadata_sql_builder(
                 .apply_priority_to_statement(SpannerSql::builder(sql)),
         ),
     )
+}
+
+/// Run one metadata statement on a shared multi-use read-only transaction and materialise its
+/// result batch.
+///
+/// Every driver-internal read of [`get_objects`](crate::objects::collect_objects) and
+/// [`get_statistics`](crate::statistics::collect_statistics) — `INFORMATION_SCHEMA` discovery and
+/// per-table aggregate scan alike — goes through one transaction, so they all observe a single
+/// consistent snapshot, and each statement comes from [`metadata_sql_builder`] so it carries the
+/// connection's retry bounds, replica selection and request priority. The results are string
+/// metadata or INT64 counts, never a TIMESTAMP, so the default timestamp precision is fine.
+pub(crate) async fn query_txn(
+    txn: &MultiUseReadOnlyTransaction,
+    statement: impl Into<SpannerSql>,
+) -> Result<RecordBatch> {
+    let result_set = txn
+        .execute_query(statement.into())
+        .await
+        .map_err(from_spanner)?;
+    let (_schema, batch) = result_set_to_batch(result_set, TimestampPrecision::default()).await?;
+    Ok(batch)
 }
 
 /// Extract column `index` of an `INFORMATION_SCHEMA` batch as a [`StringArray`]. Shared with the
