@@ -77,16 +77,14 @@ impl SpannerStatement {
     /// Both modes insert into a table that may already exist, so the spec wants their insert
     /// failure remapped: for `append` a missing table is [`Status::NotFound`] and a present one is a
     /// schema mismatch ([`Status::AlreadyExists`]); for `create_append` the `CREATE TABLE IF NOT
-    /// EXISTS` step guarantees the table is present, so only the schema-mismatch side can surface
-    /// (its spec contract: "error if the table exists, but the schema does not match"). `create` and
-    /// `replace` keep the raw insert error — their DDL step already owns the table-existence
-    /// contract ([`remap_ingest_create_error`](Self::remap_ingest_create_error)).
+    /// EXISTS` step guarantees the table is present, so only the schema-mismatch side can surface.
+    /// `create` and `replace` keep the raw insert error — their DDL step already owns the
+    /// table-existence contract ([`remap_ingest_create_error`](Self::remap_ingest_create_error)).
     ///
     /// A failure that already carries [`Status::AlreadyExists`] — a bound row duplicating a primary
-    /// key already in the table, since insert mutations keep `INSERT` semantics — keeps that status
-    /// and just gets the target table's name folded into the message. Any other failure is
-    /// reinterpreted from the [`ingest_table_exists`](Self::ingest_table_exists) probe; the original
-    /// Spanner error's detail is folded into the message.
+    /// key, since insert mutations keep `INSERT` semantics — keeps that status and just gets the
+    /// table name folded into the message. Any other failure is reinterpreted from the
+    /// [`ingest_table_exists`](Self::ingest_table_exists) probe.
     fn remap_ingest_append_error(&self, table: &str, error: Error) -> Error {
         if !matches!(
             self.ingest_mode,
@@ -135,13 +133,11 @@ impl SpannerStatement {
 
     /// Run a bulk ingest of the bound rows into `table`, honouring the configured ingest mode.
     ///
-    /// Shared by `execute` and `execute_update` so both entry points ingest identically: an ingest
-    /// needs no SQL query, so an FFI caller reaches it through either the query out-pointer
-    /// (`execute`) or the affected-rows path (`execute_update`). In the create/replace modes the
-    /// table is first built (keyless) from the ingest data's Arrow schema via DDL, which Spanner
-    /// runs immediately before the inserts. Returns the ingested-row count
-    /// (summed across chunk transactions — see [`run_ingest_mutations`](Self::run_ingest_mutations)),
-    /// or `None` when the rows were buffered for a manual-transaction commit.
+    /// Shared by `execute` and `execute_update` so both entry points ingest identically. In the
+    /// create/replace modes the table is first built (keyless) from the ingest data's Arrow schema
+    /// via DDL, which Spanner runs immediately before the inserts. Returns the ingested-row count
+    /// (summed across chunk transactions), or `None` when the rows were buffered for a
+    /// manual-transaction commit.
     ///
     /// An ingest small enough for one chunk (the common case) applies atomically; one large enough
     /// to need several chunks does **not** — each chunk commits in its own transaction, so a
@@ -176,9 +172,8 @@ impl SpannerStatement {
         // It only closes the race for the single-threaded case: a concurrent statement could fix
         // the transaction to query-kind between this check and the DDL, orphaning the table. Fully
         // closing it would mean holding the connection-wide txn lock across a multi-second admin
-        // `UpdateDatabaseDdl` RPC — not worth stalling every other statement. The residual window
-        // is exactly the documented "DDL is not transaction-aware / DML–DDL reorder" caveat (see
-        // CLAUDE.md, `run_ddl`).
+        // `UpdateDatabaseDdl` RPC. The residual window is the documented "DDL is not
+        // transaction-aware" caveat (see `run_ddl`).
         {
             let txn = lock_txn(&self.txn);
             if !txn.autocommit() {
@@ -200,13 +195,11 @@ impl SpannerStatement {
     /// table already exists.
     ///
     /// `create` mode promises to build the table, so hitting an existing one is the
-    /// ADBC-contractual `AlreadyExists` — consumers branch on that status (e.g. to fall back to
-    /// append). Spanner reports it as a generic schema-change failure ("Duplicate name in
-    /// schema"), so the existence is confirmed via the shared
-    /// [`table_exists`](crate::metadata::table_exists) probe and the remapped message names the
-    /// table. Only `create` is remapped: `create_append` guards with `IF NOT EXISTS` and `replace`
-    /// drops first, so their DDL failures are never about the table already existing. If the table
-    /// is absent — or the probe itself fails — the original DDL error surfaces unchanged.
+    /// ADBC-contractual `AlreadyExists` — consumers branch on that status. Spanner reports it as a
+    /// generic schema-change failure ("Duplicate name in schema"), so the existence is confirmed
+    /// via the shared [`table_exists`](crate::metadata::table_exists) probe. Only `create` is
+    /// remapped: `create_append` guards with `IF NOT EXISTS` and `replace` drops first. If the
+    /// table is absent — or the probe itself fails — the original DDL error surfaces unchanged.
     fn remap_ingest_create_error(&self, table: &str, error: Error) -> Error {
         // Unset (`None`) is `create`, the default, so remap its DDL failure too.
         if !matches!(self.ingest_mode, None | Some(IngestMode::Create)) {
@@ -239,32 +232,21 @@ impl SpannerStatement {
     /// **Manual mode** buffers every row's mutation for the next `commit`, which applies them
     /// atomically in the *same* read/write transaction as any buffered DML — Spanner applies
     /// buffered mutations at commit time, after the transaction's DML has executed. Never chunked:
-    /// the commit applies the user's whole transaction atomically, so an over-limit manual-mode
-    /// ingest fails at commit, as any over-limit user transaction would. Buffering is
-    /// **all-or-nothing**: the whole batch is built (outside the transaction lock) before any of
-    /// it is buffered, so a row that fails Arrow→Spanner conversion leaves the pending buffer
-    /// exactly as it was — a later `commit` never silently applies a partial batch.
+    /// an over-limit manual-mode ingest fails at commit, as any over-limit user transaction would.
+    /// Buffering is **all-or-nothing**: the whole batch is built (outside the transaction lock)
+    /// before any of it is buffered, so a row that fails Arrow→Spanner conversion leaves the
+    /// pending buffer exactly as it was.
     ///
     /// **Autocommit mode** builds and ships the mutations chunk by chunk, each chunk in its own
     /// write-only transaction (with the client's retry/replay protection), returning the ingested
-    /// row count summed across chunks. Why chunk: Spanner caps a single commit at ~80,000 mutations
-    /// — counted roughly as rows × columns, plus secondary-index entries — and ~100 MB, so one
-    /// unchunked commit fails outright once the ingest crosses those cliffs (10k rows × 10 columns
-    /// is already there). An ingest that fits [`IngestChunkBudget`]'s conservative budgets still
-    /// commits as a single atomic transaction; only one big enough to need several chunks — which
-    /// could not have committed as one transaction anyway — loses whole-ingest atomicity, and a
-    /// later chunk's failure reports exactly how many rows the earlier chunks committed (see
-    /// [`note_rows_already_committed`]). Building per chunk also bounds memory to one chunk of
-    /// mutations at a time.
-    ///
-    /// The `rows × columns` budget cannot see the **secondary-index** entries that also count
-    /// toward the per-commit cap, so a heavily-indexed table can overshoot it even inside a
-    /// driver-"safe" chunk. As a reactive backstop, a write-only chunk whose commit is rejected for
-    /// *too many mutations* is split in half and its halves retried, down to a single row — see
-    /// [`write_mutation_range`](Self::write_mutation_range). Like the multi-chunk case, a bisected
-    /// chunk is not atomic as a whole; the row count and the already-committed accounting stay
-    /// exact. (The BatchWrite path — `spanner.ingest.batch_write` — is not bisected: it ships one
-    /// group per row, so the mutation cap does not bind it the same way.)
+    /// row count summed across chunks. Spanner caps a single commit at ~80,000 mutations (roughly
+    /// rows × columns, plus secondary-index entries) and ~100 MB, which 10k rows × 10 columns
+    /// already crosses. An ingest that fits [`IngestChunkBudget`]'s conservative budgets still
+    /// commits as one atomic transaction; only one needing several chunks — which could not have
+    /// committed as one transaction anyway — loses whole-ingest atomicity, and a later chunk's
+    /// failure reports exactly how many rows the earlier chunks committed (see
+    /// [`note_rows_already_committed`]). A chunk that still overshoots the mutation cap is
+    /// bisected and retried — see [`write_mutation_range`](Self::write_mutation_range).
     fn run_ingest_mutations(&self, table: &str) -> Result<Option<i64>> {
         // Mutations name their target table directly (no SQL quoting; a named schema joins with a
         // plain dot).
@@ -283,10 +265,9 @@ impl SpannerStatement {
         if manual {
             // Manual mode: build *every* row's mutation before touching the buffer, and build
             // outside the txn lock. All-or-nothing buffering keeps the commit contract honest — a
-            // mid-row conversion failure (e.g. an out-of-range date) must not strand the rows
-            // before it for a later `commit` to apply silently. Keeping the O(rows) build out of
-            // the connection-wide mutex also avoids stalling concurrent txn-state users and cannot
-            // poison the mutex on a panic.
+            // mid-row conversion failure must not strand the rows before it for a later `commit` to
+            // apply silently — and keeping the O(rows) build out of the connection-wide mutex
+            // avoids stalling concurrent txn-state users.
             let rows = self.bound.iter().map(RecordBatch::num_rows).sum();
             let mutations = self.build_range_mutations(&target, 0, rows)?;
             // An empty append buffers nothing and would commit clean, so a missing target table
@@ -343,13 +324,10 @@ impl SpannerStatement {
     ///
     /// A zero-row ingest ships nothing, so the insert error that normally drives
     /// [`remap_ingest_append_error`](Self::remap_ingest_append_error)'s NotFound never fires — yet
-    /// the ADBC append contract is NotFound for an absent table regardless of row count. Both ingest
-    /// paths call this after a zero-row ingest (`ingested == 0`): the autocommit path after its
-    /// (no-op) commit, the manual path before buffering nothing. Only `append` needs it —
-    /// `create_append`'s `CREATE TABLE IF NOT EXISTS` guarantees the table exists, and
-    /// `create`/`replace` own existence via their own DDL. A probe that itself fails teaches nothing
-    /// about the table, so — as everywhere else — the empty ingest just succeeds (see
-    /// [`table_exists`](crate::metadata::table_exists)).
+    /// the ADBC append contract is NotFound for an absent table regardless of row count. Only
+    /// `append` needs it: `create_append`'s `CREATE TABLE IF NOT EXISTS` guarantees the table
+    /// exists, and `create`/`replace` own existence via their own DDL. A failed probe leaves the
+    /// empty ingest succeeding (see [`table_exists`](crate::metadata::table_exists)).
     fn check_empty_append_target(&self, table: &str, ingested: i64) -> Result<()> {
         if ingested == 0
             && matches!(self.ingest_mode, Some(IngestMode::Append))
@@ -367,12 +345,10 @@ impl SpannerStatement {
     /// batches, mapping each global row index back to its `(batch, row)`.
     ///
     /// The same cheap Arrow→Spanner build the forward path uses ([`bind::insert_mutation`]), so a
-    /// bisected retry rebuilds a half's mutations straight from the batches — no `Vec<Mutation>` is
-    /// cloned on the happy path solely to keep a copy around for a retry that usually never happens.
-    ///
-    /// A conversion failure here (e.g. an out-of-range date) on a *later* chunk is annotated by the
-    /// autocommit callers with the earlier chunks' committed-row count, like a commit
-    /// failure, so the `run_ingest` "reports their exact count" contract holds for build errors too.
+    /// bisected retry rebuilds a half's mutations straight from the batches — nothing is cloned on
+    /// the happy path for a retry that usually never happens. A conversion failure on a *later*
+    /// chunk is annotated by the autocommit callers with the earlier chunks' committed-row count,
+    /// like a commit failure.
     fn build_range_mutations(
         &self,
         target: &str,
@@ -440,8 +416,7 @@ impl SpannerStatement {
     /// heavily-indexed table can overshoot Spanner's ~80,000-mutation cap even inside a
     /// driver-"safe" chunk. This is the reactive backstop: on that specific error
     /// ([`is_mutation_limit_exceeded`]) the range is bisected and each half retried, down to a
-    /// single row. Every **other** error — a duplicate key, a bad value, a timeout, a cancel, an
-    /// `ABORTED` — propagates unchanged, so the append/create remaps and
+    /// single row. Every **other** error propagates unchanged, so the append/create remaps and
     /// [`note_rows_already_committed`] still fire. A single row that *still* overshoots is
     /// un-splittable, so its error propagates too (no infinite recursion, no empty commit). Like the
     /// multi-chunk ingest, a bisected chunk is **not atomic as a whole**; `prior_total` is threaded
@@ -491,25 +466,20 @@ impl SpannerStatement {
     /// Apply one ingest chunk through Spanner's **BatchWrite** RPC (the
     /// `spanner.ingest.batch_write` autocommit path), returning the number of rows applied.
     ///
-    /// Each row's insert mutation is sent as its own [`MutationGroup`]. BatchWrite applies groups
-    /// **independently and non-atomically** — the same "not atomic as a whole" guarantee the
-    /// multi-chunk write-only path carries, but now within a chunk too — which is what makes it the
+    /// Each row's insert mutation is sent as its own [`MutationGroup`], applied **independently
+    /// and non-atomically** — not atomic as a whole even within a chunk, which is what makes it the
     /// cheaper firehose transport. Each streamed [`BatchWriteResponse`] reports, per group index,
     /// whether it applied: an `OK`/absent status counts those rows as applied, and the first
     /// non-`OK` group status — code, message *and* its `google.rpc.Status` details — becomes the
-    /// returned error via [`from_status_parts`] (so a duplicate primary key still surfaces as
-    /// `AlreadyExists`, its details reach `Error::details`, and the append/create remaps fire,
-    /// exactly as on the write-only path). Because a non-atomic batch may have applied some groups
-    /// before the failing one — or before a mid-stream transport error — any error is annotated via
-    /// [`note_rows_already_committed`], folding this chunk's `applied` groups (one row each)
-    /// into `prior_total` so the count covers earlier chunks *and* this chunk's committed rows.
+    /// returned error via [`from_status_parts`], so a duplicate primary key still surfaces as
+    /// `AlreadyExists` and the append/create remaps fire exactly as on the write-only path. Because
+    /// a non-atomic batch may have applied some groups before the failing one, any error is
+    /// annotated via [`note_rows_already_committed`], folding this chunk's `applied` groups (one row
+    /// each) into `prior_total`.
     ///
-    /// The request does carry `spanner.request.priority` and `spanner.transaction.tag`
-    /// ([`RequestConfig::apply_to_batch_write`](crate::request::RequestConfig::apply_to_batch_write)).
-    /// It has no per-request *commit* options and its response has no commit statistics, so
-    /// `spanner.commit.max_delay` and `spanner.commit_stats` do not apply on this path; nor does
-    /// `spanner.request.tag`, which Spanner ignores for BatchWrite (documented on
-    /// [`OPTION_INGEST_BATCH_WRITE`](crate::OPTION_INGEST_BATCH_WRITE)).
+    /// Which options reach this path is documented on
+    /// [`OPTION_INGEST_BATCH_WRITE`](crate::OPTION_INGEST_BATCH_WRITE); they are applied by
+    /// [`RequestConfig::apply_to_batch_write`](crate::request::RequestConfig::apply_to_batch_write).
     fn batch_write_chunk(&self, mutations: Vec<Mutation>, prior_total: i64) -> Result<i64> {
         if mutations.is_empty() {
             return Ok(0);
@@ -630,8 +600,8 @@ pub(super) fn ingest_batch_write_option(value: OptionValue) -> Result<bool> {
 /// [`SpannerStatement::run_ingest_mutations`]), so a mid-ingest failure leaves the earlier chunks'
 /// rows in the table. On the write-only path a chunk is atomic, so `committed` is just the earlier
 /// chunks; on the non-atomic BatchWrite path it also includes the failing chunk's groups that did
-/// apply. Either way that count is known exactly, and reporting it tells the caller what
-/// state the table was left in instead of making them guess.
+/// apply. Either way the count is exact, and reporting it tells the caller what state the table was
+/// left in.
 ///
 /// A [`Status::Timeout`]/[`Status::Cancelled`] failure is the exception: cancel/timeout
 /// *drops* the in-flight `Commit` future, which may still land server-side, so the **failing

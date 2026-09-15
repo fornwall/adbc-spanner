@@ -3,73 +3,30 @@
 //! ## Transactions
 //!
 //! By default the connection is in **autocommit** mode: every statement runs in its own Spanner
-//! transaction (a single-use read-only transaction for queries, a read/write transaction for
-//! DML).
+//! transaction (a single-use read-only transaction for queries, a read/write transaction for DML).
 //!
-//! Setting the `adbc.connection.autocommit` option to `false` begins **manual** transaction mode.
-//! A manual transaction is exactly one of two kinds — **queries** or **DML** — fixed by its
-//! *first* statement; a statement of the other kind is rejected with [`Status::InvalidState`]
-//! until [`Connection::commit`] or [`Connection::rollback`] ends the transaction:
+//! Setting `adbc.connection.autocommit` to `false` begins **manual** transaction mode, where a
+//! transaction is exactly one of two kinds — **queries** or **DML** — fixed by its *first*
+//! statement; a statement of the other kind is rejected with [`Status::InvalidState`] until
+//! [`Connection::commit`] or [`Connection::rollback`] ends it:
 //!
-//! - **Queries** (first statement is a data-returning read): the driver opens one **multi-use
-//!   read-only transaction** and runs every query of the transaction on it, so all reads observe
-//!   a single consistent snapshot (pinned at the first query's `spanner.read.staleness` bound —
-//!   the bounded-staleness kinds are pinned to their most-stale legal equivalent, as on any
-//!   multi-use transaction). Commit and rollback are local: a Spanner read-only transaction needs
-//!   no commit/rollback RPC, so the snapshot is simply dropped.
-//! - **DML** (first statement is DML or a bulk ingest): Spanner's client exposes read/write
-//!   transactions only through a closure-based runner (no public begin/commit handle), so the
-//!   driver *buffers* DML statements — and the insert **mutations** of any bulk ingest — and
-//!   applies the whole batch atomically in a single read/write transaction on commit. That also
-//!   makes retry-on-abort safe: the buffer is simply replayed.
+//! - **Queries**: one **multi-use read-only transaction** carries every query of the transaction,
+//!   so all reads observe a single consistent snapshot (pinned at the first query's
+//!   `spanner.read.staleness` bound). Commit and rollback are local — a Spanner read-only
+//!   transaction needs no RPC, so the snapshot is simply dropped.
+//! - **DML**: Spanner's client exposes read/write transactions only through a closure-based runner
+//!   (no public begin/commit handle), so the driver *buffers* DML statements — and the insert
+//!   **mutations** of any bulk ingest — and applies the whole batch atomically in one read/write
+//!   transaction on commit. That also makes retry-on-abort safe: the buffer is simply replayed.
 //!
-//! **DDL is not transaction-aware.** Matching the ADBC BigQuery driver — which classifies
-//! nothing and sends every statement down its one execution path — DDL always executes
-//! immediately (through the admin `UpdateDatabaseDdl` API; Spanner DDL is never transactional)
-//! and leaves the transaction state untouched: it neither fixes the transaction's kind nor is
-//! rejected by it, and `commit`/`rollback` never affect it.
+//! **DDL is not transaction-aware**: it always executes immediately through the admin
+//! `UpdateDatabaseDdl` API (Spanner DDL is never transactional) and leaves the transaction state
+//! untouched, so DDL issued after buffered DML runs before it.
 //!
-//! [`Connection::rollback`] discards the buffered work (or drops the read-only snapshot).
-//!
-//! Consequences of this model, which callers should be aware of:
-//! - In manual mode, `execute_update` on DML returns `None` (the affected-row count is not known
-//!   until commit).
-//! - DML with a `THEN RETURN` clause is rejected in manual mode: it must run via `ExecuteSql` to
-//!   produce its rows, but buffered DML is applied through `ExecuteBatchDml` (which does not
-//!   support `THEN RETURN`) — and the rows would be unobtainable at commit time anyway.
-//! - **No read-your-writes (guarded):** buffered DML only executes at commit, so a query could
-//!   never observe it. Rather than silently returning a *pre-write* result, a data-returning
-//!   query (`execute`, the bound-query path, `execute_partitions`, and a query routed through
-//!   `execute_update` — which executes it read-only and discards the rows) issued in a manual
-//!   transaction that began with DML is rejected with [`Status::InvalidState`] — the kind-mixing
-//!   rule above. (`execute_schema`, a schema-only PLAN probe returning no data, is not guarded;
-//!   partitioned reads run in their own batch read-only transaction and do not join a query
-//!   transaction's snapshot.)
-//! - **DML and DDL reorder:** DDL executes immediately, so DDL issued after buffered DML runs
-//!   before it. (Inside a query transaction, immediate DDL is invisible to the pinned snapshot —
-//!   ordinary snapshot semantics.)
-//! - **Ingest mutations apply at commit time:** a buffered bulk ingest's insert mutations are
-//!   applied by Spanner as part of the commit itself — after every buffered DML statement in the
-//!   transaction has executed, regardless of issue order — so DML in the same transaction cannot
-//!   observe the ingested rows.
-//! - **A read-only connection cannot commit buffered writes.** `adbc.connection.readonly` rejects
-//!   *all* writes, and the commit that applies buffered DML / ingest mutations is one: with the
-//!   flag set, [`Connection::commit`] — and enabling `adbc.connection.autocommit`, which commits
-//!   any pending work as a side effect — fails with [`Status::InvalidState`] and leaves the
-//!   transaction open and replayable (clear the flag and commit again to apply it). Ending a
-//!   transaction that writes nothing is never gated: a query transaction commits (its snapshot is
-//!   just dropped) and [`Connection::rollback`] always works, since discarding buffered work
-//!   writes nothing.
-//! - A **failed** commit keeps the buffer and the transaction open: the caller can retry
-//!   [`Connection::commit`] (replaying the batch) or [`Connection::rollback`] to discard it. The
-//!   same holds when re-enabling autocommit fails to commit the buffer: the connection stays in
-//!   manual mode. On `ABORTED` (the retriable code preserved in `vendor_code`) the failed attempt
-//!   is guaranteed not to have committed, so the replay is exact; after an *ambiguous* transport
-//!   failure the usual Spanner caveat applies — the commit may have landed, so a replay can apply
-//!   the batch twice unless the DML is idempotent. A **mutations-only** transaction (bulk ingests
-//!   that buffered no DML) is exempt: it commits through the client's replay-protected write-only
-//!   transaction ([`write_mutations_txn`]), which applies the mutations exactly once even across
-//!   ambiguous transport failures.
+//! The user-facing consequences — no read-your-writes, `None` DML counts before commit, the
+//! commit-failure replay semantics and the read-only-connection commit guard — are documented on
+//! [`SpannerConnection`] and in
+//! [docs/transactions.md](https://github.com/fornwall/adbc-spanner/blob/main/docs/transactions.md).
 
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -134,9 +91,9 @@ pub(crate) use txn::{SharedTxn, TxnKind, TxnState, lock_txn};
 /// transaction replayable; committing a query transaction and [`Connection::rollback`] stay
 /// available (neither writes).
 ///
-/// See the [crate documentation](crate) — and the fuller module-level notes in `connection.rs` —
-/// for the list of consequences (no read-your-writes, `None` DML counts before commit,
-/// commit-failure replay semantics).
+/// See [docs/transactions.md](https://github.com/fornwall/adbc-spanner/blob/main/docs/transactions.md)
+/// for the full model: no read-your-writes, `None` DML counts before commit, and the
+/// commit-failure replay semantics.
 #[derive(Debug)]
 pub struct SpannerConnection {
     runtime: SharedRuntime,
@@ -369,13 +326,10 @@ impl Connection for SpannerConnection {
     }
 
     fn get_cancel_handle(&self) -> Box<dyn CancelHandle> {
-        // The handle latches the current operation's (sticky) signal: an in-flight metadata/commit
-        // operation wakes and returns Cancelled, and a cancel landing between two chunk fetches of
-        // a `read_partition` stream still cancels the next fetch — permanently, since the latch is
-        // never cleared. The connection's next operation mints a fresh signal instead, so a cancel
-        // with nothing running does not affect later operations, and later operations cannot
-        // revive a cancelled reader. Statements have their own signal, so this does not affect a
-        // query running on a statement from this connection.
+        // The handle latches the current operation's (sticky) signal, so an in-flight operation
+        // wakes and returns Cancelled and a cancel between two chunk fetches still cancels the next
+        // one. Statements have their own signal, so this does not affect a query running on a
+        // statement from this connection.
         Box::new(SlotCancelHandle::new(self.cancel.clone()))
     }
 
@@ -606,15 +560,12 @@ impl Connection for SpannerConnection {
     ///
     /// A partition descriptor is **opaque but executable**: a versioned JSON envelope
     /// (`{"v":1,"partition":…}`) around the serde form of the client's `Partition`, whose inner
-    /// `ExecuteSqlRequest` carries the SQL text itself along with the session and transaction
-    /// identity. `read_partition` runs whatever that blob contains against this connection's
-    /// `DatabaseClient`, with **this connection's credentials** — so a crafted descriptor executes
-    /// arbitrary SQL as the connection's principal. This is inherent to ADBC's portable-descriptor
-    /// design and the upstream serde format. The version envelope only guards against format drift
-    /// between driver versions (an unsupported version is rejected as `InvalidArguments`); there
-    /// is no in-band authentication of the blob. Treat a descriptor as an executable request, not
-    /// as opaque data:
-    /// transport it only over trusted channels and **never accept one from an untrusted source**.
+    /// `ExecuteSqlRequest` carries the SQL text along with the session and transaction identity.
+    /// `read_partition` runs whatever that blob contains with **this connection's credentials**, so
+    /// a crafted descriptor executes arbitrary SQL as the connection's principal. The version
+    /// envelope only guards against format drift between driver versions (an unsupported version is
+    /// rejected as `InvalidArguments`); there is no in-band authentication. Transport a descriptor
+    /// only over trusted channels and **never accept one from an untrusted source**.
     fn read_partition(
         &self,
         partition: impl AsRef<[u8]>,
@@ -663,11 +614,10 @@ impl Connection for SpannerConnection {
 
 /// The partition-descriptor envelope version written by [`encode_partition`].
 ///
-/// The descriptor's payload is the client's [`Partition`] serde form — a compatibility surface
-/// this driver does not control (a client-crate bump can silently change it), while descriptors
-/// travel between processes and driver versions. The version envelope makes that drift
-/// detectable: bump this when the payload format changes incompatibly, so an older driver rejects
-/// a newer descriptor with a clear error instead of a confusing shape mismatch.
+/// The payload is the client's [`Partition`] serde form — a compatibility surface this driver does
+/// not control — while descriptors travel between processes and driver versions. Bump this when the
+/// payload format changes incompatibly, so an older driver rejects a newer descriptor with a clear
+/// error instead of a confusing shape mismatch.
 pub(crate) const PARTITION_DESCRIPTOR_VERSION: u64 = 1;
 
 /// Encode a [`Partition`] into an opaque ADBC partition descriptor: the versioned JSON envelope
@@ -716,13 +666,11 @@ pub(crate) fn decode_partition(descriptor: &[u8]) -> Result<Partition> {
 }
 
 /// Validate a `current_catalog` / `current_schema` set request. Spanner has a single, unnamed (`""`)
-/// catalog, and — although it supports named schemas (addressed by qualified name and enumerated by
-/// `get_objects`) — no settable session/current schema to select one. Both "current" values are
-/// therefore fixed at `""` (mirrored by the `get_option` side, which always reports `""`), so the
-/// only conformant value is the empty string, accepted as a no-op; setting either to any other value
-/// is unsupported and rejected with `NotImplemented` (matching the C++ PostgreSQL driver's treatment
-/// of an unsupported `set` on this class). A non-string value is a malformed argument
-/// (`InvalidArguments`). `what` names the option in the error.
+/// catalog, and — although it supports named schemas — no settable session/current schema to select
+/// one. Both "current" values are therefore fixed at `""` (as `get_option` reports), so the only
+/// conformant value is the empty string, accepted as a no-op; any other value is rejected with
+/// `NotImplemented` (matching the C++ PostgreSQL driver), and a non-string value with
+/// `InvalidArguments`. `what` names the option in the error.
 fn check_unnamed_catalog_or_schema(value: OptionValue, what: &str) -> Result<()> {
     let OptionValue::String(s) = value else {
         return Err(invalid_argument(format!("expected a string {what} value")));

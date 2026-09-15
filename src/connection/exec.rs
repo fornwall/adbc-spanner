@@ -22,13 +22,12 @@ use crate::timeout::with_timeout;
 ///
 /// [`IsolationLevel::Unspecified`] leaves the builder untouched, so no level rides the
 /// `TransactionOptions` and Spanner applies its own default, `SERIALIZABLE` (there is no
-/// database-level or client-level isolation default to inherit — the option is per-transaction
-/// only). A specific level is forwarded to [`TransactionRunnerBuilder::set_isolation_level`].
+/// database- or client-level isolation default to inherit). A specific level is forwarded to
+/// [`TransactionRunnerBuilder::set_isolation_level`].
 ///
 /// This is the only place an isolation level enters the driver, and it is reached only from the
-/// read/write (DML) paths. Queries take a [timestamp bound](crate::staleness) instead — Spanner
-/// does not accept an isolation level on a read-only or partitioned-DML transaction — and the
-/// mutations-only ingest commit uses the write-only builder, which has no isolation setter.
+/// read/write (DML) paths: queries take a [timestamp bound](crate::staleness) instead, and the
+/// write-only builder has no isolation setter.
 #[must_use]
 pub(super) fn apply_isolation(
     builder: TransactionRunnerBuilder,
@@ -62,22 +61,17 @@ pub(crate) async fn build_runner(
 /// [`IsolationLevel`]. Spanner exposes two levels, `SERIALIZABLE` and `REPEATABLE_READ`; the
 /// `default` value sends none, which Spanner reads as `SERIALIZABLE`.
 ///
-/// **Three spec levels map natively.** Spanner implements `REPEATABLE_READ` as *snapshot
-/// isolation* — its proto definition matches ADBC's [`snapshot`] almost verbatim ("all reads
-/// performed during the transaction observe a consistent snapshot of the database, and the
-/// transaction is only successfully committed in the absence of conflicts between its updates and
-/// any concurrent updates that have occurred since that snapshot") — so `snapshot` is an exact
-/// match for `REPEATABLE_READ`, not a promotion. That also makes Spanner's `REPEATABLE_READ`
-/// *stronger* than the ANSI level of the same name, so it satisfies a `repeatable_read` request too.
+/// Spanner implements `REPEATABLE_READ` as *snapshot isolation* — its proto definition matches
+/// ADBC's [`snapshot`] almost verbatim — so `snapshot` is an exact match, not a promotion, and
+/// Spanner's `REPEATABLE_READ` is *stronger* than the ANSI level of the same name, satisfying a
+/// `repeatable_read` request too.
 ///
 /// The remaining two levels are **promoted upward** to the weakest supported level that still
-/// satisfies their guarantees, rather than being rejected. Isolation levels are
-/// minimum-guarantee contracts — each names the *maximum* anomalies it permits — so a stronger
-/// level always satisfies a weaker one's request, and promoting upward delivers *at least* what
-/// was asked. The ADBC spec's "if the desired isolation level is not supported … return an
-/// appropriate error" targets the opposite case, a driver that can only offer something *weaker*;
-/// this driver never downgrades. The SQL standard and JDBC's `setTransactionIsolation` likewise
-/// sanction substituting a higher level. (An unknown level string is still rejected below.)
+/// satisfies their guarantees rather than rejected: isolation levels are minimum-guarantee
+/// contracts, so a stronger level always satisfies a weaker one's request. The spec's "if the
+/// desired isolation level is not supported … return an appropriate error" targets the opposite
+/// case, a driver that can only offer something *weaker*; this driver never downgrades, and the
+/// SQL standard and JDBC's `setTransactionIsolation` likewise sanction substituting higher.
 ///
 /// | requested          | mapped to         | rationale                                                  |
 /// |--------------------|-------------------|------------------------------------------------------------|
@@ -88,9 +82,8 @@ pub(crate) async fn build_runner(
 /// | `read_committed`   | `REPEATABLE_READ` | promoted: weakest supported level that satisfies it          |
 /// | `linearizable`     | `SERIALIZABLE`    | promoted: Spanner R/W txns are externally consistent (strict serializable = linearizable) |
 ///
-/// The stored (effective) level is what `get_option` reports back, so callers see the level that
-/// will actually run, never an unsupported input echoed. A truly unknown/unparseable level string
-/// is still rejected with `InvalidArguments`.
+/// `get_option` reports the stored (effective) level, so callers see what will actually run. A
+/// truly unknown level string is rejected with `InvalidArguments`.
 ///
 /// Note that under `REPEATABLE_READ` Spanner detects **write-write conflicts only**, so a DML
 /// statement that reads rows it does not write (a subquery guard, a join, `INSERT … SELECT`) can
@@ -142,13 +135,11 @@ pub(super) fn isolation_to_adbc_string(isolation: &IsolationLevel) -> &'static s
 /// applied immediately. Batches that belong to a manual transaction (and may carry buffered
 /// mutations) go through [`run_batch_txn`] instead.
 ///
-/// `last_statement` optimization: an autocommit batch — single statement or `;`-batch — is by
-/// construction the transaction's *entire* content (the runner runs this one `ExecuteBatchDml`
-/// and commits, with nothing else in the transaction). Flagging it as the transaction's last
-/// request (`ExecuteBatchDmlRequest.last_statements`) lets Spanner release the transaction in the
-/// same round-trip, so the trailing `Commit` needs no extra server work. Mutation-carrying /
-/// manual-commit batches go through [`run_batch_txn`] with the flag off (their commit still
-/// applies buffered mutations, so the batch is *not* the transaction's last request).
+/// `last_statement` optimization: an autocommit batch is by construction the transaction's *entire*
+/// content, so flagging it as the transaction's last request
+/// (`ExecuteBatchDmlRequest.last_statements`) lets Spanner release the transaction in the same
+/// round-trip. Mutation-carrying / manual-commit batches go through [`run_batch_txn`] with the flag
+/// off — their commit still applies buffered mutations, so the batch is *not* the last request.
 pub(crate) fn run_batch_dml(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
@@ -177,17 +168,14 @@ pub(crate) fn run_batch_dml(
 /// applied by Spanner as part of its commit — i.e. *after* every statement has executed, whatever
 /// order they were issued in. The runner may retry the closure on abort, so both (cloned) lists
 /// are replayed on each attempt. This is the manual-transaction commit path; the DML-only wrapper
-/// is [`run_batch_dml`].
-///
-/// The caller's `spanner.rpc.timeout_seconds.update` value (`config.timeouts`) is an overall
-/// deadline on the whole transaction (including the runner's abort retries); expiry fails with
-/// [`Status::Timeout`](adbc_core::error::Status::Timeout). Note a commit whose confirmation the driver stopped waiting for may still
-/// have landed server-side, the usual ambiguity of any timed-out commit.
-///
-/// `last_statements` marks this batch as the transaction's final request (see the
-/// [`run_batch_dml`] doc for the `last_statement` optimization). Callers must pass `false` unless
-/// the batch is genuinely the whole transaction: the manual-commit path buffers `mutations` that
+/// is [`run_batch_dml`], whose doc also covers `last_statements`. Callers must pass `false` unless
+/// the batch is genuinely the whole transaction — the manual-commit path buffers `mutations` that
 /// Spanner applies *at* commit, so the batch is never the last request there.
+///
+/// `spanner.rpc.timeout_seconds.update` is an overall deadline on the whole transaction (including
+/// the runner's abort retries); expiry fails with
+/// [`Status::Timeout`](adbc_core::error::Status::Timeout), and a commit whose confirmation the
+/// driver stopped waiting for may still have landed server-side.
 pub(crate) fn run_batch_txn(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
@@ -258,12 +246,11 @@ pub(crate) fn run_batch_txn(
 /// can apply the batch twice — `write` is replay-protected: it begins the transaction with a
 /// mutation key and retries internally on `ABORTED`, so on success the mutations were applied
 /// **exactly once** whatever the underlying network did. The same commit configuration as the
-/// runner path is applied via [`RequestConfig::apply_to_write_only`](crate::request::RequestConfig::apply_to_write_only) /
-/// [`RetryConfig::apply_to_write_only`](crate::retry::RetryConfig::apply_to_write_only): commit priority, transaction tag,
-/// `spanner.commit.max_delay`, `spanner.commit_stats` (the returned mutation count is recorded
-/// into `config.commit_stats`), and the retry/backoff tuning on the Begin/Commit RPCs.
-/// `config.isolation` is deliberately ignored here — the write-only builder exposes no isolation
-/// setter, and a transaction that performs no reads has no reads for a level to constrain.
+/// runner path is applied via
+/// [`RequestConfig::apply_to_write_only`](crate::request::RequestConfig::apply_to_write_only) /
+/// [`RetryConfig::apply_to_write_only`](crate::retry::RetryConfig::apply_to_write_only).
+/// `config.isolation` is deliberately ignored — the write-only builder exposes no isolation setter,
+/// and a transaction that performs no reads has none for a level to constrain.
 pub(crate) fn write_mutations_txn(
     runtime: &SharedRuntime,
     client: &DatabaseClient,

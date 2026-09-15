@@ -1,20 +1,18 @@
 //! The [`SpannerStatement`] — an ADBC statement that runs SQL against Spanner and returns Arrow.
 //!
-//! A statement holds a SQL string set via [`Statement::set_sql_query`]. Calling
-//! [`Statement::execute`] runs it as a query in a single-use read-only transaction and returns a
-//! streaming Arrow [`RecordBatchReader`]: rows are pulled from Spanner and converted to Arrow in
-//! bounded chunks (see [`OPTION_ROWS_PER_BATCH`](crate::OPTION_ROWS_PER_BATCH)) as the consumer
-//! iterates, so a large result set is not fully materialised in memory. Calling
-//! [`Statement::execute_update`] runs DML inside a read/write transaction and returns the number
-//! of affected rows, and routes DDL to the admin API. SQL that is neither (a query — `adbc.h`
-//! sanctions executing any statement without expecting a result set) runs through the same
-//! read-only query machinery as `execute`, with the rows drained and discarded and no count
-//! (`None`) reported.
+//! A statement holds a SQL string set via [`Statement::set_sql_query`].
+//! [`Statement::execute`] runs it as a query in a single-use read-only transaction, returning a
+//! streaming Arrow [`RecordBatchReader`] that converts rows in bounded chunks (see
+//! [`OPTION_ROWS_PER_BATCH`](crate::OPTION_ROWS_PER_BATCH)) as the consumer iterates.
+//! [`Statement::execute_update`] runs DML in a read/write transaction and returns the affected-row
+//! count, and routes DDL to the admin API. SQL that is neither (a query — `adbc.h` sanctions
+//! executing any statement without expecting a result set) runs through the same read-only
+//! machinery as `execute`, rows drained and discarded and no count (`None`) reported.
 //!
-//! DML with a `THEN RETURN` clause returns rows: through [`Statement::execute`] they come back as
-//! an Arrow result (running via `ExecuteSql` in a read/write transaction, since `ExecuteBatchDml`
-//! does not support `THEN RETURN`); through [`Statement::execute_update`] the rows are discarded
-//! and the affected-row count is reported from the result-set stats.
+//! DML with a `THEN RETURN` clause returns rows: through [`Statement::execute`] as an Arrow result
+//! (via `ExecuteSql` in a read/write transaction, since `ExecuteBatchDml` does not support
+//! `THEN RETURN`); through [`Statement::execute_update`] the rows are discarded and the count is
+//! reported from the result-set stats.
 
 mod ingest;
 
@@ -75,9 +73,8 @@ enum DmlOutcome {
 /// `executemany` SELECT holds a single statement in memory instead of one per row.
 ///
 /// Parameter names are resolved once per batch up front (paired into `groups`); this defers only
-/// the per-row [`bind::bind_params`] + `read_sql_builder`-clone, producing the exact same statement
-/// sequence, in the same order, the eager path would have — one `(names, batch)` group at a time,
-/// row by row, skipping past a drained batch.
+/// the per-row [`bind::bind_params`] + `read_sql_builder`-clone, producing the same statement
+/// sequence, in the same order, the eager path would have.
 struct LazyBoundStatements {
     /// A fully-configured read-only query builder for the SQL (directed reads + request tags +
     /// query optimizer options + retry already applied); cloned once per row before binding.
@@ -133,9 +130,8 @@ pub struct SpannerStatement {
     /// The Arrow schema declared by a [`Statement::bind_stream`] that yielded **zero** batches (an
     /// empty bulk ingest). Kept *separate* from `bound` — rather than synthesised into it as a
     /// zero-row batch — so an empty stream neither diverts the parameter-binding DML/query paths
-    /// (which key off `bound` being non-empty) nor is mistaken for a bound parameter row. It is
-    /// consumed **only** by the bulk-ingest paths: to build the target table from the schema in the
-    /// create/replace modes, and to permit a zero-row ingest. Cleared whenever `bound` is (re)set.
+    /// (which key off `bound` being non-empty) nor is mistaken for a bound parameter row. Consumed
+    /// only by the bulk-ingest paths; cleared whenever `bound` is (re)set.
     ingest_schema: Option<SchemaRef>,
     /// Target table for bulk ingest (`adbc.ingest.target_table`), if set.
     target_table: Option<String>,
@@ -153,10 +149,8 @@ pub struct SpannerStatement {
     /// the table from the ingest data's Arrow schema.
     ingest_mode: Option<IngestMode>,
     /// Route an autocommit bulk ingest's per-chunk mutations through Spanner's **BatchWrite** RPC
-    /// (`spanner.ingest.batch_write`, boolean, default `false`) instead of a write-only
-    /// transaction — a non-atomic, higher-throughput "firehose" transport. See
-    /// [`run_ingest_mutations`](Self::run_ingest_mutations). Ignored in manual-transaction mode,
-    /// where ingests buffer and commit atomically with the surrounding transaction.
+    /// (`spanner.ingest.batch_write`) instead of a write-only transaction. Ignored in
+    /// manual-transaction mode; see [`OPTION_INGEST_BATCH_WRITE`](crate::OPTION_INGEST_BATCH_WRITE).
     ingest_batch_write: bool,
     /// Run the statement's DML as **Partitioned DML** (`spanner.dml.partitioned`, boolean, default
     /// `false`) instead of in a read/write transaction — non-atomic, idempotence-requiring, and
@@ -173,10 +167,9 @@ pub struct SpannerStatement {
     data_boost: bool,
     /// Per-operation cancellation for this statement (see [`Statement::get_cancel_handle`]): each
     /// execution entry point mints a fresh [`crate::runtime::CancelSignal`] here, and a cancel
-    /// latches the current one — forever, so a cancelled streamed reader stays cancelled even after
-    /// this statement starts a new operation. Shared through an [`Arc`] so the
-    /// [`SlotCancelHandle`]s handed out by `get_cancel_handle` keep targeting the *current*
-    /// operation for this statement's whole life.
+    /// latches the current one forever, so a cancelled streamed reader stays cancelled. Shared
+    /// through an [`Arc`] so the [`SlotCancelHandle`]s handed out by `get_cancel_handle` keep
+    /// targeting the *current* operation.
     cancel: Arc<CancelSlot>,
 }
 
@@ -283,9 +276,8 @@ impl SpannerStatement {
     /// Discard all bound data, resetting **both** `bound` and its companion
     /// [`ingest_schema`](Self) together so they can never desync. Every execution path that consumes
     /// bound data calls this — a reused statement handle must not silently re-apply stale bound rows
-    /// *or* a stale empty-stream ingest schema to a later, unrelated execution. (The `bind` /
-    /// `bind_stream` setters overwrite both directly; the `set_sql_query` / ingest-option setters
-    /// deliberately leave bound data intact, since binding may precede setting the destination.)
+    /// or a stale empty-stream ingest schema. The `set_sql_query` / ingest-option setters
+    /// deliberately leave bound data intact, since binding may precede setting the destination.
     fn clear_bound(&mut self) {
         self.bound.clear();
         self.ingest_schema = None;
@@ -370,12 +362,10 @@ impl SpannerStatement {
     ///
     /// In autocommit mode they run immediately in one atomic read/write transaction and the
     /// affected-row count is returned. In manual mode they are buffered for the next `commit` and
-    /// `None` is returned (the count is unknown until commit). Routing user-authored DML — plain
-    /// `;`-batches and parameterized DML — through here keeps it consistent with the
-    /// buffer-and-commit model. (Bulk ingest goes through
+    /// `None` is returned (the count is unknown until commit). Bulk ingest goes through
     /// [`run_ingest_mutations`](Self::run_ingest_mutations) instead, which ships mutations and
     /// chunks the autocommit path under Spanner's commit limits; user statements are never
-    /// chunked.)
+    /// chunked.
     fn run_or_buffer(&self, statements: Vec<SpannerSql>) -> Result<Option<i64>> {
         {
             let mut txn = lock_txn(&self.txn);
@@ -400,11 +390,10 @@ impl SpannerStatement {
     /// via `ExecuteSql` (not `ExecuteBatchDml`, which rejects `THEN RETURN`), draining each result
     /// set **before** commit, as Spanner requires for returned rows.
     ///
-    /// Returns the concatenated result batches (with the schema from the first) and the total
+    /// Returns the concatenated result batches (schema from the first) and the total
     /// affected-row count from the result-set stats. The rows are drained *inside* the runner's
     /// closure keeping the client's own error type, so a transaction abort still retries — the
-    /// (cloned) statement list is simply replayed, and only the last attempt's rows are returned.
-    /// Conversion to Arrow happens after the transaction commits.
+    /// (cloned) statement list is replayed and only the last attempt's rows are returned.
     fn execute_returning_dml(
         &self,
         statements: Vec<SpannerSql>,
@@ -484,10 +473,8 @@ impl SpannerStatement {
     /// `commit`, and `ExecuteBatchDml` — the commit path — rejects `THEN RETURN` outright, so the
     /// returned rows would be silently unobtainable. It is rejected up front instead.
     ///
-    /// The `adbc.connection.readonly` guard lives here rather than at the two entry points
-    /// ([`Statement::execute`] and [`Statement::execute_update`]), so the one rejection covers
-    /// every DML route — plain, `THEN RETURN` and partitioned alike — and cannot drift between
-    /// them.
+    /// The `adbc.connection.readonly` guard lives here rather than at the two entry points, so the
+    /// one rejection covers every DML route — plain, `THEN RETURN` and partitioned alike.
     fn run_dml(&self, sql: &str) -> Result<DmlOutcome> {
         if self.config.is_read_only() {
             return Err(invalid_state(
@@ -533,19 +520,13 @@ impl SpannerStatement {
     /// Run one DML statement as **Partitioned DML** (`spanner.dml.partitioned`), returning the
     /// lower-bound affected-row count Spanner reports.
     ///
-    /// Spanner splits the statement across partitions and applies each independently: there is no
-    /// commit, so the per-commit mutation limit that caps an ordinary read/write transaction does
-    /// not apply — but the statement is not atomic, a partition may be applied more than once
-    /// (hence the idempotence requirement), and the count is a *lower* bound. See
-    /// [`OPTION_DML_PARTITIONED`](crate::OPTION_DML_PARTITIONED).
-    ///
-    /// The statement shapes partitioned DML cannot express are rejected up front by
-    /// [`check_partitioned_dml`] rather than left to a server-side error. The statement itself is
-    /// built by [`sql_builder`](Self::sql_builder), so the request priority/tag, query optimizer
-    /// options and retry/backoff policies all ride along (the builder's own retry policy is the
-    /// transaction-level abort retry, left at the client default like every other path); the
-    /// transaction-level knobs it has no setter for — the transaction tag, the commit options and
-    /// the isolation level — do not apply.
+    /// The guarantees it trades away are documented on
+    /// [`OPTION_DML_PARTITIONED`](crate::OPTION_DML_PARTITIONED); the statement shapes it cannot
+    /// express are rejected up front by [`check_partitioned_dml`] rather than left to a
+    /// server-side error. The statement is built by [`sql_builder`](Self::sql_builder), so the
+    /// request priority/tag, query optimizer options and retry/backoff policies ride along; the
+    /// transaction-level knobs the builder has no setter for — the transaction tag, the commit
+    /// options and the isolation level — do not apply.
     fn run_partitioned_dml(&self, sql: &str) -> Result<i64> {
         let bound_rows = self.bound.iter().map(RecordBatch::num_rows).sum();
         check_partitioned_dml(sql, lock_txn(&self.txn).autocommit(), bound_rows)?;
@@ -584,14 +565,9 @@ impl SpannerStatement {
     ///
     /// Every bound row executes in **one** read-only snapshot, so the per-row results are mutually
     /// consistent: a single bound row keeps the cheap single-use transaction, while several bound
-    /// rows share one multi-use read-only transaction pinned at the statement's read bound. The
-    /// bounded-staleness kinds (`max:` / `min:`), which Spanner only accepts on single-use
-    /// transactions, are pinned to the most stale timestamp their window allows for the multi-row
-    /// case (see [`ReadStaleness::multi_use_timestamp_bound`](crate::staleness::ReadStaleness::multi_use_timestamp_bound)).
-    ///
-    /// Results stream through the same bounded-chunk machinery as `execute`: rows are converted to
-    /// Arrow in chunks of `spanner.rows_per_batch` (plus the byte budget) as the reader is
-    /// iterated, never materialised whole.
+    /// rows share one multi-use read-only transaction pinned at the statement's read bound via
+    /// [`ReadStaleness::multi_use_timestamp_bound`](crate::staleness::ReadStaleness::multi_use_timestamp_bound).
+    /// Results stream through the same bounded-chunk machinery as `execute`.
     fn execute_bound_query(
         &self,
         sql: &str,
@@ -705,17 +681,15 @@ impl SpannerStatement {
     ///
     /// Strips any trailing statement terminator(s) — Spanner's single-use query API rejects a
     /// trailing `;` ("Expected end of input but got `;`"), yet clients and conformance suites
-    /// routinely append one (e.g. `SELECT current_date;;;`); the DDL and DML paths go through
-    /// `split_statements`, which already drops empty trailing segments, so the stripping is scoped
-    /// to the query path and never splits a `;`-batch. Applies the manual-transaction kind guard
+    /// routinely append one; the stripping is scoped to the query path so it never splits a
+    /// `;`-batch. Applies the manual-transaction kind guard
     /// ([`ensure_query_allowed`](Self::ensure_query_allowed)), and dispatches to the bound-query
     /// path (consuming the bound rows) when parameter rows are bound.
     ///
     /// In a manual transaction the query runs on the transaction's shared multi-use read-only
-    /// transaction ([`manual_read_transaction`](Self::manual_read_transaction)) — opening it if
-    /// this is the transaction's first statement — so every query in the transaction observes one
-    /// consistent snapshot; in autocommit mode it runs in its own single-use transaction at this
-    /// statement's read bound.
+    /// transaction ([`manual_read_transaction`](Self::manual_read_transaction)), opening it if this
+    /// is the transaction's first statement; in autocommit mode it runs in its own single-use
+    /// transaction at this statement's read bound.
     fn execute_query_reader(
         &mut self,
         sql: &str,
@@ -742,11 +716,9 @@ impl SpannerStatement {
         let bound = self.config.read_staleness.timestamp_bound()?;
         let statement = self.read_sql_builder(&sql).build();
         let fetch_timeout = self.config.timeouts.fetch_timeout();
-        // Stream the result: `stream_query` fetches the first chunk (settling the schema) and the
-        // returned reader converts the rest to Arrow one bounded chunk at a time as it is
-        // iterated, with a background task prefetching the next chunk ahead of the consumer.
-        // The query timeout bounds the initial execution through that first chunk; the fetch
-        // timeout bounds each later chunk inside the prefetch task.
+        // `stream_query` fetches the first chunk (settling the schema); the returned reader
+        // converts the rest one bounded chunk at a time. The query timeout bounds the initial
+        // execution through that first chunk, the fetch timeout each later one.
         let reader = block_on_cancellable(
             &self.runtime,
             &self.cancel.current(),
@@ -783,17 +755,13 @@ impl SpannerStatement {
     ///
     /// Batching all statements into one call makes a multi-step change (for example dbt's
     /// intermediate-table build followed by a rename swap) near-atomic. DDL always runs
-    /// **immediately, regardless of the connection's transaction mode** — like the ADBC BigQuery
-    /// driver, which classifies nothing, the driver never gates DDL on the transaction: Spanner
-    /// DDL goes through the admin API and is never transactional, so it neither fixes a manual
-    /// transaction's kind nor is rejected by it (and it cannot be rolled back).
+    /// **immediately, regardless of the connection's transaction mode** — Spanner DDL goes through
+    /// the admin API and is never transactional, so it neither fixes a manual transaction's kind
+    /// nor is rejected by it, and it cannot be rolled back.
     ///
-    /// DDL is issued through the write/update path, so the update timeout bounds the whole
-    /// change — the admin-client build (first DDL on the database's client stack only; the built
-    /// client is cached in the shared [`SharedDatabaseAdmin`] cell and cloned thereafter), the
-    /// `UpdateDatabaseDdl` call, **and** its long-running operation poll loop (which otherwise
-    /// polls without any bound). An expired deadline fails with `Status::Timeout`; unset (the
-    /// default) leaves the poll unbounded.
+    /// The update timeout bounds the whole change — the admin-client build, the
+    /// `UpdateDatabaseDdl` call, **and** its long-running operation poll loop, which otherwise
+    /// polls without any bound.
     fn run_ddl(&self, statements: Vec<String>) -> Result<()> {
         if self.config.is_read_only() {
             return Err(invalid_state(
@@ -888,7 +856,7 @@ impl SpannerStatement {
         // partition carries its session, transaction id and partition token and is independently
         // serializable, so it maps directly onto ADBC's opaque descriptor. The (Arc-shared,
         // multiplexed) session lives as long as the connection's `DatabaseClient`, so descriptors
-        // stay valid after this statement is gone, for `Connection::read_partition`.
+        // stay valid after this statement is gone.
         let plan_stmt = self.build_query_statement(sql, true)?;
         let query_stmt = self.build_query_statement(sql, false)?;
         let client = self.client.clone();
@@ -959,14 +927,13 @@ impl SpannerStatement {
     /// `INT64` for a parameter compared against an `INT64` column). Returns the name → type map;
     /// a parameter whose type Spanner cannot pin down is simply absent from it.
     ///
-    /// Queries plan in a single-use read-only transaction, the same probe surface as
-    /// `execute_schema`. DML can only be planned inside a read/write transaction (Spanner rejects
-    /// it read-only — see `check_schema_query`), so it runs through the transaction runner: the
-    /// plan executes nothing, and the transaction commits empty. On a read-only connection the
-    /// DML probe is skipped (no read/write transaction just to introspect) and DDL is never
-    /// planned (not plannable over ExecuteSql; Spanner DDL takes no query parameters anyway) —
-    /// both return an empty map, typing every parameter `Null`. Either probe is bounded by the
-    /// query timeout: introspection is a read-shaped operation regardless of the statement's verb.
+    /// Queries plan in a single-use read-only transaction. DML can only be planned inside a
+    /// read/write transaction (Spanner rejects it read-only), so it runs through the transaction
+    /// runner: the plan executes nothing and the transaction commits empty. On a read-only
+    /// connection the DML probe is skipped, and DDL is never planned (not plannable over
+    /// `ExecuteSql`, and Spanner DDL takes no query parameters) — both return an empty map, typing
+    /// every parameter `Null`. Either probe is bounded by the *query* timeout: introspection is a
+    /// read-shaped operation regardless of the statement's verb.
     fn plan_parameter_types(
         &self,
         sql: &str,
@@ -1047,10 +1014,9 @@ impl SpannerStatement {
 
     /// Guard for [`execute`](Statement::execute) / [`execute_update`](Statement::execute_update)
     /// when data has been bound but there is nothing to apply it to — neither a SQL query nor a
-    /// bulk-ingest target. Binding *before* setting `adbc.ingest.target_table` is legal (the bind
-    /// and the ingest options may arrive in either order), so this can only be diagnosed at
-    /// execution time — and the message names both remedies, instead of the plain "no SQL query
-    /// set" error that would hide the missing ingest option.
+    /// bulk-ingest target. Binding *before* setting `adbc.ingest.target_table` is legal, so this
+    /// can only be diagnosed at execution time — and the message names both remedies, instead of
+    /// the plain "no SQL query set" error that would hide the missing ingest option.
     fn check_bound_has_destination(&self) -> Result<()> {
         if self.sql.is_none()
             && self.target_table.is_none()
@@ -1068,13 +1034,11 @@ impl SpannerStatement {
     ///
     /// In manual mode the transaction's kind is fixed by its first statement: buffered DML (and
     /// bulk-ingest mutations) only executes at `commit`, so a query could never observe it. Rather
-    /// than silently returning a pre-write result (e.g. an `INSERT` followed by `SELECT COUNT(*)`
+    /// than silently returning a pre-write result (an `INSERT` followed by `SELECT COUNT(*)`
     /// reporting the *old* count), reject the query up front. Queries in an unset or query-kind
-    /// manual transaction, and every query in autocommit mode, pass. A *query* routed through
-    /// `execute_update` is guarded identically (both go through
-    /// [`execute_query_reader`](Self::execute_query_reader)); the DML path enforces its own kind
-    /// when buffering; DDL is not transaction-aware (unguarded); and `execute_schema` (a
-    /// `QueryMode::Plan` probe returning no data) has no data-visibility concern.
+    /// manual transaction, and every query in autocommit mode, pass. DDL is not transaction-aware
+    /// (unguarded), and `execute_schema` (a `QueryMode::Plan` probe returning no data) has no
+    /// data-visibility concern.
     fn ensure_query_allowed(&self) -> Result<()> {
         lock_txn(&self.txn).check_kind_allowed(TxnKind::Read)
     }
@@ -1084,13 +1048,12 @@ impl SpannerStatement {
     /// transaction.
     ///
     /// The first data-returning query of a manual transaction builds the transaction — pinned at
-    /// this statement's read bound, with the bounded-staleness kinds pinned to their most-stale
-    /// legal equivalent, since Spanner accepts those only on single-use transactions (see
-    /// [`ReadStaleness::multi_use_timestamp_bound`](crate::staleness::ReadStaleness::multi_use_timestamp_bound)) — and installs it in the shared [`TxnState`]
-    /// (fixing the transaction's kind to queries); every later query returns the installed
-    /// handle, so all reads in the transaction observe one consistent snapshot. Later statements'
-    /// staleness settings are ignored — the transaction is already pinned. Building issues no RPC
-    /// (the client's default inline begin folds `BeginTransaction` into the first query), so a
+    /// this statement's read bound via
+    /// [`ReadStaleness::multi_use_timestamp_bound`](crate::staleness::ReadStaleness::multi_use_timestamp_bound)
+    /// — and installs it in the shared [`TxnState`], fixing the transaction's kind to queries;
+    /// every later query returns the installed handle, so all reads observe one consistent
+    /// snapshot, and later statements' staleness settings are ignored. Building issues no RPC (the
+    /// client's default inline begin folds `BeginTransaction` into the first query), so a
     /// transaction is never begun for a query that then fails.
     ///
     /// [`TxnState`]: crate::connection::TxnState
@@ -1187,12 +1150,10 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) if k == crate::OPTION_DATA_BOOST => {
                 self.data_boost = bool_option(value, "option spanner.data_boost")?;
             }
-            // Every remaining `spanner.*` option the statement and connection dispatch identically —
-            // staleness, request priority/tag, directed read, max_commit_delay, commit_stats, query
-            // optimizer opts, `spanner.max_timestamp_precision` (`""` resets to the driver default),
-            // RPC timeouts, retry tuning — goes through the shared table. An unrecognised key returns
-            // `None`, mapped to the same `NotImplemented` as before (so the connection-only
-            // `spanner.transaction.tag`, absent from the shared table, stays unsupported here).
+            // Every remaining `spanner.*` option the statement and connection dispatch identically
+            // goes through the shared table. An unrecognised key returns `None`, mapped to
+            // `NotImplemented` (so the connection-only `spanner.transaction.tag`, absent from the
+            // shared table, stays unsupported here).
             OptionStatement::Other(k) => {
                 if self.set_shared_option(k, value)?.is_none() {
                     return Err(unknown_option("statement", k));
@@ -1238,12 +1199,10 @@ impl Optionable for SpannerStatement {
             OptionStatement::Other(k) if k == crate::OPTION_DATA_BOOST => {
                 Some(self.data_boost.to_string())
             }
-            // Every remaining `spanner.*` option the statement and connection report identically —
-            // staleness, request priority/tag, directed read, max_commit_delay,
-            // commit_stats(.mutation_count), query optimizer opts, max_timestamp_precision, RPC
-            // timeouts, retry tuning (each the effective value: the connection's, unless overridden
-            // on this statement) — goes through the shared table, which returns the same `NotFound`
-            // for an unset (or unknown) key that the fall-through below would.
+            // Every remaining `spanner.*` option the statement and connection report identically
+            // goes through the shared table (each the effective value: the connection's, unless
+            // overridden on this statement), which returns the same `NotFound` for an unset (or
+            // unknown) key that the fall-through below would.
             OptionStatement::Other(k) => return self.shared_option_string(k),
             _ => None,
         };
@@ -1357,13 +1316,11 @@ impl Statement for SpannerStatement {
             return Ok(None);
         }
         // Neither DDL nor DML (SELECT / WITH / GRAPH / …): a query. `adbc.h` sanctions executing
-        // any statement without expecting a result set (`ExecuteQuery`'s out-stream may be NULL —
-        // "Pass NULL if the client does not expect a result set"), and such a call lands here, so
-        // run the query through the same read-only machinery as `execute` — including the
-        // manual-transaction read-your-writes guard and every read-side option — then drain and
-        // discard the rows: this entry point only reports a count, and a read query has none.
-        // Do NOT route it into the DML pipeline: that surfaces a raw `ExecuteBatchDml` error in
-        // autocommit mode and buffers the query as pending "DML" in manual mode, poisoning commit.
+        // any statement without expecting a result set ("Pass NULL if the client does not expect a
+        // result set"), and such a call lands here, so run it through the same read-only machinery
+        // as `execute`, then drain and discard the rows. Do NOT route it into the DML pipeline:
+        // that surfaces a raw `ExecuteBatchDml` error in autocommit mode and buffers the query as
+        // pending "DML" in manual mode, poisoning commit.
         if !crate::sql::is_dml(&sql) {
             // A multi-statement `;`-batch whose first statement is not DML is neither a query nor
             // an all-DML batch — reject it up front with a clear message (the DML arm below gets
@@ -1411,12 +1368,11 @@ impl Statement for SpannerStatement {
     ///
     /// Each returned descriptor is **opaque but executable**: a versioned JSON envelope
     /// (`{"v":1,"partition":…}`) around the serde form of the client's `Partition`, carrying the
-    /// SQL text (inside its `ExecuteSqlRequest`) plus the session and transaction identity. Anyone
-    /// who can hand a descriptor to `Connection::read_partition` can run arbitrary SQL with that
-    /// connection's credentials — the version envelope guards against format drift between driver
-    /// versions, it does **not** authenticate the blob. Treat descriptors as executable request
-    /// blobs, not opaque data:
-    /// transport them only over trusted channels and never accept one from an untrusted source.
+    /// SQL text plus the session and transaction identity. Anyone who can hand a descriptor to
+    /// `Connection::read_partition` can run arbitrary SQL with that connection's credentials — the
+    /// version envelope guards against format drift, it does **not** authenticate the blob.
+    /// Transport descriptors only over trusted channels and never accept one from an untrusted
+    /// source.
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
         // Mint a fresh cancel signal for this operation (see `CancelSlot`).
         self.cancel.begin_operation();
@@ -1446,11 +1402,9 @@ impl Statement for SpannerStatement {
         }
         // Otherwise derive the parameter *names* from the statement's `@name` references and ask
         // Spanner for their types via a PLAN probe (see `plan_parameter_types`). A parameter the
-        // probe cannot type — DDL (not plannable over ExecuteSql), DML on a read-only connection
-        // (planning DML needs a read/write transaction), a parameter whose type the SQL context
-        // doesn't pin down, or a failed probe (this is best-effort introspection; the execute
-        // paths surface real errors with full context) — is typed `Null`, ADBC's convention for
-        // "type cannot be determined" (`AdbcStatementGetParameterSchema` in adbc.h).
+        // probe cannot type — or a failed probe, this being best-effort introspection — is typed
+        // `Null`, ADBC's convention for "type cannot be determined"
+        // (`AdbcStatementGetParameterSchema` in adbc.h).
         let sql = self.sql()?;
         let names = crate::sql::named_parameters(&sql);
         if names.is_empty() {
@@ -1544,11 +1498,10 @@ fn undeclared_parameter_types(
 /// Shared guard for the query-only entry points (`execute_schema`, `execute_partitions`): both run
 /// through read-only transactions, and letting DML reach them surfaces Spanner's raw "DML
 /// statements can only be performed in a read-write transaction" error, which misleads the caller
-/// into thinking the transaction mode is the problem. Catch DDL and DML up front with a clear
-/// message instead. (This also covers `THEN RETURN` DML — it does produce rows, but Spanner cannot
-/// run it read-only.) `dml_rationale` completes "DML (INSERT/UPDATE/DELETE) cannot be …" with the
-/// entry point's read-only operation. Both DDL and DML are the same "not a query" class — the
-/// caller passed the wrong kind of statement — so both reject with `InvalidArguments`.
+/// into thinking the transaction mode is the problem. Catch DDL and DML up front instead (this
+/// also covers `THEN RETURN` DML — it produces rows, but Spanner cannot run it read-only).
+/// `dml_rationale` completes "DML (INSERT/UPDATE/DELETE) cannot be …" with the entry point's
+/// read-only operation.
 fn check_query_only(sql: &str, entry_point: &str, dml_rationale: &str) -> Result<()> {
     if crate::sql::is_ddl(sql) {
         return Err(invalid_argument(format!(
@@ -1582,12 +1535,11 @@ fn check_partition_query(sql: &str) -> Result<()> {
 
 /// Guard for `;`-separated **multi-statement** batches on the DML paths: `ExecuteBatchDml`
 /// executes DML only, so a batch mixing DML with queries or DDL can neither run atomically nor be
-/// split across Spanner's different execution surfaces. Reject it up front, naming the offending
-/// statement — crucially *before* anything is buffered in a manual transaction, where a poisoned
-/// buffer would otherwise fail the eventual commit of the whole batch (recoverable only by
-/// `rollback`). A single statement (or empty text) always passes: classifying a lone statement is
-/// the caller's concern. (All-DDL batches never reach this — the leading keyword routes them to
-/// `run_ddl` first.)
+/// split across Spanner's execution surfaces. Reject it up front, naming the offending statement —
+/// crucially *before* anything is buffered in a manual transaction, where a poisoned buffer would
+/// otherwise fail the eventual commit of the whole batch (recoverable only by `rollback`). A
+/// single statement (or empty text) always passes. All-DDL batches never reach this — the leading
+/// keyword routes them to `run_ddl` first.
 fn check_all_dml_batch(statements: &[String]) -> Result<()> {
     if statements.len() > 1
         && let Some(other) = statements.iter().find(|s| !crate::sql::is_dml(s))

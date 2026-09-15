@@ -15,10 +15,8 @@ use crate::error::invalid_state;
 /// the other kind is rejected with [`Status::InvalidState`](adbc_core::error::Status::InvalidState) until `commit` or `rollback` (see
 /// [`TxnState::check_kind_allowed`]).
 ///
-/// DDL is deliberately **not** a kind: like the ADBC BigQuery driver — which classifies nothing
-/// and lets every statement run down the one execution path — this driver never gates DDL on the
-/// transaction. DDL executes immediately through the admin API (Spanner DDL is never
-/// transactional) and leaves the transaction state untouched.
+/// DDL is deliberately **not** a kind: it executes immediately through the admin API (Spanner DDL
+/// is never transactional) and leaves the transaction state untouched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TxnKind {
     /// Data-returning queries, all running on one shared multi-use read-only transaction (a
