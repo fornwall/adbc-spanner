@@ -101,11 +101,7 @@ pub(crate) fn collect_statistics(
     let txn = {
         let client = client.clone();
         Arc::new(block_on_cancellable(runtime, cancel, async move {
-            let mut builder = client.read_only_transaction();
-            if let Some(b) = bound {
-                builder = builder.set_timestamp_bound(b);
-            }
-            builder.build().await.map_err(from_spanner)
+            crate::staleness::multi_use(&client, bound).await
         })?)
     };
 

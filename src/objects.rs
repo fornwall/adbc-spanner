@@ -276,11 +276,7 @@ pub(crate) fn collect_objects(
             // supports concurrent statements on one transaction: `execute_query` takes `&self`,
             // and the inline-begin state machine serialises the implicit `BeginTransaction`
             // among concurrent first statements (later ones wait for the begun transaction id).
-            let mut txn_builder = client.read_only_transaction();
-            if let Some(b) = bound {
-                txn_builder = txn_builder.set_timestamp_bound(b);
-            }
-            let txn = txn_builder.build().await.map_err(from_spanner)?;
+            let txn = crate::staleness::multi_use(&client, bound).await?;
             let (schemata, tables, columns, constraints, key_columns, referential) = try_join!(
                 query_txn(&txn, schemata_stmt),
                 query_txn_opt(&txn, tables_stmt),

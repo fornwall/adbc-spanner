@@ -689,13 +689,7 @@ impl SpannerStatement {
                     Some(txn) => txn,
                     // Autocommit: a dedicated multi-use read-only transaction at this
                     // statement's (multi-use-pinned) bound, dropped when the reader is.
-                    None => {
-                        let mut builder = client.read_only_transaction();
-                        if let Some(b) = bound {
-                            builder = builder.set_timestamp_bound(b);
-                        }
-                        Arc::new(builder.build().await.map_err(from_spanner)?)
-                    }
+                    None => Arc::new(crate::staleness::multi_use(&client, bound).await?),
                 };
                 stream_bound_query(
                     runtime,
@@ -1128,11 +1122,7 @@ impl SpannerStatement {
         let bound = self.config.read_staleness.multi_use_timestamp_bound()?;
         let client = self.client.clone();
         let built = block_on_cancellable(&self.runtime, &self.cancel.current(), async move {
-            let mut builder = client.read_only_transaction();
-            if let Some(b) = bound {
-                builder = builder.set_timestamp_bound(b);
-            }
-            builder.build().await.map_err(from_spanner)
+            crate::staleness::multi_use(&client, bound).await
         })?;
         let mut st = lock_txn(&self.txn);
         if st.autocommit() {

@@ -33,9 +33,11 @@ use adbc_core::error::Result;
 use adbc_core::options::OptionValue;
 use chrono::{DateTime, Utc};
 use google_cloud_spanner::client::DatabaseClient;
-use google_cloud_spanner::transaction::{SingleUseReadOnlyTransaction, TimestampBound};
+use google_cloud_spanner::transaction::{
+    MultiUseReadOnlyTransaction, SingleUseReadOnlyTransaction, TimestampBound,
+};
 
-use crate::error::invalid_argument;
+use crate::error::{from_spanner, invalid_argument};
 use crate::options::string_option;
 
 /// Build a single-use read-only transaction, applying an optional non-strong timestamp bound.
@@ -49,6 +51,23 @@ pub(crate) fn single_use(
         Some(b) => builder.set_timestamp_bound(b).build(),
         None => builder.build(),
     }
+}
+
+/// Build a multi-use read-only transaction, applying an optional timestamp bound (already pinned
+/// to a multi-use-legal kind by [`ReadStaleness::multi_use_timestamp_bound`]); `None` leaves the
+/// client default (a strong read). Building issues no RPC — the begin is inline on the first query.
+pub(crate) async fn multi_use(
+    client: &DatabaseClient,
+    bound: Option<TimestampBound>,
+) -> Result<MultiUseReadOnlyTransaction> {
+    let builder = client.read_only_transaction();
+    match bound {
+        Some(b) => builder.set_timestamp_bound(b),
+        None => builder,
+    }
+    .build()
+    .await
+    .map_err(from_spanner)
 }
 
 /// A parsed read bound, before it is turned into a client [`TimestampBound`]. Kept as a small,
