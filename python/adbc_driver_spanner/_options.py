@@ -168,3 +168,9 @@ class StatementOptions(enum.Enum):
     #: non-atomic **BatchWrite** RPC instead of a write-only transaction.
     #: Ignored in manual-transaction mode.
     INGEST_BATCH_WRITE = "spanner.ingest.batch_write"
+    #: ``"true"`` runs the statement's DML as Partitioned DML: Spanner splits it
+    #: across partitions and applies each independently, so a large ``UPDATE`` or
+    #: ``DELETE`` never hits the per-commit mutation limit. Not atomic — a partition
+    #: may be applied more than once, so the statement must be idempotent — and
+    #: ``rowcount`` is a lower bound, not an exact count.
+    DML_PARTITIONED = "spanner.dml.partitioned"
