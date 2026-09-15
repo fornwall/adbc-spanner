@@ -8,7 +8,7 @@ the driver uses it.
 It is a *reference for the driver's behaviour*, not a Spanner tutorial. For the option surface see
 [docs/options.md](options.md); for the ADBC-level view see [docs/adbc.md](adbc.md).
 
-**Ground truth.** Everything is cited by **file and symbol** (`src/connection.rs`
+**Ground truth.** Everything is cited by **file and symbol** (`src/connection/exec.rs`
 `apply_isolation`) rather than by line number, so a citation stays valid as the code moves and can
 be found with a grep. `<client>` is the pinned `google-cloud-spanner` preview client (see
 [CLAUDE.md](../CLAUDE.md) for the pin and its checkout path). Published Spanner limits are cited to
@@ -64,7 +64,7 @@ from the isolation level** rather than being fixed (`<client>` `gapic_dataplane/
 
 This driver never sets `read_lock_mode` — it appears nowhere in `src/` — so every read-write
 transaction gets the isolation-derived default. Composed with the
-`adbc.connection.transaction.isolation_level` mapping (`src/connection.rs`
+`adbc.connection.transaction.isolation_level` mapping (`src/connection/exec.rs`
 `parse_isolation_level` / `apply_isolation`), the effective lock mode is:
 
 | Option value | Level sent to Spanner | Effective lock mode |
@@ -106,7 +106,7 @@ exposes no begin/commit handle — only a closure it may replay on `ABORTED` (§
 cannot hold a server-side read/write transaction open across ADBC calls. Instead it **buffers work
 client-side and replays it inside one closure at commit**, and a manual transaction is exactly
 **one kind — queries *or* DML — fixed by its first statement** (`ManualTxn` in
-`src/connection.rs`). Work of the other kind is rejected with `InvalidState`
+`src/connection/txn.rs`). Work of the other kind is rejected with `InvalidState`
 (`TxnState::check_kind_allowed`) until `commit` or `rollback` ends the transaction:
 
 ```mermaid
@@ -152,7 +152,7 @@ flowchart TD
     F -->|yes| H[run_batch_txn<br/>ExecuteBatchDml + Commit<br/>mutations applied at commit]
 ```
 
-`check_commit_writable` is the one choke point `commit` and the `enter_autocommit` toggle share; it
+`check_commit_writable` (`src/connection/txn.rs`) is the one choke point `commit` and the `enter_autocommit` toggle share; it
 is gated on `ManualTxn::has_pending_work`, so a query or empty transaction still commits and
 `rollback` is never gated.
 
@@ -264,16 +264,16 @@ behalf. Each is covered below.
 - **Where we use it.**
   - **Read/write commits** — the client's transaction runner commits at the end of the closure. The
     driver has exactly **three** `read_write_transaction()` sites, all routed through
-    `apply_isolation`: `run_batch_txn` (`src/connection.rs`), `execute_returning_dml` and
+    `apply_isolation`: `run_batch_txn` (`src/connection/exec.rs`), `execute_returning_dml` and
     `plan_dml_parameter_types` (`src/statement.rs`).
-  - **Write-only commits** — `write_mutations_txn` (`src/connection.rs`) calls the client's
+  - **Write-only commits** — `write_mutations_txn` (`src/connection/exec.rs`) calls the client's
     `.write(mutations)`, i.e. `BeginTransaction`+`Commit(transaction_id)`
     (`<client>` `write_only_transaction.rs`, `WriteOnlyTransaction::write`), **not** the
     one-round-trip `write_at_least_once`. This is a deliberate exactly-once choice: the driver never
     uses the
     non-idempotent single-use commit. Its two callers are the mutations-only manual commit
     (`apply_transaction`, `src/connection.rs`) and each autocommit ingest chunk
-    (`write_mutation_chunk`, `src/statement.rs`).
+    (`write_mutation_chunk`, `src/statement/ingest.rs`).
   - **Commit stats and commit delay** attach at exactly four sites — the three runner sites above
     via `RequestConfig::apply_to_runner` and the write-only site via `apply_to_write_only`
     (`src/request.rs`). The **priority and the tags** reach those same four commit builders, but are
@@ -295,7 +295,7 @@ behalf. Each is covered below.
   `…timeout_seconds.query` for `plan_dml_parameter_types`, which is a schema probe (§4).
 - **Driver-side budgeting.** Because the 80,000 cap counts index entries the driver cannot see, bulk
   ingest budgets each chunk at **20,000 mutations** (`INGEST_CHUNK_MUTATION_LIMIT`,
-  `src/statement.rs` — a quarter of the cap, for headroom) and **4 MiB**
+  `src/statement/ingest.rs` — a quarter of the cap, for headroom) and **4 MiB**
   (`INGEST_CHUNK_BYTE_BUDGET`, well under both the 100 MiB commit cap and the 10 MiB request cap).
   The row-size input to that budget is an **estimate**
   (`batch.get_array_memory_size() / batch.num_rows()`), not a wire measurement. A chunk that still
@@ -352,7 +352,7 @@ behalf. Each is covered below.
     (`plan_query_schema`, which honours the statement's read staleness like the data read it
     describes) and `SpannerConnection::get_table_schema`. Two build an unbound
     `client.single_use()` directly: `plan_parameter_types` and the ingest `table_exists` probe
-    (`src/connection.rs`).
+    (`src/metadata.rs`).
   - **Multi-use** read-only transactions — four sites, each one snapshot shared by several reads:
     `manual_read_transaction` (the manual-mode shared snapshot), `execute_bound_query` over >1 row
     (so all bound rows share a snapshot), `collect_objects` (`src/objects.rs`, which runs its
@@ -390,7 +390,7 @@ behalf. Each is covered below.
   MiB"* cap. The driver imposes no count limit of its own.
 - **Where we use it.** Every plain DML statement the driver runs — including a **single** one — goes
   through it: `run_or_buffer` (`src/statement.rs`) → `run_batch_dml` → `run_batch_txn` →
-  `transaction.execute_batch_update` (`src/connection.rs`). A `;`-separated DML batch becomes N
+  `transaction.execute_batch_update` (`src/connection/exec.rs`). A `;`-separated DML batch becomes N
   statements in one call, and the manual DML commit replays its buffer through the same site. The
   `last_statements` flag is `true` for autocommit (the batch *is* the whole transaction, so Spanner
   can commit inline) and `false` for the manual commit.
@@ -477,7 +477,7 @@ behalf. Each is covered below.
   not per request. No published cap on the *number of groups* per request is known; the 10 MiB
   request cap applies.
 - **Where we use it.** Opt-in via `spanner.ingest.batch_write`, autocommit ingest only:
-  `batch_write_chunk` (`src/statement.rs`) builds **one `MutationGroup` per row** and streams via
+  `batch_write_chunk` (`src/statement/ingest.rs`) builds **one `MutationGroup` per row** and streams via
   `batch_write_transaction().execute_streaming(groups)`; wire path
   `/google.spanner.v1.Spanner/BatchWrite` (`<client>` `server_streaming/builder.rs`,
   `BatchWrite::send`). A non-OK
@@ -555,8 +555,8 @@ Each RPC path is bounded by one of the three `spanner.rpc.timeout_seconds.*` cla
 
 | Class | Covers | Sites |
 | ----- | ------ | ----- |
-| `query` | initial `ExecuteStreamingSql` + first chunk, PLAN probes, `PartitionQuery`, `read_partition`'s first fetch, **and all driver-internal metadata reads** | `src/statement.rs`: `execute_query_reader`, `execute_bound_query` (×2), `run_partition_query`, `plan_parameter_types`, `plan_dml_parameter_types`, `execute_schema`; `src/connection.rs`: `table_exists`, `get_table_schema`, `read_partition`; `src/objects.rs`: `collect_objects`; `src/statistics.rs`: discovery + aggregate-scan phases |
-| `update` | read/write runner (incl. abort replays), write-only commit, `BatchWrite`, partitioned DML, and `UpdateDatabaseDdl` **plus its LRO poll** | `src/connection.rs`: `run_batch_txn`, `write_mutations_txn`; `src/statement.rs`: `execute_returning_dml`, `batch_write_chunk`, `run_partitioned_dml`, `run_ddl` |
+| `query` | initial `ExecuteStreamingSql` + first chunk, PLAN probes, `PartitionQuery`, `read_partition`'s first fetch, **and all driver-internal metadata reads** | `src/statement.rs`: `execute_query_reader`, `execute_bound_query` (×2), `run_partition_query`, `plan_parameter_types`, `plan_dml_parameter_types`, `execute_schema`; `src/metadata.rs`: `table_exists`; `src/connection.rs`: `get_table_schema`, `read_partition`; `src/objects.rs`: `collect_objects`; `src/statistics.rs`: discovery + aggregate-scan phases |
+| `update` | read/write runner (incl. abort replays), write-only commit, `BatchWrite`, partitioned DML, and `UpdateDatabaseDdl` **plus its LRO poll** | `src/connection/exec.rs`: `run_batch_txn`, `write_mutations_txn`; `src/statement.rs`: `execute_returning_dml`, `run_partitioned_dml`, `run_ddl`; `src/statement/ingest.rs`: `batch_write_chunk` |
 | `fetch` | each later chunk of a streamed result (inside the prefetch task) | `src/conversion.rs`: `ResultSetChunks::next_chunk`, `BoundQueryChunks::next_chunk` |
 
 Two asymmetries worth knowing:
@@ -604,7 +604,7 @@ From the proto comments in the pinned client (not the quotas page):
   (`CommitResponse::CommitStats::mutation_count`), which is what `is_mutation_limit_exceeded` keys
   off.
 
-**Driver estimates** (not Spanner limits), all in `src/statement.rs` unless noted:
+**Driver estimates** (not Spanner limits), all in `src/statement/ingest.rs` unless noted:
 
 - `INGEST_CHUNK_MUTATION_LIMIT = 20_000` — a self-imposed quarter of the 80,000 cap, chosen for
   headroom against secondary-index entries the driver cannot count.
