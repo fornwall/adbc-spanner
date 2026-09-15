@@ -169,7 +169,7 @@ fn typed_option_getters_distinguish_unset_from_non_integer() {
 
 #[test]
 fn boolean_options_reject_int_typed_sets() {
-    // COR-4: boolean options take the strings "true"/"false", never OptionValue::Int — an
+    // Boolean options take the strings "true"/"false", never OptionValue::Int — an
     // int set would not round-trip through the getters (which serve the canonical string),
     // and no surveyed ADBC driver accepts SetOptionInt for a boolean option.
     let mut db = new_database();
@@ -213,7 +213,7 @@ fn a_non_string_uri_is_rejected() {
 
 #[test]
 fn keyfile_path_round_trips_but_inline_json_is_write_only() {
-    // SEC-1: `spanner.auth.keyfile` is a filesystem path (not a secret) and reads back
+    // `spanner.auth.keyfile` is a filesystem path (not a secret) and reads back
     // verbatim; `spanner.auth.keyfile_json` holds a live private key, so `get_option` reports
     // `NotFound` — never the key material — whether or not it is set.
     let mut db = new_database();

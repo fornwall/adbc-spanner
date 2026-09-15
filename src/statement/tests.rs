@@ -19,7 +19,7 @@ fn ingest_temporary_accepts_false_and_rejects_true() {
     let error = check_ingest_temporary(OptionValue::String("true".into())).unwrap_err();
     assert_eq!(error.status, Status::NotImplemented);
     // Malformed values fail boolean coercion, not the temporary-table check — the
-    // formerly-accepted lenient spellings (COR-7) and int-typed sets (COR-4) alike.
+    // formerly-accepted lenient spellings and int-typed sets alike.
     for bad in ["maybe", "FALSE", "0", "no", "TRUE", "1", "yes"] {
         let error = check_ingest_temporary(OptionValue::String(bad.into())).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments, "{bad}");
@@ -46,7 +46,7 @@ fn exec_incremental_accepts_false_and_rejects_true() {
     let error = check_exec_incremental(OptionValue::String("true".into())).unwrap_err();
     assert_eq!(error.status, Status::NotImplemented);
     // Malformed values fail boolean coercion, not the incremental check — the
-    // formerly-accepted lenient spellings (COR-7) and int-typed sets (COR-4) alike.
+    // formerly-accepted lenient spellings and int-typed sets alike.
     for bad in ["maybe", "FALSE", "0", "no", "TRUE", "1", "yes"] {
         let error = check_exec_incremental(OptionValue::String(bad.into())).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments, "{bad}");
@@ -140,7 +140,7 @@ fn execute_schema_guard_rejects_ddl_and_dml() {
         check_schema_query(sql).unwrap_or_else(|e| panic!("query should pass: {sql}: {e}"));
     }
     // DDL is rejected up front with the same `InvalidArguments` as DML — both are the "not a
-    // query" class (SPEC-6).
+    // query" class.
     let error = check_schema_query("CREATE TABLE t (id INT64) PRIMARY KEY (id)").unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     // DML — in any spelling, hinted, or with THEN RETURN — gets a clear `InvalidArguments`
@@ -176,7 +176,7 @@ fn execute_partitions_guard_rejects_ddl_and_dml() {
         check_partition_query(sql).unwrap_or_else(|e| panic!("query should pass: {sql}: {e}"));
     }
     // DDL is rejected up front with the same `InvalidArguments` as DML — both are the "not a
-    // query" class (SPEC-6).
+    // query" class.
     let error = check_partition_query("CREATE TABLE t (id INT64) PRIMARY KEY (id)").unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     assert!(
@@ -185,7 +185,7 @@ fn execute_partitions_guard_rejects_ddl_and_dml() {
         error.message
     );
     // DML — in any spelling, hinted, or with THEN RETURN — gets a clear `InvalidArguments`
-    // instead of Spanner's raw read-only-transaction error from `partition_query` (COR-11).
+    // instead of Spanner's raw read-only-transaction error from `partition_query`.
     for sql in [
         "INSERT INTO t (id) VALUES (1)",
         "update t set c = 1 where true",
@@ -248,7 +248,7 @@ fn string_option_requires_a_string_value() {
         "hi"
     );
     // A non-string value kind is rejected as an invalid argument, and the error names the
-    // offending option's full key rather than a generic "statement option" (IDIO-7).
+    // offending option's full key rather than a generic "statement option".
     for value in [OptionValue::Int(1), OptionValue::Double(1.0)] {
         let error = string_option(&key, value).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
@@ -271,7 +271,7 @@ fn bool_option_parses_exact_true_false() {
 #[test]
 fn bool_option_rejects_non_bool_values() {
     // A string that is not exactly "true"/"false" — including the formerly-accepted lenient
-    // spellings (case variants, 1/0, yes/no), dropped for ADBC-ecosystem parity (COR-7).
+    // spellings (case variants, 1/0, yes/no), dropped for ADBC-ecosystem parity.
     for bad in [
         "maybe", "", "2", "t", "on", "TRUE", "True", "FALSE", "False", "1", "0", "yes", "no",
         "YES", "NO",
@@ -279,7 +279,7 @@ fn bool_option_rejects_non_bool_values() {
         let error = bool_option(OptionValue::String(bad.into()), "option o").unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
     }
-    // Non-string value kinds — including int-typed sets (COR-4) — are rejected outright.
+    // Non-string value kinds — including int-typed sets — are rejected outright.
     for bad in [
         OptionValue::Int(0),
         OptionValue::Int(1),
@@ -299,7 +299,7 @@ fn bind_by_name_option_parses_as_a_boolean_naming_the_option() {
     assert!(!crate::options::bool_option(OptionValue::String("false".into()), what).unwrap());
     for bad in [
         OptionValue::String("maybe".into()),
-        // An int-typed set is rejected like any other non-string value (COR-4).
+        // An int-typed set is rejected like any other non-string value.
         OptionValue::Int(1),
     ] {
         let error = crate::options::bool_option(bad, what).unwrap_err();

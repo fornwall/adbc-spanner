@@ -108,7 +108,7 @@ fn mid_ingest_failure_notes_committed_rows() {
 
 #[test]
 fn timed_out_or_cancelled_chunk_reports_unknown_outcome() {
-    // CON-5: a cancel/timeout drops the in-flight `Commit` future, which may still land
+    // A cancel/timeout drops the in-flight `Commit` future, which may still land
     // server-side, so the failing chunk's own outcome is unknown — the annotation must flag
     // the ambiguity (and the duplicate-row risk) rather than implying exact accounting.
     for status in [Status::Timeout, Status::Cancelled] {
@@ -217,7 +217,7 @@ fn ingest_mode_parses_both_spellings_and_rejects_unknown() {
     let error = ingest_mode_option(&key, OptionValue::String("upsert".into())).unwrap_err();
     assert_eq!(error.status, Status::NotImplemented);
     assert!(error.message.contains("ingest mode \"upsert\""), "{error}");
-    // Non-string values fail string coercion, naming the option's full key (IDIO-7).
+    // Non-string values fail string coercion, naming the option's full key.
     let error = ingest_mode_option(&key, OptionValue::Int(1)).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     assert!(error.message.contains("adbc.ingest.mode"), "{error}");
@@ -232,8 +232,8 @@ fn ingest_batch_write_option_coerces_and_unsets_on_empty() {
     for empty in ["", "   "] {
         assert!(!ingest_batch_write_option(OptionValue::String(empty.into())).unwrap());
     }
-    // A non-bool string — including the formerly-accepted lenient spellings (COR-7) — and an
-    // int-typed set (COR-4) are rejected with InvalidArguments (the shared boolean coercion).
+    // A non-bool string — including the formerly-accepted lenient spellings — and an
+    // int-typed set are rejected with InvalidArguments (the shared boolean coercion).
     for bad in ["maybe", "TRUE", "1", "yes", "FALSE", "0", "no"] {
         let error = ingest_batch_write_option(OptionValue::String(bad.into())).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments, "{bad}");

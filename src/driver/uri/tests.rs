@@ -38,7 +38,7 @@ fn a_scheme_uri_sets_the_database_path() {
 fn the_documented_quickstart_uri_example_parses() {
     // The exact `uri=` example string shown in the quickstart docs (src/ffi.rs module doc,
     // docs/adbc.md, python/adbc_driver_spanner/dbapi.py) must stay a form the driver accepts,
-    // so the docs can't silently rot into a rejected spelling again (IDIO-1).
+    // so the docs can't silently rot into a rejected spelling again.
     let mut db = new_database();
     set_uri(&mut db, "spanner:///projects/p/instances/i/databases/d").unwrap();
     assert_eq!(db.database.as_deref(), Some(DB_PATH));
@@ -211,7 +211,7 @@ fn an_unknown_query_parameter_is_rejected_by_name() {
 
 #[test]
 fn secret_bearing_query_parameters_are_rejected() {
-    // SEC-2: a URI is the most-logged config artifact there is (shell history, `ps`, tracing
+    // A URI is the most-logged config artifact there is (shell history, `ps`, tracing
     // spans), so the two options whose value is a live secret cannot travel in one. They are
     // rejected by name — not silently accepted, and not lumped in with unknown keys — and the
     // error points at the option itself, which is the supported way to supply them.
@@ -262,7 +262,7 @@ fn a_rejected_uri_leaves_the_configuration_untouched() {
         "spanner:///projects/p2/instances/i2/databases/d2?spanner.emulator=maybe".to_string(),
         "spanner://host:9010/projects/p2/instances/i2/databases/d2?spanner.auth.keyfile=%G1"
             .to_string(),
-        // A refused secret-holding key (SEC-2) is no different: the whole URI is rejected
+        // A refused secret-holding key is no different: the whole URI is rejected
         // before any field is mutated, authority included.
         format!(
             "spanner://host:9010/projects/p2/instances/i2/databases/d2?{OPTION_ACCESS_TOKEN}=ya29.x"

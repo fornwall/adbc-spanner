@@ -45,7 +45,7 @@ fn parses_read_and_min_timestamp() {
         ReadBound::MinReadTimestamp(dt("2026-07-07T00:00:00+02:00"))
     );
     // The absolute prefixes tolerate whitespace around the prefix, like ` exact : 1h ` — all
-    // four kinds share one grammar (COR-7).
+    // four kinds share one grammar.
     assert_eq!(
         parse_read_bound("read : 2026-07-07T00:00:00Z").unwrap(),
         ReadBound::ReadTimestamp(dt("2026-07-07T00:00:00Z"))
@@ -54,7 +54,7 @@ fn parses_read_and_min_timestamp() {
 
 /// Prefixes are exact lowercase, like every other option value in the driver (and the ADBC
 /// ecosystem, which exact-matches option values): any case variant is rejected with the
-/// grammar error, uniformly across all four kinds (COR-7).
+/// grammar error, uniformly across all four kinds.
 #[test]
 fn rejects_uppercase_and_mixed_case_prefixes() {
     for bad in [

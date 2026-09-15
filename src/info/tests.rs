@@ -23,7 +23,7 @@ fn build_matches_schema_and_reports_defaults() {
 
 #[test]
 fn all_codes_result_covers_every_explicitly_answered_code() {
-    // The SPEC-5 invariant (mirrors the C++ validation `MetadataGetInfoAllCodes` test): any
+    // The invariant (mirrors the C++ validation `MetadataGetInfoAllCodes` test): any
     // code answered for an explicit request must also appear in the `get_info(None)` result.
     let all = build(None).unwrap();
     let all_names = all

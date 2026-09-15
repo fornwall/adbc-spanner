@@ -63,7 +63,7 @@ fn emulator_mode_with_an_access_token_is_refused() {
 
 #[test]
 fn access_token_is_write_only() {
-    // SEC-1: the token is a live bearer credential, so `get_option` reports `NotFound`
+    // The token is a live bearer credential, so `get_option` reports `NotFound`
     // whether the option is set or not — the token is never returned (matching the
     // keyfile_json convention and the `Debug` redaction).
     let mut db = new_database();
