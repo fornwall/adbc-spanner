@@ -74,17 +74,15 @@ impl SpannerStatement {
     /// Remap a failed `append`- or `create_append`-mode bulk ingest onto the statuses the ADBC
     /// bulk-ingest contract mandates.
     ///
-    /// Both modes insert into a table that may already exist, so the spec wants their insert
-    /// failure remapped: for `append` a missing table is [`Status::NotFound`] and a present one is a
-    /// schema mismatch ([`Status::AlreadyExists`]); for `create_append` the `CREATE TABLE IF NOT
-    /// EXISTS` step guarantees the table is present, so only the schema-mismatch side can surface.
-    /// `create` and `replace` keep the raw insert error — their DDL step already owns the
-    /// table-existence contract ([`remap_ingest_create_error`](Self::remap_ingest_create_error)).
+    /// For `append` a missing table is [`Status::NotFound`] and a present one is a schema mismatch
+    /// ([`Status::AlreadyExists`]); `create_append`'s `CREATE TABLE IF NOT EXISTS` guarantees the
+    /// table is present, so only the schema-mismatch side can surface. `create` and `replace` keep
+    /// the raw insert error — their DDL step owns the table-existence contract
+    /// ([`remap_ingest_create_error`](Self::remap_ingest_create_error)).
     ///
     /// A failure that already carries [`Status::AlreadyExists`] — a bound row duplicating a primary
-    /// key, since insert mutations keep `INSERT` semantics — keeps that status and just gets the
-    /// table name folded into the message. Any other failure is reinterpreted from the
-    /// [`ingest_table_exists`](Self::ingest_table_exists) probe.
+    /// key — keeps that status and just gets the table name folded in. Any other failure is
+    /// reinterpreted from the [`ingest_table_exists`](Self::ingest_table_exists) probe.
     fn remap_ingest_append_error(&self, table: &str, error: Error) -> Error {
         if !matches!(
             self.ingest_mode,
@@ -222,12 +220,11 @@ impl SpannerStatement {
     /// Ship the bound rows as Spanner **insert mutations**, honouring the connection's transaction
     /// mode and Spanner's per-commit limits.
     ///
-    /// Mutations are the `Commit` RPC's native write format: no SQL for Spanner to parse and plan
-    /// per row (why they beat per-row `INSERT` DML for bulk loads). Each cell converts through the
-    /// same Arrow→Spanner value mapping as parameter binding (see [`bind::insert_mutation`]).
-    /// Insert mutations keep `INSERT` semantics — a duplicate primary key fails with
-    /// `ALREADY_EXISTS`. (Mutations take no isolation level: Spanner commits blind writes
-    /// serializably.)
+    /// Mutations are the `Commit` RPC's native write format: no SQL to parse and plan per row (why
+    /// they beat per-row `INSERT` DML), converting each cell through the same Arrow→Spanner mapping
+    /// as parameter binding ([`bind::insert_mutation`]) and keeping `INSERT` semantics — a
+    /// duplicate primary key fails with `ALREADY_EXISTS`. Mutations take no isolation level:
+    /// Spanner commits blind writes serializably.
     ///
     /// **Manual mode** buffers every row's mutation for the next `commit`, which applies them
     /// atomically in the *same* read/write transaction as any buffered DML — Spanner applies
@@ -603,14 +600,12 @@ pub(super) fn ingest_batch_write_option(value: OptionValue) -> Result<bool> {
 /// apply. Either way the count is exact, and reporting it tells the caller what state the table was
 /// left in.
 ///
-/// A [`Status::Timeout`]/[`Status::Cancelled`] failure is the exception: cancel/timeout
-/// *drops* the in-flight `Commit` future, which may still land server-side, so the **failing
-/// chunk's own** outcome is unknown — a caller-driven retry could duplicate its rows. There the
-/// exact count still covers the earlier work, but the annotation also flags the ambiguity rather
-/// than implying the failing chunk committed nothing. Other statuses keep the plain accounting; a
-/// first-chunk failure with a known outcome (nothing committed) passes through unchanged.
-/// The status and `vendor_code` are preserved, so callers still branch on the underlying failure
-/// (e.g. `AlreadyExists` for a duplicate primary key).
+/// A [`Status::Timeout`]/[`Status::Cancelled`] failure is the exception: cancel/timeout *drops* the
+/// in-flight `Commit` future, which may still land server-side, so the **failing chunk's own**
+/// outcome is unknown and the annotation flags that ambiguity rather than implying it committed
+/// nothing. Other statuses keep the plain accounting; a first-chunk failure passes through
+/// unchanged. The status and `vendor_code` are preserved, so callers still branch on the
+/// underlying failure.
 fn note_rows_already_committed(error: Error, committed: i64) -> Error {
     let outcome_unknown = matches!(error.status, Status::Timeout | Status::Cancelled);
     if committed == 0 && !outcome_unknown {

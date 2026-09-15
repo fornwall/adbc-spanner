@@ -7,12 +7,10 @@
 //! numeric string), and `f64` seconds ([`f64_option`]). They live here so every level parses an
 //! option identically and returns the same `InvalidArguments` status on bad input.
 //!
-//! Each helper takes a `what` label naming the offending option. That label is always the option's
-//! **full key** (e.g. `"option spanner.emulator"`, not a short name like `"max_partitions"`): a
-//! caller reading the error needs the exact string they must fix, and a key spelled anywhere else
-//! can drift from the one actually dispatched on. Callers whose key is an enum derive it —
-//! `format!("option {}", key.as_ref())`. [`f64_option`] is the exception: it takes the bare option
-//! key and prefixes `option ` itself.
+//! Each helper takes a `what` label naming the offending option, always its **full key** (e.g.
+//! `"option spanner.emulator"`): a caller reading the error needs the exact string they must fix.
+//! Callers whose key is an enum derive it — `format!("option {}", key.as_ref())`. [`f64_option`] is
+//! the exception: it takes the bare key and prefixes `option ` itself.
 
 use std::time::Duration;
 
@@ -32,15 +30,13 @@ use crate::retry::RetryConfig;
 use crate::staleness::ReadStaleness;
 use crate::timeout::RpcTimeouts;
 
-/// Parse a boolean option, accepted as exactly the string `true` or `false` (lowercase — the
-/// ADBC canonical spellings, matching `adbc_core`'s own `TryFrom<OptionValue> for bool` and the
-/// reference C++ drivers; no case folding, no alternative spellings). Anything else —
-/// including an int-typed value — is rejected with `InvalidArguments`.
+/// Parse a boolean option, accepted as exactly the string `true` or `false` (the ADBC canonical
+/// spellings; no case folding, no alternative spellings). Anything else — including an int-typed
+/// value — is rejected with `InvalidArguments`.
 ///
 /// Int-typed sets are deliberately rejected rather than coerced: no surveyed ADBC driver accepts
-/// `SetOptionInt` for a boolean option (the C++ framework's `Option::AsBool`, Go's driverbase and
-/// `adbc_core`'s `TryFrom<OptionValue> for bool` all reject it), and accepting one would break the
-/// spec's set/get type symmetry, since the getters serve the canonical `"true"`/`"false"` string.
+/// `SetOptionInt` for a boolean option, and accepting one would break the spec's set/get type
+/// symmetry, since the getters serve the canonical `"true"`/`"false"` string.
 pub(crate) fn bool_option(value: OptionValue, what: &str) -> Result<bool> {
     match value {
         OptionValue::String(s) => match s.as_str() {
@@ -86,9 +82,7 @@ pub(crate) fn non_empty_string_option(value: OptionValue, what: &str) -> Result<
 /// A raw option string kept beside its parsed form: `get_option` round-trips exactly what was set
 /// while the driver works from the parsed value.
 ///
-/// The two halves can only move together, through [`set`](Self::set) — the invariant the sites
-/// using it (`spanner.directed_read`, `spanner.request.priority`, `spanner.commit.max_delay`) used
-/// to state in prose beside two parallel `Option` fields.
+/// The two halves can only move together, through [`set`](Self::set).
 #[derive(Debug, Clone)]
 pub(crate) struct RawParsed<T> {
     raw: Option<String>,
@@ -220,11 +214,10 @@ pub(crate) fn positive_usize(value: OptionValue, what: &str) -> Result<usize> {
 
 /// Reinterpret a `get_option_string` lookup as `get_option_int`.
 ///
-/// Every gettable option in this driver has a canonical string form, so the typed getters at all
-/// three levels (database / connection / statement) delegate to `get_option_string` and parse the
-/// result here. The string lookup's error is propagated **unchanged** — per ADBC, `NotFound` means
-/// "option unset/unknown", never "wrong type" — while an option that IS set but whose value cannot
-/// be represented as an integer is reported as `InvalidArguments`.
+/// Every gettable option has a canonical string form, so the typed getters at all three levels
+/// delegate to `get_option_string` and parse the result here. The string lookup's error is
+/// propagated **unchanged** — per ADBC, `NotFound` means "option unset/unknown", never "wrong
+/// type" — while a set-but-unrepresentable value is reported as `InvalidArguments`.
 pub(crate) fn int_from_stored_string(stored: Result<String>, what: &str) -> Result<i64> {
     let value = stored?;
     value
@@ -247,15 +240,10 @@ pub(crate) fn double_from_stored_string(stored: Result<String>, what: &str) -> R
 ///
 /// Every gettable option has a canonical string form, so each level's typed getters are pure
 /// reinterpretations of its own `get_option_string`: bytes are its UTF-8, ints and doubles are it
-/// parsed by [`int_from_stored_string`] / [`double_from_stored_string`] (which propagate the string
-/// lookup's `NotFound` unchanged and report a set-but-unparsable value as `InvalidArguments`). Only
-/// `get_option_string` differs per level; the key type is `Self::Option`, whose `AsRef<str>` names
-/// the key for the error message.
-///
-/// This deliberately covers only the *typed* getters. The read-only
-/// `spanner.commit_stats.mutation_count` key and friends live in `get_option_string` (via
-/// [`impl_shared_option_dispatch`]) and so are served through these bodies without any per-level
-/// special-casing here.
+/// parsed by [`int_from_stored_string`] / [`double_from_stored_string`]. Only `get_option_string`
+/// differs per level; the key type is `Self::Option`, whose `AsRef<str>` names the key for the
+/// error message. Read-only keys like `spanner.commit_stats.mutation_count` live in
+/// `get_option_string` (via [`impl_shared_option_dispatch`]) and need no special-casing here.
 macro_rules! impl_typed_option_getters {
     () => {
         fn get_option_bytes(&self, key: Self::Option) -> Result<Vec<u8>> {
@@ -283,14 +271,7 @@ pub(crate) use impl_typed_option_getters;
 /// takes an [`inherit`](Self::inherit)ed copy, and may then override the fields it also exposes
 /// (the "staleness pattern"). [`impl_shared_option_dispatch`] emits the key→setter / key→getter
 /// dispatch for these fields once, for both objects — which is why both must name their field
-/// `config`.
-///
-/// One struct because the values already travel together: the connection hands all of them to
-/// `SpannerStatement::new`, and both objects hand the commit-relevant ones to the shared
-/// [`run_batch_dml`](crate::connection::run_batch_dml) /
-/// [`run_batch_txn`](crate::connection::run_batch_txn) /
-/// [`write_mutations_txn`](crate::connection::write_mutations_txn) helpers. Bundled, adding an
-/// option touches this struct and the macro, and no signature at all.
+/// `config`. Bundled, adding an option touches this struct and the macro, and no signature.
 #[derive(Debug, Clone)]
 pub(crate) struct SharedConfig {
     /// The standard `adbc.connection.readonly` flag: a connection that has it set rejects all
@@ -298,21 +279,16 @@ pub(crate) struct SharedConfig {
     /// of already-buffered work. Behind an `Arc` and read at execution time rather than snapshotted
     /// — see [`is_read_only`](Self::is_read_only).
     pub(crate) read_only: Arc<AtomicBool>,
-    /// Isolation level applied to read/write transactions (autocommit DML and the manual-mode
-    /// commit), set via the standard `adbc.connection.transaction.isolation_level` option. It
-    /// reaches only the DML paths — queries take a timestamp bound instead (see
-    /// [`apply_isolation`](crate::connection::exec::apply_isolation)) — and
-    /// [`IsolationLevel::Unspecified`] (the default) sends no level, which Spanner reads as
-    /// `SERIALIZABLE`. Connection-set only: a statement inherits it but exposes no setter of its
-    /// own.
+    /// Isolation level applied to read/write transactions, via the standard
+    /// `adbc.connection.transaction.isolation_level` option; see
+    /// [`apply_isolation`](crate::connection::exec::apply_isolation). Connection-set only: a
+    /// statement inherits it but exposes no setter of its own.
     pub(crate) isolation: IsolationLevel,
     /// Read bound for read-only queries (`spanner.read.staleness`). The default is a strong read.
     pub(crate) read_staleness: ReadStaleness,
-    /// Request priority and request/transaction tags (`spanner.request.priority` /
-    /// `spanner.request.tag` / `spanner.transaction.tag`), plus the commit knobs
-    /// `spanner.commit.max_delay` and `spanner.commit_stats`. Unset by default. A statement may
-    /// override the priority and request tag; the transaction tag is connection-level only, but
-    /// rides along for the read/write transaction runners a statement builds.
+    /// Request priority and request/transaction tags, plus the commit knobs. Unset by default. A
+    /// statement may override the priority and request tag; the transaction tag is connection-level
+    /// only, but rides along for the read/write transaction runners a statement builds.
     pub(crate) request: RequestConfig,
     /// Directed-read replica selection for read-only queries (`spanner.directed_read`). Unset by
     /// default (Spanner's own routing).
@@ -321,11 +297,9 @@ pub(crate) struct SharedConfig {
     /// `spanner.query.optimizer_statistics_package`). Unset by default; applied to every query
     /// statement builder (via `SpannerStatement::sql_builder`).
     pub(crate) query_options: QueryOptionsConfig,
-    /// How `TIMESTAMP` columns map to Arrow (`spanner.max_timestamp_precision`): nanoseconds that
-    /// error on out-of-range instants (the default) or microseconds covering Spanner's full range.
-    /// Applied uniformly to every result path — `execute` (plain and bound queries), DML
-    /// `THEN RETURN` rows, `execute_schema`, the `execute_partitions` schema probe — and, on the
-    /// connection, to `get_table_schema` and `read_partition` (which have no statement).
+    /// How `TIMESTAMP` columns map to Arrow (`spanner.max_timestamp_precision`), applied uniformly
+    /// to every result path, and on the connection also to `get_table_schema` and `read_partition`
+    /// (which have no statement).
     pub(crate) timestamp_precision: TimestampPrecision,
     /// RPC timeouts (`spanner.rpc.timeout_seconds.{query,update,fetch}`). Unset by default (no
     /// deadline); an expired deadline fails with `Status::Timeout`. The connection applies the
@@ -364,11 +338,9 @@ impl Default for SharedConfig {
 impl SharedConfig {
     /// The config a statement created on this connection starts from.
     ///
-    /// Everything is inherited except [`commit_stats`](Self::commit_stats), which is per-object:
-    /// the statement's own commits record there, never into the connection's cell. Note the
-    /// difference in how the two `Arc` fields come across — `read_only` is deliberately *aliased*
-    /// (a later toggle on the connection reaches statements it has already created), while
-    /// `commit_stats` starts fresh.
+    /// Everything is inherited except [`commit_stats`](Self::commit_stats), which is per-object.
+    /// Note the two `Arc` fields differ: `read_only` is deliberately *aliased* (a later toggle on
+    /// the connection reaches statements it has already created), `commit_stats` starts fresh.
     pub(crate) fn inherit(&self) -> Self {
         Self {
             commit_stats: CommitStats::default(),

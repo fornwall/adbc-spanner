@@ -27,35 +27,24 @@
 //! `Dictionary(Int32, Utf8)` binds exactly like `Utf8`, each cell's key selecting the dictionary
 //! value to bind. Other Arrow types are rejected with an `InvalidArguments` error.
 //!
-//! Spanner `TIMESTAMP` has **nanosecond** precision (up to nine fractional digits), so a
-//! `Timestamp` parameter is bound at its full source precision: a `Nanosecond` input formats up to
-//! nine fractional digits, `Microsecond` six, `Millisecond` three, `Second` none — nothing is
-//! truncated. The driver's default read path is symmetric: it maps Spanner `TIMESTAMP` to Arrow
-//! `Timestamp(Nanosecond, "UTC")` and parses values back at full nanosecond precision (see
-//! [`crate::conversion::parse_timestamp_nanos`]), so nanoseconds bound here round-trip
-//! full-precision. (Arrow's nanosecond `i64` only spans ~1677-09-21 to 2262-04-11, so a Spanner
-//! timestamp outside that range cannot be read back at nanosecond precision and surfaces as an
-//! error rather than a silent truncation; set
-//! [`spanner.max_timestamp_precision=microseconds`](crate::OPTION_MAX_TIMESTAMP_PRECISION) to read
-//! the full 0001–9999 range at microsecond precision instead.)
+//! Spanner `TIMESTAMP` has **nanosecond** precision, so a `Timestamp` parameter is bound at its
+//! full source precision — nothing is truncated — and the default read path is symmetric, mapping
+//! Spanner `TIMESTAMP` back to Arrow `Timestamp(Nanosecond, "UTC")`. See
+//! [`spanner.max_timestamp_precision`](crate::OPTION_MAX_TIMESTAMP_PRECISION) for the range
+//! trade-off that mode carries.
 //!
 //! Spanner encodes `DATE` / `TIMESTAMP` / `NUMERIC` values on the wire as strings, and query
 //! parameters are sent untyped (Spanner infers the type from the SQL). So these three are formatted
 //! straight to their Spanner string forms — `YYYY-MM-DD`, RFC 3339, and a plain decimal — which
 //! keeps the full `Decimal128` (`i128`) range rather than routing through a narrower decimal type.
 //!
-//! **JSON.** A string column tagged with the canonical `arrow.json` extension (the field metadata
-//! this driver itself emits when reading a `JSON` column — see [`crate::conversion`]) binds as a
-//! Spanner `JSON`-typed parameter instead of `STRING`, and a `List` whose element carries the tag
-//! binds as `ARRAY<JSON>`. The distinction matters because Spanner does not coerce `STRING`
-//! parameters into `JSON` columns: without the explicit type, `INSERT … VALUES (@doc)` into a
-//! `JSON` column fails with a type mismatch (the untagged workaround is `PARSE_JSON(@doc)` in the
-//! SQL). Tagged values therefore round-trip: what `execute` reads from a `JSON` column can be
-//! bound straight back into one. Unlike the untyped strings above, this uses `add_typed_param`,
-//! which sends an explicit `JSON` param type alongside the string-encoded value. The tag is
-//! honoured through dictionary encoding too — the Arrow spec allows an extension array to be
-//! dictionary-encoded, so a tagged `Dictionary(_, Utf8)` column binds as `JSON` like its plain
-//! form (null cells included).
+//! **JSON.** A string column tagged with the canonical `arrow.json` extension (the metadata this
+//! driver emits when reading a `JSON` column) binds as a Spanner `JSON`-typed parameter instead of
+//! `STRING`, and a `List` whose element carries the tag binds as `ARRAY<JSON>`. This matters
+//! because Spanner does not coerce `STRING` parameters into `JSON` columns: without the explicit
+//! type, `INSERT … VALUES (@doc)` into a `JSON` column fails with a type mismatch (the untagged
+//! workaround is `PARSE_JSON(@doc)`). So tagged values round-trip. The tag is honoured through
+//! dictionary encoding too.
 
 use adbc_core::error::Result;
 use arrow_array::cast::AsArray;
@@ -80,10 +69,8 @@ use crate::sql::{named_parameters, qualified_table, quote_ident};
 /// Bind the columns of `batch` at `row` to the query parameters named by `names`.
 ///
 /// `names[i]` is the parameter that column `i` binds to; it is computed once per (sql, batch) by
-/// [`resolve_parameter_names`] and passed in, so binding many rows of the same batch does not re-lex
-/// the SQL per row (an O(rows × |sql|) cost that dominated large bound DML). See
-/// [`resolve_parameter_names`] for how the column→parameter pairing is decided (positionally by
-/// default, or by name).
+/// [`resolve_parameter_names`] and passed in, so binding many rows does not re-lex the SQL per row
+/// (an O(rows × |sql|) cost that dominated large bound DML).
 pub(crate) fn bind_params(
     builder: StatementBuilder,
     names: &[String],
@@ -106,22 +93,15 @@ pub(crate) fn bind_params(
 
 /// Work out which parameter name each column of `batch` binds to for `sql`.
 ///
-/// ADBC's parameter model is a batch of columns matched to the query's parameters. This driver
-/// resolves the pairing two ways, selected by the `adbc.statement.bind_by_name` statement option
-/// (`bind_by_name`), following the ADBC SQLite reference driver's convention
-/// (apache/arrow-adbc#3362):
+/// Selected by the `adbc.statement.bind_by_name` statement option, following the ADBC SQLite
+/// reference driver's convention (apache/arrow-adbc#3362):
 ///
-/// - **Positionally** (`bind_by_name = false`, the default — the ADBC ordinal contract): the
-///   *i*-th column binds to the *i*-th distinct `@name` parameter in query order; the counts must
-///   line up, and column names are ignored entirely. This is what positional clients expect — most
-///   ADBC drivers (PostgreSQL, Snowflake, …) bind by position, and the Python DBAPI / validation
-///   suites pass parameters as `$1`/`?` with columns not named after the parameters.
-/// - **By name** (`bind_by_name = true`): each column binds to `@<its own name>`,
-///   order-independent. A column whose name is not one of the query's parameters is rejected here
-///   with `InvalidArguments` naming that column and the parameters the query does declare (a
-///   parameter no column names is simply left unbound, which Spanner rejects at execution time).
-///   Use this when the bound column names are authoritative and may not match the parameters'
-///   textual order.
+/// - **Positionally** (`false`, the default — the ADBC ordinal contract): the *i*-th column binds
+///   to the *i*-th distinct `@name` parameter in query order; the counts must line up, and column
+///   names are ignored. This is what positional clients expect.
+/// - **By name** (`true`): each column binds to `@<its own name>`, order-independent. A column
+///   naming no query parameter is rejected with `InvalidArguments` (a parameter no column names is
+///   left unbound, which Spanner rejects at execution time).
 ///
 /// Lexing the SQL to find its `@name` parameters is the expensive part, so callers resolve once per
 /// (sql, batch) and reuse the result across every row via [`bind_params`].

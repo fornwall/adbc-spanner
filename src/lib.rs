@@ -475,9 +475,8 @@ pub const OPTION_ENDPOINT: &str = "spanner.endpoint";
 
 /// Driver-specific database option: when `true`, connect with anonymous credentials (the mode used
 /// by the Spanner emulator). Automatically enabled when `SPANNER_EMULATOR_HOST` is set. Combining
-/// it with explicitly configured credentials ([`OPTION_KEYFILE`], [`OPTION_KEYFILE_JSON`],
-/// [`OPTION_IMPERSONATE_TARGET_PRINCIPAL`], [`OPTION_ACCESS_TOKEN`], [`OPTION_QUOTA_PROJECT`]) is
-/// refused at connect time rather than silently ignoring them.
+/// it with an explicitly configured credential or [`OPTION_QUOTA_PROJECT`] is refused at connect
+/// time rather than silently ignoring them.
 pub const OPTION_EMULATOR: &str = "spanner.emulator";
 
 /// Driver-specific database option: path to a service-account JSON key file (dbt's `keyfile`).
@@ -491,16 +490,13 @@ pub const OPTION_KEYFILE: &str = "spanner.auth.keyfile";
 ///
 /// **Write-only, and not a URI query parameter.** The value is a live private key, so `get_option`
 /// always fails with [`Status::NotFound`](adbc_core::error::Status::NotFound) — set or not — and a
-/// `spanner://` URI carrying this key is rejected with
-/// [`Status::InvalidArguments`](adbc_core::error::Status::InvalidArguments), since a URI is
-/// routinely logged (shell history, process listings, tracing spans).
+/// `spanner://` URI carrying it is `InvalidArguments`, a URI being routinely logged.
 pub const OPTION_KEYFILE_JSON: &str = "spanner.auth.keyfile_json";
 
 /// Driver-specific database option: the service-account email to impersonate. Setting it **enables
 /// service-account impersonation** — the base credentials (ADC, keyfile, …) mint a short-lived
-/// access token for this principal via IAM Credentials `generateAccessToken`, and the driver
-/// authenticates as the target. Unset, authentication is unchanged. Follows gcloud's
-/// `--impersonate-service-account` / `google-cloud-auth`'s `impersonated` builder.
+/// access token for this principal via IAM Credentials `generateAccessToken`. Unset, authentication
+/// is unchanged. Follows gcloud's `--impersonate-service-account`.
 pub const OPTION_IMPERSONATE_TARGET_PRINCIPAL: &str = "spanner.auth.impersonate.target_principal";
 
 /// Driver-specific database option: an optional delegation chain for impersonation — a
@@ -527,13 +523,11 @@ pub const OPTION_IMPERSONATE_LIFETIME: &str = "spanner.auth.impersonate.lifetime
 pub const OPTION_ACCESS_TOKEN: &str = "spanner.auth.access_token";
 
 /// Driver-specific database option: the **quota / billing project** charged for Spanner API usage
-/// (the `x-goog-user-project` header), decoupled from the project owning the data — for a
-/// credential whose home project differs from the target. The caller must hold
-/// `serviceusage.services.use` on it. Mirrors gcloud's `--billing-project`.
-///
-/// Composes with every non-emulator credential source and is refused in emulator mode. Not a
-/// secret, so it round-trips through `get_option`; `""` unsets it. The `GOOGLE_CLOUD_QUOTA_PROJECT`
-/// environment variable takes precedence over it in the auth library.
+/// (the `x-goog-user-project` header), decoupled from the project owning the data. The caller must
+/// hold `serviceusage.services.use` on it. Mirrors gcloud's `--billing-project`. Composes with
+/// every non-emulator credential source and is refused in emulator mode. Not a secret, so it
+/// round-trips through `get_option`; `""` unsets it. `GOOGLE_CLOUD_QUOTA_PROJECT` takes precedence
+/// over it in the auth library.
 pub const OPTION_QUOTA_PROJECT: &str = "spanner.auth.quota_project";
 
 /// Driver-specific statement option: the number of rows converted into each Arrow
@@ -544,10 +538,8 @@ pub const OPTION_ROWS_PER_BATCH: &str = "spanner.rows_per_batch";
 
 /// Driver-specific statement option: enable **Data Boost** for
 /// [`Statement::execute_partitions`](adbc_core::Statement::execute_partitions), so each partition
-/// executes on Spanner's serverless, workload-isolated compute. The flag is baked into every
-/// partition descriptor, so a partition read back with
-/// [`Connection::read_partition`](adbc_core::Connection::read_partition) — on any connection or
-/// worker — honours it. A boolean, default `false`.
+/// executes on Spanner's serverless, workload-isolated compute. Baked into every partition
+/// descriptor, so any connection or worker reading one back honours it. A boolean, default `false`.
 pub const OPTION_DATA_BOOST: &str = "spanner.data_boost";
 
 /// Statement option controlling how bound Arrow columns pair with the query's `@name` parameters,
@@ -588,11 +580,10 @@ pub const OPTION_INGEST_BATCH_WRITE: &str = "spanner.ingest.batch_write";
 /// - **The row count is a lower bound** — Spanner reports `row_count_lower_bound`, which
 ///   undercounts when a partition was retried; `execute_update` returns it as-is.
 ///
-/// Spanner also restricts what it can run: exactly **one** statement per transaction (a
-/// `;`-separated batch is `InvalidArguments`), no `THEN RETURN` (also `InvalidArguments`), and it
-/// cannot join a manual transaction (`InvalidState`). Non-DML statements and bulk ingests ignore
-/// the flag. The commit options, `spanner.transaction.tag` and the isolation level are inert here
-/// (there is no `Commit`); everything else applies.
+/// Spanner also restricts what it can run: exactly **one** statement per transaction, no
+/// `THEN RETURN` (both `InvalidArguments`), and it cannot join a manual transaction
+/// (`InvalidState`). Non-DML statements and bulk ingests ignore the flag. The commit options,
+/// `spanner.transaction.tag` and the isolation level are inert here (there is no `Commit`).
 pub const OPTION_DML_PARTITIONED: &str = "spanner.dml.partitioned";
 
 /// Driver-specific connection **and** statement option: the **read bound** for read-only queries.
@@ -802,7 +793,7 @@ pub const OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS: &str =
 
 /// Driver-specific connection **and** statement option: the maximum precision at which Spanner
 /// `TIMESTAMP` columns are read into Arrow. `""` resets to the default; round-trips through
-/// `get_option`; inherited by statements the connection creates, overridable per statement.
+/// `get_option`.
 ///
 /// - `nanoseconds_error_on_overflow` (the default) — `Timestamp(Nanosecond, "UTC")`, preserving the
 ///   wire value's full precision. Arrow's `i64` nanoseconds span only ~1677-09-21 to 2262-04-11,

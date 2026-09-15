@@ -177,8 +177,7 @@ pub(crate) async fn result_set_to_batch(
 
 /// Materialise already-drained Spanner rows (plus their result-set metadata) as a single Arrow
 /// [`RecordBatch`] together with its schema. Used where the rows had to be drained inside a
-/// read/write transaction runner (whose closure must keep the client's error type for abort/retry
-/// detection) and are converted afterwards — e.g. DML with `THEN RETURN`.
+/// read/write transaction runner and are converted afterwards — e.g. DML with `THEN RETURN`.
 pub(crate) fn rows_to_batch(
     metadata: Option<&ResultSetMetadata>,
     rows: &[Row],
@@ -234,9 +233,8 @@ fn approx_row_bytes(row: &Row) -> usize {
 }
 
 /// Approximate the byte size of a single Spanner [`Value`] (see [`approx_row_bytes`]). Strings —
-/// which is how Spanner ships `STRING`, `BYTES` (base64), `INT64`, `NUMERIC`, `DATE`, `TIMESTAMP`,
-/// `JSON`, … over the wire — count their UTF-8 length; nested lists/structs recurse; other scalars
-/// count as a small fixed size.
+/// how Spanner ships most types over the wire — count their UTF-8 length; nested lists/structs
+/// recurse; other scalars count as a small fixed size.
 fn approx_value_bytes(value: &Value) -> usize {
     match value.kind() {
         Kind::Null => 0,
@@ -374,11 +372,9 @@ impl Iterator for SpannerBatchReader {
 
     fn next(&mut self) -> Option<Self::Item> {
         // Emit the prefetched first chunk (which settled the schema) before pulling any more. An
-        // *empty* first chunk means an empty result set — `pull_chunk` returns no rows only once the
-        // stream is already exhausted — so skip it and fall through to end the stream: an empty
-        // result yields zero batches (its schema is still exposed via `schema()`), the Arrow-standard
-        // end-of-stream shape the ADBC contract expects (adbc_validation's empty-readback case reads
-        // a released/NULL array, not a spurious 0-row batch).
+        // *empty* first chunk means an empty result set, so skip it and end the stream: an empty
+        // result yields zero batches (its schema still reaches `schema()`), the Arrow-standard
+        // end-of-stream shape the ADBC contract expects.
         if let Some(rows) = self.first.take()
             && !rows.is_empty()
         {
@@ -414,11 +410,9 @@ impl RecordBatchReader for SpannerBatchReader {
 }
 
 /// A lazy source of the per-bound-row query statements a [`BoundQueryChunks`] source executes, one
-/// at a time. Each `SpannerSql` (its query text plus bound parameter map) is materialised only right
-/// before it is handed to Spanner, so a large `executemany` SELECT holds a single statement in
-/// memory rather than one per bound row. Implemented in `src/statement.rs`. `next_statement` yields
-/// `None` once every bound row is drained; a per-row bind failure surfaces as `Some(Err(..))` at
-/// that point in the stream.
+/// at a time, so a large `executemany` SELECT holds a single statement in memory rather than one
+/// per bound row (implemented in `src/statement.rs`). `next_statement` yields `None` once every
+/// bound row is drained; a per-row bind failure surfaces as `Some(Err(..))` at that point.
 pub(crate) trait BoundStatementSource: Send {
     fn next_statement(&mut self) -> Option<Result<SpannerSql>>;
 }
@@ -475,11 +469,9 @@ pub(crate) async fn stream_bound_query(
 }
 
 /// The prefetch task's view of a bound (parameterized) query: the successive per-bound-row result
-/// sets, drained in bounded chunks, all inside one shared multi-use read-only transaction. Owns the
-/// `Arc<MultiUseReadOnlyTransaction>` (so the shared snapshot outlives lazy iteration — the prefetch
-/// task holds the source) and the lazy statement source; each `next_chunk` is bounded by the
-/// statement's fetch timeout (`spanner.rpc.timeout_seconds.fetch`), covering both the chunk pull and
-/// the execution of the next bound row's statement when the current result set drains.
+/// sets, drained in bounded chunks, all inside one shared multi-use read-only transaction, whose
+/// `Arc` it owns so the snapshot outlives lazy iteration. Each `next_chunk` is bounded by the fetch
+/// timeout, covering both the chunk pull and the execution of the next bound row's statement.
 struct BoundQueryChunks {
     /// The shared snapshot every statement executes in.
     transaction: Arc<MultiUseReadOnlyTransaction>,
@@ -551,11 +543,9 @@ async fn next_bound_chunk(
 }
 
 /// Build the Arrow schema for a result set from Spanner's column metadata, falling back to
-/// all-`Utf8` columns inferred from the first row's width when metadata is unavailable.
-///
-/// Returns `Result` (and prefixes the offending column name on error) so an unmappable type can be
-/// rejected cleanly; today every Spanner type maps to some Arrow type, so this does not fail in
-/// practice — see [`arrow_type`].
+/// all-`Utf8` columns inferred from the first row's width when metadata is unavailable. Returns
+/// `Result` (naming the offending column) so an unmappable type can be rejected cleanly; today
+/// every Spanner type maps to some Arrow type.
 pub(crate) fn build_schema(
     metadata: Option<&ResultSetMetadata>,
     first_row: Option<&Row>,
