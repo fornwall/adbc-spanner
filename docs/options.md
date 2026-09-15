@@ -99,12 +99,12 @@ holds configuration).
 | `spanner.emulator` | boolean | `false` (forced `true` when `SPANNER_EMULATOR_HOST` is set non-empty) | yes, always (`true`/`false`) | Connect with **anonymous credentials** (emulator mode). Combining emulator mode with explicitly configured credentials (`spanner.auth.keyfile`, `spanner.auth.keyfile_json`, `spanner.auth.impersonate.target_principal`, or `spanner.auth.access_token`) is refused at connect time with `InvalidState` instead of silently ignoring them; ambient ADC does not conflict. |
 | `spanner.auth.keyfile` | string: path to a credential JSON file | unset (Application Default Credentials) | yes, when set | Path to a Google credential JSON key file (dbt's `keyfile`). The credential flow is auto-detected from the JSON's `"type"` field: `service_account`, `authorized_user`, `impersonated_service_account`, or `external_account`. Overridden by `spanner.auth.keyfile_json` if both are set. See [README § Authentication](../README.md#authentication). |
 | `spanner.auth.keyfile_json` | string: inline credential JSON | unset (Application Default Credentials) | **no — write-only** (`get_option` always fails with `NotFound`, set or not: the value is a live private key and is never returned) | Inline Google credential JSON (dbt's `keyfile_json`); same auto-detection as `spanner.auth.keyfile`, and wins over it when both are set. Must be set as an option: it is **not** accepted as a `uri` query parameter (see [Connection URIs](#connection-uris)). |
-| `spanner.auth.impersonate.target_principal` | string: service-account email | unset (no impersonation) | yes, when set | Setting this **enables service-account impersonation**: the base credentials (keyfile or ADC) mint a short-lived token for this target via the IAM Credentials `generateAccessToken` API, and the driver authenticates as the target. Follows gcloud's `--impersonate-service-account` / `google-cloud-auth`'s `impersonated` builder. See [README § Service-account impersonation](../README.md#service-account-impersonation). |
+| `spanner.auth.impersonate.target_principal` | string: service-account email | unset (no impersonation) | yes, when set | Setting this **enables service-account impersonation**: the base credentials (keyfile or ADC) mint a short-lived token for this target via the IAM Credentials `generateAccessToken` API, and the driver authenticates as the target. Follows gcloud's `--impersonate-service-account` / `google-cloud-auth`'s `impersonated` builder. |
 | `spanner.auth.impersonate.delegates` | string: comma-separated service-account emails | unset (no delegation chain) | yes, when non-empty (normalised: entries trimmed, empties dropped, re-joined with `,`) | Delegation chain for impersonation; each account must hold the *Token Creator* role on the next, the last on the target principal. Only used when a target principal is set. |
 | `spanner.auth.impersonate.scopes` | string: comma-separated OAuth 2.0 scopes | unset (the `cloud-platform` scope) | yes, when non-empty (normalised as above) | Scopes for the impersonated token. Only used when a target principal is set. |
 | `spanner.auth.impersonate.lifetime` | non-negative seconds | `3600` (one hour) | yes, when explicitly set (the implicit default is **not** reported) | Lifetime of the impersonated access token, in seconds. Only used when a target principal is set. |
-| `spanner.auth.access_token` | string: OAuth 2.0 bearer token | unset (Application Default Credentials) | **no — write-only** (`get_option` always fails with `NotFound`, set or not: the value is a live bearer token and is never returned, matching `spanner.auth.keyfile_json`) | Authenticate with a caller-supplied OAuth 2.0 access token, sent verbatim as `Authorization: Bearer <token>` with **no refresh** (the caller owns token validity). A complete credential in its own right, so it is **mutually exclusive** with `spanner.auth.keyfile`, `spanner.auth.keyfile_json`, and `spanner.auth.impersonate.target_principal` — combining it with any of them is refused at connect time with `InvalidState`. Must be set as an option: it is **not** accepted as a `uri` query parameter (see [Connection URIs](#connection-uris)). See [README § OAuth access token](../README.md#oauth-access-token). |
-| `spanner.auth.quota_project` | string: GCP project id | unset (the credential's own project) | yes, when set (`""` unsets) | The **quota / billing project** charged for API usage, decoupled from the project that owns the data — sent as the `x-goog-user-project` header. Attached to whichever credentials are in effect (ADC, keyfile, impersonation, or the access token), so it composes with every non-emulator credential path; the caller must hold `serviceusage.services.use` on it. Refused in emulator mode (which ignores it), like the credential options. Mirrors BigQuery's `bigquery.auth.quota_project` / gcloud's `--billing-project`. If `GOOGLE_CLOUD_QUOTA_PROJECT` is set, the auth library gives it precedence. See [README § Quota / billing project](../README.md#quota--billing-project). |
+| `spanner.auth.access_token` | string: OAuth 2.0 bearer token | unset (Application Default Credentials) | **no — write-only** (`get_option` always fails with `NotFound`, set or not: the value is a live bearer token and is never returned, matching `spanner.auth.keyfile_json`) | Authenticate with a caller-supplied OAuth 2.0 access token, sent verbatim as `Authorization: Bearer <token>` with **no refresh** (the caller owns token validity). A complete credential in its own right, so it is **mutually exclusive** with `spanner.auth.keyfile`, `spanner.auth.keyfile_json`, and `spanner.auth.impersonate.target_principal` — combining it with any of them is refused at connect time with `InvalidState`. Must be set as an option: it is **not** accepted as a `uri` query parameter (see [Connection URIs](#connection-uris)). |
+| `spanner.auth.quota_project` | string: GCP project id | unset (the credential's own project) | yes, when set (`""` unsets) | The **quota / billing project** charged for API usage, decoupled from the project that owns the data — sent as the `x-goog-user-project` header. Attached to whichever credentials are in effect (ADC, keyfile, impersonation, or the access token), so it composes with every non-emulator credential path; the caller must hold `serviceusage.services.use` on it. Refused in emulator mode (which ignores it), like the credential options. Mirrors BigQuery's `bigquery.auth.quota_project` / gcloud's `--billing-project`. If `GOOGLE_CLOUD_QUOTA_PROJECT` is set, the auth library gives it precedence. |
 
 ### Connection URIs
 
@@ -163,29 +163,23 @@ one.
 ### Manual transactions
 
 Setting `adbc.connection.autocommit=false` enters manual transaction mode. A transaction is exactly
-**one kind of work**, fixed by its first statement:
+**one kind of work**, fixed by its first statement: **queries**, which share one multi-use read-only
+snapshot, or **DML**, which is buffered and applied atomically in one read/write transaction at
+`commit` (so `execute_update` returns no row count until then, and there is **no
+read-your-writes**). Mixing the two kinds fails with `InvalidState`; `rollback` discards the
+buffered work / drops the snapshot. **DDL is not transaction-aware** — it always applies
+immediately, so it reorders ahead of buffered DML and cannot be rolled back.
 
-- **Queries** — every query in the transaction shares one multi-use read-only snapshot, so they all
-  see the same consistent point in time.
-- **DML** — statements are *buffered* and applied atomically in one read/write transaction at
-  `commit`. `execute_update` therefore returns an unknown row count until then, and a query inside a
-  DML transaction fails with `InvalidState` (there is **no read-your-writes**).
-
-Mixing the two kinds fails with `InvalidState`. `rollback` discards the buffered work / drops the
-snapshot.
-
-**DDL is not transaction-aware**: it always applies immediately, so it reorders ahead of buffered
-DML and cannot be rolled back. See [README § Supported optional ADBC functionality](../README.md#supported-optional-adbc-functionality) for the full caveats.
+[docs/transactions.md](transactions.md) owns this model in full: the state machine, what `commit`
+actually sends, and the Spanner constraints behind it.
 
 ### Isolation levels
 
 `adbc.connection.transaction.isolation_level` applies to the **read/write transactions the driver
 builds for DML** — autocommit DML, the `ExecuteBatchDml` batch, and the manual-mode commit of
-buffered DML. It has **no effect on queries**: read-only transactions take a
-[timestamp bound](#stale-reads) instead of an isolation level (Spanner rejects `REPEATABLE_READ` on
-read-only and partitioned-DML transactions), and a mutations-only ingest commit uses the write-only
-path, which has no isolation setting. Setting it on a connection that only runs queries is accepted
-and inert.
+buffered DML. It has **no effect on queries**, which take a [timestamp bound](#stale-reads)
+instead, nor on a mutations-only ingest commit, which uses the write-only path; setting it on a
+connection that only runs queries is accepted and inert.
 
 | Spec level | Effect |
 | ---------- | ------ |
@@ -197,9 +191,11 @@ and inert.
 | `linearizable` | **Promoted** to `serializable`. |
 
 The three weaker/stronger spec levels are promoted upward to the weakest supported level that still
-satisfies them, rather than rejected — this is spec-permitted and safe (a stronger level always
-satisfies a weaker one's guarantees). `get_option` reports the **effective** level, so a promoted
+satisfies them, rather than rejected — spec-permitted and safe, since a stronger level always
+satisfies a weaker one's guarantees. `get_option` reports the **effective** level, so a promoted
 value reads back as what it was promoted to. Unknown strings are rejected with `InvalidArguments`.
+The level also decides Spanner's lock mode — see
+[docs/transactions.md](transactions.md#1-spanners-transaction-model).
 
 > **Write-skew caveat.** Under `repeatable_read` Spanner detects **write-write conflicts only**: a
 > DML statement that reads rows it does not write (a subquery guard, a join, `INSERT … SELECT`) can
@@ -241,13 +237,13 @@ connection's value at creation and may override it; `""` unsets (except where no
 | ------ | --------------------- | ------- | ----------- | ----------- |
 | `spanner.rows_per_batch` | positive integer | `8192` | yes, always (also via `get_option_int`) | Number of rows converted into each Arrow `RecordBatch` streamed by `execute`. Larger batches trade memory for fewer per-batch conversions; smaller batches lower first-batch latency and peak memory. |
 | `spanner.data_boost` | boolean | `false` | yes, always (`true`/`false`) | Run `execute_partitions` partitions on [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview) (Spanner's serverless, workload-isolated compute). Baked into every partition descriptor, so `read_partition` honours it on any connection. |
-| `adbc.statement.bind_by_name` | boolean | `false` (positional) | yes, always (`true`/`false`) | How bound Arrow columns pair with the query's `@name` parameters, following the ADBC SQLite reference driver's `bind_by_name` convention ([apache/arrow-adbc#3362](https://github.com/apache/arrow-adbc/issues/3362)). **`false`** (the default): strictly positional — the *i*-th bound column binds to the *i*-th distinct parameter in query order, column names ignored (the ADBC ordinal contract positional clients and validation suites rely on). **`true`**: strict by-name — each column binds to `@<its own name>` (order-independent); a bound column that names no query parameter fails with `InvalidArguments` naming the missing parameter. See [README § Supported optional ADBC functionality](../README.md#supported-optional-adbc-functionality). |
+| `adbc.statement.bind_by_name` | boolean | `false` (positional) | yes, always (`true`/`false`) | How bound Arrow columns pair with the query's `@name` parameters, following the ADBC SQLite reference driver's `bind_by_name` convention ([apache/arrow-adbc#3362](https://github.com/apache/arrow-adbc/issues/3362)). **`false`** (the default): strictly positional — the *i*-th bound column binds to the *i*-th distinct parameter in query order, column names ignored (the ADBC ordinal contract positional clients and validation suites rely on). **`true`**: strict by-name — each column binds to `@<its own name>` (order-independent); a bound column that names no query parameter fails with `InvalidArguments` naming the missing parameter. |
 | `adbc.statement.exec.incremental` | boolean; only `false` accepted | `false` | yes, always reports `false` | **Standard ADBC.** Incremental `execute_partitions` (returning partitions as they become available) is not implemented. The spec default `false` is accepted as a no-op — so generic clients that always set it keep working — while `true` fails with `NotImplemented`. |
 | `adbc.ingest.target_table` | string: table name | unset | yes, when set | **Standard ADBC.** Bulk-ingest target table. Setting it clears any SQL query on the statement (query and ingest target are mutually exclusive on one handle). |
 | `adbc.ingest.target_db_schema` | string: named schema (`""` = Spanner's default, unnamed schema) | unset (default schema) | yes, when set | **Standard ADBC.** Named schema qualifying the ingest target table. |
 | `adbc.ingest.target_catalog` | `""` only | unset | yes, when set | **Standard ADBC.** Spanner has a single, unnamed catalog, so only the empty catalog is accepted; any other name fails with `NotImplemented`. |
 | `adbc.ingest.temporary` | boolean; only `false` accepted | `false` | yes, always reports `false` | **Standard ADBC.** Spanner has no temporary tables. The spec default `false` is accepted as a no-op (so generic clients that always set it keep working); `true` fails with `NotImplemented`. |
-| `adbc.ingest.mode` | `adbc.ingest.mode.append`, `adbc.ingest.mode.create`, `adbc.ingest.mode.create_append`, `adbc.ingest.mode.replace` (short forms `append` / `create` / `create_append` / `replace` also accepted) | `adbc.ingest.mode.create` (the ADBC spec default) | yes, always (the canonical `adbc.ingest.mode.*` form; unset reports the default, `adbc.ingest.mode.create`) | **Standard ADBC.** Bulk-ingest mode: `append` inserts into an existing table; `create` builds the table and errors if it already exists; `create_append` builds it only if absent; `replace` drops any existing table first. The three table-building modes derive the schema from the ingest data's Arrow schema and declare no primary key (Spanner keys such a table on a [hidden `rowid`](https://cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys) of its own, invisible to `SELECT *` / `get_table_schema` / `get_objects`, so the table's columns are exactly the ingested ones). For a table keyed on your own columns — which fixes Spanner's physical row layout — write the `CREATE TABLE` yourself and ingest with `append`; that is also the only way duplicate rows conflict. See [README § Supported optional ADBC functionality](../README.md#supported-optional-adbc-functionality). |
+| `adbc.ingest.mode` | `adbc.ingest.mode.append`, `adbc.ingest.mode.create`, `adbc.ingest.mode.create_append`, `adbc.ingest.mode.replace` (short forms `append` / `create` / `create_append` / `replace` also accepted) | `adbc.ingest.mode.create` (the ADBC spec default) | yes, always (the canonical `adbc.ingest.mode.*` form; unset reports the default, `adbc.ingest.mode.create`) | **Standard ADBC.** Bulk-ingest mode: `append` inserts into an existing table; `create` builds the table and errors if it already exists; `create_append` builds it only if absent; `replace` drops any existing table first. The three table-building modes derive the schema from the ingest data's Arrow schema and declare no primary key (Spanner keys such a table on a [hidden `rowid`](https://cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys) of its own, invisible to `SELECT *` / `get_table_schema` / `get_objects`, so the table's columns are exactly the ingested ones). For a table keyed on your own columns — which fixes Spanner's physical row layout — write the `CREATE TABLE` yourself and ingest with `append`; that is also the only way duplicate rows conflict. |
 | `spanner.ingest.batch_write` | boolean; `""` unsets | `false` (write-only transaction) | yes, always (`true`/`false`) | Route an **autocommit** bulk ingest's per-chunk mutations through Spanner's **BatchWrite** RPC instead of a write-only transaction — a non-atomic, higher-throughput ("firehose") transport. Insert semantics, chunking, the ingested-row count, the read-only-connection guard and the append-mode `NotFound`/`AlreadyExists` remap are all preserved; BatchWrite applies its mutation groups **non-atomically** (the same "not atomic as a whole" guarantee the multi-chunk write-only path already has). **Ignored** in manual-transaction mode (ingests buffer and commit atomically there). `spanner.request.priority`, `spanner.transaction.tag` and `spanner.transaction.exclude_from_change_streams` apply on this path; `spanner.request.tag` does **not** (Spanner ignores per-request tags on BatchWrite), and neither do `spanner.commit.max_delay` / `spanner.commit_stats`, since BatchWrite takes no per-request commit options (so `spanner.commit_stats` reports no `mutation_count` for a BatchWrite ingest). |
 | `spanner.dml.partitioned` | boolean; `""` unsets | `false` (ordinary read/write transaction) | yes, always (`true`/`false`) | Run the statement's DML as [Partitioned DML](https://docs.cloud.google.com/spanner/docs/dml-partitioned): Spanner splits it across partitions and applies each independently, so a large `UPDATE`/`DELETE` never hits the per-commit mutation limit. In exchange it is **not atomic** — partitions commit separately and one may be applied **more than once**, so the statement must be **idempotent** (`SET active = true`, not `SET n = n + 1`) — and `execute_update` returns a **lower bound** on the affected rows (`row_count_lower_bound`), not an exact count. Partitioned DML runs exactly one statement, so a `;`-separated batch, several bound parameter rows, and a `THEN RETURN` clause each fail with `InvalidArguments`; it is its own transaction type, so it cannot join a manual transaction (`InvalidState` while `adbc.connection.autocommit` is `false`). Non-DML statements and bulk ingests ignore the flag. `spanner.request.priority`, `spanner.request.tag`, the `spanner.query.optimizer_*` options, `spanner.transaction.exclude_from_change_streams`, `spanner.rpc.timeout_seconds.update`, the `spanner.retry.*` tuning and the `adbc.connection.readonly` guard all apply; `spanner.commit.max_delay`, `spanner.commit_stats`, `spanner.transaction.tag` and `adbc.connection.transaction.isolation_level` do **not** (partitioned DML has no `Commit`, no per-transaction tag, and Spanner does not support `REPEATABLE_READ` for it). |
 
@@ -333,14 +329,11 @@ Spanner `TIMESTAMP` values span 0001-01-01 to 9999-12-31 at nanosecond precision
   not `0`). This is lossy for values with real nanosecond precision — that loss is the price of the
   full range.
 
-Exactly these two values exist **by design**. A third mode that keeps nanoseconds and silently
-wraps or clamps out-of-range values (as some drivers offer under a plain `nanoseconds` value) is
-deliberately not offered: a wrapped timestamp is a plausible-looking, wrong instant —
-indistinguishable from real data, i.e. silent corruption. Every supported mode is either lossless
-or explicit about what it loses (documented microsecond truncation), and anything else fails
-loudly. The option is modeled on the Snowflake ADBC driver's `max_timestamp_precision`
-([apache/arrow-adbc#2917](https://github.com/apache/arrow-adbc/issues/2917)), minus its
-silent-wraparound value.
+Exactly these two values exist: every supported mode is either lossless or explicit about what it
+loses, and there is deliberately no mode that keeps nanoseconds while silently wrapping or clamping
+an out-of-range value. The option is modeled on the Snowflake ADBC driver's
+`max_timestamp_precision` ([apache/arrow-adbc#2917](https://github.com/apache/arrow-adbc/issues/2917)),
+minus its silent-wraparound value.
 
 The selected mode applies uniformly to **every** surface that produces timestamp data or
 timestamp-typed schemas: `execute` (plain, parameterized and multi-row bound queries, including
@@ -389,13 +382,12 @@ negatives fail with `InvalidArguments`. `0` disables the timeout (same as unset,
 round-trips); an empty string (`""`) unsets. All three round-trip through `get_option` and
 `get_option_double`.
 
-Enforcement is an **overall deadline per operation** (a `tokio::time::timeout` around the whole
-driver-side operation, including any retries the client performs inside it), not a per-attempt
-gRPC timeout. An expired deadline fails with ADBC `Timeout` status. Note that a timed-out *commit*
-may still have landed server-side — the usual ambiguity of any commit whose confirmation was not
-awaited — and a timed-out DDL change may likewise have already applied (its poll simply stopped
-being awaited). Unlike the request-tag options, which leave the driver-internal metadata queries untagged, these
-timeouts *do* bound them, so no driver-side network path is left able to hang unboundedly.
+Enforcement is an **overall deadline per operation** — around the whole driver-side operation,
+including any retries the client performs inside it — not a per-attempt gRPC timeout. An expired
+deadline fails with ADBC `Timeout` status. A timed-out *commit* may still have landed server-side
+(the usual ambiguity of any commit whose confirmation was not awaited), and a timed-out DDL change
+may likewise have already applied. Unlike the request-tag options, which leave the driver-internal
+metadata queries untagged, these timeouts *do* bound them.
 
 ## Retry tuning
 
@@ -407,53 +399,35 @@ operation-wide [RPC timeout](#rpc-timeouts) (if any) fires. The `spanner.retry.*
 *bound* that retrying instead, mirroring the gax `RetryPolicyExt` / `ExponentialBackoffBuilder`
 knobs. They come in two independent families:
 
-**How many times / for how long** — either may be set alone; the retry loop stops at whichever limit
-is reached first:
+**How many times / for how long** — `spanner.retry.max_attempts` and
+`spanner.retry.max_elapsed_seconds` (see the table above for each one's grammar); either may be set
+alone, and the retry loop stops at whichever limit is reached first. Zero, negative, non-finite and
+(for attempts) fractional or above-`u32::MAX` values fail with `InvalidArguments`; an empty string
+(`""`) unsets.
 
-- **`spanner.retry.max_attempts`** — the maximum number of attempts, the first try plus retries, as
-  a positive integer (accepted as an integer, a whole-valued double, or a numeric string). `1`
-  disables retrying. Round-trips through `get_option` and `get_option_int`.
-- **`spanner.retry.max_elapsed_seconds`** — an upper bound, in seconds, on the total wall-clock time
-  spent across attempts before the last error is surfaced as permanent. A finite, strictly positive
-  number (fractions allowed), accepted from a numeric string, integer or double. Round-trips through
-  `get_option` and `get_option_double`.
+**How long to wait between attempts** — the client's truncated exponential backoff with jitter,
+tuned by `spanner.retry.backoff.{initial_seconds,max_seconds,multiplier}`. Setting **any** of the
+three replaces the client's default backoff with an exponential backoff whose unset knobs take the
+client defaults (1s / 60s / ×2), with the whole combination clamped to the gax recommended ranges
+(initial delay ≥ 1ms, maximum delay in `[1s, 24h]`, multiplier in `[1.0, 32.0]`) so it can never
+fail to build. Each is a finite, strictly positive number accepted from a numeric string, integer or
+double, and an empty string unsets it. The two families are **orthogonal** — either may be set alone.
 
-Zero, negative, non-finite and (for attempts) fractional or above-`u32::MAX` values fail with
-`InvalidArguments`; an empty string (`""`) unsets.
-
-**How long to wait between attempts** — the client's truncated exponential backoff with jitter:
-
-- **`spanner.retry.backoff.initial_seconds`** — the first inter-attempt delay, in seconds (client
-  default 1s).
-- **`spanner.retry.backoff.max_seconds`** — the ceiling the growing delay is truncated at, in seconds
-  (client default 60s); raised to the effective initial delay if set below it.
-- **`spanner.retry.backoff.multiplier`** — the per-attempt growth factor (client default `2.0`); a
-  value below `1.0` is floored to `1.0` (a constant delay).
-
-Setting **any** of the three replaces the client's default backoff with an exponential backoff whose
-unset knobs take the client defaults, with the whole combination clamped to the gax recommended
-ranges (initial delay ≥ 1ms, maximum delay in `[1s, 24h]`, multiplier in `[1.0, 32.0]`) so it can
-never fail to build. Each is a finite, strictly positive number accepted from a numeric string,
-integer or double, round-trips through `get_option` / `get_option_double`, and an empty string
-unsets it. The two families are **orthogonal** — either may be set on its own.
-
-When **nothing** is set the client keeps its own default policy, so the feature is purely opt-in and
-by default changes nothing. When anything is set, the driver applies a bounded policy that still
-retries transport / IO errors on idempotent requests exactly like the client's default — the limits
-are layered on top rather than replacing that behaviour — to every user query/DML statement, the
-read/write transaction runner's begin+commit RPCs, the bulk-ingest write-only transaction, and the
-`ExecuteBatchDml` batch. This tunes the *per-attempt* retry loop; the [RPC timeout](#rpc-timeouts)
-family bounds the *overall* per-operation wall time — the two are complementary. The
-transaction-level abort retry (Spanner's optimistic-concurrency re-run on `ABORTED`) is a separate
-policy and stays at the client default.
+When **nothing** is set the client keeps its own default policy, so the feature is purely opt-in.
+When anything is set, the driver applies a bounded policy that still retries transport / IO errors
+on idempotent requests exactly like the client's default — the limits are layered on top rather than
+replacing that behaviour — to every user query/DML statement, the read/write transaction runner's
+begin+commit RPCs, the bulk-ingest write-only transaction, and the `ExecuteBatchDml` batch. This
+tunes the *per-attempt* retry loop; the [RPC timeout](#rpc-timeouts) family bounds the *overall*
+per-operation wall time — the two are complementary. The transaction-level abort retry (Spanner's
+optimistic-concurrency re-run on `ABORTED`) is a separate policy and stays at the client default.
 
 ### What the two limits actually deliver, per RPC path
 
 The Spanner client runs **two different retry loops**. They agree on how attempts are counted, but
-not on elapsed time — so the *elapsed* limit lands differently depending on which RPC carries the
-work. That gap is an upstream defect the driver cannot correct (the same policy object feeds both
-loops, and no policy can recover a loop start the caller re-takes on every decision), so it is
-documented rather than compensated:
+not on elapsed time, so the *elapsed* limit lands differently depending on which RPC carries the
+work. That gap is an upstream defect the driver cannot correct, so it is documented rather than
+compensated:
 
 | | Unary RPCs — DML, `ExecuteBatchDml`, begin, commit | Streaming queries — `ExecuteStreamingSql` |
 | --- | --- | --- |
@@ -461,12 +435,10 @@ documented rather than compensated:
 | `spanner.retry.max_elapsed_seconds` | bounds the loop as documented | **inert** — never fires |
 | client default when unset | uncapped | capped at 10 attempts |
 
-The cause is that the streaming query path is dispatched outside gax's retry loop and hand-rolls its
-stream resumption, building a fresh retry state per resume decision with a freshly-taken start
-instant (hence the never-firing elapsed budget). That same fresh state used to be seeded with the
-count of *retries so far*, which made `max_attempts = N` permit `N + 1` attempts there; upstream has
-since fixed the seed, so the attempt limit is now exact on both paths. If you need a wall-clock
-bound on a **query**, use the [RPC timeout](#rpc-timeouts) family
+The streaming query path is dispatched outside gax's retry loop and hand-rolls its stream
+resumption, building a fresh retry state — with a freshly-taken start instant — per resume decision;
+hence the never-firing elapsed budget. If you need a wall-clock bound on a **query**, use the
+[RPC timeout](#rpc-timeouts) family
 (`spanner.rpc.timeout_seconds.query` / `…fetch`) — it does bound that path. The exact numbers above
 are pinned by tests (`retry_max_attempts_*` / `retry_max_elapsed_seconds_*` in
 `tests/mock_spanner.rs`).
