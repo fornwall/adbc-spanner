@@ -27,9 +27,9 @@ use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::StatementBuilder;
 use google_cloud_spanner::transaction::MultiUseReadOnlyTransaction;
 
-use crate::connection::{LikeMatcher, metadata_sql_builder, str_col};
 use crate::conversion::result_set_to_batch;
 use crate::error::{err, from_spanner};
+use crate::metadata::{LikeMatcher, metadata_sql_builder, str_col};
 use crate::nested::{arrow_err, dense_union, field, list_item, list_of, struct_fields};
 use crate::options::SharedConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};

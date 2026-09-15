@@ -135,6 +135,7 @@ mod error;
 #[allow(unsafe_code)] // The hand-written C ABI export layer; see the module docs.
 mod ffi;
 mod info;
+mod metadata;
 mod nested;
 mod objects;
 mod options;

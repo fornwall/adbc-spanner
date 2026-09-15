@@ -24,9 +24,9 @@ use futures_util::try_join;
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::MultiUseReadOnlyTransaction;
 
-use crate::connection::{LikeMatcher, metadata_sql_builder, str_col};
 use crate::conversion::result_set_to_batch;
 use crate::error::{err, from_spanner};
+use crate::metadata::{LikeMatcher, metadata_sql_builder, str_col};
 use crate::nested::{arrow_err, field, list_item, list_of, list_of_nullable, struct_fields};
 use crate::options::SharedConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
