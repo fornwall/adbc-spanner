@@ -44,9 +44,9 @@ class SpannerQuirks(model.DriverQuirks):
         statement_prepare=True,
         statement_rows_affected=True,
         supported_xdbc_fields=[],
-        # Spanner's default catalog and schema are both the empty string (GoogleSQL
-        # INFORMATION_SCHEMA), which is what get_objects reports.
-        current_catalog="",
+        # The driver reports the database id as the ADBC catalog; the default schema is
+        # the unnamed "" of GoogleSQL INFORMATION_SCHEMA.
+        current_catalog="adbc-test",
         current_schema="",
     )
 

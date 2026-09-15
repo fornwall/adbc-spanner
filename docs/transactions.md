@@ -273,7 +273,7 @@ behalf. Each is covered below.
     uses the
     non-idempotent single-use commit. Its two callers are the mutations-only manual commit
     (`apply_transaction`, `src/connection.rs`) and each autocommit ingest chunk
-    (`write_mutation_chunk`, `src/statement/ingest.rs`).
+    (`write_mutation_range`, `src/statement/ingest.rs`).
   - **Commit stats and commit delay** attach at exactly four sites — the three runner sites above
     via `RequestConfig::apply_to_runner` and the write-only site via `apply_to_write_only`
     (`src/request.rs`). The **priority and the tags** reach those same four commit builders, but are
@@ -389,7 +389,7 @@ behalf. Each is covered below.
   mention the RPC at all. The effective bound is the *"Request size other than for commits | 10
   MiB"* cap. The driver imposes no count limit of its own.
 - **Where we use it.** Every plain DML statement the driver runs — including a **single** one — goes
-  through it: `run_or_buffer` (`src/statement.rs`) → `run_batch_dml` → `run_batch_txn` →
+  through it: `run_or_buffer` (`src/statement.rs`) → `run_batch_txn` →
   `transaction.execute_batch_update` (`src/connection/exec.rs`). A `;`-separated DML batch becomes N
   statements in one call, and the manual DML commit replays its buffer through the same site. The
   `last_statements` flag is `true` for autocommit (the batch *is* the whole transaction, so Spanner

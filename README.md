@@ -80,8 +80,9 @@ Every option named here is specified in full in **[docs/options.md](docs/options
   `false`; `true` fails with `NotImplemented`.
 - Temporary ingest tables — `adbc.ingest.temporary=true` fails with `NotImplemented` (Spanner has
   none).
-- Named catalogs — a non-empty `adbc.connection.catalog` or `adbc.ingest.target_catalog` fails with
-  `NotImplemented`; Spanner has a single, unnamed catalog.
+- Other catalogs — the driver's catalog level is the database it is connected to, so
+  `adbc.connection.catalog` and `adbc.ingest.target_catalog` accept only that database's id (or
+  `""`, meaning unset); any other value fails, since a connection cannot reach another database.
 - A settable current schema — a non-empty `adbc.connection.db_schema` fails with `NotImplemented`.
   Spanner has named schemas, but no session-level schema to select one.
 

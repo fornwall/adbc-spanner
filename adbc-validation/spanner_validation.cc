@@ -341,19 +341,28 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   // true: Spanner DDL goes through the admin UpdateDatabaseDdl API, applies
   // immediately whatever the transaction state, and cannot be rolled back.
   bool ddl_implicit_commit_txn() const override { return true; }
-  // Spanner has a single, unnamed catalog and default schema (both "", which base
-  // catalog()/db_schema() return), so the connection reports them rather than NOT_FOUND.
+  // Spanner's catalog level is the database itself, and its default schema is the
+  // unnamed "" of INFORMATION_SCHEMA, so the connection reports both rather than
+  // NOT_FOUND.
   bool supports_metadata_current_catalog() const override { return true; }
   bool supports_metadata_current_db_schema() const override { return true; }
   // View-typed columns, a target catalog, and a target db-schema are all real
-  // driver capabilities (the driver binds Arrow view layouts, accepts the single
-  // unnamed catalog "", and has named-schema support), so declare them rather than
-  // hiding the cases behind a false quirk. All five cases are gate-enforced.
+  // driver capabilities (the driver binds Arrow view layouts, accepts its own
+  // database as the target catalog, and has named-schema support), so declare them
+  // rather than hiding the cases behind a false quirk. All five cases are gate-enforced.
   bool supports_ingest_view_types() const override { return true; }
   bool supports_bulk_ingest_catalog() const override { return true; }
   bool supports_bulk_ingest_db_schema() const override { return true; }
 
-  std::string catalog() const override { return ""; }
+  // The driver reports the database id as the ADBC catalog, so every case that
+  // filters by, sets, or asserts the current catalog must use the same name.
+  // ADBC_SPANNER_URI is always spanner:///projects/<p>/instances/<i>/databases/<d>
+  // with no query parameters, so the last path segment is the database id.
+  std::string catalog() const override {
+    const std::string uri = EnvOr("ADBC_SPANNER_URI", "");
+    const auto slash = uri.find_last_of('/');
+    return slash == std::string::npos ? uri : uri.substr(slash + 1);
+  }
   std::string db_schema() const override { return ""; }
 
  private:
