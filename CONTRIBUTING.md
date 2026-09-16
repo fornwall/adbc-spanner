@@ -2,8 +2,8 @@
 
 Thanks for your interest in `adbc-spanner`, a Rust [ADBC](https://arrow.apache.org/adbc/) driver for
 Google Cloud Spanner. This document covers the local checks, the release process, and the versioning
-policy. `CLAUDE.md` holds the deeper architecture notes and is the source of truth for the
-temporary dependency pins (see [Dependency pins](#dependency-pins) below).
+policy. `CLAUDE.md` holds concise repository guidance and the checklist for changing temporary
+dependency pins (see [Dependency pins](#dependency-pins) below).
 
 ## Building and testing
 
@@ -85,6 +85,6 @@ blocks `cargo publish`:
    `apache/arrow-adbc` `main` revision).
 
 Do not edit these pins ad hoc. The **Revert checklist** in `CLAUDE.md` ("Temporary git pins") is the
-single source of truth: it lists both current revision SHAs and every location (`Cargo.toml`,
+single source of truth for coordinated changes: it lists every location (`Cargo.toml`,
 `deny.toml`, `README.md`, the docs, and the `publish` flag) that must change in lockstep when a
-family is reverted to a crates.io release.
+family is reverted to a crates.io release. Read current revision SHAs from `Cargo.toml`/`Cargo.lock`.
