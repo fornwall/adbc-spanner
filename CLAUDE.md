@@ -131,12 +131,19 @@ same rev (see `README.md`).
 | Family | Rev | Why it is still pinned |
 | --- | --- | --- |
 | `google-cloud-rust` (8 crates) | `ec54ef0ad69ecd24487c1d3b93a2e4082d820b58` | Native `STRUCT` mapping needs `Type::struct_type()`, on `main` but in no release. |
-| `apache/arrow-adbc` (3 crates) | `32c67b092c0f7cabf2be75062f001a9e17a48cc1` | `Connection`/`Statement::get_cancel_handle` and the `CancelHandle` trait, added for 0.25.0. |
+| `apache/arrow-adbc` (3 crates) | `32c67b092c0f7cabf2be75062f001a9e17a48cc1` | Deliberate: this driver tracks arrow-adbc `main`. |
 
-The pinned arrow-adbc rev is workspace version **0.25.0** (unreleased); the newest release is
-**0.24.0**. `InfoCode::Other(u32)` (arrow-adbc#4510), long cited as this pin's reason, **did ship in
-0.24.0** — only the cancel-handle API still blocks. Before reverting, diff the released `src/`
-against the pinned checkout's `rust/core/src/`.
+The arrow-adbc pin is a **choice, not a constraint** — do not spend time trying to revert it.
+The pinned rev is workspace version **0.25.0** (unreleased); the newest release is **0.24.0**.
+Two reasons this pin has been cited in the past are no longer blockers: `InfoCode::Other(u32)`
+(arrow-adbc#4510) shipped in 0.24.0, and the `CancelHandle` trait / `get_cancel_handle` (new for
+0.25.0) is only *used* by driver-owned code — `SlotCancelHandle` in `src/runtime.rs` and the
+`Box<dyn CancelHandle>` in `src/ffi/handle.rs` — which could declare the trait locally now that
+`src/ffi/` is this driver's own export layer rather than `adbc_ffi::export_driver!`. The driver
+stays on `main` because it implements against the current ADBC surface, and that is the decision.
+
+Note this pin is one of the two independent `cargo publish` blockers (see `publish = false`
+below), so publishing to crates.io stays off while it stands.
 
 ### Revert checklist
 
