@@ -1,274 +1,117 @@
-# Testing overview
+# Testing
 
-This is the single map of how `adbc-spanner` is tested: what each kind of test covers, how to run it
-locally, which CI workflow runs it, and where the detailed, co-located documentation lives. The
-detailed reference material stays next to the code it tracks (so it does not drift); this page just
-links out to it.
+Run commands from the repository root. Target-dependent Rust and Python tests skip when their
+required environment variables are unset. CI sets `ADBC_TEST_REQUIRE_TARGET=1` to make missing
+targets or shared libraries fail instead; leave it unset for ordinary local runs.
 
-Every emulator- or credential-gated suite **self-skips** when its target environment variable is
-unset, so a plain `cargo test` is green everywhere with no external dependencies. (In CI that
-silence would be dangerous — a dropped env var would turn a whole suite green with zero coverage —
-so every CI job that needs a target also sets `ADBC_TEST_REQUIRE_TARGET=1`, which flips the skip
-into a loud failure. Do not set it locally.)
+| Suite | Local command | CI / details |
+| --- | --- | --- |
+| Unit tests and doctests | `cargo test` | [CI](../.github/workflows/ci.yml) |
+| Mock gRPC server | `cargo test --test mock_spanner` | [CI](../.github/workflows/ci.yml), [tests](../tests/mock_spanner.rs) |
+| Emulator integration | `scripts/with-emulator.sh cargo test` | [CI](../.github/workflows/ci.yml) |
+| Python package | See [Python setup](#python-package) below | [Python README](../python/README.md), [CI](../.github/workflows/ci.yml) |
+| Transport faults | `scripts/with-toxiproxy.sh cargo test --test resilience -- --test-threads=1` | [Resilience guide](../tests/RESILIENCE.md) |
+| ADBC C++ conformance | `scripts/run-adbc-validation.sh` | [Harness guide](../adbc-validation/README.md) |
+| Foundry type/feature coverage | `scripts/run-foundry-validation.sh` | [Harness guide](../foundry-validation/README.md) |
+| Fuzzing | `cargo +nightly fuzz run <target>` | [Fuzz workflow](../.github/workflows/fuzz.yml) |
+| Conversion benchmarks | `cargo bench --bench conversion` | [Benchmarks](../benches/conversion.rs); local only |
 
-| Kind | Local command | CI workflow | Detail doc |
-| --- | --- | --- | --- |
-| Unit tests + doctests | `cargo test` | [`ci.yml`](../.github/workflows/ci.yml) | — |
-| Emulator integration | `scripts/with-emulator.sh cargo test` | [`ci.yml`](../.github/workflows/ci.yml) | — |
-| Real Cloud Spanner | `SPANNER_GCP_DATABASE=… cargo test --test integration` | — (local only) | — |
-| Python package | `pytest python/tests` (needs an emulator) | [`ci.yml`](../.github/workflows/ci.yml) | [`python/README.md`](../python/README.md) |
-| Resilience / fault injection | `scripts/with-toxiproxy.sh cargo test --test resilience` | [`resilience.yml`](../.github/workflows/resilience.yml) | [`tests/RESILIENCE.md`](../tests/RESILIENCE.md) |
-| ADBC C++ validation | `scripts/run-adbc-validation.sh` | [`adbc-validation.yml`](../.github/workflows/adbc-validation.yml) | [`adbc-validation/README.md`](../adbc-validation/README.md) |
-| Foundry differential oracle | `scripts/run-foundry-validation.sh` | [`foundry-validation.yml`](../.github/workflows/foundry-validation.yml) | [`foundry-validation/README.md`](../foundry-validation/README.md) |
-| Fuzzing | `cargo +nightly fuzz run <target>` | [`fuzz.yml`](../.github/workflows/fuzz.yml) | — |
-| Benchmarks | `cargo bench` | — | — |
+## Offline coverage and CI
 
-## Unit tests and doctests
+Unit tests cover SQL parsing, options, value conversion and transaction state. The in-process
+mock server also checks gRPC errors and details, cancellation, timeouts, retry limits, ingest
+failures and request options on the wire. These need no emulator or cloud credentials.
 
-The unit tests and rustdoc doctests exercise the pure-Rust logic that needs no network — SQL
-statement splitting / DDL detection, the `DATE`/`TIMESTAMP`/`NUMERIC` value parsers, staleness and
-directed-read grammars, option parsing, and the Arrow conversion helpers. They also include the
-in-process **mock gRPC server** suite ([`tests/mock_spanner.rs`](../tests/mock_spanner.rs)), which
-scripts a `google.spanner.v1.Spanner` server (the pinned client's `spanner-grpc-mock` crate) to
-return exact gRPC statuses (`ABORTED` + `RetryInfo`, mid-stream `UNAVAILABLE`, a stream that goes
-silent) and asserts the driver maps them correctly — logical faults an L4 proxy cannot produce.
+[CI](../.github/workflows/ci.yml) runs on pushes to `main` and pull requests. It runs unit tests
+with `--features fuzzing`, doctests with `--all-features`, mock tests, and the `integration` and
+`ffi_lifecycle` binaries. Additional checks are formatting, Clippy, rustdoc with warnings denied,
+a build without default features, actionlint, cargo-deny and cargo-machete. New emulator-backed
+test binaries must be added explicitly to the workflow.
 
-All of it is offline and deterministic, so it needs no emulator:
+The Python job tests DBAPI, Arrow, DataFrame integrations and type mapping against Google's
+Python client, on Python 3.11 and `3.x`. C++ validation runs plain, C++ ASan/UBSan and Rust ASan
+builds; Foundry and resilience have separate workflows on pushes to `main` and pull requests.
+Resilience and fuzzing also run nightly and create or update a tracking issue on failure.
 
-```sh
-cargo test                        # unit tests + doctests; emulator/credential suites self-skip
-cargo test --test mock_spanner    # just the mock gRPC server suite
-```
+## Emulator and real-database targets
 
-Runs on every push and pull request in [`ci.yml`](../.github/workflows/ci.yml), alongside
-`cargo fmt --check`, `clippy -D warnings`, `cargo doc` (warnings denied, so broken rustdoc links
-fail CI), a `--no-default-features` build, `actionlint` over the workflow files, and supply-chain
-checks (`cargo-deny` + `cargo-machete`).
-
-## How a test run picks its target
-
-`tests/integration.rs` resolves its target from the environment — the emulator wins if both
-variables are set:
-
-```mermaid
-flowchart TD
-    A["cargo test --test integration"] --> B{"SPANNER_EMULATOR_HOST set?"}
-    B -- yes --> C["Emulator<br/>fixed test-project / test-instance / adbc-test ids"]
-    B -- no --> D{"SPANNER_GCP_DATABASE set?"}
-    D -- yes --> E["Real Cloud Spanner<br/>project.instance.database, via ADC"]
-    D -- no --> F{"ADBC_TEST_REQUIRE_TARGET truthy?"}
-    F -- no --> G["Self-skip<br/>(plain cargo test stays green)"]
-    F -- yes --> H["Panic<br/>(CI: env wiring is broken)"]
-```
-
-## Emulator integration tests
-
-Two binaries run the driver end-to-end against a local
-[Cloud Spanner emulator](https://cloud.google.com/spanner/docs/emulator). Both are gated on
-`SPANNER_EMULATOR_HOST` and self-skip when unset.
-
-- [`tests/integration.rs`](../tests/integration.rs) — the driver's behaviour: schema setup via the
-  admin clients, DML, typed `SELECT`, bulk ingest, manual transactions, partitioned execution,
-  `get_objects`/`get_statistics`, and an **FFI smoke test** that loads the built cdylib through the
-  ADBC driver manager (the `AdbcSpannerInit` C entrypoint) and runs a query.
-- [`tests/ffi_lifecycle.rs`](../tests/ffi_lifecycle.rs) — the raw C-ABI lifecycle battery, driving
-  the cdylib through `libloading` rather than the managed wrappers, so it reaches double-release,
-  error-struct reuse and stream-release paths the managed API never hits. Its queries are table-less
-  `GENERATE_ARRAY`s, so it needs no schema and takes no serialization guard.
-
-Both binaries must be named explicitly in CI — `cargo test --test integration` alone does **not**
-run the second one, so a new `tests/*.rs` needs a matching edit in
-[`ci.yml`](../.github/workflows/ci.yml).
+[`tests/integration.rs`](../tests/integration.rs) covers queries, DML, ingest, transactions,
+metadata, partitioning and C-ABI conformance. [`tests/ffi_lifecycle.rs`](../tests/ffi_lifecycle.rs)
+checks stream/handle lifetimes through the driver manager, raw C ABI and Rust API.
+Both prefer a nonempty `SPANNER_EMULATOR_HOST`, then `SPANNER_GCP_DATABASE`.
 
 ```sh
-scripts/with-emulator.sh cargo test          # runs the emulator in Docker, then tears it down
+cargo build  # required for tests that load the shared library
+scripts/with-emulator.sh cargo test
 ```
 
-`scripts/with-emulator.sh` starts the emulator in Docker, waits for the **admin API** to actually
-answer (a REST 200, not just an open TCP port — the forwarded port accepts connections ~1s before the
-emulator serves, and starting that early makes schema setup fail with a confusing "Instance not
-found"), exports `SPANNER_EMULATOR_HOST`, runs the command, then tears the emulator down. Docker is
-required.
+The emulator helper needs Docker, starts a disposable container, waits for readiness and removes
+it after the command. With curl installed it checks the admin REST API, otherwise it uses a short
+delay after the gRPC port opens. Tests use `test-project/test-instance/adbc-test`.
 
-> **The gRPC port must be `9010`.** The pinned client derives the admin/REST endpoint by
-> literal-substring-replacing `9010`→`9020` in the gRPC endpoint, so on any other port the admin
-> requests go to the gRPC port and **every DDL / `create_database` call fails**. The *host* is free;
-> the port is not, and the driver has no override. To run several emulators at once (e.g. parallel
-> worktrees), give each container no published port and connect via its docker-network IP on the
-> internal `9010`/`9020`.
+Keep the emulator's gRPC/admin ports at **9010/9020**: the pinned Rust client derives the admin
+endpoint from the gRPC endpoint. Changing the helper's port variables does not change that
+mapping. Parallel emulators can use distinct Docker-network IPs with their internal ports and
+unique container names.
 
-In [`ci.yml`](../.github/workflows/ci.yml) the emulator runs as a service container and the
-integration suite runs against it on every push and PR.
-
-## Real Cloud Spanner tests
-
-The same [`tests/integration.rs`](../tests/integration.rs) suite can run against a **real** Cloud
-Spanner database instead of the emulator, reached with Application Default Credentials. This is the
-only path that exercises the non-emulator ADC auth flow.
+For a real database, unset `SPANNER_EMULATOR_HOST` and use Application Default Credentials:
 
 ```sh
-SPANNER_GCP_DATABASE=my-project.my-instance.my-db cargo test --test integration -- --nocapture
+SPANNER_GCP_DATABASE=my-project.my-instance.my-test-db \
+  cargo test --test integration --test ffi_lifecycle -- --nocapture
 ```
 
-The target is `project.instance.database`; the instance must already exist, and the test
-best-effort creates the database and its scratch tables and cleans up after itself.
+The instance must exist. Setup attempts to create the database and test tables; fixtures mutate
+named tables and leave some schema behind, so use a dedicated test database. No CI workflow runs
+against a real database.
 
-**Opt-in auth end-to-end tests** (the `auth_end_to_end` module) additionally exercise the
-`spanner.auth.keyfile` and `spanner.auth.impersonate.target_principal` credential paths against a real database
-(the emulator refuses these credentials). They self-skip unless `SPANNER_GCP_DATABASE` plus
-`SPANNER_TEST_KEYFILE` and/or `SPANNER_TEST_IMPERSONATE_TARGET_PRINCIPAL` are set.
+The `auth_end_to_end` tests additionally use `SPANNER_TEST_KEYFILE` and/or
+`SPANNER_TEST_IMPERSONATE_TARGET_PRINCIPAL` with `SPANNER_GCP_DATABASE`. These opt-in tests always
+use the real target, independently of the normal emulator-first selection.
 
-This suite is **run locally only** — no CI job exercises a real Cloud Spanner database. The canonical
-functional suites (`ci.yml` / `adbc-validation.yml`) run entirely against the emulator, so the
-non-emulator ADC auth path is covered by running the command above by hand against a real target.
+## Python package
 
-## Python package tests
-
-[`python/tests`](../python/tests) exercises the `adbc-driver-spanner` wheel the way a real user
-would: it loads the built cdylib through `adbc_driver_manager` and drives the DBAPI/Arrow surface —
-DDL, DML, bulk ingest, manual transactions, options, the DataFrame paths (pandas / polars / duckdb),
-the README cookbook snippets, and a **differential oracle** (`test_differential_oracle.py`) that
-checks the driver's type mapping against Google's own `google-cloud-spanner` client. Gated on
-`SPANNER_EMULATOR_HOST`; self-skips when unset.
+In a Python 3.11+ virtual environment, build and install the current driver before testing.
+These commands use the Linux library name; substitute the platform's library on macOS/Windows.
 
 ```sh
 cargo build
-cp target/debug/libadbc_spanner.so python/adbc_driver_spanner/   # what the wheel job does
-pip install ./python pyarrow pandas polars duckdb pytest google-cloud-spanner
+cp target/debug/libadbc_spanner.so python/adbc_driver_spanner/
+python -m pip install ./python pyarrow pandas polars duckdb pytest google-cloud-spanner
 scripts/with-emulator.sh python -m pytest python/tests -v
 ```
 
-[`ci.yml`](../.github/workflows/ci.yml) runs this as a **gating** job on every push and PR, against
-both ends of the supported Python range (3.11 and the latest 3.x). `SPANNER_EMULATOR_REST_PORT`
-overrides the REST admin port for the test fixtures (it is read by `conftest.py`, not the driver).
-
-## Resilience / fault injection
-
-[`tests/resilience.rs`](../tests/resilience.rs) drives the driver against the emulator **through a
-[Toxiproxy](https://github.com/Shopify/toxiproxy) TCP proxy** and injects transport-level faults —
-bandwidth throttles, TCP resets, orderly mid-stream closes — asserting the driver cancels, surfaces
-clean errors, recovers, and never loses a buffered write or silently truncates a stream. It self-skips
-unless `TOXIPROXY_URL` + `SPANNER_EMULATOR_HOST` are set.
-
-```sh
-cargo build
-scripts/with-toxiproxy.sh cargo test --test resilience -- --nocapture --test-threads=1
-```
-
-Run serially (`--test-threads=1`): the tests share one global proxy. Docker is required.
-[`resilience.yml`](../.github/workflows/resilience.yml) runs it as a **gating** job on every push to
-main and every pull request, plus manual dispatch and a nightly run that files a tracking issue on
-failure. The whole suite is ~28s, and every timing assertion has one to three orders of magnitude of
-headroom, so runner jitter is not a plausible flake source. Note a check from a separate workflow
-only blocks a merge once branch protection lists it — a repo admin must add *Resilience harness
-(emulator + Toxiproxy)* as a required check. Toxiproxy injects transport faults only; the
-logical-gRPC-fault complement lives in the `tests/mock_spanner.rs` suite (see
-[Unit tests](#unit-tests-and-doctests) above).
-
-See [`tests/RESILIENCE.md`](../tests/RESILIENCE.md) for the full list of injected toxics, what each
-test proves, and the honest limitations of transport-level fault injection.
-
-## ADBC C++ validation suite
-
-[`adbc-validation/`](../adbc-validation/) runs the canonical Apache Arrow ADBC validation suite — the
-driver-agnostic conformance battery the in-tree ADBC drivers (SQLite, PostgreSQL, …) use — against
-the built `libadbc_spanner` cdylib over its **C ABI**, complementing the Rust trait-level integration
-tests.
-
-```sh
-scripts/run-adbc-validation.sh              # throwaway emulator, the gated CI subset
-scripts/run-adbc-validation.sh --full       # every case (local exploration)
-scripts/run-adbc-validation.sh --check-drift  # build + stale-allowlist guard only (no database)
-ADBC_VALIDATION_SANITIZE=address,undefined scripts/run-adbc-validation.sh  # + C-side ASan/UBSan
-ADBC_VALIDATION_SANITIZE=address ADBC_VALIDATION_RUST_SANITIZE=address \
-  scripts/run-adbc-validation.sh            # + the cdylib itself, ASan-instrumented (nightly)
-```
-
-The script builds the cdylib and a C++ harness (needs a C++20 compiler, CMake ≥ 3.20 and git) and
-runs the suite. [`adbc-validation.yml`](../.github/workflows/adbc-validation.yml) runs the gated
-subset as a **gating** CI job, in three legs: `plain`; `asan-ubsan` (the C++ side built with
-`-fsanitize=address,undefined`, driving the uninstrumented cdylib — its `malloc`/`free`/`memcpy`
-interceptors catch memory bugs on the C-ABI structs at the FFI boundary); and `rust-asan` (the
-**cdylib itself** built with nightly `-Zsanitizer=address` + `-Zbuild-std`, driven by a clang
-`-fsanitize=address` C++ side so both share one compiler-rt ASan runtime — catching memory bugs
-*inside* Rust that never reach a C-side interceptor). The `rust-asan` leg carries a **cross-boundary
-ASan canary**: before the suite runs it builds the cdylib with `--cfg asan_canary` (a test-only
-intentionally-out-of-bounds symbol, absent from every normal build) and calls it from a clang
-`-fsanitize=address` program against a C++-allocated buffer, asserting ASan reports the
-`heap-buffer-overflow` — so a silently-disarmed instrumentation makes the leg go red instead of
-passing as a no-op. See the validation README's *Sanitizers* section.
-
-See [`adbc-validation/README.md`](../adbc-validation/README.md) for the exact gated allowlist, what
-each case covers, and the follow-up work on the remaining `StatementTest` cases.
-
-## Foundry differential-oracle validation
-
-[`foundry-validation/`](../foundry-validation/) runs the **ADBC Driver Foundry** validation suite (a
-type/feature coverage matrix) against the cdylib through the ADBC driver manager — a Python harness
-that loads the driver and runs a corpus of declarative query cases with Spanner-dialect overrides. It
-is complementary to the C++ conformance suite above.
-
-```sh
-scripts/run-foundry-validation.sh           # throwaway emulator, runs the suite
-scripts/run-foundry-validation.sh -k ingest # extra args are forwarded to pytest
-```
-
-The script builds the driver, installs the pinned validation package, bootstraps the emulator, and
-runs pytest. [`foundry-validation.yml`](../.github/workflows/foundry-validation.yml) runs it as a
-**gating** CI job on pushes to main and PRs: every case passes or skips with a reason — no expected
-failures.
-
-See [`foundry-validation/README.md`](../foundry-validation/README.md) for the per-category status and
-the Spanner-specific adaptations.
+The suite includes executable README examples. Rebuild, re-copy and reinstall after driver changes.
 
 ## Fuzzing
 
-The [`fuzz/`](../fuzz/) crate has [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) targets over
-the parts that parse untrusted strings, asserting the absence of panics (and, for `like`, no
-exponential blowup). Each is a `libfuzzer-sys` harness over the `fuzzing` feature module in
-`src/lib.rs`. The ten targets:
-
-| Target | Covers |
-| --- | --- |
-| `sql` | statement splitting / DDL detection |
-| `values` | the `DATE`/`TIMESTAMP`/`NUMERIC` parsers |
-| `like` | the `LIKE` matcher |
-| `keyword` | keyword classification |
-| `options` | option key/value parsing |
-| `params` | parameter extraction |
-| `partition` | partition-descriptor decoding |
-| `staleness` | `spanner.read.staleness` + the shared duration grammar |
-| `directed_read` | `spanner.directed_read` |
-| `uri` | the `spanner:` connection URI |
+Install cargo-fuzz and a nightly toolchain, then run a target:
 
 ```sh
-cargo +nightly fuzz run sql                 # run one target locally (needs nightly)
+cargo +nightly fuzz run sql
 ```
 
-`fuzz/` is a **member of the root workspace**, so there is one `Cargo.lock` for the whole repo and
-`cargo fuzz` builds into the root `target/`. `default-members = ["."]` keeps it out of the default
-build scope, so plain `cargo build`/`test`/`clippy` never touch it and never need nightly.
+| Target | Coverage |
+| --- | --- |
+| `sql` | Statement splitting and DDL detection |
+| `values` | DATE, TIMESTAMP and NUMERIC parsing |
+| `like` | LIKE matching |
+| `keyword` | Keyword classification |
+| `options` | Option keys and values |
+| `params` | Parameter extraction |
+| `partition` | Partition descriptor decoding |
+| `staleness` | Read staleness and duration grammar |
+| `directed_read` | Directed-read grammar |
+| `uri` | Connection URI parsing |
 
-[`fuzz.yml`](../.github/workflows/fuzz.yml) fuzzes **every** target nightly (and on demand), seeding
-from the committed [`fuzz/seeds/`](../fuzz/seeds) corpus and caching the generated corpus between
-runs so coverage accumulates. A target with no seed directory is simply fuzzed without one.
-
-Its matrix is **derived** from the `[[bin]]` targets in `fuzz/Cargo.toml` by the workflow's
-`discover` job, not hardcoded, so declaring a target is all it takes to have it fuzzed — there is no
-list to remember. This matters because a hardcoded matrix is exactly how `staleness`,
-`directed_read` and `uri` went unfuzzed for several releases after being added: declared, seeded and
-documented, but never run. `every_fuzz_target_is_wired_and_documented` (in `src/lib.rs`, run by the
-gating `test` job) fails the build if a harness file has no `[[bin]]`, if the workflow reverts to a
-literal list, or if a target is missing from this page.
+[`fuzz/`](../fuzz/) shares the root workspace and lockfile but is excluded from default build,
+test and Clippy commands. The [workflow](../.github/workflows/fuzz.yml) derives its matrix from
+`fuzz/Cargo.toml`, seeds runs from `fuzz/seeds/`, and caches the generated corpus. The unit test
+`every_fuzz_target_is_wired_and_documented` checks harnesses, manifest entries, CI discovery and
+target names in this page and `CLAUDE.md`.
 
 ## Benchmarks
 
-[Criterion](https://github.com/bheisler/criterion.rs) benchmarks in
-[`benches/conversion.rs`](../benches/conversion.rs) cover the hottest path — decoding Spanner wire
-values into Arrow arrays (`src/conversion.rs`). They run entirely offline against synthetic values
-(no network or emulator), one default-size streaming chunk (8192 rows) per benchmark.
-
-```sh
-cargo bench                 # full measurement
-cargo bench -- --test       # fast single-pass sanity run
-```
+[`benches/conversion.rs`](../benches/conversion.rs) measures wire-value-to-Arrow conversion using
+synthetic 8192-row batches, without a database. Use `cargo bench --bench conversion -- --test` for
+a quick sanity run. For end-to-end reads and profiling, see [Python benchmarks](../python/benchmarks/README.md).

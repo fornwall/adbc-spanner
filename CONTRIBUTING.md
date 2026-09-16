@@ -1,90 +1,59 @@
 # Contributing
 
-Thanks for your interest in `adbc-spanner`, a Rust [ADBC](https://arrow.apache.org/adbc/) driver for
-Google Cloud Spanner. This document covers the local checks, the release process, and the versioning
-policy. `CLAUDE.md` holds concise repository guidance and the checklist for changing temporary
-dependency pins (see [Dependency pins](#dependency-pins) below).
+Repository conventions are in [CLAUDE.md](CLAUDE.md); test setup and CI coverage are in
+[docs/testing.md](docs/testing.md).
 
 ## Building and testing
 
-See [docs/testing.md](docs/testing.md) for the full testing overview (all suites, how to run each,
-and which CI workflow runs it). The essentials:
+Use the toolchain pinned in `rust-toolchain.toml`. From the repository root:
 
 ```sh
-cargo build                 # builds the rlib and the cdylib (libadbc_spanner.so/.dylib/.dll)
-cargo test                  # unit tests + doctests; the emulator integration test self-skips
+cargo build
+cargo test
 cargo clippy --all-targets --all-features -- -D warnings
-cargo fmt --all --check     # CI enforces formatting
+cargo fmt --all --check
+scripts/with-emulator.sh cargo test  # requires Docker
 ```
 
-Plain `cargo test` is green everywhere: the emulator-gated integration and resilience suites
-self-skip when no target is configured. To run everything, including the Spanner emulator
-integration tests:
+Tests that need a Spanner target self-skip when none is configured. The emulator command runs
+them against a disposable database; Toxiproxy fault tests and external validation harnesses
+have separate commands in the testing guide. Rust integration tests can also use
+`SPANNER_GCP_DATABASE=project.instance.database` with Application Default Credentials.
 
-```sh
-scripts/with-emulator.sh cargo test
-```
-
-`scripts/with-emulator.sh` runs the emulator in Docker, exports `SPANNER_EMULATOR_HOST`, runs the
-command, and tears the emulator down. The suite can also run against a real Cloud Spanner database
-via `SPANNER_GCP_DATABASE` (`project.instance.database`, using Application Default Credentials); see
-the "Testing against the emulator" section of `CLAUDE.md`.
-
-CI enforces all of the above — `cargo fmt --all --check`, `cargo clippy --all-targets --all-features
--- -D warnings`, the unit tests + doctests, and the emulator integration test — so run them before
-pushing.
-
-## Pull requests
-
-- Match the surrounding style; keep `fmt` and `clippy` clean (CI fails otherwise).
-- Keep changes truthful and focused; the existing code favors "why" comments at every non-obvious
-  constraint — follow that convention.
+Before pushing code changes, run formatting, clippy, tests and emulator tests. CI also checks
+rustdoc, the build without default features, Python integration, workflows and dependencies.
+Keep pull requests focused and explain non-obvious constraints in nearby comments.
 
 ## Versioning
 
-This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html): given `MAJOR.MINOR.PATCH`,
-
-- `MAJOR` for incompatible API / behavior changes,
-- `MINOR` for backwards-compatible functionality (e.g. a new option or supported type), and
-- `PATCH` for backwards-compatible bug fixes.
-
-While the crate is pre-1.0, the public surface may still shift between minor versions.
+Use `MAJOR.MINOR.PATCH`: major for incompatible changes, minor for compatible functionality,
+and patch for compatible fixes. Before 1.0, incompatible API changes may occur in minor releases.
 
 ## Releasing
 
-Always cut releases with [`cargo-release`](https://github.com/crate-ci/cargo-release) (configured
-under `[package.metadata.release]` in `Cargo.toml`) — never bump the version, commit, or tag by
-hand. Hand-rolling a release risks a malformed tag or a version that disagrees with `Cargo.toml`
-(which the `version-gate` CI job rejects), and cargo-release does the exact same steps
-deterministically.
-
-Prerequisites: `cargo install cargo-release` and push access to `main`.
+Use [`cargo-release`](https://github.com/crate-ci/cargo-release), configured in `Cargo.toml`;
+do not bump versions or create release commits/tags manually. Install it with
+`cargo install cargo-release`; releases require push access to `main`.
 
 ```sh
-cargo release patch            # dry run (default) — preview only
-cargo release patch --execute  # bump + commit "Release X.Y.Z" + tag vX.Y.Z + push
+cargo release patch            # dry run
+cargo release patch --execute  # version, commit, tag and push
 ```
 
-A `pre-release-hook` runs `cargo fmt --all --check`, clippy, and `cargo test` before the tag is
-minted, so a release refuses to proceed if the local checks fail.
+The pre-release hook runs fmt, clippy and `cargo test`. Cargo-release also updates the Python
+fallback version. Its `publish = false` setting disables crates.io publishing while git pins remain.
 
-crates.io publishing is currently off (`publish = false`), because of the temporary git-pinned
-dependencies (see below), so `cargo release --execute` only versions, commits, tags, and pushes — it
-does not touch crates.io. Pushing the `vX.Y.Z` tag triggers CI (`libraries.yml`) to build and attach
-the platform shared libraries to the GitHub Release and to build and publish the Python wheel
-(`adbc-driver-spanner`) to PyPI via trusted publishing. A `version-gate` job fails the release if the
-tag disagrees with the crate version, so crate / tag / wheel cannot drift.
+A `vX.Y.Z` tag triggers `.github/workflows/libraries.yml`. Publishing requires a matching crate
+version and successful CI for the tagged commit. The workflow attaches shared libraries to the
+GitHub Release, then publishes Python wheels to PyPI through trusted publishing.
 
 ## Dependency pins
 
-`Cargo.toml` temporarily pins two dependency families to git revisions, each of which independently
-blocks `cargo publish`:
+`Cargo.toml` pins the Google Cloud family and `adbc_core`/`adbc_ffi`/`adbc_driver_manager` to git.
+The pinned APIs provide native STRUCT inspection and support for unknown ADBC info codes.
+Either family independently prevents crates.io publishing.
 
-1. the `google-cloud-*` family (to a `google-cloud-rust` revision), and
-2. `adbc_core` — plus the dev-dependencies `adbc_ffi` / `adbc_driver_manager` — (to an
-   `apache/arrow-adbc` `main` revision).
-
-Do not edit these pins ad hoc. The **Revert checklist** in `CLAUDE.md` ("Temporary git pins") is the
-single source of truth for coordinated changes: it lists every location (`Cargo.toml`,
-`deny.toml`, `README.md`, the docs, and the `publish` flag) that must change in lockstep when a
-family is reverted to a crates.io release. Read current revision SHAs from `Cargo.toml`/`Cargo.lock`.
+Read revisions from `Cargo.toml`/`Cargo.lock` and follow the
+[revert checklist](CLAUDE.md#revert-checklist) when switching to registry releases. Keep each
+family on one revision, including the ADBC C++ validation header; downstream Rust users must
+use the same `adbc_core` source. Check published API availability before removing a pin.

@@ -43,8 +43,9 @@ See [docs/testing.md](docs/testing.md) for additional suites and CI coverage.
 - Prefer `scripts/with-emulator.sh <cmd>`: it starts Docker, waits for the admin API and cleans up.
 - The emulator's gRPC endpoint must use port `9010`; the pinned client derives REST port `9020`
   from that suffix. For parallel emulators, use separate Docker-network IPs without published ports.
-- Tests prefer `SPANNER_EMULATOR_HOST`, then `SPANNER_GCP_DATABASE` (`project.instance.database`,
-  using ADC); without a target they self-skip. `ADBC_TEST_REQUIRE_TARGET=1` is for CI, not local use.
+- Rust integration tests prefer `SPANNER_EMULATOR_HOST`, then `SPANNER_GCP_DATABASE`
+  (`project.instance.database`, using ADC); Python end-to-end tests require the emulator.
+  Without a target they self-skip; `ADBC_TEST_REQUIRE_TARGET=1` makes a missing target fail.
 - CI runs functional suites against the emulator; real-database and auth end-to-end tests are local.
 - Register new emulator-backed test binaries in `.github/workflows/ci.yml`; CI lists them explicitly.
 
@@ -59,11 +60,11 @@ and in `docs/testing.md`; a test checks this, and CI derives its matrix from the
 
 - Read exact revisions from `Cargo.toml`/`Cargo.lock`. Locate matching dependency source with
   `cargo metadata --format-version 1 --locked`; do not guess Cargo checkout hashes or revisions.
-- Consult the pinned source for API details. The Spanner client is the googleapis preview client;
-  docs.rs/latest and older yoshidan-style examples describe a different API.
+- Consult the pinned source for API details. The client is the googleapis preview client;
+  older yoshidan-style examples use a different API, and docs.rs may describe another revision.
 - Keep `adbc_core`, `adbc_ffi`, `adbc_driver_manager` and CMake's `ARROW_ADBC_TAG` on one revision;
   `src/ffi/abi.rs` transcribes that revision's `c/include/arrow-adbc/adbc.h`.
-- Keep the eight dependencies from `google-cloud-rust`, including `spanner-grpc-mock`, on one rev.
+- Keep all dependencies from `google-cloud-rust`, including `spanner-grpc-mock`, on one revision.
 - Tracking arrow-adbc `main` is deliberate; do not revert that pin merely to use a release.
   The Google Cloud pin supplies `Type::struct_type()` for native STRUCT mapping.
 - Each git dependency family independently blocks crates.io publishing.
@@ -76,9 +77,8 @@ When intentionally moving a family to crates.io, update every affected location 
 - `ARROW_ADBC_TAG` in `adbc-validation/CMakeLists.txt` for arrow-adbc changes.
 - `deny.toml` allow-git entries once a repository has no remaining git dependencies.
 - The type-mapping note in `README.md`, [CONTRIBUTING.md](CONTRIBUTING.md) and this section.
-- Keep release `publish = false` until both families permit publishing. `spanner-grpc-mock` is
-  unpublished upstream: verify whether its git dev-dependency is acceptable before enabling it.
-  Revisit the Arrow version ranges when replacing git `adbc_core`.
+- Keep release `publish = false` until both families permit publishing; check registry availability
+  and publish compatibility of `spanner-grpc-mock` too. Revisit Arrow ranges with `adbc_core`.
 
 ## Releasing
 

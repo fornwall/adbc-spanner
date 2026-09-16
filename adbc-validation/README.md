@@ -1,377 +1,90 @@
-# ADBC C++ validation suite
+# ADBC C++ validation
 
-> Part of the testing overview in [docs/testing.md](../docs/testing.md).
+Runs Apache Arrow ADBC's driver-independent C++ validation suite against the built shared
+library through the ADBC driver manager. This checks the driver's C ABI alongside the
+[Rust and Python tests](../docs/testing.md).
 
-Runs the canonical [Apache Arrow ADBC validation suite][suite] against
-`adbc-spanner`. The suite is the driver-agnostic conformance test battery that
-the in-tree ADBC drivers (SQLite, PostgreSQL, Snowflake, …) use. It exercises the
-driver through its **C ABI** — the built `libadbc_spanner` cdylib, loaded by the
-ADBC driver manager exactly as a real language binding would — so it complements
-the Rust trait-level tests in `tests/integration.rs`.
-
-[suite]: https://github.com/apache/arrow-adbc/tree/main/c/validation
-
-## Running
+## Run
 
 ```sh
-# Throwaway emulator, the CI checks (gate + expected-failure + stale guards):
-scripts/run-adbc-validation.sh
+scripts/run-adbc-validation.sh                 # emulator: normal CI checks
+scripts/run-adbc-validation.sh --full          # every case, including known failures
+scripts/run-adbc-validation.sh --check-drift   # build and check exclusions; no database
 
-# Throwaway emulator, every test (local exploration; expect failures/skips):
-scripts/run-adbc-validation.sh --full
-
-# Against an already-running emulator or a real Cloud Spanner database:
 SPANNER_EMULATOR_HOST=localhost:9010 scripts/run-adbc-validation.sh
-SPANNER_GCP_DATABASE=my-project.my-instance.my-db scripts/run-adbc-validation.sh
+SPANNER_GCP_DATABASE=my-project.my-instance.my-test-db scripts/run-adbc-validation.sh
 ```
 
-The script builds the cdylib and the harness, creates the emulator
-instance/database when needed, and runs the suite. Requirements beyond the Rust
-toolchain: a C++20 compiler, CMake (≥ 3.20) and git. Everything else — the
-arrow-adbc validation library, the ADBC driver manager, fmt, nanoarrow and
-GoogleTest — is fetched and built from source at a pinned arrow-adbc revision
-(`ARROW_ADBC_TAG` in `CMakeLists.txt` — an `apache/arrow-adbc` `main` revision
-carrying [apache/arrow-adbc#4514](https://github.com/apache/arrow-adbc/pull/4514),
-which routes the suite's hardcoded dialect-sensitive SQL through the
-`DriverQuirks::RewriteSql` hook, and
-[apache/arrow-adbc#4534](https://github.com/apache/arrow-adbc/pull/4534), which
-makes the `TestSqlPrepareUpdate` readbacks order-deterministic). No system
-packages are required. C++20 rather than C++17 because
-[apache/arrow-adbc#4610](https://github.com/apache/arrow-adbc/pull/4610) made it
-arrow-adbc's baseline: its validation targets ask for `cxx_std_20`, and this
-harness includes their headers.
+Requirements: Rust, Bash 4+, a C compiler, a C++20 compiler, CMake 3.20+, git, Python 3 and curl;
+Docker when starting an emulator. The script builds the driver and harness and prepares the emulator
+database. A real target uses ADC and must already exist; use a dedicated test database.
+`SPANNER_EMULATOR_HOST` takes precedence over `SPANNER_GCP_DATABASE`.
 
-The **driver** (cdylib) exports the C ABI from its own hand-written layer,
-`src/ffi/` — no FFI exporter crate is involved (`adbc_ffi` is only a
-dev-dependency, for the `FFI_Adbc*` struct definitions a raw-`libloading` test in
-`tests/integration.rs` uses). It therefore owns the behaviours this suite checks
-at the boundary directly: an idempotent `AdbcError` release (no double-free on a
-second release), `rows_affected = -1` on the query path, a preserved
-`AdbcError.private_data` for ADBC 1.0.0 callers, `ErrorGetDetail*`, and
-`ErrorFromArrayStream`. It links `adbc_core` (the Rust ADBC traits) from a git pin
-— an `apache/arrow-adbc` `main` revision, see `Cargo.toml`. The **C++** validation
-library and driver manager come from `ARROW_ADBC_TAG`; they interoperate with the
-driver over the C ABI.
+[CMakeLists.txt](CMakeLists.txt) pins arrow-adbc with `ARROW_ADBC_TAG` and fetches/builds the C++
+dependencies. Keep that revision aligned with the Rust arrow-adbc dependencies in `Cargo.toml`.
+`ADBC_VALIDATION_BUILD_DIR` overrides the build directory.
 
-`SpannerQuirks` (in `spanner_validation.cc`) describes Spanner's capabilities to
-the suite — named `@p` parameters, backtick identifier quoting, DDL via the admin
-API, all four ingest modes, the Arrow
-types Spanner widens on readback (`IngestSelectRoundTripType`) — so tests that do
-not apply to Spanner's model self-skip rather than fail. Its `RewriteSql`
-override substitutes GoogleSQL for the suite's dialect-sensitive default SQL per
-stable query id: Spanner-valid `CREATE TABLE`s (INT64/STRING(MAX)),
-`INSERT`s with the column list Spanner requires, readbacks that
-drop the `NULLS FIRST`/`NULLS LAST` the emulator rejects (GoogleSQL's
-defaults match them anyway), and CASTs that give Spanner's parameter-type
-inference the context a bare `SELECT @p0, @p1` lacks. Every rewrite pins the
-upstream default SQL, so an `ARROW_ADBC_TAG` bump that changes a query fails
-loudly instead of silently rewriting the wrong thing.
+`--full` uses CTest to run cases in separate processes. It prints failures but deliberately does
+not propagate CTest's failure exit status; use the default mode for CI.
 
-## Sanitizers (ASan / UBSan)
+## Coverage and exclusions
 
-Set `ADBC_VALIDATION_SANITIZE` to build the **C++ side** of the suite (this harness, the
-fetched arrow-adbc driver manager + `adbc_validation`, and the vendored nanoarrow/fmt) with
-`-fsanitize=…`, then run the same gate against it:
+[`SpannerQuirks`](spanner_validation.cc) declares capabilities, readback type conversions,
+identifier/parameter syntax and GoogleSQL rewrites. Rewrites assert the expected upstream SQL
+so changed queries require review when the pin advances.
+
+The suite covers database/connection lifetimes, metadata, transaction options, queries, prepared
+parameters, row counts, partitioning, cancellation, error/stream lifetimes and all four ingest
+modes. It includes native, widened, large/view, dictionary and list Arrow representations where
+supported. Exact cases come from the pinned suite, rather than a separately maintained count.
+
+[`run-adbc-validation.sh`](../scripts/run-adbc-validation.sh) has one `EXCLUDED` list:
+
+| Excluded case | Current limitation |
+| --- | --- |
+| `SpannerStatementTest.SqlIngestUInt64` | The driver cannot create a column for Arrow `UInt64`; its full range cannot fit `INT64`. |
+| `SpannerStatementTest.SqlIngestDuration` | No ingest column mapping. |
+| `SpannerStatementTest.SqlIngestInterval` | No ingest column mapping. |
+
+The default run enforces three checks:
+
+1. Every non-excluded case passes or self-skips, including cases added upstream.
+2. Every excluded case still fails or skips; an unexpected pass requires removing the exclusion.
+3. Every exclusion still names an available test; renamed or removed cases fail the drift check.
+
+Quirk-controlled skips remain in the normal run: `Transactions` requires behavior incompatible
+with immediate DDL and buffered manual writes; `SqlIngestPrimaryKey` expects ordered generated
+keys; the `SqlIngestTemporary*` cases require temporary tables. These skips are not covered by the
+unexpected-pass guard and should be reviewed when capabilities change.
+
+## Sanitizers
+
+The [CI workflow](../.github/workflows/adbc-validation.yml) runs the same checks in three modes:
+
+| Mode | Instrumentation |
+| --- | --- |
+| `plain` | Normal Rust and C++ builds |
+| `asan-ubsan` | C/C++ address and undefined-behavior sanitizers; Rust stays uninstrumented |
+| `rust-asan` | Rust and its standard library built with nightly ASan; C++ built with clang ASan |
 
 ```sh
 ADBC_VALIDATION_SANITIZE=address,undefined scripts/run-adbc-validation.sh
-```
 
-By default the **cdylib stays uninstrumented** — it is built by `cargo` (stable) and `dlopen`-loaded
-by the driver manager, exactly as in production. This still finds the memory bugs that matter at the C
-ABI boundary: AddressSanitizer's `malloc`/`free`/`memcpy` interceptors are process-wide, and
-Rust's default allocator *is* libc `malloc`, so a double-free / heap-overflow / use-after-free on
-the C-ABI structs the driver hands across the boundary — `ArrowArray`/`ArrowSchema` release
-callbacks, `AdbcError` `private_data` lifecycle — is reported **with symbolized Rust frames**,
-even though the cdylib itself carries no instrumentation. UBSan additionally covers UB in the
-C/C++ code. A memory error that never reaches an interceptor — e.g. a plain out-of-bounds store
-*inside* Rust — is invisible this way; that gap is closed by the instrumented-cdylib mode below
-(and `cargo-fuzz` additionally runs the offline parser paths under ASan).
-
-### Instrumenting the Rust cdylib itself
-
-Set `ADBC_VALIDATION_RUST_SANITIZE=address` (alongside `ADBC_VALIDATION_SANITIZE=address`) to build
-the **cdylib itself** with nightly Rust's `-Zsanitizer=address`, catching memory bugs *inside* Rust
-that the C-side interceptors above cannot see:
-
-```sh
 ADBC_VALIDATION_SANITIZE=address ADBC_VALIDATION_RUST_SANITIZE=address \
   scripts/run-adbc-validation.sh
 ```
 
-This needs the **nightly** toolchain with the `rust-src` component (the script uses `-Zbuild-std`
-so the standard library is instrumented too — otherwise ASan misreports std allocations), and it
-compiles the **C++ side with clang**: Rust's `-Zsanitizer=address` links LLVM **compiler-rt** ASan,
-which must be the *same* runtime the main test executable links, so mixing it with gcc's `libasan`
-is unsound and aborts at startup. The script therefore defaults `CC`/`CXX` to `clang`/`clang++`
-when this is set (export your own to override). The instrumented artifact lands under
-`target/<host-triple>/debug/` (an explicit `--target` is required by `-Zbuild-std`), which the
-script resolves for you. Only `address` is supported — Rust has no `-Zsanitizer=undefined` cdylib
-equivalent, so this leg's C++ side carries just `address` (the `asan-ubsan` leg keeps full C-side
-UBSan coverage).
+The Rust mode needs nightly with `rust-src`, clang and clang++. It uses `-Zsanitizer=address`
+and `-Zbuild-std`, defaults `CC`/`CXX` to clang, and loads the library from
+`target/<host-triple>/debug/`. Keep the C++ and Rust ASan runtimes compatible when overriding
+compilers. Rust mode supports `address`; UBSan coverage comes from the separate C++ mode.
 
-**Canary (positive control).** A passing `rust-asan` leg on its own does not prove the Rust
-instrumentation is actually armed — a silent `-Zsanitizer=address` / `-Zbuild-std` regression would
-leave the suite green and give false confidence. So this mode also builds the cdylib with
-`--cfg asan_canary` (enabling `adbc_spanner_asan_canary`, an intentionally-out-of-bounds symbol in
-`src/asan_canary.rs`, present in no other build — a bare `--cfg` is not set by `cargo build` or even
-`--all-features`) and, before running the suite, compiles `asan_canary.cc` with clang
-`-fsanitize=address` and calls that symbol against a **C++-allocated** buffer: instrumented Rust
-writing one byte past C++-allocated heap. ASan must report a cross-boundary `heap-buffer-overflow`
-attributed to the Rust frame; if it does **not**, the cdylib is not ASan-armed and the run script
-**fails loudly** rather than passing as a no-op. The check runs right after the cdylib build (before
-the slow arrow-adbc build), so a disarmed leg fails fast.
+C++ ASan can catch errors reaching its process-wide allocator/memory interceptors, but cannot
+check every memory access inside uninstrumented Rust. Rust ASan covers those instrumented
+accesses. Its positive-control [canary](asan_canary.cc) calls a test-only out-of-bounds Rust
+function on a C++ allocation and requires an ASan heap-buffer-overflow report before the suite
+runs. That symbol is enabled only by the script's `--cfg asan_canary` build.
 
-Notes:
-- **LeakSanitizer is disabled** (`ASAN_OPTIONS=detect_leaks=0`, set by the script): the driver's
-  shared Tokio runtime, gRPC connection pools and lazy globals are intentionally process-lifetime
-  and would otherwise drown the run in non-actionable "leaks" — even more so with the Rust side
-  instrumented. Memory-error (ASan) and UB (UBSan) checks stay fatal.
-- aws-lc-rs' C/assembly TLS code is not instrumented (the `cc`-built C keeps its own flags and
-  assembly is never instrumented); ASan tolerates this. This is also why MSan is not offered.
-- Each mode uses a separate build tree (`.adbc-validation-build-san` for the C-side-only mode,
-  `-rustsan` for the instrumented-cdylib mode, which also differs by compiler) so switching does
-  not force an arrow-adbc rebuild.
-
-CI runs three legs — `plain`, `asan-ubsan` and `rust-asan` — (see
-`.github/workflows/adbc-validation.yml`) over the identical gate/expected-failure/stale checks. The
-`asan-ubsan` leg is a strict superset of `plain`; `rust-asan` adds the in-Rust memory-error coverage
-the C-side-only legs cannot provide, guarded by the cross-boundary ASan canary above so a
-silently-disarmed `rust-asan` leg goes red instead of green.
-
-## What CI gates on
-
-- **`SpannerDatabaseTest` + `SpannerConnectionTest`** in full — lifecycle +
-  metadata: `get_info`, `get_objects` (table columns, primary-key/constraint
-  metadata, and foreign-key `constraint_column_usage`), `get_table_types`,
-  `get_table_schema` (a plain table, `NOT_FOUND` for missing and query-shaped
-  table names, and a named-schema-qualified table — Spanner has `CREATE SCHEMA`),
-  autocommit/transaction options.
-- **The `SpannerStatementTest` cases that pass cleanly** — `execute` and
-  `execute_schema` for int/string columns and their error paths, `prepare` /
-  `get_parameter_schema` / parameter-count / no-query validation, parameter
-  binding end-to-end (`SqlBind`, `SqlPrepareSelectParams`), query error
-  handling, trailing-semicolon queries (`SELECT current_date;;;` — the driver
-  strips trailing statement terminators on the query path, which Spanner's
-  single-use query API otherwise rejects), query cancellation (`SqlQueryCancel`,
-  which requires the result stream's `get_next` to return exactly `ECANCELED`
-  after a cancel — see the note below), DML row counts
-  (`SqlQueryRowsAffectedDelete{,Stream}`), manual-transaction rollback of
-  buffered DML (`SqlQueryInsertRollback`), concurrent statements, result
-  independence/invalidation, `AdbcError` compatibility
-  (`src/ffi/error.rs` writes the error at whichever revision the caller
-  allocated, so a 1.0.0 caller's `private_data` survives), the whole ingest
-  **round-trip family** —
-  bool/int/float/string/binary/date/timestamp columns (including the
-  large/view Arrow layouts, dictionary-encoded strings and `List` columns) plus
-  the append/replace/create-append modes, multi-connection visibility and the
-  sample table — and the ingest **error paths** (`SqlIngestErrors`:
-  ingest-without-bind → `INVALID_STATE`, append to a nonexistent table → error,
-  create over an existing table → error, incompatible-schema append → error).
-
-The gate runs **every case except the documented `EXCLUDED` expected-failures**
-(see the next section), and they all pass or self-skip — today **97 cases: 91
-pass, 6 self-skip**. `DatabaseTest` and `ConnectionTest` pass in full; from `StatementTest`
-everything but the `EXCLUDED` list in `scripts/run-adbc-validation.sh` runs here.
-`SpannerQuirks::supports_bulk_ingest` declares
-all four ingest modes (append, create, create_append, replace — the create
-modes build the table from the ingest data's Arrow schema, declaring no primary
-key, so its columns are exactly the ingested ones),
-which un-skipped the last two `ConnectionTest` cases, `MetadataGetTableSchema`
-and `MetadataGetTableSchemaEscaping` (both gated upstream on
-`supports_bulk_ingest(CREATE)`, though their fixtures only use plain DDL).
-
-(`MetadataGetStatisticNames` is gated too: `get_statistic_names` returns a
-valid empty catalog — Spanner has no per-column statistics to name, which the
-suite accepts.)
-
-## How the gate stays honest: one `EXCLUDED` list, three checks
-
-There is no allowlist of cases to run. Instead `scripts/run-adbc-validation.sh`
-carries a single `EXCLUDED` array — the cases that are known-not-passing or
-not-applicable to Spanner's model, each tagged with a reason grouped by the
-buckets below — and derives everything from it. On the default (CI) run it makes
-three assertions:
-
-1. **Gate (negative filter).** It runs `spanner_validation --gtest_filter=-<EXCLUDED>`,
-   i.e. *every case except* the excluded ones, and requires them all to pass or
-   self-skip. This is what **auto-enrolls new upstream tests**: a case added by a
-   bump of `ARROW_ADBC_TAG` is not in `EXCLUDED`, so it runs in the gate. If it
-   fails, CI goes red and you triage it — fix the driver, or add it to `EXCLUDED`
-   with a reason. Nothing new can silently escape the suite.
-2. **Expected-failure guard (xfail-strict).** It then runs *only* the excluded
-   cases (`--gtest_filter=<EXCLUDED> --gtest_output=xml:…`), captures the
-   (deliberately non-zero) exit, and parses the JUnit XML per test case. If any
-   excluded case actually **passed** (ran with no failure — a *skip* does not
-   count), CI fails: an expected-failure that started passing must be removed from
-   `EXCLUDED` so the gate enforces it. This keeps the list from silently
-   accumulating cases the driver has since grown to satisfy.
-3. **Stale guard.** It enumerates the available cases via `--gtest_list_tests`
-   (no database needed) and fails if any `EXCLUDED` entry no longer exists
-   upstream (renamed/removed), so the list can't rot.
-
-So the manual periodic `--full` triage is gone: new cases run automatically, a
-regressing exclusion or a fixed exclusion both turn CI red, and CI just calls this
-script (see `.github/workflows/adbc-validation.yml`). Run only the static stale
-guard — no emulator required — with:
-
-```sh
-scripts/run-adbc-validation.sh --check-drift
-```
-
-Today `EXCLUDED` holds **3** cases (97 non-excluded cases — 91 passing plus 6 that
-self-skip: `Transactions`, `SqlIngestPrimaryKey`, and the four `SqlIngestTemporary*`
-— + 3 excluded = 100 upstream cases total).
-
-Six cases are deliberately **not** excluded because they **self-skip**, which the
-gate tolerates — so they need no expected-failure bookkeeping. Each is inapplicable
-to Spanner's model, so it can never "start passing", and a skip states the truth
-("not applicable to Spanner") rather than implying the driver got it wrong:
-
-- `Transactions` creates a table inside an uncommitted transaction and expects it
-  hidden from other connections and removed on rollback — i.e. transactional DDL.
-  Spanner has none (DDL goes through the admin `UpdateDatabaseDdl` API, auto-commits
-  immediately, and cannot be rolled back), so the `ddl_implicit_commit_txn` quirk
-  makes the case self-skip via its own guard.
-- `SqlIngestPrimaryKey` — the case append-ingests rows *omitting* the primary-key
-  column and expects the database to auto-assign ascending key values. Spanner has
-  no ordered auto-increment (a keyless insert mutation writes NULL, and a second
-  NULL key is a duplicate-PK error; SEQUENCEs are bit-reversed, so even a DEFAULT
-  key could not satisfy the case's `ORDER BY id` insertion-order readback), so
-  `PrimaryKeyIngestTableDdl` returns `nullopt` — the quirk's sanctioned way to
-  declare the feature absent.
-- `SqlIngestTemporary{,Append,Replace,Exclusive}` — Spanner has no temporary tables
-  (`supports_bulk_ingest_temporary` is `false`; the driver also rejects
-  `adbc.ingest.temporary=true` outright).
-
-The view-type and target-catalog/db-schema ingest variants are the *opposite* call:
-the driver genuinely supports those inputs, so their quirks are declared `true`
-rather than hiding the cases behind a false quirk — and with the `RewriteSql`
-readbacks all five (`SqlIngestBinaryView`, `SqlIngestStringView`,
-`SqlIngestTargetCatalog`, `SqlIngestTargetSchema`, `SqlIngestTargetCatalogSchema`)
-pass cleanly and are gate-enforced.
-
-## The `EXCLUDED` cases, by bucket
-
-Every excluded case (runnable individually via `--full`) fails **cleanly** (no
-aborts — see the note below) or self-skips; all three fall into a single bucket,
-not fixable by rewriting SQL:
-
-- **Arrow types with no Spanner column mapping** — `SqlIngestUInt64`,
-  `SqlIngestDuration` and `SqlIngestInterval` fail at ingest time with "cannot
-  create a Spanner column for Arrow type …". `UInt64` cannot widen to `INT64`
-  (`u64::MAX` exceeds `i64::MAX`) and its natural home, `NUMERIC`, reads back as
-  `Decimal128` — which the suite's `SchemaField` cannot express with a precision
-  and scale, so the shared `IngestSelectRoundTripType` round-trip could not be
-  declared even with driver support. `Duration` has no fixed-unit Spanner
-  counterpart at all (one `INTERVAL` column reads back as exactly one Arrow
-  type, and `ValidateIngestedTemporalData` FAILs any non-`TIMESTAMP` temporal
-  readback); `Interval(MonthDayNano)` *is* a clean 1:1 with Spanner `INTERVAL`
-  on real Spanner, but the emulator rejects an `INTERVAL` column outright
-  (`CREATE TABLE` trips a `GOOGLESQL_RET_CHECK` in `IsSupportedColumnType`), so
-  it could not pass in CI even once the driver grows the mapping.
-
-**`ECANCELED` through the C stream** (`SqlQueryCancel`) was formerly a bucket of
-its own, and is now **gate-enforced**. The case requires the result stream's
-`get_next` to return exactly `ECANCELED` (125) after a cancel. arrow-rs's
-`FFI_ArrowArrayStream` exporter maps every `ArrowError` to
-`ENOSYS`/`ENOMEM`/`EIO`/`EINVAL` — no variant reaches 125 — so while the driver
-was exported by that machinery a between-chunk cancel could only surface as
-`EINVAL`. The driver now exports its own Arrow C stream (`src/ffi/stream.rs`):
-on a reader error it walks the error's source chain to the
-`adbc_core::error::Error` the driver boxed inside `ArrowError::ExternalError`
-and maps that error's ADBC status to an errno (`Cancelled` → `ECANCELED`,
-`Timeout` → `ETIMEDOUT`, …), falling back to the Arrow-variant errno when there
-is no driver error embedded. The same layer implements the 1.1.0
-`ErrorFromArrayStream` entry point, so a failed stream can also hand back the
-structured `AdbcError` — status, message and details — that the Arrow C Stream
-Interface can only express as an errno and a string. Cancellation is also still
-covered natively by `cancel_between_stream_chunks_cancels_the_next_fetch` in
-`tests/integration.rs` (it is sticky: a cancel landing between two chunk fetches
-cancels the next one).
-
-`SqlIngestUInt8/16/32` and `SqlIngestFixedSizeBinary` were formerly part of the
-Arrow-types bucket above; the driver grew both mappings (unsigned widths that fit `i64` widen
-to `INT64`, `FixedSizeBinary` binds as `BYTES`), so all four now pass and are
-gate-enforced. `SqlIngestFloat16` likewise: Spanner has no 16-bit float, but
-every `f16` is exactly representable in `f32`, so the driver widens it into a
-`FLOAT32` column and `IngestSelectRoundTripType` declares the
-`HALF_FLOAT` → `FLOAT` readback. (It used to self-skip behind the
-`supports_ingest_float16` quirk, which
-[apache/arrow-adbc#4779](https://github.com/apache/arrow-adbc/pull/4779) removed.)
-
-**Insertion-order readbacks** (`SqlPrepareUpdate` / `SqlPrepareUpdateStream`) were
-another former bucket: no SQL can recover insertion order from a Spanner table,
-whose rows come back in primary-key order — and an ingest-created table's key is
-the implicit `rowid`, a bit-reversed identity.
-[apache/arrow-adbc#4534](https://github.com/apache/arrow-adbc/pull/4534) gave both
-readbacks a deterministic `ORDER BY <col> ASC NULLS FIRST` and sorted the expected
-vectors, so with the `RewriteSql` overrides both now pass and are gate-enforced.
-
-`SqlPartitionedInts` was formerly a bucket of its own ("rigid single-partition
-assumption"): the upstream case hardcoded `ASSERT_EQ(1, num_partitions)` for
-`SELECT 42`, but Spanner's `partitionQuery` is free to return more — the emulator
-returns 2. apache/arrow-adbc#4493 relaxed it to allow `>= 1` partitions and assert
-on the *union* of all of them, so with `ARROW_ADBC_TAG` on a `main` revision that
-carries the fix the case now passes and is **gate-enforced** (the driver
-implements `execute_partitions`/`read_partition` and the `supports_partitioned_data`
-quirk is `true`). Its round-trip is additionally covered natively by
-`execute_partitions_round_trip` in `tests/integration.rs`.
-
-`SqlQueryFloats` / `SqlSchemaFloats` were formerly part of a "suite-internal
-non-Spanner DDL" bucket: both hardcoded `SELECT CAST(1.5 AS FLOAT)`, and GoogleSQL
-has no bare `FLOAT` type. apache/arrow-adbc#4496 added the generic
-`DriverQuirks::RewriteSql(query_id, default_sql)` hook (a per-query override in the
-spirit of the existing `BindParameter` dialect hook), which `SpannerQuirks`
-overrides to rewrite that query to `SELECT CAST(1.5 AS FLOAT64)`. With
-`ARROW_ADBC_TAG` on a revision that carries the hook, both cases now pass
-and are **gate-enforced**.
-
-That hook then dissolved the two biggest former buckets wholesale.
-[apache/arrow-adbc#4514](https://github.com/apache/arrow-adbc/pull/4514) routes the
-rest of the statement tests' hardcoded SQL through `RewriteSql` under stable query
-ids, and the `SpannerQuirks` override substitutes GoogleSQL per id
-(see the table in `spanner_validation.cc`):
-
-- The **"suite-internal non-Spanner DDL"** bucket (`SqlBind`, `SqlQueryEmpty`,
-  `SqlQueryInsertRollback`, `SqlQueryRowsAffectedDelete{,Stream}`,
-  `SqlPrepareSelectParams`) — Spanner-valid `CREATE TABLE`s (`INT64` /
-  `STRING(MAX)`; a keyless `CREATE TABLE` is legal Spanner, so the portable DDL
-  needs no `PRIMARY KEY` bolted on), `INSERT`s with the column list GoogleSQL
-  requires, and CASTs that give the parameter-type inference the context a bare
-  `SELECT @p0, @p1` lacks. All six now pass, gate-enforced.
-- The **"ingest readback"** bucket (the whole `SqlIngest*` type family plus
-  `Append`/`Replace`/`CreateAppend`/`MultipleConnections`/`Sample`) — the
-  `SELECT * FROM bulk_ingest … NULLS FIRST` readbacks trip over the
-  emulator's `NULLS FIRST`/`NULLS LAST` rejection. The rewrites drop the NULLS
-  clause (GoogleSQL's ASC/DESC defaults are exactly NULLS FIRST/NULLS LAST, so
-  the semantics are unchanged) and add an `ORDER BY` to the one readback whose
-  expected values are order-sensitive without one (`Append` — an ingest-created
-  table is ordered by the implicit `rowid`, not insertion order); the
-  `TestSqlIngestType` query id carries the ingested Arrow type as a suffix, which
-  lets the two `List` cases order by `` `col`[SAFE_OFFSET(0)] `` instead (GoogleSQL
-  cannot `ORDER BY` an ARRAY column). Alongside, `IngestSelectRoundTripType`
-  declares Spanner's readback widenings (small/unsigned ints → `INT64`,
-  large/view strings → `STRING`, binary variants → `BYTES`) and the fixture's
-  `ValidateIngestedTemporalData` checks the timestamp values the driver returns
-  (any-unit Arrow timestamps → Spanner `TIMESTAMP` → `Timestamp(Nanosecond,
-  "UTC")`). Twenty-four ingest cases moved from excluded to gate-enforced (and
-  `SqlIngestPrimaryKey` to a quirk-sanctioned self-skip) — with the six DDL/DML
-  cases above, thirty newly enforced cases in all.
-
-The three FFI-exporter issues that previously blocked a whole swath of these — a
-non-idempotent error release (which aborted the process), a missing
-`rows_affected` on the query path, and a clobbered 1.0.0 `AdbcError.private_data` —
-are what unblocked `SqlQueryInts` / `SqlQueryStrings` / `SqlPrepareSelectNoParams` /
-`SqlPrepareErrorNoQuery` and `ErrorCompatibility`. They were first fixed upstream in
-`adbc_ffi`; the driver's own `src/ffi/` layer now implements that behaviour
-directly, so the suite no longer depends on any exporter crate for them.
-
-## A note on `--full` process isolation
-
-`--full` runs each test in its own process via `ctest`. This is no longer
-required for safety — the driver's `AdbcError` release callback is idempotent
-(`src/ffi/error.rs` clears the struct's `message`/`private_data`/`release` as it
-frees them), so a *failed* assertion now reports cleanly instead of
-double-freeing and aborting the process. Per-test isolation is kept because it
-still gives the cleanest independent pass/fail report.
+Leak detection is disabled by default for process-lifetime runtime/client state; ASan memory
+errors and UBSan reports remain fatal. Native TLS C/assembly is not instrumented by the Rust
+flag. Plain, C++-sanitized and Rust-sanitized runs use separate build directories.
