@@ -49,11 +49,11 @@ jobs:
           # adbc-driver-manager wheels (10.15 x86-64 / 11.0 arm64) — the Python
           # package is unusable without it, so older would gain nothing.
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-26
             lib: libadbc_spanner.dylib
             macos_deployment_target: "11.0"
           - target: x86_64-apple-darwin
-            runner: macos-14 # cross-compiled from the arm64 runner (Apple toolchain is universal).
+            runner: macos-26 # cross-compiled from the arm64 runner (Apple toolchain is universal).
             lib: libadbc_spanner.dylib
             macos_deployment_target: "10.15"
           - target: x86_64-pc-windows-msvc
@@ -78,9 +78,11 @@ jobs:
       # aws-lc-sys needs NASM to assemble on Windows x86-64. ARM64 Windows uses no NASM.
       - name: Install NASM (Windows x86-64)
         if: matrix.target == 'x86_64-pc-windows-msvc'
-        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1
+        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
+        with:
+          version: "3.02"
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}
 
@@ -174,8 +176,8 @@ jobs:
   # targets <arch>-unknown-linux-musl natively, and RUSTFLAGS=-Ctarget-feature=-crt-static
   # keeps the cdylib dynamic so it dlopen()s on Alpine. Only the compile runs in the
   # container; checkout/package/upload run on the host so the JS actions work normally.
-  # Each arch builds natively on its own runner (x86-64 on ubuntu-22.04, aarch64 on
-  # ubuntu-22.04-arm) so the aws-lc C compiles native — no musl cross-toolchain needed.
+  # Each arch builds natively on its own runner (x86-64 on ubuntu-24.04, aarch64 on
+  # ubuntu-24.04-arm) so the aws-lc C compiles native — no musl cross-toolchain needed.
   build-musl:
     name: ${{ matrix.target }}
     strategy:
@@ -183,9 +185,9 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            runner: ubuntu-22.04
+            runner: ubuntu-24.04
           - target: aarch64-unknown-linux-musl
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -201,6 +203,7 @@ jobs:
       # musl base toolchain (gcc/libgcc + apk packages) — the *Rust* version is still
       # rust-toolchain.toml's single pin, which rustup honours inside the container (it
       # auto-installs that toolchain over the image's default when `cargo build` runs).
+      # Image: rust:1.98.1-alpine3.24.
       - name: Build shared library (Alpine/musl)
         run: |
           set -euo pipefail
@@ -208,7 +211,7 @@ jobs:
             -v "$PWD":/work -w /work \
             -e CARGO_TARGET_DIR=/work/target \
             -e RUSTFLAGS="-C target-feature=-crt-static" \
-            rust@sha256:a41f7740f8b45d45795624eec13a8b42263cc700f19f7e4e86e04d3dda08a479 \
+            rust@sha256:1716b3aa042d735f4566d14dc54e8037de9d69556e2d5dd58131d93a613d173d \
             sh -euc '
               apk add --no-cache build-base cmake perl git
               cargo build --release
@@ -433,7 +436,7 @@ jobs:
       - name: Publish release assets
         # Pinned to a commit: this step runs with contents: write and publishes the release
         # assets users download — a hijacked v3 tag must not be able to replace them.
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           # dist/* now also includes the driver manifest and the generated SHA256SUMS file.
           files: dist/*
@@ -455,13 +458,13 @@ jobs:
           # Only drives `setup.py bdist_wheel` to repackage the prebuilt libraries;
           # the wheel tag is forced to py3-none-<platform>, so this version does not
           # affect the artifact. Pinned (not "3.x") for a reproducible release host.
-          python-version: "3.14"
+          python-version: "3.14.7"
 
       - name: Install build tooling
         # setuptools only: it has vendored the `bdist_wheel` command since v70.1, and
         # `python/setup.py` imports it from there, so the standalone `wheel` package is
         # no longer part of this build.
-        run: python -m pip install --upgrade setuptools
+        run: python -m pip install --upgrade pip setuptools
 
       - name: Download platform libraries
         uses: actions/download-artifact@v8
@@ -652,7 +655,7 @@ jobs:
       - name: Publish to PyPI
         # Pinned to a commit: this step holds the OIDC id-token for PyPI trusted publishing
         # and sees the wheels in plaintext — release/v1 is a mutable *branch*.
-        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # release/v1, 2026-02-18
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           # No username/password: presence of the OIDC token triggers the
           # trusted-publishing flow. PEP 740 attestations are generated by

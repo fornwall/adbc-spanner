@@ -41,9 +41,11 @@ jobs:
       # Pinned exactly: clang-format's output drifts between releases, so an unpinned
       # runner-provided binary would reformat on its own schedule and turn an unrelated PR
       # red. The PyPI package ships the upstream LLVM binary, so a contributor gets a
-      # byte-identical formatter from `pipx install clang-format==22.1.8`.
+      # byte-identical formatter from `pipx install clang-format==23.1.1`.
       - name: Install clang-format
-        run: pipx install clang-format==22.1.8
+        run: |
+          pipx install clang-format==23.1.1
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Check formatting
         run: clang-format --dry-run --Werror --verbose adbc-validation/*.cc

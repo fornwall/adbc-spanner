@@ -46,7 +46,7 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -142,11 +142,12 @@ jobs:
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
+          check-latest: true
 
       - name: Build the driver shared library
         run: cargo build
@@ -159,7 +160,7 @@ jobs:
           # pyarrow/pandas/polars/duckdb exercise the Arrow + DataFrame paths, including the
           # README cookbook snippets that import them. google-cloud-spanner is the oracle for the
           # differential type-mapping test (test_differential_oracle.py).
-          python -m pip install ./python pyarrow pandas polars duckdb pytest google-cloud-spanner
+          python -m pip install --upgrade ./python pyarrow pandas polars duckdb pytest google-cloud-spanner
 
       - name: Wait for the Spanner emulator
         run: |
@@ -200,13 +201,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
 
-      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2
+      - uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab # v2.87.13
         with:
-          tool: cargo-machete
+          tool: cargo-machete@0.9.2
 
       - name: Unused dependencies
         run: cargo machete

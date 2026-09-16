@@ -52,12 +52,13 @@ jobs:
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - uses: actions/setup-python@v7
         with:
-          # adbc-drivers-validation requires Python >= 3.13.
-          python-version: "3.13"
+          # Run the suite on the latest stable Python (it requires >= 3.13).
+          python-version: "3.x"
+          check-latest: true
 
       - name: Wait for the Spanner emulator
         run: |

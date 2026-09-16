@@ -55,9 +55,8 @@ endif()
 # apache/arrow-adbc#4534; that PR is merged, so the fork is gone and this is a
 # plain upstream `main` pin again.)
 #
-# This is the same *family* as the adbc_core / adbc_ffi git pin the driver
-# builds on (see Cargo.toml), but the two revisions are bumped independently
-# and may differ — this one only selects the C++ validation-suite sources.
+# Keep this revision in sync with the adbc_core / adbc_ffi / adbc_driver_manager
+# git pins in Cargo.toml so the driver and validation suite share one ADBC revision.
 # Its apache/arrow-adbc base (rather than the 0.23 release tag) carries five
 # C++ validation fixes this suite relies on:
 # apache/arrow-adbc#4493 — TestSqlPartitionedInts now allows >1 partition, so
@@ -85,7 +84,7 @@ endif()
 # exists, so a stale `CMakeCache.txt` (e.g. one restored from a run on the old
 # rev) would silently keep the previous tag and rebuild against the wrong
 # arrow-adbc source. FORCE makes a rev bump here authoritative.
-set(ARROW_ADBC_TAG "32c67b092c0f7cabf2be75062f001a9e17a48cc1"
+set(ARROW_ADBC_TAG "2daa02564ddc331eda0f1f280752d11460aed47d"
     CACHE STRING "arrow-adbc revision (apache/arrow-adbc main, see above)" FORCE)
 
 include(FetchContent)

@@ -101,7 +101,7 @@ jobs:
         # The rust-asan leg needs nightly for -Zsanitizer=address / -Zbuild-std, plus the rust-src
         # component so build-std can recompile+instrument the standard library.
         if: matrix.toolchain == 'nightly'
-        uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae # nightly branch, 2026-07-10
+        uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly branch, 2026-09-03
         with:
           toolchain: nightly
           components: rust-src
@@ -111,9 +111,20 @@ jobs:
       # mixed). The run script defaults CC/CXX to clang when ADBC_VALIDATION_RUST_SANITIZE is set.
       - name: Install clang (compiler-rt ASan, to match the instrumented cdylib)
         if: matrix.rust-sanitize != ''
-        run: sudo apt-get update && sudo apt-get install -y clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
+        with:
+          version: "23.1.1"
+          # The action's bundled release list predates LLVM 23.
+          force-url: https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/LLVM-23.1.1-Linux-X64.tar.xz
+          directory: ${{ runner.temp }}/llvm
+          env: true
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install CMake
+        run: |
+          pipx install cmake==4.4.3
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Wait for the Spanner emulator
         run: |
@@ -136,14 +147,14 @@ jobs:
       # the runner OS, the matrix leg (plain / asan-ubsan / rust-asan build the same sources
       # with different flags — and rust-asan with a different compiler, clang vs gcc — so they
       # must NOT share a tree) and a hash of
-      # adbc-validation/CMakeLists.txt — which carries the pinned ARROW_ADBC_TAG and every
-      # CMake/toolchain flag — so bumping the arrow-adbc rev (or any build flag) mints a fresh key.
+      # adbc-validation/CMakeLists.txt and this workflow — which carry the pinned ARROW_ADBC_TAG,
+      # build flags and tool versions — so changing any of them mints a fresh key.
       #
       # Deliberately NO restore-keys: a partial-key hit would restore a build tree
       # (including its CMakeCache.txt) from a run on the *old* arrow-adbc rev, and
       # FetchContent may then keep the stale checkout instead of re-fetching the new
       # tag — masking the rev bump and compiling against the wrong arrow-adbc source.
-      # An exact key match is safe (same CMakeLists → same rev + flags); a rev bump
+      # An exact key match is safe (same sources, tools and flags); a rev bump
       # is an exact miss → empty tree → clean clone of the correct rev. The cost is a
       # cold rebuild of arrow-adbc + GoogleTest on each CMakeLists change, which is
       # rare (only rev/flag bumps) and worth the correctness guarantee.
@@ -151,7 +162,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ env.ADBC_VALIDATION_BUILD_DIR }}
-          key: adbc-validation-${{ runner.os }}-${{ matrix.name }}-${{ hashFiles('adbc-validation/CMakeLists.txt') }}
+          key: adbc-validation-${{ runner.os }}-${{ matrix.name }}-${{ hashFiles('adbc-validation/CMakeLists.txt', '.github/workflows/adbc-validation.yml') }}
 
       - name: Run the ADBC C++ validation suite (gated subset)
         run: scripts/run-adbc-validation.sh

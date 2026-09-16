@@ -51,7 +51,7 @@ dependencies = [
 [[package]]
 name = "adbc_core"
 version = "0.25.0"
-source = "git+https://github.com/apache/arrow-adbc?rev=32c67b092c0f7cabf2be75062f001a9e17a48cc1#32c67b092c0f7cabf2be75062f001a9e17a48cc1"
+source = "git+https://github.com/apache/arrow-adbc?rev=2daa02564ddc331eda0f1f280752d11460aed47d#2daa02564ddc331eda0f1f280752d11460aed47d"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -60,7 +60,7 @@ dependencies = [
 [[package]]
 name = "adbc_driver_manager"
 version = "0.25.0"
-source = "git+https://github.com/apache/arrow-adbc?rev=32c67b092c0f7cabf2be75062f001a9e17a48cc1#32c67b092c0f7cabf2be75062f001a9e17a48cc1"
+source = "git+https://github.com/apache/arrow-adbc?rev=2daa02564ddc331eda0f1f280752d11460aed47d#2daa02564ddc331eda0f1f280752d11460aed47d"
 dependencies = [
  "adbc_core",
  "adbc_ffi",
@@ -77,7 +77,7 @@ dependencies = [
 [[package]]
 name = "adbc_ffi"
 version = "0.25.0"
-source = "git+https://github.com/apache/arrow-adbc?rev=32c67b092c0f7cabf2be75062f001a9e17a48cc1#32c67b092c0f7cabf2be75062f001a9e17a48cc1"
+source = "git+https://github.com/apache/arrow-adbc?rev=2daa02564ddc331eda0f1f280752d11460aed47d#2daa02564ddc331eda0f1f280752d11460aed47d"
 dependencies = [
  "adbc_core",
  "arrow-array",

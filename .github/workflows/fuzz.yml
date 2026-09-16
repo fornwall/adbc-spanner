@@ -66,15 +66,15 @@ jobs:
         # major tag) — a hijacked mutable tag would otherwise run in CI with repo read access.
         # dtolnay/rust-toolchain reads the toolchain from its ref name, so pinning the SHA
         # requires selecting the toolchain explicitly below.
-        uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae # nightly branch, 2026-07-10
+        uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly branch, 2026-09-03
         with:
           toolchain: nightly
 
-      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2
+      - uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab # v2.87.13
         with:
-          tool: cargo-fuzz
+          tool: cargo-fuzz@0.13.2
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # `fuzz/` is a member of the root workspace, so `cargo fuzz` builds into the root
           # `target/` (keyed off the single root Cargo.lock), not `fuzz/target`.

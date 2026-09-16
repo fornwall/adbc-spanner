@@ -84,10 +84,9 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
                                    const std::string& name, const std::string& schema,
                                    struct AdbcError* error) const override {
     const std::string table = Qualified(name, schema);
-    RAISE_ADBC(
-        RunIgnoringResult(connection,
-                          "CREATE TABLE " + table + " (int64s INT64, strings STRING(MAX))",
-                          error));
+    RAISE_ADBC(RunIgnoringResult(
+        connection, "CREATE TABLE " + table + " (int64s INT64, strings STRING(MAX))",
+        error));
     return RunIgnoringResult(
         connection,
         "INSERT INTO " + table +
@@ -243,7 +242,8 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
         {"StatementTest::TestSqlQueryEmpty::create-table-queryempty",
          {"CREATE TABLE queryempty (FOO INT)", "CREATE TABLE queryempty (FOO INT64)"}},
         {"StatementTest::TestSqlQueryInsertRollback::create-table-rollbacktest",
-         {"CREATE TABLE `rollbacktest` (a INT)", "CREATE TABLE `rollbacktest` (a INT64)"}},
+         {"CREATE TABLE `rollbacktest` (a INT)",
+          "CREATE TABLE `rollbacktest` (a INT64)"}},
         {"StatementTest::TestSqlQueryRowsAffectedDelete::create-table-delete-test",
          {"CREATE TABLE `delete_test` (foo INT)",
           "CREATE TABLE `delete_test` (foo INT64)"}},

@@ -105,7 +105,7 @@ harness = false
 # The C ABI itself is NOT taken from a crate: `src/ffi/` is this driver's own export layer, so
 # there is no `adbc_ffi` dependency here (it stays a dev-dependency, for the FFI struct
 # definitions the raw-`libloading` lifecycle test drives the library through).
-adbc_core = { git = "https://github.com/apache/arrow-adbc", rev = "32c67b092c0f7cabf2be75062f001a9e17a48cc1" }
+adbc_core = { git = "https://github.com/apache/arrow-adbc", rev = "2daa02564ddc331eda0f1f280752d11460aed47d" }
 # Arrow types the ADBC traits are expressed in. Kept in the range the (git) adbc crates
 # allow (>=58, <60) so the RecordBatch / Schema / RecordBatchReader types unify across them.
 # The `ffi` feature supplies `FFI_ArrowArray`/`FFI_ArrowSchema`/`FFI_ArrowArrayStream`, the C
@@ -236,14 +236,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync"
 proptest = "1"
 # Driver manager: loads the built cdylib through the C ABI for the FFI smoke test.
 # Same git pin as adbc_core above (the three arrow-adbc crates must share one revision).
-adbc_driver_manager = { git = "https://github.com/apache/arrow-adbc", rev = "32c67b092c0f7cabf2be75062f001a9e17a48cc1" }
+adbc_driver_manager = { git = "https://github.com/apache/arrow-adbc", rev = "2daa02564ddc331eda0f1f280752d11460aed47d" }
 # The `FFI_Adbc*` C struct definitions, so the raw-`libloading` lifecycle test in
 # tests/integration.rs can drive the cdylib's entrypoint directly, bypassing the driver manager
 # (and so `src/ffi/roundtrip.rs` can name the init-function type `ManagedDriver::load_static`
 # wants). An independent transcription of the same header `src/ffi/abi.rs` transcribes, so the
 # test cannot agree with the layer it is checking by construction.
 # Same git pin as adbc_core above (the three arrow-adbc crates must share one revision).
-adbc_ffi = { git = "https://github.com/apache/arrow-adbc", rev = "32c67b092c0f7cabf2be75062f001a9e17a48cc1" }
+adbc_ffi = { git = "https://github.com/apache/arrow-adbc", rev = "2daa02564ddc331eda0f1f280752d11460aed47d" }
 # Loads the built cdylib directly (bypassing the driver manager) so the raw-FFI lifecycle test
 # can drive double-release / error-struct-reuse paths the managed wrappers never hit. Already in
 # the dependency graph via adbc_driver_manager; same version range.
