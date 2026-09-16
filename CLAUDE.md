@@ -64,8 +64,12 @@ Unit tests live in a sibling `src/<module>/tests.rs` (e.g. `src/sql/tests.rs`), 
 | `driver.rs` | `SpannerDriver` + `SpannerDatabase`: config, emulator, building the client |
 | `driver/credentials.rs` | The mutually exclusive auth ladder + quota project |
 | `driver/uri.rs` | `spanner:` URIs — path = database, `//host` = endpoint, params = options |
-| `connection.rs` | Transaction state (`TxnState`/`ManualTxn`), isolation/read-only, table metadata, partitions |
-| `statement.rs` | `execute`/`execute_update`/`execute_schema`/`execute_partitions`, DDL, bulk ingest |
+| `connection.rs` | The ADBC `Connection` surface: options, metadata entry points, partitions |
+| `connection/txn.rs` | Transaction state — `TxnState`/`ManualTxn`, the two-kinds rule, buffering |
+| `connection/exec.rs` | Isolation parsing and the three read/write-transaction runners |
+| `metadata.rs` | Shared `INFORMATION_SCHEMA` plumbing + the UTF-8-correct `LIKE` matcher |
+| `statement.rs` | `execute`/`execute_update`/`execute_schema`/`execute_partitions`, DDL |
+| `statement/ingest.rs` | Bulk ingest: chunking, mutations, BatchWrite, the mutation-limit bisect |
 | `bind.rs` | Arrow → Spanner values: parameter binding, ingest mutations, `create_table_sql` |
 | `conversion.rs` | Result sets → Arrow (the type mapping); the streaming `SpannerBatchReader` |
 | `sql.rs` | The one home for SQL text: lexing, splitting, quoting, parameter extraction |
@@ -146,8 +150,8 @@ one place enumerating every edit needed to revert a family to versioned crates.i
   details), `google-cloud-wkt` (names the `Duration` that `set_max_commit_delay` takes).
 - `Cargo.toml` `[dev-dependencies]` — arrow-adbc: `adbc_driver_manager`, `adbc_ffi` (its `FFI_Adbc*`
   structs are an independent transcription of the header `src/ffi/abi.rs` transcribes, used by
-  `src/ffi/roundtrip.rs` and the raw-`libloading` lifecycle test in `tests/integration.rs`, so those
-  tests cannot agree with the layer they check by construction). google-cloud:
+  `src/ffi/roundtrip.rs` and the raw-`libloading` lifecycle tests in `tests/ffi_lifecycle.rs`, so
+  those tests cannot agree with the layer they check by construction). google-cloud:
   `google-cloud-spanner-admin-instance-v1`, `google-cloud-spanner-admin-database-v1`,
   `spanner-grpc-mock` (the `tests/mock_spanner.rs` harness; `publish = false` upstream and never on
   crates.io, so it stays a git pin — check whether `cargo publish` tolerates a version-less git
@@ -168,8 +172,9 @@ backend) — there is no `ring` option, which is why release CI builds each arch
 
 `docs/testing.md` maps every suite and how to run it. What matters here:
 
-- **Targets.** `tests/integration.rs` self-skips unless a target is configured, so plain `cargo test`
-  is green everywhere. `test_target()` resolves two, emulator first: `SPANNER_EMULATOR_HOST` (a local
+- **Targets.** `tests/integration.rs` and `tests/ffi_lifecycle.rs` self-skip unless a target is
+  configured, so plain `cargo test` is green everywhere. CI names each emulator-backed binary
+  explicitly, so a new `tests/*.rs` does not run there until `ci.yml` lists it. `test_target()` resolves two, emulator first: `SPANNER_EMULATOR_HOST` (a local
   emulator; its fixed `test-project`/`test-instance`/`adbc-test` ids are created by the test) and
   `SPANNER_GCP_DATABASE` (a real database, `project.instance.database`, via ADC). CI sets
   `ADBC_TEST_REQUIRE_TARGET=1` so a skip fails instead; do not set it locally.

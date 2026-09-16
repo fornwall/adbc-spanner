@@ -88,7 +88,7 @@ pub(crate) fn collect_statistics(
 ) -> Result<Vec<SchemaStatistics>> {
     let timeout = config.timeouts.query_timeout();
     // Build ONE multi-use read-only transaction so the INFORMATION_SCHEMA discovery *and* every
-    // per-table aggregate scan observe a single, consistent snapshot (SPAN-5): a table created
+    // per-table aggregate scan observe a single, consistent snapshot: a table created
     // between discovery and its scan can no longer fail the call, and all counts are taken at one
     // timestamp. Mirrors `collect_objects`, including honouring `spanner.read.staleness` (pinned to
     // its multi-use-legal equivalent) so a stale read still reads from one pinned timestamp.
