@@ -186,7 +186,7 @@ pub(crate) fn collect_statistics(
         let columns = columns_by_table
             .remove(&(schema, table))
             .unwrap_or_default();
-        let (sql, plan) = build_table_query(schema, table, &columns);
+        let (sql, plan) = build_table_query(schema, table, &columns)?;
         prepared.push(PreparedTable {
             schema: schema.to_string(),
             table: table.to_string(),
@@ -254,13 +254,13 @@ fn build_table_query(
     schema: &str,
     table: &str,
     columns: &[(String, bool)],
-) -> (String, Vec<(String, i16)>) {
+) -> Result<(String, Vec<(String, i16)>)> {
     use adbc_core::constants::{ADBC_STATISTIC_DISTINCT_COUNT_KEY, ADBC_STATISTIC_NULL_COUNT_KEY};
 
     let mut exprs = vec!["COUNT(*)".to_string()];
     let mut plan: Vec<(String, i16)> = Vec::new();
     for (name, groupable) in columns {
-        let quoted = quote_ident(name);
+        let quoted = quote_ident(name)?;
         exprs.push(format!("COUNTIF({quoted} IS NULL)"));
         plan.push((name.clone(), ADBC_STATISTIC_NULL_COUNT_KEY));
         if *groupable {
@@ -271,9 +271,9 @@ fn build_table_query(
     let sql = format!(
         "SELECT {} FROM {}",
         exprs.join(", "),
-        qualified_table(Some(schema), table)
+        qualified_table(Some(schema), table)?
     );
-    (sql, plan)
+    Ok((sql, plan))
 }
 
 /// Extract the `ROW_COUNT` and per-column `NULL_COUNT`/`DISTINCT_COUNT` statistics from a table's
@@ -544,7 +544,7 @@ mod tests {
             ("Tags".to_string(), false),
             ("Name".to_string(), true),
         ];
-        let (sql, plan) = build_table_query("", "Users", &columns);
+        let (sql, plan) = build_table_query("", "Users", &columns).unwrap();
         assert_eq!(
             sql,
             "SELECT COUNT(*), COUNTIF(`Id` IS NULL), COUNT(DISTINCT `Id`), \
@@ -563,7 +563,7 @@ mod tests {
         );
 
         // A non-empty schema qualifies the table; a table with no columns is just the row count.
-        let (sql, plan) = build_table_query("app", "Users", &[]);
+        let (sql, plan) = build_table_query("app", "Users", &[]).unwrap();
         assert_eq!(sql, "SELECT COUNT(*) FROM `app`.`Users`");
         assert!(plan.is_empty());
     }
@@ -575,7 +575,7 @@ mod tests {
     #[test]
     fn parse_table_statistics_reads_each_plan_entry_at_its_own_aggregate() {
         let columns = vec![("Id".to_string(), true), ("Tags".to_string(), false)];
-        let (_, plan) = build_table_query("", "Users", &columns);
+        let (_, plan) = build_table_query("", "Users", &columns).unwrap();
         // COUNT(*), COUNTIF(Id IS NULL), COUNT(DISTINCT Id), COUNTIF(Tags IS NULL).
         let counts = [100i64, 7, 93, 11];
         let batch = RecordBatch::try_from_iter(counts.iter().enumerate().map(|(i, c)| {

@@ -381,7 +381,7 @@ impl Connection for SpannerConnection {
         // Mint a fresh cancel signal for this operation (see `CancelSlot`).
         self.cancel.begin_operation();
         check_lookup_catalog(catalog, self.catalog())?;
-        let table = qualified_table(db_schema, table_name);
+        let table = qualified_table(db_schema, table_name)?;
         let sql = format!("SELECT * FROM {table} LIMIT 0");
         let client = self.client.clone();
         let bound = self.config.read_staleness.timestamp_bound()?;

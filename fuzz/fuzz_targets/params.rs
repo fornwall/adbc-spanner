@@ -11,45 +11,64 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|input: (String, Vec<String>, bool)| {
     let (sql, column_names, bind_by_name) = input;
 
-    // named_parameters: every extracted name is distinct, is a well-formed parameter identifier,
-    // and occurs verbatim (with its `@`) in the SQL — never synthesized or mangled.
+    // named_parameters: every extracted name is distinct *case-insensitively* (Spanner resolves
+    // parameters case-insensitively and rejects two spellings of one name), is non-empty, carries
+    // neither delimiter nor escape, and occurs verbatim in the SQL — never synthesized or mangled.
+    // The name is not required to sit adjacent to its `@`: `@ p`, `@/*c*/p` and ``@`p` `` are all
+    // references to `p`.
     let params = named_parameters(&sql);
     for (i, name) in params.iter().enumerate() {
-        assert!(!params[..i].contains(name), "duplicate parameter {name:?}");
-        let mut chars = name.chars();
-        let first = chars.next().expect("parameter names are non-empty");
         assert!(
-            first == '_' || first.is_ascii_alphabetic(),
-            "bad first char in parameter {name:?}"
+            !params[..i]
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(name.as_str())),
+            "duplicate parameter {name:?}"
+        );
+        assert!(!name.is_empty(), "empty parameter name");
+        assert!(
+            !name.contains(['`', '\\']),
+            "parameter {name:?} carries a delimiter or escape"
         );
         assert!(
-            chars.all(|c| c == '_' || c.is_ascii_alphanumeric()),
-            "bad char in parameter {name:?}"
-        );
-        assert!(
-            sql.contains(&format!("@{name}")),
-            "@{name} does not occur in {sql:?}"
+            sql.contains(name.as_str()),
+            "{name} does not occur in {sql:?}"
         );
     }
 
     // resolve_parameter_names against a batch with these column names must follow the documented
     // contract exactly for the chosen mode (restated here):
-    // - by-name (bind_by_name = true): the columns themselves iff every column names a parameter,
-    //   else a clean InvalidArguments rejection (asserted inside the wrapper);
+    // - by-name (bind_by_name = true): each column's matching parameter iff every column names one
+    //   (case-insensitively) and no two columns name the same parameter, else a clean
+    //   InvalidArguments rejection (asserted inside the wrapper);
     // - positional (bind_by_name = false): the query's parameters iff the counts match, else that
     //   same clean rejection.
-    let all_named = column_names.iter().all(|c| params.contains(c));
+    let matching = |column: &String| {
+        params
+            .iter()
+            .find(|p| p.eq_ignore_ascii_case(column.as_str()))
+    };
+    let all_named = column_names.iter().all(|c| matching(c).is_some());
+    let all_distinct = !column_names.iter().enumerate().any(|(i, c)| {
+        column_names[..i]
+            .iter()
+            .any(|earlier| earlier.eq_ignore_ascii_case(c.as_str()))
+    });
     match resolve_parameter_names(&sql, &column_names, bind_by_name) {
         Some(resolved) if bind_by_name => {
             assert!(
-                all_named,
-                "by-name accepted an unmatched column: {column_names:?}"
+                all_named && all_distinct,
+                "by-name accepted an unmatched or duplicated column: {column_names:?}"
             );
-            assert_eq!(resolved, column_names);
+            // Each column binds under the query's own spelling of the parameter it names.
+            let expected: Vec<String> = column_names
+                .iter()
+                .map(|c| matching(c).expect("checked above").clone())
+                .collect();
+            assert_eq!(resolved, expected);
         }
         Some(resolved) => assert_eq!(resolved, params),
         None if bind_by_name => assert!(
-            !all_named,
+            !all_named || !all_distinct,
             "by-name rejected a fully-matching pairing: {sql:?} / {column_names:?}"
         ),
         None => assert!(
@@ -58,34 +77,33 @@ fuzz_target!(|input: (String, Vec<String>, bool)| {
         ),
     }
 
-    // quote_ident: backtick-delimited, every backtick/backslash in the body is escaped — so
-    // unquoting recovers the input exactly — and, checked against the crate's own GoogleSQL
-    // lexer, the quoted identifier embeds into surrounding SQL as one opaque token (the
-    // identifier-injection vector the function exists to close).
+    // quote_ident: either the identifier is rejected, or the result is backtick-delimited and its
+    // body carries no backtick and no backslash at all.
+    //
+    // That second property is deliberately stated without reference to this crate's lexer. Spanner
+    // has two parsers that disagree about escaping — the query parser honours `` \` `` inside
+    // backticks, the DDL parser does not and ends the identifier at the first backtick — so an
+    // oracle built on the driver's own model of GoogleSQL can only confirm the driver is
+    // self-consistent, which is exactly how an escaping bug on the DDL path stayed invisible here.
+    // "No delimiter and no escape in the body" is grammar-independent: it holds under both.
     for ident in column_names
         .iter()
         .map(String::as_str)
         .chain([sql.as_str()])
     {
-        let quoted = quote_ident(ident);
+        let Some(quoted) = quote_ident(ident) else {
+            continue;
+        };
         assert!(
             quoted.len() >= 2 && quoted.starts_with('`') && quoted.ends_with('`'),
             "not backtick-delimited: {quoted:?}"
         );
         let body = &quoted[1..quoted.len() - 1];
-        let mut unquoted = String::new();
-        let mut chars = body.chars();
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => unquoted.push(chars.next().expect("dangling escape")),
-                '`' => panic!("unescaped backtick in {quoted:?}"),
-                other => unquoted.push(other),
-            }
-        }
-        assert_eq!(
-            unquoted, ident,
-            "unquoting {quoted:?} did not recover input"
+        assert!(
+            !body.contains(['`', '\\']),
+            "accepted identifier {quoted:?} is not one opaque token"
         );
+        assert_eq!(body, ident, "quoting {ident:?} altered it");
 
         let embedded = format!("SELECT {quoted} FROM t; SELECT 1");
         assert_eq!(

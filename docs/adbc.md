@@ -78,10 +78,15 @@ immediately and cannot be rolled back. See [transactions](transactions.md).
 in memory before execution.
 
 - For SQL parameters, columns bind positionally to distinct `@name` parameters in SQL order.
+  A parameter may be written `@name`, ``@`name` `` or with whitespace or a comment after the `@`,
+  and names are matched case-insensitively, as Spanner resolves them.
   `adbc.statement.bind_by_name=true` matches column names instead. Multiple bound rows execute
   the query for each row, sharing one snapshot.
 - For ingest, `adbc.ingest.target_table` selects a table and `adbc.ingest.mode` controls its
-  creation or replacement. Rows become insert mutations. Autocommit ingest commits chunks, so a
+  creation or replacement. Table, schema and column names are validated before any RPC: a name
+  containing a backtick, a backslash or a control character is rejected rather than escaped,
+  because Spanner's DDL parser does not honour escapes inside backticks. Rows become insert
+  mutations. Autocommit ingest commits chunks, so a
   whole ingest is not atomic; manual mode buffers all mutations for one commit. Any table DDL
   still executes immediately.
 

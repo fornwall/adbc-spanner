@@ -169,9 +169,9 @@ pub mod fuzzing {
     pub fn named_parameters(sql: &str) -> Vec<String> {
         crate::sql::named_parameters(sql)
     }
-    /// Backtick-quote a Spanner identifier (GoogleSQL backslash escaping).
-    pub fn quote_ident(ident: &str) -> String {
-        crate::sql::quote_ident(ident)
+    /// Backtick-quote a Spanner identifier, or reject a name backticks cannot safely contain.
+    pub fn quote_ident(ident: &str) -> Option<String> {
+        crate::sql::quote_ident(ident).ok()
     }
     /// Resolve the column→parameter pairing for `sql` against a batch whose columns are named
     /// `column_names` (built here as nullable `Int64`; the pairing never looks at types), under the

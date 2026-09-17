@@ -114,19 +114,38 @@ pub(crate) fn resolve_parameter_names(
     let column_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     let params = named_parameters(sql);
 
-    // Strict by-name: every bound column must correspond to a query parameter.
+    // Strict by-name: every bound column must correspond to a query parameter. Spanner matches
+    // parameter names case-insensitively (`@p` binds from `P`), so the column->parameter lookup
+    // is case-insensitive too, and each column binds under the *query's* spelling — sending a
+    // second spelling of a name Spanner already knows buys nothing.
     if bind_by_name {
-        let param_set: std::collections::HashSet<&str> =
-            params.iter().map(String::as_str).collect();
-        if let Some(missing) = column_names.iter().find(|c| !param_set.contains(*c)) {
-            return Err(invalid_argument(format!(
-                "cannot bind column {missing:?}: adbc.statement.bind_by_name is true, so every \
-                 bound column must be named after one of the query's parameters, which are \
-                 {params:?}; rename the column or set adbc.statement.bind_by_name to false to \
-                 bind positionally",
-            )));
+        let param_set: std::collections::HashMap<String, &str> = params
+            .iter()
+            .map(|p| (p.to_ascii_lowercase(), p.as_str()))
+            .collect();
+        let mut resolved = Vec::with_capacity(column_names.len());
+        let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for column in &column_names {
+            let Some(param) = param_set.get(&column.to_ascii_lowercase()) else {
+                return Err(invalid_argument(format!(
+                    "cannot bind column {column:?}: adbc.statement.bind_by_name is true, so every \
+                     bound column must be named after one of the query's parameters, which are \
+                     {params:?}; rename the column or set adbc.statement.bind_by_name to false to \
+                     bind positionally",
+                )));
+            };
+            // Two columns differing only in case name one parameter; Spanner would reject the
+            // resulting request with "Duplicate parameter name", so say so here instead.
+            if !bound.insert((*param).to_ascii_lowercase()) {
+                return Err(invalid_argument(format!(
+                    "cannot bind column {column:?}: it names the same query parameter {param:?} as \
+                     an earlier column (parameter names are case-insensitive); bind one column per \
+                     parameter",
+                )));
+            }
+            resolved.push((*param).to_string());
         }
-        return Ok(column_names.iter().map(|c| (*c).to_string()).collect());
+        return Ok(resolved);
     }
 
     // Positional (the default): i-th column -> i-th parameter. Counts must line up.
@@ -662,12 +681,12 @@ pub(crate) fn create_table_sql(
         let column_type = spanner_field_type(field).map_err(|e| {
             crate::error::annotate(e, |m| format!("ingest column {:?}: {m}", field.name()))
         })?;
-        columns.push(format!("{} {}", quote_ident(field.name()), column_type));
+        columns.push(format!("{} {}", quote_ident(field.name())?, column_type));
     }
     let guard = if if_not_exists { "IF NOT EXISTS " } else { "" };
     Ok(format!(
         "CREATE TABLE {guard}{} ({})",
-        qualified_table(db_schema, table),
+        qualified_table(db_schema, table)?,
         columns.join(", "),
     ))
 }

@@ -555,6 +555,132 @@ fn manual_transaction_kinds_round_trip() {
     cleanup.execute_update().expect("drop scratch tables");
 }
 
+/// A hostile identifier reaching generated DDL must be rejected by the driver **before** any RPC.
+///
+/// Bulk ingest in `create` mode builds a `CREATE TABLE` out of caller-supplied names: the target
+/// table, the optional schema, and every bound Arrow field name. Spanner's two parsers disagree
+/// about escaping inside backticks — the query parser honours `` \` ``, the Database Admin DDL
+/// parser does not, ending the identifier at the first backtick and treating the backslash as an
+/// ordinary character — so backslash-escaping a name is not enough on the DDL path.
+///
+/// With escaping, an Arrow field named
+/// ``k` INT64, Id INT64 NOT NULL) PRIMARY KEY (Id), INTERLEAVE IN PARENT … ON DELETE CASCADE -- ``
+/// produced DDL that Spanner **executed**, creating the table interleaved into an unrelated parent
+/// with cascading delete. DDL is not transactional in Spanner, so such a schema change cannot be
+/// rolled back — the rejection has to happen driver-side, which is why `quote_ident` validates
+/// instead of escaping.
+#[test]
+fn hostile_identifiers_are_rejected_before_any_ddl_runs() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
+
+    // A parent table for the payload to try to interleave into.
+    let mut setup = connection.new_statement().expect("new statement");
+    setup
+        .set_sql_query(
+            "DROP TABLE IF EXISTS AdbcInjChild; \
+             DROP TABLE IF EXISTS AdbcInjParent; \
+             CREATE TABLE AdbcInjParent (Id INT64 NOT NULL) PRIMARY KEY (Id)",
+        )
+        .unwrap();
+    setup.execute_update().expect("create the injection parent");
+
+    // A column name that closes its own backticks and appends schema clauses.
+    let payload = "k` INT64, Id INT64 NOT NULL) PRIMARY KEY (Id), \
+                   INTERLEAVE IN PARENT AdbcInjParent ON DELETE CASCADE -- ";
+    let rows = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("Id", DataType::Int64, false),
+            Field::new(payload, DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64])),
+            Arc::new(Int64Array::from(vec![2_i64])),
+        ],
+    )
+    .unwrap();
+    let mut statement = ingest_stmt(connection, "AdbcInjChild", "create");
+    statement.bind(rows).expect("bind the hostile batch");
+    let err = statement
+        .execute_update()
+        .expect_err("a hostile column name must not reach Spanner");
+    assert_eq!(
+        err.status,
+        Status::InvalidArguments,
+        "hostile column name must be rejected as InvalidArguments: {err:?}"
+    );
+
+    // ...and nothing was created: no interleaved child, by any spelling.
+    let mut probe = connection.new_statement().expect("new statement");
+    probe
+        .set_sql_query(
+            "SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.TABLES \
+             WHERE PARENT_TABLE_NAME = 'AdbcInjParent'",
+        )
+        .unwrap();
+    let batches: Vec<_> = probe
+        .execute()
+        .expect("probe for an injected child table")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        col::<Int64Array>(batches[0].column(0)).value(0),
+        0,
+        "the injected DDL created an interleaved child table"
+    );
+
+    // The same guard covers the target table and schema options, and the empty name.
+    for table in [
+        "AdbcInj`x",
+        "AdbcInj\\x",
+        "",
+        "AdbcInj` (Id INT64) PRIMARY KEY (Id) -- ",
+    ] {
+        let err = ingest_labels(connection, table, "create")
+            .expect_err("a hostile ingest target table must be rejected");
+        assert_eq!(
+            err.status,
+            Status::InvalidArguments,
+            "target table {table:?} must be rejected: {err:?}"
+        );
+    }
+
+    // A legitimate name that merely needs quoting still works: reserved words and spaces are
+    // exactly what backticks are for.
+    let quoted_ok = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("Id", DataType::Int64, false),
+            Field::new("select", DataType::Int64, false),
+            Field::new("spaced name", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64])),
+            Arc::new(Int64Array::from(vec![2_i64])),
+            Arc::new(Int64Array::from(vec![3_i64])),
+        ],
+    )
+    .unwrap();
+    let mut ok_statement = ingest_stmt(connection, "AdbcInjOk", "create");
+    ok_statement.bind(quoted_ok).expect("bind the valid batch");
+    assert_eq!(
+        ok_statement
+            .execute_update()
+            .expect("a name needing quoting must still ingest"),
+        Some(1)
+    );
+
+    let mut cleanup = connection.new_statement().expect("new statement");
+    cleanup
+        .set_sql_query(
+            "DROP TABLE IF EXISTS AdbcInjOk; DROP TABLE IF EXISTS AdbcInjChild; \
+             DROP TABLE IF EXISTS AdbcInjParent",
+        )
+        .unwrap();
+    cleanup.execute_update().expect("drop the injection tables");
+}
+
 /// The two-column `Id` / `Label` batch the create-mode bulk-ingest tests bind.
 fn ingest_label_rows() -> RecordBatch {
     RecordBatch::try_new(
@@ -724,12 +850,19 @@ fn get_table_schema_reports_column_types() {
     assert_eq!(singers_schema.field(2).data_type(), &DataType::Boolean);
     assert_eq!(singers_schema.field(3).data_type(), &DataType::Float64);
 
-    // A name with an embedded backtick must be escaped, not interpolated into the probe SQL, so it
-    // cleanly reports NotFound like any other absent table.
+    // A name with an embedded backtick cannot be represented inside backticks on every Spanner
+    // parser (the DDL one ignores backslash escapes), so it is rejected here rather than escaped
+    // and interpolated into the probe SQL.
     let hostile = connection
         .get_table_schema(None, None, "no`such`table")
         .expect_err("hostile table name must not resolve");
-    assert_eq!(hostile.status, adbc_core::error::Status::NotFound);
+    assert_eq!(hostile.status, adbc_core::error::Status::InvalidArguments);
+    // An absent but representable name still reports NotFound, so the rejection above is about
+    // the name's shape and not about the table being missing.
+    let absent = connection
+        .get_table_schema(None, None, "NoSuchTable")
+        .expect_err("an absent table must not resolve");
+    assert_eq!(absent.status, adbc_core::error::Status::NotFound);
 
     // The catalog argument is honoured: the connection's one catalog is the database id, so naming
     // it behaves like `None`, while any other catalog is NotFound (nothing can exist in it).

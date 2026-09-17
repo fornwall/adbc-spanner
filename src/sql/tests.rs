@@ -1,14 +1,39 @@
 use super::*;
+use adbc_core::error::Status;
 
 #[test]
-fn raw_prefix_detection() {
-    // Any case of `r` / `rb` / `br` is a raw-literal prefix; nothing else is.
-    for word in ["r", "R", "rb", "Rb", "rB", "RB", "br", "bR", "Br", "BR"] {
-        assert!(is_raw_prefix(word), "should be a raw prefix: {word}");
+fn backslash_binds_the_next_char_in_every_literal_including_raw() {
+    // A literal prefix changes how Spanner *interprets* the bytes, never where the literal
+    // *ends*, and this lexer only ever looks for the end — so `\` binds the following character
+    // in a raw literal exactly as in a plain one. GoogleSQL: "a raw string cannot end with an odd
+    // number of backslashes". Verified against the Spanner emulator, which parses each of these
+    // as a single `SELECT` of one string:
+    //     SELECT r'x\'; SELECT 2'          ->  one row, value  x\'; SELECT 2
+    //     SELECT r'''a\'''; SELECT 2'''    ->  one row, value  a\'''; SELECT 2
+    // Reading `\'` as a closing quote instead would hand Spanner a statement boundary it never
+    // saw, turning one harmless SELECT into a batch containing a live DELETE.
+    assert_eq!(
+        split_statements(r"SELECT r'x\'; DELETE FROM t WHERE true; SELECT 1'"),
+        vec![r"SELECT r'x\'; DELETE FROM t WHERE true; SELECT 1'"]
+    );
+    assert_eq!(
+        split_statements(r"SELECT r'''a\'''; DELETE FROM t WHERE true'''"),
+        vec![r"SELECT r'''a\'''; DELETE FROM t WHERE true'''"]
+    );
+    // Every prefix spelling behaves the same, as does an unprefixed literal.
+    for prefix in ["r", "R", "rb", "RB", "br", "Br", "b", "B", ""] {
+        let sql = format!(r"SELECT {prefix}'x\'; DELETE FROM t'");
+        assert_eq!(
+            split_statements(&sql),
+            vec![sql.clone()],
+            "prefix {prefix:?}"
+        );
     }
-    for word in ["", "b", "B", "rr", "bb", "rbr", "raw", "x", "ré"] {
-        assert!(!is_raw_prefix(word), "should not be a raw prefix: {word}");
-    }
+    // An even number of backslashes does close the literal, so the `;` after it really separates.
+    assert_eq!(
+        split_statements(r"SELECT r'a\\'; DELETE FROM t WHERE stale"),
+        vec![r"SELECT r'a\\'", "DELETE FROM t WHERE stale"]
+    );
 }
 
 #[test]
@@ -104,11 +129,23 @@ fn first_keyword_edge_cases() {
     assert_eq!(first_keyword("select_into x"), Some("select"));
     assert_eq!(first_keyword("_select 1"), None);
     assert_eq!(first_keyword("9select 1"), None);
-    // A bare `@param` / `@@var` (not a `@{…}` hint) is not a keyword, and a space between
-    // `@` and `{` is not a hint either.
+    // A bare `@param` / `@@var` (not a `@{…}` hint) is not a keyword.
     assert_eq!(first_keyword("@p"), None);
+    assert_eq!(first_keyword("@ p"), None);
     assert_eq!(first_keyword("@@seed UPDATE t"), None);
-    assert_eq!(first_keyword("@ {A=1} SELECT 1"), None);
+    // GoogleSQL lexes `@` and `{` as separate tokens, so whitespace or a comment may sit between
+    // them and the result is still a statement hint. Spanner executes all three of these (the
+    // emulator returns a row for each), so the statement after the hint must still be classified
+    // — otherwise hinted DML is misread as "no keyword" and routed to a read-only single-use
+    // transaction, which Spanner rejects with "DML statements can only be performed in a
+    // read-write or partitioned-dml transaction".
+    assert_eq!(first_keyword("@ {A=1} SELECT 1"), Some("SELECT"));
+    assert_eq!(first_keyword("@\n{A=1} SELECT 1"), Some("SELECT"));
+    assert_eq!(first_keyword("@/* c */{A=1} SELECT 1"), Some("SELECT"));
+    assert!(is_dml(
+        "@ {PDML_MAX_PARALLELISM=8} UPDATE t SET n = 1 WHERE true"
+    ));
+    assert!(is_ddl("@ {A=1} CREATE TABLE t (id INT64) PRIMARY KEY (id)"));
 }
 
 #[test]
@@ -122,10 +159,13 @@ fn detects_then_return() {
     ] {
         assert!(is_dml_returning(sql), "should detect THEN RETURN: {sql}");
     }
-    // Raw strings end at their closing quote (`\` is not an escape), so a clause after one is
-    // still found.
-    assert!(is_dml_returning(
+    // `\'` does not close a raw literal, so the words after it are still inside the string and
+    // are not a clause; an even backslash run does close it, and then the clause is found.
+    assert!(!is_dml_returning(
         r"UPDATE t SET s = r'x\' WHERE true THEN RETURN Id"
+    ));
+    assert!(is_dml_returning(
+        r"UPDATE t SET s = r'x\\' WHERE true THEN RETURN Id"
     ));
     for sql in [
         "INSERT INTO t (id) VALUES (1)",
@@ -134,7 +174,7 @@ fn detects_then_return() {
         // the triple-quoted and raw literal forms.
         "INSERT INTO t (s) VALUES ('THEN RETURN')",
         "INSERT INTO t (s) VALUES ('''THEN RETURN''')",
-        r"INSERT INTO t (s) VALUES (r'THEN RETURN\')",
+        r"INSERT INTO t (s) VALUES (r'THEN RETURN\\')",
         "UPDATE t SET `then return` = 1 WHERE true",
         // `THEN RETURN` inside a comment is not a clause.
         "UPDATE t SET a = 1 /* THEN RETURN */ WHERE true",
@@ -226,11 +266,17 @@ fn lexer_partitions_input_byte_for_byte() {
             Lexeme::Comment("-- c"),
         ]
     );
+    // `\'` is an escaped quote even behind a raw prefix, so the literal swallows the rest of the
+    // input instead of ending at that quote; doubling the backslash closes it.
     assert_eq!(
         lex(r"r'x\' y").collect::<Vec<_>>(),
+        vec![Lexeme::Word("r"), Lexeme::Quoted(r"'x\' y")]
+    );
+    assert_eq!(
+        lex(r"r'x\\' y").collect::<Vec<_>>(),
         vec![
             Lexeme::Word("r"),
-            Lexeme::Quoted(r"'x\'"),
+            Lexeme::Quoted(r"'x\\'"),
             Lexeme::Other(' '),
             Lexeme::Word("y"),
         ]
@@ -307,29 +353,32 @@ fn split_drops_interleaved_comment_only_segment_in_ddl_batch() {
 
 #[test]
 fn split_respects_raw_strings() {
-    // In a raw string the backslash is an ordinary character, not an escape: `r'C:\'` ends at
-    // the quote, so the `;` after it is a real separator. Treating `\'` as an escape here
-    // swallows the separator and ships the whole batch as one malformed statement.
+    // A trailing backslash does NOT end a raw literal — it escapes the quote, exactly as in a
+    // plain literal — so `r'C:\'` is unterminated and swallows the rest of the input. This is
+    // the path-shaped value that makes the distinction matter: were `\'` read as a closing
+    // quote, the `DELETE` below would become a statement of its own and be executed.
     assert_eq!(
         split_statements(r"UPDATE t SET path = r'C:\'; DELETE FROM u WHERE stale"),
-        vec![r"UPDATE t SET path = r'C:\'", "DELETE FROM u WHERE stale"]
+        vec![r"UPDATE t SET path = r'C:\'; DELETE FROM u WHERE stale"]
     );
-    // All prefix spellings: rb / br / uppercase.
+    // All prefix spellings behave alike, raw or not.
     assert_eq!(
         split_statements(r"INSERT INTO t (b) VALUES (rb'\'); SELECT 1"),
-        vec![r"INSERT INTO t (b) VALUES (rb'\')", "SELECT 1"]
+        vec![r"INSERT INTO t (b) VALUES (rb'\'); SELECT 1"]
     );
     assert_eq!(
         split_statements(r#"SELECT BR"\"; SELECT R'\'"#),
-        vec![r#"SELECT BR"\""#, r"SELECT R'\'"]
+        vec![r#"SELECT BR"\"; SELECT R'\'"#]
     );
-    // A plain bytes prefix (no r) keeps backslash escapes: `b'\';x'` is one literal.
     assert_eq!(
         split_statements(r"SELECT b'\';x'; SELECT 2"),
         vec![r"SELECT b'\';x'", "SELECT 2"]
     );
-    // A prefix only counts when adjacent: `r 'x'` and `xr'y'` are not raw strings — but both
-    // are still ordinary (escaped) literals, so the split is unchanged either way here.
+    // Properly closed literals still separate normally, whatever the prefix.
+    assert_eq!(
+        split_statements(r"UPDATE t SET path = r'C:\\'; DELETE FROM u WHERE stale"),
+        vec![r"UPDATE t SET path = r'C:\\'", "DELETE FROM u WHERE stale"]
+    );
     assert_eq!(
         split_statements("SELECT r ';'; SELECT xr';'"),
         vec!["SELECT r ';'", "SELECT xr';'"]
@@ -355,10 +404,16 @@ fn split_respects_triple_quoted_strings() {
         split_statements("SELECT '''a''b'''; SELECT 2"),
         vec!["SELECT '''a''b'''", "SELECT 2"]
     );
-    // Raw + triple combined: the backslash does not escape the closing quotes.
+    // Raw + triple combined: the backslash escapes the first closing quote here too, so the
+    // literal is still open and the `;` is inside it (emulator-verified, see
+    // `backslash_binds_the_next_char_in_every_literal_including_raw`).
     assert_eq!(
         split_statements(r"SELECT r'''a\'''; SELECT 2"),
-        vec![r"SELECT r'''a\'''", "SELECT 2"]
+        vec![r"SELECT r'''a\'''; SELECT 2"]
+    );
+    assert_eq!(
+        split_statements(r"SELECT r'''a\\'''; SELECT 2"),
+        vec![r"SELECT r'''a\\'''", "SELECT 2"]
     );
     // An empty literal ('' / "") is not the start of a triple-quoted string.
     assert_eq!(
@@ -415,6 +470,75 @@ fn strips_trailing_query_terminators() {
 }
 
 #[test]
+fn strip_trailing_terminators_handles_statementless_and_leading_semicolons() {
+    // The statement is recovered from the splitter, not trimmed off the end, so a leading or
+    // interior `;` goes the same way as a trailing one.
+    assert_eq!(strip_trailing_terminators("; SELECT 1"), "SELECT 1");
+    assert_eq!(strip_trailing_terminators(" ; SELECT 1 ; "), "SELECT 1");
+    assert_eq!(strip_trailing_terminators(";;SELECT 1"), "SELECT 1");
+    // A trailing comment-only segment is dropped with the terminator; a comment that belongs to
+    // the statement is part of it and survives.
+    assert_eq!(
+        strip_trailing_terminators("SELECT 1;\n-- tail\n;"),
+        "SELECT 1"
+    );
+    assert_eq!(
+        strip_trailing_terminators("SELECT 1 -- tail"),
+        "SELECT 1 -- tail"
+    );
+    // Input that parses to no statement at all is returned untouched (the `len() != 1` branch),
+    // leaving Spanner to produce the error rather than inventing one here.
+    for sql in [
+        "",
+        ";",
+        ";;",
+        "  \n",
+        "-- only a comment",
+        "/* just a block */",
+    ] {
+        assert_eq!(strip_trailing_terminators(sql), sql, "for {sql:?}");
+    }
+}
+
+#[test]
+fn split_drops_only_comment_and_whitespace_segments() {
+    // Comment-only segments are dropped even when separated by interior whitespace — the
+    // whitespace arm of `push_statement`'s check is what makes this work, since `trim` only
+    // strips the ends and cannot remove the space *between* two comments.
+    assert_eq!(split_statements("/* a */ /* b */"), Vec::<String>::new());
+    assert_eq!(split_statements("-- a\n /* b */ # c"), Vec::<String>::new());
+    // Punctuation is not a comment: it is user-written SQL text, so it is kept and left for
+    // Spanner to reject rather than silently swallowed along with a typo.
+    assert_eq!(split_statements("SELECT 1; ()"), vec!["SELECT 1", "()"]);
+}
+
+#[test]
+fn split_statements_returns_verbatim_in_order_slices() {
+    // The invariant `fuzz/fuzz_targets/keyword.rs` leans on: `split_statements` rebuilds each
+    // statement character by character, so this pins that the rebuild never alters or reorders
+    // the text. Exercised over the shapes most likely to break it.
+    for sql in [
+        r"SELECT r'x\'; DELETE FROM t'",
+        "SELECT '''a;b''' ; SELECT `c;d` ; -- t\n SELECT 2",
+        "/* unterminated ; SELECT 1",
+        "SELECT 'unterminated ; SELECT 1",
+        "SELECT 1;;;SELECT 2",
+        "SELECT '\u{2028}\u{0}é😀'; SELECT 2",
+        "",
+    ] {
+        let mut cursor = 0;
+        for statement in split_statements(sql) {
+            assert_eq!(statement, statement.trim());
+            assert!(!statement.is_empty());
+            let found = sql[cursor..]
+                .find(statement.as_str())
+                .unwrap_or_else(|| panic!("{statement:?} is not an in-order slice of {sql:?}"));
+            cursor += found + statement.len();
+        }
+    }
+}
+
+#[test]
 fn extracts_named_parameters() {
     // Basic references, in order, with a later reuse deduped.
     assert_eq!(
@@ -439,11 +563,15 @@ fn extracts_named_parameters() {
 
 #[test]
 fn named_parameters_skip_raw_and_triple_quoted_strings() {
-    // In a raw string the backslash is not an escape: the literal ends at the first quote and
-    // scanning resumes after it. Treating `\'` as escaped keeps the lexer in string mode and
-    // swallows the parameters that follow.
-    assert_eq!(named_parameters(r"SELECT r'\', @p"), vec!["p"]);
-    assert_eq!(named_parameters(r"SELECT rb'@x\', @p"), vec!["p"]);
+    // In a raw string the backslash still escapes, so `r'\'` is unterminated and the `@p` after
+    // it is inside the literal, not a parameter. Closing the literal exposes it again.
+    assert_eq!(named_parameters(r"SELECT r'\', @p"), Vec::<String>::new());
+    assert_eq!(
+        named_parameters(r"SELECT rb'@x\', @p"),
+        Vec::<String>::new()
+    );
+    assert_eq!(named_parameters(r"SELECT r'\\', @p"), vec!["p"]);
+    assert_eq!(named_parameters(r"SELECT rb'@x\\', @p"), vec!["p"]);
     // `@name` inside a triple-quoted string is not a parameter; one after it is.
     assert_eq!(named_parameters("SELECT '''@x''', @y"), vec!["y"]);
     assert_eq!(named_parameters(r#"SELECT """it's @x""", @y"#), vec!["y"]);
@@ -455,21 +583,152 @@ fn named_parameters_skip_raw_and_triple_quoted_strings() {
 }
 
 #[test]
-fn qualifies_table_names() {
-    assert_eq!(qualified_table(None, "Users"), "`Users`");
-    assert_eq!(qualified_table(Some(""), "Users"), "`Users`");
-    assert_eq!(qualified_table(Some("app"), "Users"), "`app`.`Users`");
-    // Caller-supplied names are escaped, so a backtick cannot leak into the surrounding SQL.
-    assert_eq!(qualified_table(None, "a`b"), r"`a\`b`");
-    assert_eq!(qualified_table(Some("s`x"), r"t\y"), r"`s\`x`.`t\\y`");
+fn named_parameters_accept_every_spelling_spanner_does() {
+    // GoogleSQL lexes `@` and the name as separate tokens, and the name may itself be a quoted
+    // identifier. Spanner treats all of these as a reference to `p` (emulator: each returns a row
+    // when `p` is bound, and reports "Incomplete query parameters p" when it is not). Missing them
+    // makes valid SQL unbindable: `resolve_parameter_names` sees zero parameters for a one-column
+    // batch and fails with a parameter-count mismatch.
+    for sql in [
+        "SELECT @p AS a",
+        "SELECT @ p AS a",
+        "SELECT @/* c */p AS a",
+        "SELECT @`p` AS a",
+        "SELECT @\n  p AS a",
+    ] {
+        assert_eq!(named_parameters(sql), vec!["p"], "for {sql:?}");
+    }
+    // A backtick-quoted name may contain characters a bare identifier cannot.
+    assert_eq!(named_parameters("SELECT @`a b` AS x"), vec!["a b"]);
+    // An escaped or empty quoted name is skipped rather than decoded incorrectly, and an
+    // unterminated one has no closing delimiter to strip (its last byte may even sit
+    // mid-character, so this must not be a byte slice).
+    assert_eq!(named_parameters(r"SELECT @`a\`b`"), Vec::<String>::new());
+    assert_eq!(named_parameters("SELECT @``"), Vec::<String>::new());
+    assert_eq!(named_parameters("SELECT @`"), Vec::<String>::new());
+    assert_eq!(named_parameters("SELECT @`θ"), Vec::<String>::new());
+    assert_eq!(
+        named_parameters("SELECT @`unterminated"),
+        Vec::<String>::new()
+    );
+    // A hint or system variable is still not a parameter, with or without a separator.
+    assert_eq!(
+        named_parameters("@ {JOIN_METHOD=HASH_JOIN} SELECT * FROM t WHERE id = @id"),
+        vec!["id"]
+    );
+    assert_eq!(named_parameters("SELECT @@rows"), Vec::<String>::new());
+    // A quoted identifier that is not a parameter name is untouched.
+    assert_eq!(named_parameters("SELECT `@col`, @p"), vec!["p"]);
 }
 
 #[test]
-fn quotes_identifiers_with_googlesql_escapes() {
-    assert_eq!(quote_ident("plain"), "`plain`");
-    assert_eq!(quote_ident("create"), "`create`");
-    assert_eq!(quote_ident("a`b"), r"`a\`b`");
-    assert_eq!(quote_ident(r"a\b"), r"`a\\b`");
-    assert_eq!(quote_ident(r"a\`b"), r"`a\\\`b`");
-    assert_eq!(quote_ident("spaced name"), "`spaced name`");
+fn named_parameters_dedupe_case_insensitively() {
+    // Spanner resolves parameter names case-insensitively (`@p` binds from `P`) and rejects a
+    // request carrying two spellings of one name with "Duplicate parameter name p". Reporting
+    // both spellings would make the driver build exactly that rejected request — and demand two
+    // bound columns for one logical parameter. The first spelling wins, because that is the one
+    // the query planner reports back.
+    assert_eq!(
+        named_parameters("UPDATE t SET s = @v WHERE id = @V"),
+        vec!["v"]
+    );
+    assert_eq!(named_parameters("SELECT @Name, @name, @NAME"), vec!["Name"]);
+    // Distinct names are still distinct, and first-appearance order is preserved.
+    assert_eq!(
+        named_parameters("SELECT @b, @a, @B, @c, @A"),
+        vec!["b", "a", "c"]
+    );
+}
+
+#[test]
+fn named_parameters_dedupe_scales_to_large_statements() {
+    // The dedupe is a hash lookup, not a linear scan of everything seen so far: a wide generated
+    // statement (still well under Spanner's 1 MB request limit) must not cost quadratic time.
+    // This runs on the calling thread before any RPC, in `get_parameter_schema` and once per
+    // (sql, batch) in `resolve_parameter_names`.
+    let sql = format!(
+        "SELECT {}",
+        (0..20_000)
+            .map(|i| format!("@p{i}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let params = named_parameters(&sql);
+    assert_eq!(params.len(), 20_000);
+    assert_eq!(params[0], "p0");
+    assert_eq!(params[19_999], "p19999");
+}
+
+#[test]
+fn qualifies_table_names() {
+    assert_eq!(qualified_table(None, "Users").unwrap(), "`Users`");
+    assert_eq!(qualified_table(Some(""), "Users").unwrap(), "`Users`");
+    assert_eq!(
+        qualified_table(Some("app"), "Users").unwrap(),
+        "`app`.`Users`"
+    );
+    // A schema is one identifier, not a path: a dot inside it cannot add a qualification level.
+    assert_eq!(qualified_table(Some("a.b"), "t").unwrap(), "`a.b`.`t`");
+    // Either half being unquotable rejects the whole name.
+    for (schema, table) in [
+        (None, "a`b"),
+        (Some("s`x"), "t"),
+        (Some("s"), r"t\y"),
+        (None, ""),
+        (Some("s"), ""),
+    ] {
+        assert_eq!(
+            qualified_table(schema, table).unwrap_err().status,
+            Status::InvalidArguments,
+            "should be rejected: {schema:?}.{table:?}"
+        );
+    }
+}
+
+#[test]
+fn quote_ident_accepts_every_name_spanner_can_represent() {
+    // Backticks make reserved words, spaces and non-ASCII letters usable as identifiers; all of
+    // these are accepted by Spanner as column names (emulator-verified).
+    assert_eq!(quote_ident("plain").unwrap(), "`plain`");
+    assert_eq!(quote_ident("create").unwrap(), "`create`");
+    assert_eq!(quote_ident("spaced name").unwrap(), "`spaced name`");
+    assert_eq!(quote_ident("é").unwrap(), "`é`");
+    assert_eq!(quote_ident("a.b").unwrap(), "`a.b`");
+}
+
+#[test]
+fn quote_ident_rejects_names_backticks_cannot_contain() {
+    // The identifier-injection boundary. Spanner's two parsers disagree about escaping — the
+    // query parser honours `` \` ``, the DDL parser ends the identifier at the first backtick and
+    // treats `\` as an ordinary character — so no escaping scheme is safe on both paths.
+    // Rejecting is: what survives contains neither a delimiter nor an escape, making it one
+    // opaque token under either grammar.
+    //
+    // The payload below is the real one: as an ingest column name it previously produced
+    // `CREATE TABLE `t` (`k\` INT64, Id INT64 NOT NULL) PRIMARY KEY (Id), INTERLEAVE IN PARENT
+    // parent ON DELETE CASCADE -- ` INT64)`, which the emulator executed — creating a table
+    // interleaved into an unrelated parent with cascading delete. DDL is not transactional, so
+    // the injected schema change could not be rolled back.
+    let payload = "k` INT64, Id INT64 NOT NULL) PRIMARY KEY (Id), \
+                   INTERLEAVE IN PARENT parent ON DELETE CASCADE -- ";
+    for ident in [
+        payload, "a`b", r"a\b", r"a\`b", "a\nb", "a\rb", "a\tb", "a\0b", "",
+    ] {
+        let err = quote_ident(ident).unwrap_err();
+        assert_eq!(
+            err.status,
+            Status::InvalidArguments,
+            "should be rejected: {ident:?}"
+        );
+    }
+    // Whatever a name does contain, an accepted one never carries a backtick or backslash
+    // beyond its two delimiters — the property that holds under both Spanner grammars.
+    for ident in ["plain", "spaced name", "é", "a.b", "créate", "x-y", "1"] {
+        let quoted = quote_ident(ident).unwrap();
+        assert!(quoted.starts_with('`') && quoted.ends_with('`'));
+        assert!(
+            !quoted[1..quoted.len() - 1].contains(['`', '\\']),
+            "{quoted:?} is not one opaque token"
+        );
+    }
 }

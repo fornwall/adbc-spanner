@@ -159,9 +159,9 @@ settings and timeouts, but no request/transaction tags.
 | --- | --- | --- | --- | --- |
 | `spanner.rows_per_batch` | positive integer | `8192` | always | Maximum rows per Arrow batch, also subject to the conversion byte budget. |
 | `spanner.data_boost` | boolean | `false` | always | Enables [Data Boost](https://docs.cloud.google.com/spanner/docs/databoost/databoost-overview) for partitioned execution; carried in partition descriptors. |
-| `adbc.statement.bind_by_name` | boolean | `false` | always | By default, columns bind to distinct parameters in SQL order. `true` matches column names; unknown names return `InvalidArguments`. |
+| `adbc.statement.bind_by_name` | boolean | `false` | always | By default, columns bind to distinct parameters in SQL order. `true` matches column names, case-insensitively as Spanner resolves them; unknown names return `InvalidArguments`. |
 | `adbc.statement.exec.incremental` | boolean, only `false` supported | `false` | always | `true` returns `NotImplemented`; incremental partition generation is unsupported. |
-| `adbc.ingest.target_table` | table name | unset | set | Selects bulk ingest and clears SQL. Setting SQL clears this target. |
+| `adbc.ingest.target_table` | table name | unset | set | Selects bulk ingest and clears SQL. Setting SQL clears this target. Names containing a backtick, a backslash or a control character, and the empty name, return `InvalidArguments`. |
 | `adbc.ingest.target_db_schema` | schema name; `""` for default schema | default schema | set | Qualifies the target table. |
 | `adbc.ingest.target_catalog` | connection's database id | connection's catalog | set | Other values, including `""`, return `NotImplemented`. |
 | `adbc.ingest.temporary` | boolean, only `false` supported | `false` | always | `true` returns `NotImplemented`; temporary tables are unsupported. |

@@ -44,7 +44,7 @@ impl SpannerStatement {
         if drop_first {
             statements.push(format!(
                 "DROP TABLE IF EXISTS {}",
-                crate::sql::qualified_table(db_schema, table)
+                crate::sql::qualified_table(db_schema, table)?
             ));
         }
         statements.push(bind::create_table_sql(
