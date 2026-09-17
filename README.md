@@ -1,3 +1,6 @@
+> [!WARNING]
+> **Experimental.** Project is AI-generated and has not seen real world usage.
+
 # adbc-spanner
 
 [![CI](https://github.com/fornwall/adbc-spanner/actions/workflows/ci.yml/badge.svg)](https://github.com/fornwall/adbc-spanner/actions/workflows/ci.yml)
