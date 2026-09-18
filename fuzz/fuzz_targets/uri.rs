@@ -9,5 +9,5 @@ use libfuzzer_sys::fuzz_target;
 // (which only feeds `Other(key)`). No network I/O — it stops well before `connect()` — and must
 // never panic.
 fuzz_target!(|uri: &str| {
-    adbc_spanner::fuzzing::expand_connection_uri(uri);
+    spanner_adbc::fuzzing::expand_connection_uri(uri);
 });

@@ -29,11 +29,11 @@ use adbc_core::error::Status;
 use adbc_core::options::{AdbcVersion, OptionDatabase, OptionStatement, OptionValue};
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_driver_manager::ManagedDriver;
-use adbc_spanner::{SpannerConnection, SpannerDatabase, SpannerDriver};
 use arrow_array::{RecordBatch, RecordBatchReader};
 use google_cloud_lro::Poller;
 use google_cloud_spanner::client::Spanner;
 use google_cloud_spanner_admin_instance_v1::model::Instance;
+use spanner_adbc::{SpannerConnection, SpannerDatabase, SpannerDriver};
 
 // Identifiers used against the emulator, matching `tests/integration.rs` so both binaries drive the
 // same emulator database interchangeably, whichever runs first.
@@ -216,7 +216,7 @@ fn connect_with_retry(database: &SpannerDatabase) -> SpannerConnection {
     panic!("create connection failed after retries: {last_err:?}");
 }
 
-/// Locate the built `cdylib` (`libadbc_spanner.so` / `.dylib` / `.dll`) next to the test binary.
+/// Locate the built `cdylib` (`libspanner_adbc.so` / `.dylib` / `.dll`) next to the test binary.
 fn cdylib_path() -> Option<std::path::PathBuf> {
     // The test binary lives in `target/<profile>/deps/`; the cdylib is in `target/<profile>/`.
     let dir = std::env::current_exe()
@@ -225,11 +225,11 @@ fn cdylib_path() -> Option<std::path::PathBuf> {
         .parent()?
         .to_path_buf();
     let name = if cfg!(target_os = "windows") {
-        "adbc_spanner.dll"
+        "spanner_adbc.dll"
     } else if cfg!(target_os = "macos") {
-        "libadbc_spanner.dylib"
+        "libspanner_adbc.dylib"
     } else {
-        "libadbc_spanner.so"
+        "libspanner_adbc.so"
     };
     let path = dir.join(name);
     path.exists().then_some(path)
@@ -242,7 +242,7 @@ fn required_cdylib_path() -> Option<std::path::PathBuf> {
     if path.is_none() && require_target() {
         panic!(
             "ADBC_TEST_REQUIRE_TARGET is set but the cdylib \
-             (libadbc_spanner.so / .dylib / adbc_spanner.dll) is not built next to the test \
+             (libspanner_adbc.so / .dylib / spanner_adbc.dll) is not built next to the test \
              binary — run `cargo build` first. Refusing to skip the FFI test vacuously."
         );
     }
@@ -304,7 +304,7 @@ fn ffi_streaming_statement(
     let mut statement = connection.new_statement().expect("new statement");
     statement
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
             OptionValue::Int(batch),
         )
         .expect("set rows_per_batch");
@@ -384,7 +384,7 @@ fn stream_survives_statement_connection_database_release() {
     let mut statement = connection.new_statement().expect("new statement");
     statement
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
             OptionValue::Int(100),
         )
         .expect("set rows_per_batch");
@@ -586,7 +586,7 @@ fn drop_half_consumed_reader_then_connection_still_works() {
         let mut statement = connection.new_statement().expect("new statement");
         statement
             .set_option(
-                OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+                OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
                 OptionValue::Int(500),
             )
             .expect("set rows_per_batch");

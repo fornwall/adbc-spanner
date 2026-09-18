@@ -11,7 +11,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install 'adbc-driver-manager[dbapi]' polars google-cloud-spanner
 cargo build --release
-cp target/release/libadbc_spanner.so python/adbc_driver_spanner/
+cp target/release/libspanner_adbc.so python/adbc_driver_spanner/
 ```
 
 Re-copy the library after rebuilding so benchmarks use the new binary.
@@ -45,7 +45,7 @@ and stage the library before recording:
 
 ```sh
 RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling
-cp target/profiling/libadbc_spanner.so python/adbc_driver_spanner/
+cp target/profiling/libspanner_adbc.so python/adbc_driver_spanner/
 PYTHONPATH=python scripts/with-emulator.sh \
   perf record -F 199 --call-graph fp -o perf.data -- \
   .venv/bin/python python/benchmarks/perf_read.py

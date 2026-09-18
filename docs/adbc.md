@@ -1,6 +1,6 @@
 # ADBC interface
 
-`adbc-spanner` implements the [ADBC interfaces](https://arrow.apache.org/adbc/current/format/specification.html)
+`spanner-adbc` implements the [ADBC interfaces](https://arrow.apache.org/adbc/current/format/specification.html)
 using Google Cloud Spanner and Arrow record batches. See the [README](../README.md) for usage,
 [options](options.md) for configuration, and [transactions](transactions.md) for transaction rules.
 
@@ -26,7 +26,7 @@ there; `--no-default-features` builds the Rust interface without it.
 import adbc_driver_manager
 
 db = adbc_driver_manager.AdbcDatabase(
-    driver="/path/to/libadbc_spanner.so",
+    driver="/path/to/libspanner_adbc.so",
     entrypoint="AdbcSpannerInit",
     uri="spanner:///projects/p/instances/i/databases/d",
 )

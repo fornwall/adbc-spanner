@@ -35,10 +35,10 @@ jobs:
           # manylinux container and lower the tags together.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
-            lib: libadbc_spanner.so
+            lib: libspanner_adbc.so
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
-            lib: libadbc_spanner.so
+            lib: libspanner_adbc.so
           # NOTE: the linux x86-64 *musl* (Alpine) library is built by the separate
           # `build-musl` job below, not this matrix — it must be compiled inside Alpine
           # (its gcc/libgcc are musl-native), see that job's comment for why.
@@ -50,18 +50,18 @@ jobs:
           # package is unusable without it, so older would gain nothing.
           - target: aarch64-apple-darwin
             runner: macos-26
-            lib: libadbc_spanner.dylib
+            lib: libspanner_adbc.dylib
             macos_deployment_target: "11.0"
           - target: x86_64-apple-darwin
             runner: macos-26 # cross-compiled from the arm64 runner (Apple toolchain is universal).
-            lib: libadbc_spanner.dylib
+            lib: libspanner_adbc.dylib
             macos_deployment_target: "10.15"
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
-            lib: adbc_spanner.dll
+            lib: spanner_adbc.dll
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm # native ARM64 Windows; aws-lc-rs cross-compiles poorly, native is clean.
-            lib: adbc_spanner.dll
+            lib: spanner_adbc.dll
 
     steps:
       - uses: actions/checkout@v7
@@ -138,7 +138,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          staging="adbc-spanner-${{ matrix.target }}"
+          staging="spanner-adbc-${{ matrix.target }}"
           mkdir -p "$staging" dist
           cp "target/${{ matrix.target }}/release/${{ matrix.lib }}" "$staging/"
           cp README.md LICENSE "$staging/"
@@ -146,7 +146,7 @@ jobs:
             # Include the MSVC import library for consumers that link at build time.
             # It is a required part of the Windows artifact, so a missing one is a
             # build regression that must fail the job loudly, not be swallowed.
-            implib="target/${{ matrix.target }}/release/adbc_spanner.dll.lib"
+            implib="target/${{ matrix.target }}/release/spanner_adbc.dll.lib"
             if [ ! -f "$implib" ]; then
               echo "::error::expected Windows import library $implib is missing" >&2
               exit 1
@@ -161,7 +161,7 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
-          name: adbc-spanner-${{ matrix.target }}
+          name: spanner-adbc-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
 
@@ -223,7 +223,7 @@ jobs:
       - name: Verify the library is a musl (not glibc) shared object
         run: |
           set -euo pipefail
-          lib="target/release/libadbc_spanner.so"
+          lib="target/release/libspanner_adbc.so"
           if [ ! -f "$lib" ]; then
             echo "::error::musl build produced no cdylib at $lib (crt-static dropping it?)" >&2
             exit 1
@@ -258,9 +258,9 @@ jobs:
       - name: Package
         run: |
           set -euo pipefail
-          staging="adbc-spanner-${{ matrix.target }}"
+          staging="spanner-adbc-${{ matrix.target }}"
           mkdir -p "$staging" dist
-          cp target/release/libadbc_spanner.so "$staging/"
+          cp target/release/libspanner_adbc.so "$staging/"
           cp README.md LICENSE "$staging/"
           tar -czf "dist/${staging}.tar.gz" "$staging"
           ls -l dist
@@ -268,7 +268,7 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
-          name: adbc-spanner-${{ matrix.target }}
+          name: spanner-adbc-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
 
@@ -364,7 +364,7 @@ jobs:
           # the git-pinned dependencies are never fetched) is more robust than a
           # positional grep of Cargo.toml — it parses the manifest the way cargo does.
           crate_version="$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "adbc-spanner") | .version')"
+            | jq -r '.packages[] | select(.name == "spanner-adbc") | .version')"
           tag_version="${GITHUB_REF#refs/tags/v}"
           echo "tag v${tag_version} vs Cargo.toml version ${crate_version}"
           if [[ "$tag_version" != "$crate_version" ]]; then
@@ -389,9 +389,9 @@ jobs:
           # pattern the step downloads *every* artifact of the run — and since `python-wheels`
           # runs concurrently (both jobs only need `build`), its `python-wheels` artifact could
           # land in dist/ depending on timing and be attached to the GitHub Release without
-          # matching the `adbc-spanner-*` checksum glob below. Wheels are published to PyPI by
+          # matching the `spanner-adbc-*` checksum glob below. Wheels are published to PyPI by
           # `python-publish`, not attached to the release.
-          pattern: adbc-spanner-*
+          pattern: spanner-adbc-*
           path: dist
           merge-multiple: true
 
@@ -429,7 +429,7 @@ jobs:
           # pin the driver by hash instead of trusting a mutable release tag (verify
           # with `sha256sum -c SHA256SUMS`). The globs match the platform archives and
           # the driver manifest, never the SHA256SUMS file itself.
-          sha256sum adbc-spanner-* spanner.toml > SHA256SUMS
+          sha256sum spanner-adbc-* spanner.toml > SHA256SUMS
           echo "Published checksums:"
           cat SHA256SUMS
 
@@ -486,7 +486,7 @@ jobs:
           # same robust parse the `version-gate` job uses — more reliable than a
           # positional grep of Cargo.toml, since it parses the manifest the way cargo does.
           crate_version="$(cargo metadata --no-deps --format-version 1 --manifest-path ../Cargo.toml \
-            | jq -r '.packages[] | select(.name == "adbc-spanner") | .version')"
+            | jq -r '.packages[] | select(.name == "spanner-adbc") | .version')"
           echo "__version__ = \"${crate_version}\"" > adbc_driver_spanner/_version.py
           echo "wheel version: ${crate_version}"
 
@@ -504,18 +504,18 @@ jobs:
           # macOS" step. If you change any of these tags, change the build job
           # (and its check) to match.
           rows=(
-            "x86_64-unknown-linux-gnu|libadbc_spanner.so|manylinux_2_35_x86_64"
-            "aarch64-unknown-linux-gnu|libadbc_spanner.so|manylinux_2_35_aarch64"
-            "x86_64-unknown-linux-musl|libadbc_spanner.so|musllinux_1_2_x86_64"
-            "aarch64-unknown-linux-musl|libadbc_spanner.so|musllinux_1_2_aarch64"
-            "aarch64-apple-darwin|libadbc_spanner.dylib|macosx_11_0_arm64"
-            "x86_64-apple-darwin|libadbc_spanner.dylib|macosx_10_15_x86_64"
-            "x86_64-pc-windows-msvc|adbc_spanner.dll|win_amd64"
-            "aarch64-pc-windows-msvc|adbc_spanner.dll|win_arm64"
+            "x86_64-unknown-linux-gnu|libspanner_adbc.so|manylinux_2_35_x86_64"
+            "aarch64-unknown-linux-gnu|libspanner_adbc.so|manylinux_2_35_aarch64"
+            "x86_64-unknown-linux-musl|libspanner_adbc.so|musllinux_1_2_x86_64"
+            "aarch64-unknown-linux-musl|libspanner_adbc.so|musllinux_1_2_aarch64"
+            "aarch64-apple-darwin|libspanner_adbc.dylib|macosx_11_0_arm64"
+            "x86_64-apple-darwin|libspanner_adbc.dylib|macosx_10_15_x86_64"
+            "x86_64-pc-windows-msvc|spanner_adbc.dll|win_amd64"
+            "aarch64-pc-windows-msvc|spanner_adbc.dll|win_arm64"
           )
           for row in "${rows[@]}"; do
             IFS="|" read -r target lib plat <<< "$row"
-            staging="adbc-spanner-${target}"
+            staging="spanner-adbc-${target}"
             work="$(mktemp -d)"
             if [ -f "../artifacts/${staging}.tar.gz" ]; then
               tar -xzf "../artifacts/${staging}.tar.gz" -C "$work"
@@ -548,9 +548,9 @@ jobs:
             case "$whl" in
               # Both manylinux (glibc) and musllinux (Alpine) tags contain "linux"
               # and bundle the same .so filename.
-              *linux*) lib='adbc_driver_spanner/libadbc_spanner.so' ;;
-              *macosx*) lib='adbc_driver_spanner/libadbc_spanner.dylib' ;;
-              *win*) lib='adbc_driver_spanner/adbc_spanner.dll' ;;
+              *linux*) lib='adbc_driver_spanner/libspanner_adbc.so' ;;
+              *macosx*) lib='adbc_driver_spanner/libspanner_adbc.dylib' ;;
+              *win*) lib='adbc_driver_spanner/spanner_adbc.dll' ;;
               *) echo "::error::unrecognised wheel platform tag: ${whl}" >&2; exit 1 ;;
             esac
             if ! python -m zipfile -l "$whl" | grep -qF "$lib"; then

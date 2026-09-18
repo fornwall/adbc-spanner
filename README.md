@@ -1,9 +1,9 @@
 > [!WARNING]
 > **Experimental.** Project is AI-generated and has not seen real world usage.
 
-# adbc-spanner
+# spanner-adbc
 
-[![CI](https://github.com/fornwall/adbc-spanner/actions/workflows/ci.yml/badge.svg)](https://github.com/fornwall/adbc-spanner/actions/workflows/ci.yml)
+[![CI](https://github.com/fornwall/spanner-adbc/actions/workflows/ci.yml/badge.svg)](https://github.com/fornwall/spanner-adbc/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 An [ADBC](https://arrow.apache.org/adbc/) (Arrow Database Connectivity) driver for
@@ -70,13 +70,13 @@ The library exports `AdbcSpannerInit` and the `AdbcDriverInit` fallback:
 
 | Platform | Library |
 | --- | --- |
-| Linux | `libadbc_spanner.so` |
-| macOS | `libadbc_spanner.dylib` |
-| Windows | `adbc_spanner.dll` |
+| Linux | `libspanner_adbc.so` |
+| macOS | `libspanner_adbc.dylib` |
+| Windows | `spanner_adbc.dll` |
 
 Download artifacts from the
-[Shared libraries workflow](https://github.com/fornwall/adbc-spanner/actions/workflows/libraries.yml)
-or a tagged [release](https://github.com/fornwall/adbc-spanner/releases). To build locally, run
+[Shared libraries workflow](https://github.com/fornwall/spanner-adbc/actions/workflows/libraries.yml)
+or a tagged [release](https://github.com/fornwall/spanner-adbc/releases). To build locally, run
 `cargo build --release`; the library is written under `target/release/`.
 
 ### Configuration options

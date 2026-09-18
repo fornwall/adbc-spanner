@@ -3,8 +3,8 @@
 [![PyPI version](https://img.shields.io/pypi/v/adbc-driver-spanner.svg)](https://pypi.org/project/adbc-driver-spanner/)
 [![Python versions](https://img.shields.io/pypi/pyversions/adbc-driver-spanner.svg)](https://pypi.org/project/adbc-driver-spanner/)
 [![Wheel](https://img.shields.io/pypi/wheel/adbc-driver-spanner.svg)](https://pypi.org/project/adbc-driver-spanner/#files)
-[![License](https://img.shields.io/pypi/l/adbc-driver-spanner.svg)](https://github.com/fornwall/adbc-spanner/blob/main/LICENSE)
-[![Build](https://github.com/fornwall/adbc-spanner/actions/workflows/libraries.yml/badge.svg)](https://github.com/fornwall/adbc-spanner/actions/workflows/libraries.yml)
+[![License](https://img.shields.io/pypi/l/adbc-driver-spanner.svg)](https://github.com/fornwall/spanner-adbc/blob/main/LICENSE)
+[![Build](https://github.com/fornwall/spanner-adbc/actions/workflows/libraries.yml/badge.svg)](https://github.com/fornwall/spanner-adbc/actions/workflows/libraries.yml)
 
 A Python [ADBC](https://arrow.apache.org/adbc/) driver for **Google Cloud Spanner**.
 
@@ -77,7 +77,7 @@ Current driver managers can also infer `spanner` from the URI scheme when `drive
   [spanner.toml][manifest-file].
 
 [manifests]: https://arrow.apache.org/adbc/current/format/driver_manifests.html
-[manifest-file]: https://github.com/fornwall/adbc-spanner/blob/main/spanner.toml
+[manifest-file]: https://github.com/fornwall/spanner-adbc/blob/main/spanner.toml
 
 ## Authentication
 
@@ -126,7 +126,7 @@ Use `DatabaseOptions`, `ConnectionOptions`, and `StatementOptions` enums, or raw
 The [option reference][options] lists types, defaults, and accepted values. Set cursor options with
 `conn.cursor(adbc_stmt_kwargs={...})` or `cur.adbc_statement.set_options(**{...})`.
 
-[options]: https://github.com/fornwall/adbc-spanner/blob/main/docs/options.md
+[options]: https://github.com/fornwall/spanner-adbc/blob/main/docs/options.md
 
 ```python
 import adbc_driver_spanner.dbapi as spanner
@@ -156,7 +156,7 @@ cannot read buffered writes.
 
 DDL always executes immediately: rollback cannot undo it, and it runs before buffered DML.
 Use `autocommit=True` for immediately committed DML, including `THEN RETURN` statements.
-See [transactions](https://github.com/fornwall/adbc-spanner/blob/main/docs/transactions.md) for
+See [transactions](https://github.com/fornwall/spanner-adbc/blob/main/docs/transactions.md) for
 bulk-ingest and partitioned-DML behavior.
 
 ```python
@@ -330,4 +330,4 @@ from trusted sources: they execute using the receiving connection's credentials.
 | Windows arm64  | `win_arm64`              | ARM64 Windows                                |
 
 Building for an older OS requires a compatible native driver and Python dependencies.
-For local builds and releases, see [CONTRIBUTING.md](https://github.com/fornwall/adbc-spanner/blob/main/CONTRIBUTING.md).
+For local builds and releases, see [CONTRIBUTING.md](https://github.com/fornwall/spanner-adbc/blob/main/CONTRIBUTING.md).

@@ -1,9 +1,9 @@
 #![no_main]
 
-use adbc_spanner::fuzzing::{
+use libfuzzer_sys::fuzz_target;
+use spanner_adbc::fuzzing::{
     first_keyword, is_ddl, is_dml, split_statements, strip_trailing_terminators,
 };
-use libfuzzer_sys::fuzz_target;
 
 // Fuzz the statement classifier (`first_keyword` — whose statement-hint skipping had a real bug)
 // and the trailing-terminator strip. Both lex arbitrary untrusted SQL, so beyond "never panics"

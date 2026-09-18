@@ -13,7 +13,7 @@
 set -euo pipefail
 
 IMAGE="${SPANNER_EMULATOR_IMAGE:-gcr.io/cloud-spanner-emulator/emulator}"
-CONTAINER="${SPANNER_EMULATOR_CONTAINER:-adbc-spanner-emulator}"
+CONTAINER="${SPANNER_EMULATOR_CONTAINER:-spanner-adbc-emulator}"
 GRPC_PORT="${SPANNER_EMULATOR_GRPC_PORT:-9010}"
 REST_PORT="${SPANNER_EMULATOR_REST_PORT:-9020}"
 

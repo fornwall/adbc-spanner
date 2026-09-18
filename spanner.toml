@@ -55,8 +55,8 @@ manifest_version = 1
 name = 'Google Cloud Spanner'
 publisher = 'fornwall'
 license = 'Apache-2.0'
-url = 'https://github.com/fornwall/adbc-spanner'
-source = 'https://github.com/fornwall/adbc-spanner'
+url = 'https://github.com/fornwall/spanner-adbc'
+source = 'https://github.com/fornwall/spanner-adbc'
 
 [ADBC]
 # Maximum ADBC specification revision this driver implements. The export layer
@@ -73,11 +73,11 @@ entrypoint = 'AdbcSpannerInit'
 # table defines them (x86-64 -> `amd64`, aarch64 -> `arm64`, musl -> `_musl`).
 # These eight are the targets .github/workflows/libraries.yml builds.
 [Driver.shared]
-linux_amd64 = '/usr/local/lib/libadbc_spanner.so'
-linux_arm64 = '/usr/local/lib/libadbc_spanner.so'
-linux_amd64_musl = '/usr/local/lib/libadbc_spanner.so'
-linux_arm64_musl = '/usr/local/lib/libadbc_spanner.so'
-macos_arm64 = '/usr/local/lib/libadbc_spanner.dylib'
-macos_amd64 = '/usr/local/lib/libadbc_spanner.dylib'
-windows_amd64 = 'C:\Program Files\ADBC\Drivers\adbc_spanner.dll'
-windows_arm64 = 'C:\Program Files\ADBC\Drivers\adbc_spanner.dll'
+linux_amd64 = '/usr/local/lib/libspanner_adbc.so'
+linux_arm64 = '/usr/local/lib/libspanner_adbc.so'
+linux_amd64_musl = '/usr/local/lib/libspanner_adbc.so'
+linux_arm64_musl = '/usr/local/lib/libspanner_adbc.so'
+macos_arm64 = '/usr/local/lib/libspanner_adbc.dylib'
+macos_amd64 = '/usr/local/lib/libspanner_adbc.dylib'
+windows_amd64 = 'C:\Program Files\ADBC\Drivers\spanner_adbc.dll'
+windows_arm64 = 'C:\Program Files\ADBC\Drivers\spanner_adbc.dll'

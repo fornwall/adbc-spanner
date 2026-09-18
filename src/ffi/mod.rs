@@ -15,7 +15,7 @@
 //!
 //! Nothing outside this module is aware that the driver is exported over C.
 //!
-//! The shared library (`libadbc_spanner.so` / `.dylib` / `adbc_spanner.dll`) exports
+//! The shared library (`libspanner_adbc.so` / `.dylib` / `spanner_adbc.dll`) exports
 //! [`AdbcSpannerInit`] — the driver-specific init symbol, named per the ADBC convention — and
 //! [`AdbcDriverInit`], the fallback a driver manager tries when it was told no symbol name. Load
 //! it from any ADBC driver manager by pointing at the library path, e.g. from Python:
@@ -23,7 +23,7 @@
 //! ```python
 //! import adbc_driver_manager
 //! db = adbc_driver_manager.AdbcDatabase(
-//!     driver="/path/to/libadbc_spanner.so",
+//!     driver="/path/to/libspanner_adbc.so",
 //!     entrypoint="AdbcSpannerInit",
 //!     uri="spanner:///projects/p/instances/i/databases/d",
 //! )

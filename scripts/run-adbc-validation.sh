@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build the adbc-spanner cdylib and the canonical Apache Arrow ADBC C++
+# Build the spanner-adbc cdylib and the canonical Apache Arrow ADBC C++
 # validation suite (see adbc-validation/), then run the suite against the driver
 # loaded through the ADBC driver manager.
 #
@@ -139,12 +139,12 @@ EXCLUDED_FILTER="$(IFS=:; printf '%s' "${EXCLUDED[*]}")"
 
 # Cross-boundary ASan canary (rust-asan leg only). A green rust-asan leg is no proof the Rust
 # instrumentation is armed — a -Zsanitizer/-Zbuild-std regression disarms it silently. So call an
-# intentionally-out-of-bounds Rust symbol (adbc_spanner_asan_canary, compiled only under
+# intentionally-out-of-bounds Rust symbol (spanner_adbc_asan_canary, compiled only under
 # --cfg asan_canary) from a clang -fsanitize=address program against a C++-allocated buffer: the
 # exact cross-boundary shape this leg exists to cover. ASan MUST report a heap-buffer-overflow;
 # if it does not, the leg is a no-op and we fail loudly.
 run_rust_asan_canary() {
-  local lib="$REPO_ROOT/target/$RUST_TARGET/debug/libadbc_spanner.so"
+  local lib="$REPO_ROOT/target/$RUST_TARGET/debug/libspanner_adbc.so"
   local src="$REPO_ROOT/adbc-validation/asan_canary.cc"
   local bin="$BUILD_DIR/asan_canary"
   mkdir -p "$BUILD_DIR"
@@ -166,7 +166,7 @@ run_rust_asan_canary() {
       && printf '%s' "$out" | grep -q 'AddressSanitizer' \
       && printf '%s' "$out" | grep -q 'heap-buffer-overflow'; then
     echo ">> ASan canary OK: cross-boundary heap-buffer-overflow reported (exit $rc) — the cdylib IS ASan-armed"
-    printf '%s\n' "$out" | grep -E 'heap-buffer-overflow|adbc_spanner_asan_canary' | head -n 4 \
+    printf '%s\n' "$out" | grep -E 'heap-buffer-overflow|spanner_adbc_asan_canary' | head -n 4 \
       | sed 's/^/     /'
     return 0
   fi
@@ -184,14 +184,14 @@ build_harness() {
     # --target, so the artifact lands under target/<triple>/debug/. `--cfg asan_canary` compiles
     # the test-only tripwire (src/asan_canary.rs) into THIS build only — nothing else sets that
     # cfg, so the out-of-bounds symbol never leaks into a shipped cdylib.
-    echo ">> building the adbc-spanner cdylib with -Zsanitizer=$RUST_SANITIZE (nightly, -Zbuild-std, --target $RUST_TARGET, --cfg asan_canary)"
+    echo ">> building the spanner-adbc cdylib with -Zsanitizer=$RUST_SANITIZE (nightly, -Zbuild-std, --target $RUST_TARGET, --cfg asan_canary)"
     RUSTFLAGS="-Zsanitizer=$RUST_SANITIZE --cfg asan_canary ${RUSTFLAGS:-}" \
       cargo +nightly build -Zbuild-std --target "$RUST_TARGET"
     # Positive control: prove the freshly-built cdylib is ACTUALLY ASan-armed before running the
     # (slow) suite, so a silently-disarmed leg fails fast here instead of going green as a no-op.
     run_rust_asan_canary
   else
-    echo ">> building the adbc-spanner cdylib"
+    echo ">> building the spanner-adbc cdylib"
     cargo build
   fi
 
@@ -364,10 +364,10 @@ fi
 # The instrumented leg builds with an explicit --target, so its artifact lives under
 # target/<triple>/debug/ rather than target/debug/.
 if [ -n "$RUST_SANITIZE" ]; then
-  export ADBC_SPANNER_LIBRARY="$REPO_ROOT/target/$RUST_TARGET/debug/libadbc_spanner.so"
+  export ADBC_SPANNER_LIBRARY="$REPO_ROOT/target/$RUST_TARGET/debug/libspanner_adbc.so"
 else
-  export ADBC_SPANNER_LIBRARY="$REPO_ROOT/target/debug/libadbc_spanner.so"
-  [ -f "$ADBC_SPANNER_LIBRARY" ] || ADBC_SPANNER_LIBRARY="$REPO_ROOT/target/debug/libadbc_spanner.dylib"
+  export ADBC_SPANNER_LIBRARY="$REPO_ROOT/target/debug/libspanner_adbc.so"
+  [ -f "$ADBC_SPANNER_LIBRARY" ] || ADBC_SPANNER_LIBRARY="$REPO_ROOT/target/debug/libspanner_adbc.dylib"
 fi
 
 echo ">> ADBC_SPANNER_LIBRARY=$ADBC_SPANNER_LIBRARY"

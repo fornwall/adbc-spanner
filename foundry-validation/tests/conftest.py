@@ -233,4 +233,4 @@ def driver(request, pytestconfig) -> adbc_drivers_validation.model.DriverQuirks:
 def driver_path(driver) -> str:
     ext = {"win32": "dll", "darwin": "dylib"}.get(sys.platform, "so")
     # Built cdylib at the repo root: foundry-validation/tests -> repo root.
-    return str(Path(__file__).resolve().parents[2] / f"target/debug/libadbc_spanner.{ext}")
+    return str(Path(__file__).resolve().parents[2] / f"target/debug/libspanner_adbc.{ext}")

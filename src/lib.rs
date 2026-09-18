@@ -1,4 +1,4 @@
-//! # adbc-spanner
+//! # spanner-adbc
 //!
 //! An [ADBC](https://arrow.apache.org/adbc/) (Arrow Database Connectivity) driver for
 //! [Google Cloud Spanner](https://cloud.google.com/spanner), built on top of the official
@@ -16,7 +16,7 @@
 //!
 //! A database is configured through ADBC options; the authoritative reference for every option at
 //! every level — types, defaults and `get_option` round-trip behaviour — is
-//! [docs/options.md](https://github.com/fornwall/adbc-spanner/blob/main/docs/options.md). An option
+//! [docs/options.md](https://github.com/fornwall/spanner-adbc/blob/main/docs/options.md). An option
 //! documented below as a *connection **and** statement* option is inherited by every statement the
 //! connection creates, and may then be overridden on that statement.
 //!
@@ -45,7 +45,7 @@
 //! (`None`) row counts until then. DDL is not transaction-aware: it always executes immediately.
 //!
 //! See [`SpannerConnection`] and
-//! [docs/transactions.md](https://github.com/fornwall/adbc-spanner/blob/main/docs/transactions.md)
+//! [docs/transactions.md](https://github.com/fornwall/spanner-adbc/blob/main/docs/transactions.md)
 //! for the full model.
 //!
 //! ## Example
@@ -53,7 +53,7 @@
 //! ```no_run
 //! use adbc_core::{Driver, Database, Connection, Statement};
 //! use adbc_core::options::{OptionDatabase, OptionValue};
-//! use adbc_spanner::SpannerDriver;
+//! use spanner_adbc::SpannerDriver;
 //! use arrow_array::RecordBatchReader;
 //!
 //! # fn main() -> adbc_core::error::Result<()> {
@@ -813,7 +813,7 @@ pub const OPTION_MAX_TIMESTAMP_PRECISION: &str = "spanner.max_timestamp_precisio
 pub const VENDOR_NAME: &str = "Google Cloud Spanner";
 
 /// The driver name reported by [`Connection::get_info`](adbc_core::Connection::get_info).
-pub const DRIVER_NAME: &str = "adbc-spanner";
+pub const DRIVER_NAME: &str = "spanner-adbc";
 
 /// The version of this driver.
 pub const DRIVER_VERSION: &str = env!("CARGO_PKG_VERSION");

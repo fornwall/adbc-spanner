@@ -6,7 +6,7 @@ use libfuzzer_sys::fuzz_target;
 // query strings (byte/char handling, quotes, comments), so they must never panic and must uphold
 // their invariants.
 fuzz_target!(|sql: String| {
-    let statements = adbc_spanner::fuzzing::split_statements(&sql);
+    let statements = spanner_adbc::fuzzing::split_statements(&sql);
 
     // Preservation invariant: every statement is non-empty, trimmed, and appears verbatim in the
     // input at non-decreasing positions. Each is a contiguous slice of the input, so it must be
@@ -24,10 +24,10 @@ fuzz_target!(|sql: String| {
 
     // DDL / `THEN RETURN` detection must not panic on the whole batch or any individual
     // statement (`is_dml_returning` walks the same lexer with `CASE`/`END` depth tracking).
-    let _ = adbc_spanner::fuzzing::is_ddl(&sql);
-    let _ = adbc_spanner::fuzzing::is_dml_returning(&sql);
+    let _ = spanner_adbc::fuzzing::is_ddl(&sql);
+    let _ = spanner_adbc::fuzzing::is_dml_returning(&sql);
     for statement in &statements {
-        let _ = adbc_spanner::fuzzing::is_ddl(statement);
-        let _ = adbc_spanner::fuzzing::is_dml_returning(statement);
+        let _ = spanner_adbc::fuzzing::is_ddl(statement);
+        let _ = spanner_adbc::fuzzing::is_dml_returning(statement);
     }
 });

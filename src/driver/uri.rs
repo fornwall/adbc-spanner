@@ -158,7 +158,7 @@ struct ParsedConnectionUri {
 ///
 /// `uri` is the whole option value, carried along only so the errors can quote what the caller set.
 ///
-/// [docs/options.md]: https://github.com/fornwall/adbc-spanner/blob/main/docs/options.md#connection-uris
+/// [docs/options.md]: https://github.com/fornwall/spanner-adbc/blob/main/docs/options.md#connection-uris
 fn parse_connection_uri(uri: &str, remainder: &str) -> Result<ParsedConnectionUri> {
     let (remainder, fragment) = match remainder.split_once('#') {
         Some((rest, fragment)) => (rest, Some(fragment)),

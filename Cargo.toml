@@ -1,7 +1,7 @@
 # `fuzz/` is a member of this workspace, not a workspace of its own, so the whole repo
 # resolves to ONE `Cargo.lock` (this file's). That makes fuzz dependency drift structurally
 # impossible: the fuzz targets share this crate's exact dependency graph — same git pins, same
-# `adbc-spanner` version — instead of re-resolving them independently into a second, silently
+# `spanner-adbc` version — instead of re-resolving them independently into a second, silently
 # staleable `fuzz/Cargo.lock`. `default-members` keeps the default build/test/clippy scope to
 # this crate alone, so `cargo build`/`cargo test`/`cargo clippy` never pull in `libfuzzer-sys`
 # or need nightly; the fuzz member is built only by `cargo fuzz` (or an explicit `-p`). See
@@ -17,15 +17,15 @@ default-members = ["."]
 exclude = [".claude"]
 
 [package]
-name = "adbc-spanner"
+name = "spanner-adbc"
 version = "0.7.0"
 edition = "2024"
 rust-version = "1.98.1"
 license = "Apache-2.0"
 description = "ADBC (Arrow Database Connectivity) driver for Google Cloud Spanner"
-repository = "https://github.com/fornwall/adbc-spanner"
-homepage = "https://github.com/fornwall/adbc-spanner"
-documentation = "https://docs.rs/adbc-spanner"
+repository = "https://github.com/fornwall/spanner-adbc"
+homepage = "https://github.com/fornwall/spanner-adbc"
+documentation = "https://docs.rs/spanner-adbc"
 readme = "README.md"
 keywords = ["adbc", "arrow", "spanner", "database", "gcp"]
 # Both slugs are valid crates.io categories.
@@ -69,7 +69,7 @@ push = true
 
 [lib]
 # cdylib: the loadable ADBC driver shared library
-#         (libadbc_spanner.so / libadbc_spanner.dylib / adbc_spanner.dll).
+#         (libspanner_adbc.so / libspanner_adbc.dylib / spanner_adbc.dll).
 # rlib:   lets Rust code depend on this crate directly.
 crate-type = ["cdylib", "rlib"]
 
@@ -79,7 +79,7 @@ default = ["ffi"]
 # driver manager (any language) can load through `AdbcSpannerInit`. Disable for a pure-Rust rlib
 # dependency: without it the crate contains no `unsafe` at all (see `forbid` in src/lib.rs).
 ffi = []
-# Exposes internal parsing helpers under `adbc_spanner::fuzzing` for the fuzz targets.
+# Exposes internal parsing helpers under `spanner_adbc::fuzzing` for the fuzz targets.
 # Not a stable API; used only by the `fuzz/` crate. Pulls in `arbitrary` so the
 # option-fuzzing entry point can take a derived-`Arbitrary` input type.
 fuzzing = ["dep:arbitrary"]

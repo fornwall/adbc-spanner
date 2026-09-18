@@ -8,5 +8,5 @@ use libfuzzer_sys::fuzz_target;
 // error, and an accepted one round-trips through the driver's encoder with the versioned envelope
 // as the fixed point (decode → encode → decode → encode reproduces the bytes).
 fuzz_target!(|descriptor: &[u8]| {
-    let _ = adbc_spanner::fuzzing::decode_partition(descriptor);
+    let _ = spanner_adbc::fuzzing::decode_partition(descriptor);
 });

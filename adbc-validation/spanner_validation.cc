@@ -1,9 +1,9 @@
 // Runs the canonical Apache Arrow ADBC C++ validation suite against the
-// adbc-spanner driver, loaded as a shared library through the ADBC driver
+// spanner-adbc driver, loaded as a shared library through the ADBC driver
 // manager. The driver library path and target Spanner database come from the
 // environment (set by scripts/run-adbc-validation.sh):
 //
-//   ADBC_SPANNER_LIBRARY   path to the built cdylib (libadbc_spanner.so)
+//   ADBC_SPANNER_LIBRARY   path to the built cdylib (libspanner_adbc.so)
 //   ADBC_SPANNER_URI       spanner:///projects/<p>/instances/<i>/databases/<d>
 //   SPANNER_EMULATOR_HOST  (read by the driver itself) selects the emulator
 //

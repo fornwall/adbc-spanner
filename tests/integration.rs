@@ -25,7 +25,7 @@
 //!   set, the emulator wins.
 //!
 //! Setup (creating the database and table) uses the Spanner admin clients directly; the actual query
-//! and DML round-trip goes through the `adbc-spanner` driver being tested.
+//! and DML round-trip goes through the `spanner-adbc` driver being tested.
 
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -37,7 +37,6 @@ use adbc_core::options::{
 };
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_driver_manager::ManagedDriver;
-use adbc_spanner::{SpannerConnection, SpannerDatabase, SpannerDriver, SpannerStatement};
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int16Array, Int64Array, ListArray, RecordBatch, RecordBatchIterator, RecordBatchReader,
@@ -50,6 +49,7 @@ use google_cloud_lro::Poller;
 use google_cloud_spanner::client::Spanner;
 use google_cloud_spanner_admin_instance_v1::model::Instance;
 use proptest::prelude::*;
+use spanner_adbc::{SpannerConnection, SpannerDatabase, SpannerDriver, SpannerStatement};
 
 // Identifiers used against the emulator, which starts empty and lets us create everything.
 const PROJECT: &str = "test-project";
@@ -2088,7 +2088,7 @@ fn parameter_binding_round_trip() {
     .unwrap();
     let mut pu = connection.new_statement().expect("new statement");
     pu.set_option(
-        OptionStatement::Other(adbc_spanner::OPTION_BIND_BY_NAME.into()),
+        OptionStatement::Other(spanner_adbc::OPTION_BIND_BY_NAME.into()),
         OptionValue::String("true".into()),
     )
     .expect("set bind_by_name=true");
@@ -2692,7 +2692,7 @@ fn commit_stats_reports_mutation_count() {
     let mut insert = connection.new_statement().expect("new statement");
     insert
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_COMMIT_STATS.to_string()),
+            OptionStatement::Other(spanner_adbc::OPTION_COMMIT_STATS.to_string()),
             OptionValue::String("true".to_string()),
         )
         .expect("enable commit stats");
@@ -2700,7 +2700,7 @@ fn commit_stats_reports_mutation_count() {
     assert_eq!(
         insert
             .get_option_string(OptionStatement::Other(
-                adbc_spanner::OPTION_COMMIT_STATS.to_string()
+                spanner_adbc::OPTION_COMMIT_STATS.to_string()
             ))
             .expect("read commit_stats flag"),
         "true"
@@ -2708,7 +2708,7 @@ fn commit_stats_reports_mutation_count() {
     // No commit has run yet, so the mutation count is NotFound.
     let before = insert
         .get_option_int(OptionStatement::Other(
-            adbc_spanner::OPTION_COMMIT_STATS_MUTATION_COUNT.to_string(),
+            spanner_adbc::OPTION_COMMIT_STATS_MUTATION_COUNT.to_string(),
         ))
         .expect_err("mutation count must be NotFound before any commit");
     assert_eq!(before.status, Status::NotFound);
@@ -2722,7 +2722,7 @@ fn commit_stats_reports_mutation_count() {
     assert_eq!(insert.execute_update().expect("insert"), Some(2));
 
     let mutation_count = insert.get_option_int(OptionStatement::Other(
-        adbc_spanner::OPTION_COMMIT_STATS_MUTATION_COUNT.to_string(),
+        spanner_adbc::OPTION_COMMIT_STATS_MUTATION_COUNT.to_string(),
     ));
     if target.is_emulator {
         // The emulator ignores `return_commit_stats`, so no count is captured.
@@ -2745,7 +2745,7 @@ fn commit_stats_reports_mutation_count() {
 
     // Setting the read-only mutation-count key is rejected.
     let rejected = insert.set_option(
-        OptionStatement::Other(adbc_spanner::OPTION_COMMIT_STATS_MUTATION_COUNT.to_string()),
+        OptionStatement::Other(spanner_adbc::OPTION_COMMIT_STATS_MUTATION_COUNT.to_string()),
         OptionValue::Int(1),
     );
     assert_eq!(
@@ -2893,7 +2893,7 @@ fn bulk_ingest_via_batch_write() {
         .unwrap();
     ingest
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_INGEST_BATCH_WRITE.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_INGEST_BATCH_WRITE.into()),
             OptionValue::String("true".into()),
         )
         .unwrap();
@@ -2901,7 +2901,7 @@ fn bulk_ingest_via_batch_write() {
     assert_eq!(
         ingest
             .get_option_string(OptionStatement::Other(
-                adbc_spanner::OPTION_INGEST_BATCH_WRITE.into()
+                spanner_adbc::OPTION_INGEST_BATCH_WRITE.into()
             ))
             .unwrap(),
         "true"
@@ -2952,7 +2952,7 @@ fn bulk_ingest_via_batch_write() {
     )
     .unwrap();
     dup.set_option(
-        OptionStatement::Other(adbc_spanner::OPTION_INGEST_BATCH_WRITE.into()),
+        OptionStatement::Other(spanner_adbc::OPTION_INGEST_BATCH_WRITE.into()),
         OptionValue::String("true".into()),
     )
     .unwrap();
@@ -4475,7 +4475,7 @@ fn ddl_execute_clears_stale_bound_rows() {
     drop_tables(connection, &["BoundLeak"]);
 }
 
-/// Locate the built `cdylib` (`libadbc_spanner.so` / `.dylib` / `.dll`) next to the test binary.
+/// Locate the built `cdylib` (`libspanner_adbc.so` / `.dylib` / `.dll`) next to the test binary.
 fn cdylib_path() -> Option<std::path::PathBuf> {
     // The test binary lives in `target/<profile>/deps/`; the cdylib is in `target/<profile>/`.
     let dir = std::env::current_exe()
@@ -4484,11 +4484,11 @@ fn cdylib_path() -> Option<std::path::PathBuf> {
         .parent()?
         .to_path_buf();
     let name = if cfg!(target_os = "windows") {
-        "adbc_spanner.dll"
+        "spanner_adbc.dll"
     } else if cfg!(target_os = "macos") {
-        "libadbc_spanner.dylib"
+        "libspanner_adbc.dylib"
     } else {
-        "libadbc_spanner.so"
+        "libspanner_adbc.so"
     };
     let path = dir.join(name);
     path.exists().then_some(path)
@@ -4501,7 +4501,7 @@ fn required_cdylib_path() -> Option<std::path::PathBuf> {
     if path.is_none() && require_target() {
         panic!(
             "ADBC_TEST_REQUIRE_TARGET is set but the cdylib \
-             (libadbc_spanner.so / .dylib / adbc_spanner.dll) is not built next to the test \
+             (libspanner_adbc.so / .dylib / spanner_adbc.dll) is not built next to the test \
              binary — run `cargo build` first. Refusing to skip the FFI test vacuously."
         );
     }
@@ -5775,14 +5775,14 @@ fn execute_streams_in_batches() {
     // A small batch size so the 2500 rows span several batches.
     query
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
             OptionValue::Int(1000),
         )
         .expect("set rows_per_batch");
     assert_eq!(
         query
             .get_option_int(OptionStatement::Other(
-                adbc_spanner::OPTION_ROWS_PER_BATCH.into()
+                spanner_adbc::OPTION_ROWS_PER_BATCH.into()
             ))
             .expect("get rows_per_batch"),
         1000
@@ -5828,7 +5828,7 @@ fn bind_by_name_modes() {
     };
     let connection = &mut fx.connection;
 
-    let bind_by_name_key = || OptionStatement::Other(adbc_spanner::OPTION_BIND_BY_NAME.into());
+    let bind_by_name_key = || OptionStatement::Other(spanner_adbc::OPTION_BIND_BY_NAME.into());
     // Two Int64 columns named after the query's parameters but in SWAPPED order: `b` (=10)
     // first, `a` (=20) second — the coincidental-name-match input where the binding mode is
     // observable in the result.
@@ -5956,7 +5956,7 @@ fn bound_query_streams_in_batches() {
     // A small batch size so each bound row's 500-row result spans several batches.
     query
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
             OptionValue::Int(200),
         )
         .expect("set rows_per_batch");
@@ -6024,7 +6024,7 @@ fn cancel_between_stream_chunks_cancels_the_next_fetch() {
     let mut query = connection.new_statement().expect("new statement");
     query
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
             OptionValue::Int(100),
         )
         .expect("set rows_per_batch");
@@ -6091,7 +6091,7 @@ fn dropping_reader_mid_stream_aborts_the_prefetch() {
     // Small batches so several chunks remain unfetched when the reader is dropped.
     query
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
             OptionValue::Int(50),
         )
         .expect("set rows_per_batch");
@@ -6357,7 +6357,7 @@ fn execute_partitions_round_trip() {
     // The Data Boost option round-trips through get_option. Data Boost is baked into each
     // descriptor at partition-creation time (asserted on the descriptors below), so it travels
     // with the token rather than being re-supplied at `read_partition` time.
-    let data_boost_key = || OptionStatement::Other(adbc_spanner::OPTION_DATA_BOOST.into());
+    let data_boost_key = || OptionStatement::Other(spanner_adbc::OPTION_DATA_BOOST.into());
     statement
         .set_option(data_boost_key(), OptionValue::String("true".into()))
         .expect("set data_boost");
@@ -7010,7 +7010,7 @@ fn connection_cancel_is_sticky_until_the_next_operation() {
 #[test]
 fn request_priority_and_tags() {
     use adbc_core::error::Status;
-    use adbc_spanner::{OPTION_REQUEST_PRIORITY, OPTION_REQUEST_TAG, OPTION_TRANSACTION_TAG};
+    use spanner_adbc::{OPTION_REQUEST_PRIORITY, OPTION_REQUEST_TAG, OPTION_TRANSACTION_TAG};
 
     let Some(mut fx) = fixture() else {
         return;
@@ -7416,7 +7416,7 @@ fn zero_row_schema_fidelity() {
 #[test]
 fn rpc_timeouts() {
     use adbc_core::error::Status;
-    use adbc_spanner::{
+    use spanner_adbc::{
         OPTION_RPC_TIMEOUT_FETCH, OPTION_RPC_TIMEOUT_QUERY, OPTION_RPC_TIMEOUT_UPDATE,
     };
 
@@ -7503,7 +7503,7 @@ fn rpc_timeouts() {
     let mut query = connection.new_statement().expect("new statement");
     query
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
             OptionValue::Int(40),
         )
         .expect("small batches so the fetch deadline path is exercised across chunks");
@@ -7816,7 +7816,7 @@ fn change_stream_via_plain_sql() {
 ///   credentials come from ADC). Enables `impersonation_auth_end_to_end`.
 mod auth_end_to_end {
     use super::*;
-    use adbc_spanner::{OPTION_IMPERSONATE_TARGET_PRINCIPAL, OPTION_KEYFILE};
+    use spanner_adbc::{OPTION_IMPERSONATE_TARGET_PRINCIPAL, OPTION_KEYFILE};
 
     /// Resolve the **real** Cloud Spanner target from `SPANNER_GCP_DATABASE` alone.
     ///

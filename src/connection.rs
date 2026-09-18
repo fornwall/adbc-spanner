@@ -3,7 +3,7 @@
 //! The transaction model — autocommit by default; a manual transaction being exactly one of two
 //! kinds, queries or DML, fixed by its first statement; DML buffering until commit; DDL always
 //! immediate — is documented on [`SpannerConnection`] and in
-//! [docs/transactions.md](https://github.com/fornwall/adbc-spanner/blob/main/docs/transactions.md).
+//! [docs/transactions.md](https://github.com/fornwall/spanner-adbc/blob/main/docs/transactions.md).
 //! The invariants that keep it sound under concurrent statements live on `TxnState`'s methods in
 //! [`txn`].
 
@@ -70,7 +70,7 @@ pub(crate) use txn::{SharedTxn, TxnKind, TxnState, lock_txn};
 /// transaction replayable; committing a query transaction and [`Connection::rollback`] stay
 /// available (neither writes).
 ///
-/// See [docs/transactions.md](https://github.com/fornwall/adbc-spanner/blob/main/docs/transactions.md)
+/// See [docs/transactions.md](https://github.com/fornwall/spanner-adbc/blob/main/docs/transactions.md)
 /// for the full model: no read-your-writes, `None` DML counts before commit, and the
 /// commit-failure replay semantics.
 #[derive(Debug)]

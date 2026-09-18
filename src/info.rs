@@ -29,7 +29,7 @@ const ADBC_VERSION_1_1_0: i64 = 1_001_000;
 
 /// The version of the `arrow-array` crate this driver is built against (resolved from `Cargo.lock`
 /// by `build.rs`), reported for `DriverArrowVersion` with the conventional leading `v`.
-const ARROW_VERSION: &str = concat!("v", env!("ADBC_SPANNER_ARROW_VERSION"));
+const ARROW_VERSION: &str = concat!("v", env!("SPANNER_ADBC_ARROW_VERSION"));
 
 /// Every info code this driver recognises, in code order — the exact result set of
 /// `get_info(None)` ("fetch all"). Includes the codes whose value is null (see [`value_for`]):

@@ -1,9 +1,9 @@
 #![no_main]
 
-use adbc_spanner::fuzzing::{
+use libfuzzer_sys::fuzz_target;
+use spanner_adbc::fuzzing::{
     named_parameters, quote_ident, resolve_parameter_names, split_statements,
 };
-use libfuzzer_sys::fuzz_target;
 
 // Fuzz the bind-side SQL surfaces with an arbitrary (query, bound column names) pair: `@name`
 // parameter extraction, the column→parameter pairing, and identifier quoting. Each is checked

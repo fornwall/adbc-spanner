@@ -97,9 +97,9 @@ def test_install_writes_a_manifest_named_for_the_driver(tmp_path):
 
 def test_manifest_escapes_backslashes(tmp_path):
     """A Windows path must survive the round trip through TOML."""
-    text = manifest_mod.manifest_text(r"C:\Program Files\ADBC\adbc_spanner.dll")
+    text = manifest_mod.manifest_text(r"C:\Program Files\ADBC\spanner_adbc.dll")
     shared = tomllib.loads(text)["Driver"]["shared"]
-    assert shared.endswith(r"ADBC\adbc_spanner.dll")
+    assert shared.endswith(r"ADBC\spanner_adbc.dll")
     assert "\\\\" not in shared
 
 

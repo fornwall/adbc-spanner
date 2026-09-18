@@ -8,7 +8,7 @@
 // The shape it exercises is the one the whole rust-asan leg is about: instrumented Rust writing
 // out of bounds on **C++-allocated** memory. This program:
 //   1. `dlopen`s the cdylib (exactly how the ADBC driver manager loads the driver),
-//   2. `dlsym`s `adbc_spanner_asan_canary` (present only in an `--cfg asan_canary` build),
+//   2. `dlsym`s `spanner_adbc_asan_canary` (present only in an `--cfg asan_canary` build),
 //   3. `new[]`-allocates a small heap buffer here on the C++ side (so the ASan redzone/poison
 //      lives on the C++ allocation), and
 //   4. calls into the instrumented Rust function, which writes one byte past the end.
@@ -31,7 +31,7 @@ typedef void (*canary_fn)(unsigned char* ptr, size_t len);
 
 int main(int argc, char** argv) {
   if (argc != 2) {
-    std::fprintf(stderr, "usage: %s <path-to-libadbc_spanner.so>\n", argv[0]);
+    std::fprintf(stderr, "usage: %s <path-to-libspanner_adbc.so>\n", argv[0]);
     return 2;
   }
 
@@ -43,11 +43,11 @@ int main(int argc, char** argv) {
   }
 
   dlerror();  // clear any stale error
-  void* sym = dlsym(handle, "adbc_spanner_asan_canary");
+  void* sym = dlsym(handle, "spanner_adbc_asan_canary");
   const char* dlsym_err = dlerror();
   if (sym == nullptr || dlsym_err != nullptr) {
     std::fprintf(stderr,
-                 "canary: dlsym(adbc_spanner_asan_canary) failed: %s\n"
+                 "canary: dlsym(spanner_adbc_asan_canary) failed: %s\n"
                  "canary: is the cdylib built with --cfg asan_canary?\n",
                  dlsym_err ? dlsym_err : "symbol not found");
     return 2;
@@ -60,7 +60,7 @@ int main(int argc, char** argv) {
 
   std::fprintf(
       stderr,
-      "canary: calling instrumented Rust adbc_spanner_asan_canary to write 1 byte past a "
+      "canary: calling instrumented Rust spanner_adbc_asan_canary to write 1 byte past a "
       "%zu-byte C++ heap buffer\n",
       len);
   std::fflush(stderr);

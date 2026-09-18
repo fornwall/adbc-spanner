@@ -1,4 +1,4 @@
-# Driver quirks describing the adbc-spanner driver to the ADBC Driver Foundry
+# Driver quirks describing the spanner-adbc driver to the ADBC Driver Foundry
 # validation suite (https://github.com/adbc-drivers/validation).
 #
 # The suite is driver-agnostic: it drives our cdylib through the ADBC driver
@@ -12,9 +12,9 @@ from adbc_drivers_validation import model, quirks
 
 class SpannerQuirks(model.DriverQuirks):
     name = "spanner"
-    driver = "adbc_spanner"
+    driver = "spanner_adbc"
     # These must match what the driver reports via get_info (see src/lib.rs, src/info.rs).
-    driver_name = "adbc-spanner"
+    driver_name = "spanner-adbc"
     vendor_name = "Google Cloud Spanner"
     vendor_version = None  # the driver reports VendorVersion as a null value (no Spanner server version)
     short_version = "emulator"

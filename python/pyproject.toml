@@ -51,8 +51,8 @@ dbapi = ["adbc-driver-manager[dbapi]>=1.0", "pyarrow>=14.0.1"]
 adbc-driver-spanner-install-manifest = "adbc_driver_spanner.manifest:main"
 
 [project.urls]
-Homepage = "https://github.com/fornwall/adbc-spanner"
-Repository = "https://github.com/fornwall/adbc-spanner"
+Homepage = "https://github.com/fornwall/spanner-adbc"
+Repository = "https://github.com/fornwall/spanner-adbc"
 
 [tool.setuptools]
 packages = ["adbc_driver_spanner"]

@@ -170,7 +170,7 @@ name = "Google Cloud Spanner"
 publisher = "fornwall"
 license = "Apache-2.0"
 version = {_toml_string(__version__)}
-url = "https://github.com/fornwall/adbc-spanner"
+url = "https://github.com/fornwall/spanner-adbc"
 source = "adbc-driver-spanner (Python wheel)"
 
 [ADBC]

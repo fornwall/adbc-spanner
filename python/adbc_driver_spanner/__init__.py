@@ -69,7 +69,7 @@ def connect(
 def _driver_path() -> str:
     """Absolute path to the shared library bundled in this wheel."""
     here = pathlib.Path(__file__).resolve().parent
-    for name in ("libadbc_spanner.so", "libadbc_spanner.dylib", "adbc_spanner.dll"):
+    for name in ("libspanner_adbc.so", "libspanner_adbc.dylib", "spanner_adbc.dll"):
         candidate = here / name
         if candidate.is_file():
             return str(candidate)

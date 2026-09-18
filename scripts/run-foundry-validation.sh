@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Run the ADBC Driver Foundry validation suite (https://github.com/adbc-drivers/validation)
-# against the adbc-spanner driver. This is a *type/feature coverage* harness — complementary to
+# against the spanner-adbc driver. This is a *type/feature coverage* harness — complementary to
 # scripts/run-adbc-validation.sh, which runs Apache arrow-adbc's C++ C-ABI conformance suite.
 #
 # The suite is driver-agnostic: it loads our cdylib through the ADBC driver manager. It is not
@@ -56,7 +56,7 @@ if [ -z "${SPANNER_EMULATOR_HOST:-}" ] && [ -z "${SPANNER_GCP_DATABASE:-}" ]; th
   exec "$REPO_ROOT/scripts/with-emulator.sh" "$0" "$@"
 fi
 
-echo ">> building the adbc-spanner cdylib"
+echo ">> building the spanner-adbc cdylib"
 cargo build
 
 # The pin must hold even when *some* version is already installed: import-existence

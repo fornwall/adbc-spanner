@@ -12,10 +12,10 @@
 use std::hint::black_box;
 use std::sync::Arc;
 
-use adbc_spanner::bench_support::build_array;
 use arrow_schema::{DataType, Field, Fields, TimeUnit};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use google_cloud_spanner::value::{ToValue, Value};
+use spanner_adbc::bench_support::build_array;
 
 /// Rows per benchmarked chunk — the driver's default `spanner.rows_per_batch`.
 const ROWS: usize = 8192;

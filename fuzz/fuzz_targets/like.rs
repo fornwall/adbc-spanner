@@ -13,7 +13,7 @@ use regex::Regex;
 //      (exactly one char) are special; every other char (including `\`) is a literal.
 fuzz_target!(|input: (String, String)| {
     let (pattern, value) = input;
-    let got = adbc_spanner::fuzzing::like_match(&pattern, &value);
+    let got = spanner_adbc::fuzzing::like_match(&pattern, &value);
 
     // Build an equivalent anchored regex: `%` -> `.*`, `_` -> `.`, everything else escaped.
     // `(?s)` makes `.` match newlines too, matching LIKE's "any character" semantics, and

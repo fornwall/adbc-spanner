@@ -1,6 +1,6 @@
 //! Resolves the version of the `arrow-array` crate this build links against, so `get_info` can
 //! report the ADBC `DriverArrowVersion` info code. The arrow crates export no version constant,
-//! so the version is read out of `Cargo.lock` and embedded via `ADBC_SPANNER_ARROW_VERSION`.
+//! so the version is read out of `Cargo.lock` and embedded via `SPANNER_ADBC_ARROW_VERSION`.
 
 use std::env;
 use std::fs;
@@ -36,7 +36,7 @@ fn main() {
             "unknown".to_string()
         }
     };
-    println!("cargo:rustc-env=ADBC_SPANNER_ARROW_VERSION={version}");
+    println!("cargo:rustc-env=SPANNER_ADBC_ARROW_VERSION={version}");
 }
 
 /// The `version` of the `arrow-array` package in the lockfile — `None` unless exactly one

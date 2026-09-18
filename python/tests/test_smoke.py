@@ -24,7 +24,7 @@ def test_missing_library_raises_clearly():
     here = pathlib.Path(adbc_driver_spanner.__file__).parent
     has_lib = any(
         (here / n).is_file()
-        for n in ("libadbc_spanner.so", "libadbc_spanner.dylib", "adbc_spanner.dll")
+        for n in ("libspanner_adbc.so", "libspanner_adbc.dylib", "spanner_adbc.dll")
     )
     if has_lib:
         # A real wheel is installed; just confirm the path resolves.

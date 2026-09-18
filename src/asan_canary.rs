@@ -20,7 +20,7 @@
 //!
 //! ## What it proves (the cross-boundary shape)
 //!
-//! [`adbc_spanner_asan_canary`] takes a pointer + length to a buffer the **C++ side allocated**
+//! [`spanner_adbc_asan_canary`] takes a pointer + length to a buffer the **C++ side allocated**
 //! (with `new`/`malloc`, so the ASan redzone/poison lives on the C++ allocation) and writes one
 //! byte past the end from *inside the instrumented Rust cdylib*. Because both sides share one
 //! compiler-rt ASan runtime and shadow memory, the instrumented Rust store is checked against the
@@ -48,7 +48,7 @@
 // Exported as a C symbol via `#[no_mangle]`, so `pub` is required even though the module is private
 // and the lint cannot see the FFI export.
 #[allow(unreachable_pub)]
-pub extern "C" fn adbc_spanner_asan_canary(ptr: *mut u8, len: usize) {
+pub extern "C" fn spanner_adbc_asan_canary(ptr: *mut u8, len: usize) {
     // Compute the one-past-the-end address and write to it. `write_volatile` keeps the compiler
     // from eliding the store (nothing reads it back), so ASan is guaranteed to see the access.
     // SAFETY: intentionally out of bounds — see the function's Safety section.

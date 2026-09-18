@@ -6,5 +6,5 @@ use libfuzzer_sys::fuzz_target;
 // (`<mode>[:<sel>,...][;auto_failover_disabled]`, each `<sel>` a `<location>[:<type>]`). It parses
 // an untrusted option string, so beyond the documented rejections it must never panic.
 fuzz_target!(|value: &str| {
-    adbc_spanner::fuzzing::parse_directed_read(value);
+    spanner_adbc::fuzzing::parse_directed_read(value);
 });

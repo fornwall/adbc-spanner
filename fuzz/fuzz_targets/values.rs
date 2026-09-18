@@ -1,8 +1,8 @@
 #![no_main]
 
-use adbc_spanner::fuzzing::{parse_date_days, parse_numeric_i128, parse_timestamp_nanos};
 use chrono::{DateTime, Datelike, Duration, NaiveDate};
 use libfuzzer_sys::fuzz_target;
+use spanner_adbc::fuzzing::{parse_date_days, parse_numeric_i128, parse_timestamp_nanos};
 
 // Fuzz the Spanner value-string parsers (DATE / TIMESTAMP / NUMERIC). They decode wire-format
 // strings and must never panic on malformed input (only return None).

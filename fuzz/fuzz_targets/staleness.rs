@@ -8,6 +8,6 @@ use libfuzzer_sys::fuzz_target;
 // mapping. This is the parser whose missing coverage let COR-1's panic through — it decodes an
 // untrusted option value, so it must never panic (only return a clean error).
 fuzz_target!(|value: &str| {
-    adbc_spanner::fuzzing::parse_read_staleness(value);
-    adbc_spanner::fuzzing::parse_duration(value);
+    spanner_adbc::fuzzing::parse_read_staleness(value);
+    spanner_adbc::fuzzing::parse_duration(value);
 });

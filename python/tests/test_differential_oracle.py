@@ -32,7 +32,7 @@ pa = pytest.importorskip("pyarrow")
 pc = pytest.importorskip("pyarrow.compute")
 spanner = pytest.importorskip("google.cloud.spanner")
 
-import adbc_driver_spanner.dbapi as adbc_spanner
+import adbc_driver_spanner.dbapi as spanner_adbc
 from adbc_driver_spanner import DatabaseOptions
 
 from conftest import DATABASE, INSTANCE, PROJECT
@@ -220,7 +220,7 @@ def _official_query(database, sql):
 
 
 def test_scalar_and_array_types_match_oracle(emulator_database, official_database):
-    conn = adbc_spanner.connect(
+    conn = spanner_adbc.connect(
         db_kwargs={
             DatabaseOptions.URI.value: f"spanner:///{emulator_database}",
             DatabaseOptions.EMULATOR.value: "true",
@@ -284,7 +284,7 @@ def test_array_of_struct_matches_oracle(emulator_database, official_database):
         ") AS arr"
     )
 
-    conn = adbc_spanner.connect(
+    conn = spanner_adbc.connect(
         db_kwargs={
             DatabaseOptions.URI.value: f"spanner:///{emulator_database}",
             DatabaseOptions.EMULATOR.value: "true",

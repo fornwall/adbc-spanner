@@ -42,11 +42,11 @@ use std::time::{Duration, Instant};
 use adbc_core::error::Status as AdbcStatus;
 use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, OptionValue};
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
-use adbc_spanner::{SpannerConnection, SpannerDriver, SpannerStatement};
 use arrow_array::cast::AsArray;
 use arrow_array::{Date32Array, Int64Array, RecordBatch, RecordBatchReader, StringArray};
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use prost::Message;
+use spanner_adbc::{SpannerConnection, SpannerDriver, SpannerStatement};
 use spanner_grpc_mock::MockSpanner;
 use spanner_grpc_mock::google::spanner::v1;
 
@@ -105,11 +105,11 @@ impl MockServer {
                     OptionValue::String(format!("spanner:///{DATABASE}")),
                 ),
                 (
-                    OptionDatabase::Other(adbc_spanner::OPTION_ENDPOINT.into()),
+                    OptionDatabase::Other(spanner_adbc::OPTION_ENDPOINT.into()),
                     OptionValue::String(self.endpoint.clone()),
                 ),
                 (
-                    OptionDatabase::Other(adbc_spanner::OPTION_EMULATOR.into()),
+                    OptionDatabase::Other(spanner_adbc::OPTION_EMULATOR.into()),
                     OptionValue::String("true".into()),
                 ),
             ])
@@ -306,11 +306,11 @@ impl GatedEndpoint {
                     OptionValue::String(format!("spanner:///{DATABASE}")),
                 ),
                 (
-                    OptionDatabase::Other(adbc_spanner::OPTION_ENDPOINT.into()),
+                    OptionDatabase::Other(spanner_adbc::OPTION_ENDPOINT.into()),
                     OptionValue::String(self.endpoint.clone()),
                 ),
                 (
-                    OptionDatabase::Other(adbc_spanner::OPTION_EMULATOR.into()),
+                    OptionDatabase::Other(spanner_adbc::OPTION_EMULATOR.into()),
                     OptionValue::String("true".into()),
                 ),
             ])
@@ -1427,7 +1427,7 @@ fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
     // is what blocks on the silent stream.
     statement
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
             OptionValue::Int(1),
         )
         .expect("set rows_per_batch");
@@ -1507,7 +1507,7 @@ fn ddl_update_timeout_fires_on_a_silent_admin_endpoint() {
     let mut statement = connection.new_statement().expect("new statement");
     statement
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_RPC_TIMEOUT_UPDATE.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_RPC_TIMEOUT_UPDATE.into()),
             OptionValue::Double(0.25),
         )
         .expect("set the update deadline");
@@ -1525,7 +1525,7 @@ fn ddl_update_timeout_fires_on_a_silent_admin_endpoint() {
     assert!(
         error
             .message
-            .contains(adbc_spanner::OPTION_RPC_TIMEOUT_UPDATE),
+            .contains(spanner_adbc::OPTION_RPC_TIMEOUT_UPDATE),
         "the DDL timeout error must name the update option: {}",
         error.message
     );
@@ -1573,14 +1573,14 @@ fn silent_stream_reader(
     let mut statement = connection.new_statement().expect("new statement");
     statement
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
             OptionValue::Int(1),
         )
         .expect("set rows_per_batch");
     if let Some(seconds) = fetch_seconds {
         statement
             .set_option(
-                OptionStatement::Other(adbc_spanner::OPTION_RPC_TIMEOUT_FETCH.into()),
+                OptionStatement::Other(spanner_adbc::OPTION_RPC_TIMEOUT_FETCH.into()),
                 OptionValue::Double(seconds),
             )
             .expect("set the fetch deadline");
@@ -1645,7 +1645,7 @@ fn fetch_timeout_fires_on_a_silent_stream() {
     assert!(
         adbc_error
             .message
-            .contains(adbc_spanner::OPTION_RPC_TIMEOUT_FETCH),
+            .contains(spanner_adbc::OPTION_RPC_TIMEOUT_FETCH),
         "the chunk-fetch timeout error must name the fetch option: {}",
         adbc_error.message
     );
@@ -1721,7 +1721,7 @@ fn query_timeout_fires_on_a_stream_that_is_silent_from_the_start() {
     let mut statement = connection.new_statement().expect("new statement");
     statement
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_RPC_TIMEOUT_QUERY.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_RPC_TIMEOUT_QUERY.into()),
             OptionValue::Double(0.5),
         )
         .expect("set the query deadline");
@@ -1738,7 +1738,7 @@ fn query_timeout_fires_on_a_stream_that_is_silent_from_the_start() {
     assert!(
         error
             .message
-            .contains(adbc_spanner::OPTION_RPC_TIMEOUT_QUERY),
+            .contains(spanner_adbc::OPTION_RPC_TIMEOUT_QUERY),
         "the execute timeout error must name the query option (and so not the fetch one): {}",
         error.message
     );
@@ -1785,7 +1785,7 @@ fn new_operation_does_not_uncancel_an_earlier_streamed_reader() {
     let mut statement = connection.new_statement().expect("new statement");
     statement
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
             OptionValue::Int(1),
         )
         .expect("set rows_per_batch");
@@ -2163,7 +2163,7 @@ fn batch_write_group_failure_forwards_status_details() {
     let mut statement = append_ingest_statement(&mut connection);
     statement
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_INGEST_BATCH_WRITE.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_INGEST_BATCH_WRITE.into()),
             OptionValue::String("true".into()),
         )
         .expect("route the ingest through BatchWrite");
@@ -2252,7 +2252,7 @@ fn batch_write_folds_same_chunk_applied_rows_into_committed_count() {
     let mut statement = append_ingest_statement(&mut connection);
     statement
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_INGEST_BATCH_WRITE.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_INGEST_BATCH_WRITE.into()),
             OptionValue::String("true".into()),
         )
         .expect("route the ingest through BatchWrite");
@@ -2456,7 +2456,7 @@ fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
     // capture the returned mutation count.
     statement
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_COMMIT_STATS.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_COMMIT_STATS.into()),
             OptionValue::String("true".into()),
         )
         .expect("enable commit stats");
@@ -2464,7 +2464,7 @@ fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
     // CommitRequest as a 100ms `max_commit_delay` (asserted below).
     statement
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_MAX_COMMIT_DELAY.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_MAX_COMMIT_DELAY.into()),
             OptionValue::String("100ms".into()),
         )
         .expect("set the commit delay");
@@ -2506,7 +2506,7 @@ fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
     assert_eq!(
         statement
             .get_option_int(OptionStatement::Other(
-                adbc_spanner::OPTION_COMMIT_STATS_MUTATION_COUNT.into()
+                spanner_adbc::OPTION_COMMIT_STATS_MUTATION_COUNT.into()
             ))
             .expect("mutation count must be readable after a stats-bearing commit"),
         SCRIPTED_MUTATION_COUNT,
@@ -2565,7 +2565,7 @@ fn max_commit_delay_reaches_the_wire_on_runner_commits() {
         if let Some(value) = delay {
             statement
                 .set_option(
-                    OptionStatement::Other(adbc_spanner::OPTION_MAX_COMMIT_DELAY.into()),
+                    OptionStatement::Other(spanner_adbc::OPTION_MAX_COMMIT_DELAY.into()),
                     OptionValue::String(value.into()),
                 )
                 .expect("set statement-level commit delay");
@@ -2584,7 +2584,7 @@ fn max_commit_delay_reaches_the_wire_on_runner_commits() {
     // 2. Statements created after this inherit the connection-level delay.
     connection
         .set_option(
-            OptionConnection::Other(adbc_spanner::OPTION_MAX_COMMIT_DELAY.into()),
+            OptionConnection::Other(spanner_adbc::OPTION_MAX_COMMIT_DELAY.into()),
             OptionValue::String("100ms".into()),
         )
         .expect("set connection-level commit delay");
@@ -3126,7 +3126,7 @@ fn read_staleness_reaches_the_wire_on_single_use_queries() {
     // Connection-level value; statements inherit it at creation (and may override it).
     connection
         .set_option(
-            OptionConnection::Other(adbc_spanner::OPTION_READ_STALENESS.into()),
+            OptionConnection::Other(spanner_adbc::OPTION_READ_STALENESS.into()),
             OptionValue::String("exact:10s".into()),
         )
         .expect("set connection-level staleness");
@@ -3136,7 +3136,7 @@ fn read_staleness_reaches_the_wire_on_single_use_queries() {
         if let Some(value) = staleness {
             statement
                 .set_option(
-                    OptionStatement::Other(adbc_spanner::OPTION_READ_STALENESS.into()),
+                    OptionStatement::Other(spanner_adbc::OPTION_READ_STALENESS.into()),
                     OptionValue::String(value.into()),
                 )
                 .expect("set statement-level staleness");
@@ -3226,7 +3226,7 @@ fn read_staleness_reaches_the_wire_on_metadata_reads() {
     let mut connection = server.connect();
     connection
         .set_option(
-            OptionConnection::Other(adbc_spanner::OPTION_READ_STALENESS.into()),
+            OptionConnection::Other(spanner_adbc::OPTION_READ_STALENESS.into()),
             OptionValue::String("exact:10s".into()),
         )
         .expect("set connection-level staleness");
@@ -3311,7 +3311,7 @@ fn bound_query_transaction_selectors(staleness: &str) -> Vec<Option<v1::Transact
     let mut statement = connection.new_statement().expect("new statement");
     statement
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_READ_STALENESS.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_READ_STALENESS.into()),
             OptionValue::String(staleness.into()),
         )
         .expect("set staleness");
@@ -3468,7 +3468,7 @@ fn directed_read_reaches_the_wire_on_queries_but_never_on_dml() {
     // Connection-level value; statements inherit it at creation (and may override it).
     connection
         .set_option(
-            OptionConnection::Other(adbc_spanner::OPTION_DIRECTED_READ.into()),
+            OptionConnection::Other(spanner_adbc::OPTION_DIRECTED_READ.into()),
             OptionValue::String("include:us-east1:read_only".into()),
         )
         .expect("set connection-level directed read");
@@ -3486,7 +3486,7 @@ fn directed_read_reaches_the_wire_on_queries_but_never_on_dml() {
     let mut override_query = connection.new_statement().expect("new statement");
     override_query
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_DIRECTED_READ.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_DIRECTED_READ.into()),
             OptionValue::String("exclude:eu-west1".into()),
         )
         .expect("set statement-level directed read");
@@ -3611,9 +3611,9 @@ fn query_optimizer_options_reach_the_wire_on_queries() {
     let mut connection = server.connect();
     // Connection-level values; statements inherit them at creation (and may override them).
     for (key, value) in [
-        (adbc_spanner::OPTION_QUERY_OPTIMIZER_VERSION, "6"),
+        (spanner_adbc::OPTION_QUERY_OPTIMIZER_VERSION, "6"),
         (
-            adbc_spanner::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE,
+            spanner_adbc::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE,
             "auto_20260101",
         ),
     ] {
@@ -3646,16 +3646,16 @@ fn query_optimizer_options_reach_the_wire_on_queries() {
     run_query(
         "SELECT c FROM Overridden",
         &[
-            (adbc_spanner::OPTION_QUERY_OPTIMIZER_VERSION, "latest"),
+            (spanner_adbc::OPTION_QUERY_OPTIMIZER_VERSION, "latest"),
             (
-                adbc_spanner::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE,
+                spanner_adbc::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE,
                 "custom_package",
             ),
         ],
     );
     run_query(
         "SELECT c FROM PartlyOverridden",
-        &[(adbc_spanner::OPTION_QUERY_OPTIMIZER_VERSION, "7")],
+        &[(spanner_adbc::OPTION_QUERY_OPTIMIZER_VERSION, "7")],
     );
 
     let requests = requests.lock().unwrap();
@@ -3794,13 +3794,13 @@ fn batch_dml_carries_the_request_priority_and_tag() {
     let mut connection = server.connect();
     connection
         .set_option(
-            OptionConnection::Other(adbc_spanner::OPTION_REQUEST_PRIORITY.into()),
+            OptionConnection::Other(spanner_adbc::OPTION_REQUEST_PRIORITY.into()),
             OptionValue::String("low".into()),
         )
         .expect("set the request priority");
     connection
         .set_option(
-            OptionConnection::Other(adbc_spanner::OPTION_REQUEST_TAG.into()),
+            OptionConnection::Other(spanner_adbc::OPTION_REQUEST_TAG.into()),
             OptionValue::String("etl-batch".into()),
         )
         .expect("set the request tag");
@@ -3873,9 +3873,9 @@ fn batch_write_carries_the_request_options_and_change_stream_exclusion() {
 
     let mut connection = server.connect();
     for (key, value) in [
-        (adbc_spanner::OPTION_REQUEST_PRIORITY, "high"),
-        (adbc_spanner::OPTION_TRANSACTION_TAG, "nightly-etl"),
-        (adbc_spanner::OPTION_REQUEST_TAG, "ignored-by-batch-write"),
+        (spanner_adbc::OPTION_REQUEST_PRIORITY, "high"),
+        (spanner_adbc::OPTION_TRANSACTION_TAG, "nightly-etl"),
+        (spanner_adbc::OPTION_REQUEST_TAG, "ignored-by-batch-write"),
     ] {
         connection
             .set_option(
@@ -3891,7 +3891,7 @@ fn batch_write_carries_the_request_options_and_change_stream_exclusion() {
         let mut statement = append_ingest_statement(connection);
         statement
             .set_option(
-                OptionStatement::Other(adbc_spanner::OPTION_INGEST_BATCH_WRITE.into()),
+                OptionStatement::Other(spanner_adbc::OPTION_INGEST_BATCH_WRITE.into()),
                 OptionValue::String("true".into()),
             )
             .expect("route the ingest through BatchWrite");
@@ -3934,7 +3934,7 @@ fn batch_write_carries_the_request_options_and_change_stream_exclusion() {
     // 2. The same ingest with the change-stream exclusion set on the connection.
     connection
         .set_option(
-            OptionConnection::Other(adbc_spanner::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS.into()),
+            OptionConnection::Other(spanner_adbc::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS.into()),
             OptionValue::String("true".into()),
         )
         .expect("exclude the transaction from change streams");
@@ -4037,7 +4037,7 @@ fn exclude_from_change_streams_reaches_the_wire_on_runner_commits() {
     // 2. Set on the connection; a statement created afterwards inherits it.
     connection
         .set_option(
-            OptionConnection::Other(adbc_spanner::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS.into()),
+            OptionConnection::Other(spanner_adbc::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS.into()),
             OptionValue::String("true".into()),
         )
         .expect("exclude the transaction from change streams");
@@ -4111,9 +4111,9 @@ fn request_priority_reaches_metadata_reads_but_tags_do_not() {
 
     let mut connection = server.connect();
     for (key, value) in [
-        (adbc_spanner::OPTION_REQUEST_PRIORITY, "high"),
-        (adbc_spanner::OPTION_REQUEST_TAG, "user-req"),
-        (adbc_spanner::OPTION_TRANSACTION_TAG, "user-txn"),
+        (spanner_adbc::OPTION_REQUEST_PRIORITY, "high"),
+        (spanner_adbc::OPTION_REQUEST_TAG, "user-req"),
+        (spanner_adbc::OPTION_TRANSACTION_TAG, "user-txn"),
     ] {
         connection
             .set_option(
@@ -4277,11 +4277,11 @@ fn connections_share_one_client_stack_until_an_option_is_set() {
                 OptionValue::String(format!("spanner:///{DATABASE}")),
             ),
             (
-                OptionDatabase::Other(adbc_spanner::OPTION_ENDPOINT.into()),
+                OptionDatabase::Other(spanner_adbc::OPTION_ENDPOINT.into()),
                 OptionValue::String(server.endpoint.clone()),
             ),
             (
-                OptionDatabase::Other(adbc_spanner::OPTION_EMULATOR.into()),
+                OptionDatabase::Other(spanner_adbc::OPTION_EMULATOR.into()),
                 OptionValue::String("true".into()),
             ),
         ])
@@ -4317,7 +4317,7 @@ fn connections_share_one_client_stack_until_an_option_is_set() {
     // the cache, so the next connection rebuilds the stack — a second CreateSession.
     database
         .set_option(
-            OptionDatabase::Other(adbc_spanner::OPTION_ENDPOINT.into()),
+            OptionDatabase::Other(spanner_adbc::OPTION_ENDPOINT.into()),
             OptionValue::String(server.endpoint.clone()),
         )
         .expect("re-set endpoint");
@@ -4405,8 +4405,8 @@ const RETRY_PROBE_CAP: usize = 20;
 /// milliseconds rather than the client's default 1s-doubling backoff.
 fn set_constant_backoff(statement: &mut impl Statement) {
     for (key, value) in [
-        (adbc_spanner::OPTION_RETRY_BACKOFF_INITIAL_SECONDS, 0.01),
-        (adbc_spanner::OPTION_RETRY_BACKOFF_MULTIPLIER, 1.0),
+        (spanner_adbc::OPTION_RETRY_BACKOFF_INITIAL_SECONDS, 0.01),
+        (spanner_adbc::OPTION_RETRY_BACKOFF_MULTIPLIER, 1.0),
     ] {
         statement
             .set_option(
@@ -4501,7 +4501,7 @@ fn retry_max_attempts_is_exact_on_unary_rpcs() {
 
     for max_attempts in [1_i64, 2, 3] {
         let attempts = unary_attempts(
-            adbc_spanner::OPTION_RETRY_MAX_ATTEMPTS,
+            spanner_adbc::OPTION_RETRY_MAX_ATTEMPTS,
             OptionValue::Int(max_attempts),
         );
         assert_eq!(
@@ -4523,7 +4523,7 @@ fn retry_max_attempts_is_exact_on_the_streaming_path() {
 
     for max_attempts in [1_i64, 2, 3] {
         let attempts = streaming_attempts(
-            adbc_spanner::OPTION_RETRY_MAX_ATTEMPTS,
+            spanner_adbc::OPTION_RETRY_MAX_ATTEMPTS,
             OptionValue::Int(max_attempts),
         );
         assert_eq!(
@@ -4551,7 +4551,7 @@ fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_pat
     // comparison against an observed baseline instead of against a constant that might coincide
     // with it.
     let unbounded = unary_attempts(
-        adbc_spanner::OPTION_RETRY_MAX_ELAPSED_SECONDS,
+        spanner_adbc::OPTION_RETRY_MAX_ELAPSED_SECONDS,
         OptionValue::String(String::new()),
     );
     assert_eq!(
@@ -4567,7 +4567,7 @@ fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_pat
     // fired at all; `>= 2` proves it did not simply abandon the very first failure, which is how a
     // too-small budget would make this test pass for the wrong reason.
     let unary = unary_attempts(
-        adbc_spanner::OPTION_RETRY_MAX_ELAPSED_SECONDS,
+        spanner_adbc::OPTION_RETRY_MAX_ELAPSED_SECONDS,
         OptionValue::Double(0.15),
     );
     assert!(
@@ -4578,7 +4578,7 @@ fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_pat
 
     // The streaming loop runs until the mock stops it: the budget never fires.
     let streaming = streaming_attempts(
-        adbc_spanner::OPTION_RETRY_MAX_ELAPSED_SECONDS,
+        spanner_adbc::OPTION_RETRY_MAX_ELAPSED_SECONDS,
         OptionValue::Double(0.05),
     );
     assert_eq!(

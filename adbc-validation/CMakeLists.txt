@@ -1,11 +1,11 @@
 # Builds the canonical Apache Arrow ADBC C++ validation suite against the
-# adbc-spanner driver (loaded as a shared library through the ADBC driver
+# spanner-adbc driver (loaded as a shared library through the ADBC driver
 # manager). See README.md for how to run it.
 #
 # Everything external is fetched and built from source at a pinned arrow-adbc
 # release, so the only host requirements are a C++20 compiler, CMake and git.
 cmake_minimum_required(VERSION 3.20)
-project(adbc_spanner_validation LANGUAGES C CXX)
+project(spanner_adbc_validation LANGUAGES C CXX)
 
 # C++20 is arrow-adbc's baseline as of apache/arrow-adbc#4610 (`feat(c): require C++20 as
 # the baseline`): its validation targets ask for `cxx_std_20`, and its headers — which this

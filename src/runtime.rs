@@ -287,7 +287,7 @@ async fn prefetch_loop<S: ChunkSource>(
 pub(crate) fn new_runtime() -> Result<SharedRuntime> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_name("adbc-spanner")
+        .thread_name("spanner-adbc")
         .build()
         .map_err(|e| {
             err(

@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-`adbc-spanner` is a Rust ADBC driver for Google Cloud Spanner, returning Arrow record batches.
+`spanner-adbc` is a Rust ADBC driver for Google Cloud Spanner, returning Arrow record batches.
 It implements `adbc_core` traits and a hand-written C ABI in `src/ffi/`, exporting
 `AdbcSpannerInit` and `AdbcDriverInit` from a cdylib.
 

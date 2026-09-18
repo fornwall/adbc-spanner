@@ -1,5 +1,5 @@
 [package]
-name = "adbc-spanner-fuzz"
+name = "spanner-adbc-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 # This crate is a member of the root workspace (there is no `[workspace]` here on purpose — see
 # the note in ../Cargo.toml). Keep cargo-release from ever versioning or tagging it: releases
-# only cut the `adbc-spanner` crate.
+# only cut the `spanner-adbc` crate.
 [package.metadata.release]
 release = false
 
@@ -20,7 +20,7 @@ libfuzzer-sys = "0.4"
 regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
-[dependencies.adbc-spanner]
+[dependencies.spanner-adbc]
 path = ".."
 default-features = false
 features = ["fuzzing"]

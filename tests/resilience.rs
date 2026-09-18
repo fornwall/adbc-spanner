@@ -42,12 +42,12 @@ use std::time::{Duration, Instant};
 use adbc_core::error::{Error as AdbcError, Result as AdbcResult, Status as AdbcStatus};
 use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, OptionValue};
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
-use adbc_spanner::{SpannerConnection, SpannerDatabase, SpannerDriver};
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::ArrowError;
 use google_cloud_lro::Poller;
 use google_cloud_spanner::client::Spanner;
 use google_cloud_spanner_admin_instance_v1::model::Instance;
+use spanner_adbc::{SpannerConnection, SpannerDatabase, SpannerDriver};
 
 // Fixed identifiers, matching tests/integration.rs so the emulator setup is interchangeable.
 const PROJECT: &str = "test-project";
@@ -413,7 +413,7 @@ fn cancel_interrupts_in_flight_query() {
     let mut statement = connection.new_statement().expect("new statement");
     statement
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
             OptionValue::Int(300),
         )
         .expect("set rows_per_batch");
@@ -739,7 +739,7 @@ fn update_timeout_bounds_a_faulted_write_then_recovers_when_unset() {
         .lock()
         .expect("connection lock")
         .set_option(
-            OptionConnection::Other(adbc_spanner::OPTION_RPC_TIMEOUT_UPDATE.into()),
+            OptionConnection::Other(spanner_adbc::OPTION_RPC_TIMEOUT_UPDATE.into()),
             OptionValue::Double(deadline_secs),
         )
         .expect("set update timeout");
@@ -786,7 +786,7 @@ fn update_timeout_bounds_a_faulted_write_then_recovers_when_unset() {
     assert!(
         error
             .message
-            .contains(adbc_spanner::OPTION_RPC_TIMEOUT_UPDATE),
+            .contains(spanner_adbc::OPTION_RPC_TIMEOUT_UPDATE),
         "the timeout error must name the responsible option; got: {}",
         error.message
     );
@@ -805,7 +805,7 @@ fn update_timeout_bounds_a_faulted_write_then_recovers_when_unset() {
         .lock()
         .expect("connection lock")
         .set_option(
-            OptionConnection::Other(adbc_spanner::OPTION_RPC_TIMEOUT_UPDATE.into()),
+            OptionConnection::Other(spanner_adbc::OPTION_RPC_TIMEOUT_UPDATE.into()),
             OptionValue::String(String::new()),
         )
         .expect("unset update timeout");
@@ -878,7 +878,7 @@ fn mid_stream_disconnect_after_batches_surfaces_error_then_recovers() {
     let mut statement = connection.new_statement().expect("new statement");
     statement
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
             OptionValue::Int(300),
         )
         .expect("set rows_per_batch");
@@ -996,7 +996,7 @@ fn truncated_stream_surfaces_error_then_recovers() {
     let mut statement = connection.new_statement().expect("new statement");
     statement
         .set_option(
-            OptionStatement::Other(adbc_spanner::OPTION_ROWS_PER_BATCH.into()),
+            OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
             OptionValue::Int(300),
         )
         .expect("set rows_per_batch");

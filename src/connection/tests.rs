@@ -265,7 +265,7 @@ fn malformed_partition_descriptor_envelopes_error_cleanly() {
 
 #[test]
 fn partition_descriptor_round_trips_large_floats() {
-    // Regression for a nightly fuzz find (adbc-spanner#188): a descriptor whose payload
+    // Regression for a nightly fuzz find (spanner-adbc#188): a descriptor whose payload
     // carries an integer literal too large for i64/u64 is parsed to f64, so re-encoding emits
     // a ryu float. serde_json's default float parser is fast-but-imprecise (up to one ULP
     // off), so `parse(ryu(x)) != x` and each decode → encode pass drifted to an adjacent ULP —

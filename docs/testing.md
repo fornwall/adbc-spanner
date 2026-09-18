@@ -76,7 +76,7 @@ These commands use the Linux library name; substitute the platform's library on 
 
 ```sh
 cargo build
-cp target/debug/libadbc_spanner.so python/adbc_driver_spanner/
+cp target/debug/libspanner_adbc.so python/adbc_driver_spanner/
 python -m pip install ./python pyarrow pandas polars duckdb pytest google-cloud-spanner
 scripts/with-emulator.sh python -m pytest python/tests -v
 ```
