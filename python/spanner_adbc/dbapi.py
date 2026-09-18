@@ -4,7 +4,7 @@ This is the layer most users want: it returns a standard DBAPI connection with
 cursors, plus the ADBC Arrow extensions (``fetch_arrow_table``, ``fetch_df``,
 ``adbc_ingest``) that pandas / polars / DuckDB consume directly.
 
-    import adbc_driver_spanner.dbapi as spanner
+    import spanner_adbc.dbapi as spanner
     with spanner.connect(uri="spanner:///projects/p/instances/i/databases/d") as conn:
         df = conn.cursor().execute("SELECT * FROM Singers").fetch_df()
 

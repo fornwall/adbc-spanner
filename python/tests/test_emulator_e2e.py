@@ -10,10 +10,10 @@ import pytest
 
 pa = pytest.importorskip("pyarrow")
 
-import adbc_driver_spanner
-import adbc_driver_spanner.dbapi as spanner
+import spanner_adbc
+import spanner_adbc.dbapi as spanner
 from adbc_driver_manager import ProgrammingError
-from adbc_driver_spanner import DatabaseOptions, StatementOptions
+from spanner_adbc import DatabaseOptions, StatementOptions
 
 
 def _connect(database, *, autocommit):
@@ -28,7 +28,7 @@ def _connect(database, *, autocommit):
 
 def test_driver_library_is_bundled():
     # The wheel under test must ship the native library; a bare source tree wouldn't.
-    assert adbc_driver_spanner._driver_path()
+    assert spanner_adbc._driver_path()
 
 
 def test_ddl_dml_query_roundtrip(emulator_database):

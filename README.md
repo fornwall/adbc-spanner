@@ -8,7 +8,7 @@
 
 An [ADBC](https://arrow.apache.org/adbc/) (Arrow Database Connectivity) driver for
 [Google Cloud Spanner](https://cloud.google.com/spanner), available as a
-[Python package](https://pypi.org/project/adbc-driver-spanner/), a Rust crate from git, and a
+[Python package](https://pypi.org/project/spanner-adbc/), a Rust crate from git, and a
 [loadable shared library](#shared-library-loadable-driver). CI tests against the Spanner emulator;
 real-database and authentication tests run locally.
 

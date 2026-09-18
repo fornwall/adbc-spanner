@@ -9,8 +9,8 @@ is documented in [transactions](transactions.md) and [options](options.md).
 A future adapter could wrap the [Python DBAPI interface](../python/README.md):
 
 ```python
-import adbc_driver_spanner.dbapi as spanner
-from adbc_driver_spanner import DatabaseOptions
+import spanner_adbc.dbapi as spanner
+from spanner_adbc import DatabaseOptions
 
 conn = spanner.connect(
     db_kwargs={

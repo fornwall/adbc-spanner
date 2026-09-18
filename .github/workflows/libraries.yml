@@ -487,7 +487,7 @@ jobs:
           # positional grep of Cargo.toml, since it parses the manifest the way cargo does.
           crate_version="$(cargo metadata --no-deps --format-version 1 --manifest-path ../Cargo.toml \
             | jq -r '.packages[] | select(.name == "spanner-adbc") | .version')"
-          echo "__version__ = \"${crate_version}\"" > adbc_driver_spanner/_version.py
+          echo "__version__ = \"${crate_version}\"" > spanner_adbc/_version.py
           echo "wheel version: ${crate_version}"
 
       - name: Build wheels
@@ -523,10 +523,10 @@ jobs:
               unzip -q "../artifacts/${staging}.zip" -d "$work"
             fi
             # Exactly one platform's library must be present per wheel build.
-            rm -f adbc_driver_spanner/*.so adbc_driver_spanner/*.dylib adbc_driver_spanner/*.dll
-            cp "$work/${staging}/${lib}" adbc_driver_spanner/
+            rm -f spanner_adbc/*.so spanner_adbc/*.dylib spanner_adbc/*.dll
+            cp "$work/${staging}/${lib}" spanner_adbc/
             python setup.py bdist_wheel --plat-name "$plat"
-            rm -rf build adbc_driver_spanner/*.so adbc_driver_spanner/*.dylib adbc_driver_spanner/*.dll
+            rm -rf build spanner_adbc/*.so spanner_adbc/*.dylib spanner_adbc/*.dll
           done
           mv dist/*.whl wheelhouse/
           ls -l wheelhouse
@@ -548,9 +548,9 @@ jobs:
             case "$whl" in
               # Both manylinux (glibc) and musllinux (Alpine) tags contain "linux"
               # and bundle the same .so filename.
-              *linux*) lib='adbc_driver_spanner/libspanner_adbc.so' ;;
-              *macosx*) lib='adbc_driver_spanner/libspanner_adbc.dylib' ;;
-              *win*) lib='adbc_driver_spanner/spanner_adbc.dll' ;;
+              *linux*) lib='spanner_adbc/libspanner_adbc.so' ;;
+              *macosx*) lib='spanner_adbc/libspanner_adbc.dylib' ;;
+              *win*) lib='spanner_adbc/spanner_adbc.dll' ;;
               *) echo "::error::unrecognised wheel platform tag: ${whl}" >&2; exit 1 ;;
             esac
             if ! python -m zipfile -l "$whl" | grep -qF "$lib"; then
@@ -575,7 +575,7 @@ jobs:
           # Import from a directory without the source tree so the *installed*
           # package is exercised; _driver_path() raises unless the lib is bundled.
           cd "$RUNNER_TEMP"
-          python -c "import adbc_driver_spanner; print(adbc_driver_spanner._driver_path()); import adbc_driver_spanner.dbapi"
+          python -c "import spanner_adbc; print(spanner_adbc._driver_path()); import spanner_adbc.dbapi"
 
       # Prove that the manifest the wheel installs actually makes the driver
       # *discoverable*: a manifest that ships but is never found is worse than none,
@@ -594,8 +594,8 @@ jobs:
           import tempfile
           import tomllib
 
-          import adbc_driver_spanner
-          import adbc_driver_spanner.manifest as manifest
+          import spanner_adbc
+          import spanner_adbc.manifest as manifest
 
           directory = tempfile.mkdtemp()
           path = manifest.install(directory)
@@ -604,7 +604,7 @@ jobs:
           assert doc["manifest_version"] == 1, doc
           # Driver.shared is used verbatim by the dynamic loader, so it has to be the
           # absolute path of the library this wheel bundles.
-          assert doc["Driver"]["shared"] == adbc_driver_spanner._driver_path(), doc
+          assert doc["Driver"]["shared"] == spanner_adbc._driver_path(), doc
 
           os.environ["ADBC_DRIVER_PATH"] = directory
           import adbc_driver_manager
@@ -642,7 +642,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/adbc-driver-spanner
+      url: https://pypi.org/p/spanner-adbc
     permissions:
       id-token: write # mandatory for trusted publishing; nothing else needed.
     steps:

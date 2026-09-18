@@ -47,6 +47,10 @@ A `vX.Y.Z` tag triggers `.github/workflows/libraries.yml`. Publishing requires a
 version and successful CI for the tagged commit. The workflow attaches shared libraries to the
 GitHub Release, then publishes Python wheels to PyPI through trusted publishing.
 
+The PyPI project is `spanner-adbc`; the Python import package is `spanner_adbc`.
+Its PyPI trusted publisher uses owner `fornwall`, repository `spanner-adbc`, workflow
+`libraries.yml`, and GitHub environment `pypi`.
+
 ## Dependency pins
 
 `Cargo.toml` pins the Google Cloud family and `adbc_core`/`adbc_ffi`/`adbc_driver_manager` to git.

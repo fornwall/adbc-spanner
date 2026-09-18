@@ -24,7 +24,7 @@ Options: ``--rows N`` (default 100000), ``--repeat K`` (default 5),
 ``--batch B`` (ingest batch size for setup, default 20000).
 
 Requires ``SPANNER_EMULATOR_HOST`` (set by ``with-emulator.sh``) and the
-bundled driver library next to ``adbc_driver_spanner`` (see the benchmark
+bundled driver library next to ``spanner_adbc`` (see the benchmark
 README). The instance/database are created here over the emulator's REST admin
 API, exactly like the Python test suite's conftest.
 """
@@ -155,8 +155,8 @@ def build_data(n: int):
 
 
 def setup_table(database: str, n: int, batch: int) -> None:
-    import adbc_driver_spanner.dbapi as spanner_adbc
-    from adbc_driver_spanner import DatabaseOptions
+    import spanner_adbc.dbapi as spanner_adbc
+    from spanner_adbc import DatabaseOptions
 
     data = build_data(n)
     conn = spanner_adbc.connect(
@@ -192,8 +192,8 @@ def run_adbc(database: str):
     """ADBC: Arrow record batches -> zero-copy Polars -> mean."""
     import polars as pl
 
-    import adbc_driver_spanner.dbapi as spanner_adbc
-    from adbc_driver_spanner import DatabaseOptions
+    import spanner_adbc.dbapi as spanner_adbc
+    from spanner_adbc import DatabaseOptions
 
     conn = spanner_adbc.connect(
         db_kwargs={

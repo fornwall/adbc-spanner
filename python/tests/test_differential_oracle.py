@@ -4,7 +4,7 @@ The highest-signal way to catch bugs in ``src/conversion.rs`` is to run the same
 query through two independent clients against the *same* emulator database and
 assert the results agree after normalization:
 
-* our ADBC driver (``adbc_driver_spanner``), which returns Apache Arrow, and
+* our ADBC driver (``spanner_adbc``), which returns Apache Arrow, and
 * the official ``google-cloud-spanner`` Python client, which returns native
   Python objects and acts as the oracle for "what the value really is".
 
@@ -32,8 +32,8 @@ pa = pytest.importorskip("pyarrow")
 pc = pytest.importorskip("pyarrow.compute")
 spanner = pytest.importorskip("google.cloud.spanner")
 
-import adbc_driver_spanner.dbapi as spanner_adbc
-from adbc_driver_spanner import DatabaseOptions
+import spanner_adbc.dbapi as spanner_adbc
+from spanner_adbc import DatabaseOptions
 
 from conftest import DATABASE, INSTANCE, PROJECT
 

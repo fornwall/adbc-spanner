@@ -18,8 +18,8 @@ pa = pytest.importorskip("pyarrow")
 pl = pytest.importorskip("polars")
 from polars.testing import assert_frame_equal
 
-import adbc_driver_spanner.dbapi as spanner
-from adbc_driver_spanner import DatabaseOptions
+import spanner_adbc.dbapi as spanner
+from spanner_adbc import DatabaseOptions
 
 
 def _connect(database):

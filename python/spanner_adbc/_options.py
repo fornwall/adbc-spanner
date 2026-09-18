@@ -3,14 +3,14 @@
 These enums mirror the style of the BigQuery ADBC driver's ``DatabaseOptions`` /
 ``StatementOptions``: each member's ``.value`` is the raw option-key string the
 driver understands. Every driver setting is passed as one of these keys — through
-``db_kwargs=`` / ``conn_kwargs=`` on :func:`adbc_driver_spanner.dbapi.connect`, or
+``db_kwargs=`` / ``conn_kwargs=`` on :func:`spanner_adbc.dbapi.connect`, or
 ``adbc_stmt_kwargs=`` on ``conn.cursor(...)`` — and these enums make that
 discoverable and typo-safe.
 
 Example::
 
-    import adbc_driver_spanner.dbapi as spanner
-    from adbc_driver_spanner import ConnectionOptions, DatabaseOptions, StatementOptions
+    import spanner_adbc.dbapi as spanner
+    from spanner_adbc import ConnectionOptions, DatabaseOptions, StatementOptions
 
     with spanner.connect(
         db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/p/instances/i/databases/d"},

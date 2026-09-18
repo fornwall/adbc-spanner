@@ -155,7 +155,7 @@ jobs:
       - name: Install the Python package with the freshly built driver
         run: |
           set -euo pipefail
-          cp target/debug/libspanner_adbc.so python/adbc_driver_spanner/
+          cp target/debug/libspanner_adbc.so python/spanner_adbc/
           python -m pip install --upgrade pip
           # pyarrow/pandas/polars/duckdb exercise the Arrow + DataFrame paths, including the
           # README cookbook snippets that import them. google-cloud-spanner is the oracle for the

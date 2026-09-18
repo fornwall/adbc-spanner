@@ -42,8 +42,8 @@ def test_readme_has_runnable_snippets():
 @pytest.fixture(scope="module")
 def cookbook_env(emulator_database):
     """Seed the `Singers` table and redirect `spanner.connect` at the emulator database."""
-    import adbc_driver_spanner.dbapi as sp
-    from adbc_driver_spanner import DatabaseOptions
+    import spanner_adbc.dbapi as sp
+    from spanner_adbc import DatabaseOptions
 
     conn = sp.connect(
         db_kwargs={

@@ -12,10 +12,10 @@ from pathlib import Path
 
 import pytest
 
-import adbc_driver_spanner
-import adbc_driver_spanner.dbapi
-import adbc_driver_spanner.dbapi as spanner
-from adbc_driver_spanner import (
+import spanner_adbc
+import spanner_adbc.dbapi
+import spanner_adbc.dbapi as spanner
+from spanner_adbc import (
     ConnectionOptions,
     DatabaseOptions,
     StatementOptions,
@@ -142,7 +142,7 @@ def test_every_driver_option_key_has_a_typed_enum_member(heading, enum_cls):
     missing = expected - present
     assert not missing, (
         f"{enum_cls.__name__} has no member for driver option(s) {sorted(missing)}. "
-        "Add one to python/adbc_driver_spanner/_options.py, or — if the omission is "
+        "Add one to python/spanner_adbc/_options.py, or — if the omission is "
         "deliberate — record it with a reason in _EXPECTED_MISSING."
     )
 
@@ -162,7 +162,7 @@ def test_typed_enum_members_are_real_keys_at_their_level(heading, enum_cls):
 def test_connect_functions_take_db_kwargs():
     """Both connect entry points expose the raw-option escape hatch and nothing
     else credential-shaped — all options travel through db_kwargs now."""
-    for fn in (adbc_driver_spanner.connect, adbc_driver_spanner.dbapi.connect):
+    for fn in (spanner_adbc.connect, spanner_adbc.dbapi.connect):
         params = inspect.signature(fn).parameters
         assert "db_kwargs" in params
         # The friendly per-credential kwargs were removed in favour of db_kwargs.

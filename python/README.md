@@ -1,9 +1,9 @@
-# adbc-driver-spanner
+# spanner-adbc
 
-[![PyPI version](https://img.shields.io/pypi/v/adbc-driver-spanner.svg)](https://pypi.org/project/adbc-driver-spanner/)
-[![Python versions](https://img.shields.io/pypi/pyversions/adbc-driver-spanner.svg)](https://pypi.org/project/adbc-driver-spanner/)
-[![Wheel](https://img.shields.io/pypi/wheel/adbc-driver-spanner.svg)](https://pypi.org/project/adbc-driver-spanner/#files)
-[![License](https://img.shields.io/pypi/l/adbc-driver-spanner.svg)](https://github.com/fornwall/spanner-adbc/blob/main/LICENSE)
+[![PyPI version](https://img.shields.io/pypi/v/spanner-adbc.svg)](https://pypi.org/project/spanner-adbc/)
+[![Python versions](https://img.shields.io/pypi/pyversions/spanner-adbc.svg)](https://pypi.org/project/spanner-adbc/)
+[![Wheel](https://img.shields.io/pypi/wheel/spanner-adbc.svg)](https://pypi.org/project/spanner-adbc/#files)
+[![License](https://img.shields.io/pypi/l/spanner-adbc.svg)](https://github.com/fornwall/spanner-adbc/blob/main/LICENSE)
 [![Build](https://github.com/fornwall/spanner-adbc/actions/workflows/libraries.yml/badge.svg)](https://github.com/fornwall/spanner-adbc/actions/workflows/libraries.yml)
 
 A Python [ADBC](https://arrow.apache.org/adbc/) driver for **Google Cloud Spanner**.
@@ -17,18 +17,19 @@ Requires Python 3.11 or later. Wheels bundle the native driver; see
 [Supported platforms](#supported-platforms) for OS requirements.
 
 ```sh
-pip install "adbc-driver-spanner[dbapi]"  # includes PyArrow and pandas
+pip install "spanner-adbc[dbapi]"  # includes PyArrow and pandas
 ```
 
-For the low-level ADBC API without DataFrame dependencies, install `adbc-driver-spanner`.
+For the low-level ADBC API without DataFrame dependencies, install `spanner-adbc`.
+The Python import name is `spanner_adbc`.
 
 ## Quickstart
 
 This example assumes an existing `Singers` table with `SingerId` and `FirstName` columns.
 
 ```python
-import adbc_driver_spanner.dbapi as spanner
-from adbc_driver_spanner import DatabaseOptions
+import spanner_adbc.dbapi as spanner
+from spanner_adbc import DatabaseOptions
 
 with spanner.connect(
     db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
@@ -50,10 +51,10 @@ Use a current driver manager; Python manifest support requires
 
 ```sh
 pip install --upgrade adbc-driver-manager
-python -m adbc_driver_spanner.manifest install
+python -m spanner_adbc.manifest install
 ```
 
-The equivalent console command is `adbc-driver-spanner-install-manifest`.
+The equivalent console command is `spanner-adbc-install-manifest`.
 
 ```python docs-test: skip
 import adbc_driver_manager.dbapi
@@ -70,7 +71,7 @@ Current driver managers can also infer `spanner` from the URI scheme when `drive
 - Re-run the installer after upgrading, reinstalling, or moving the environment: the manifest
   contains the library's absolute path.
 - The default directory is `<sys.prefix>/etc/adbc/drivers` inside a virtual environment, or the
-  platform's user configuration directory otherwise. `python -m adbc_driver_spanner.manifest path`
+  platform's user configuration directory otherwise. `python -m spanner_adbc.manifest path`
   prints the target path.
 - Use `install --dir /path/to/drivers` for a custom directory on `ADBC_DRIVER_PATH`.
 - For a standalone shared library, edit the `Driver.shared` paths in the repository's
@@ -101,8 +102,8 @@ credentials or impersonation. See the [option reference][options] for scopes and
 For the [Spanner emulator](https://cloud.google.com/spanner/docs/emulator), use anonymous mode:
 
 ```python docs-test: skip
-import adbc_driver_spanner.dbapi as spanner
-from adbc_driver_spanner import DatabaseOptions
+import spanner_adbc.dbapi as spanner
+from spanner_adbc import DatabaseOptions
 
 with spanner.connect(db_kwargs={
     DatabaseOptions.URI.value: "spanner:///projects/p/instances/i/databases/d",
@@ -129,8 +130,8 @@ The [option reference][options] lists types, defaults, and accepted values. Set 
 [options]: https://github.com/fornwall/spanner-adbc/blob/main/docs/options.md
 
 ```python
-import adbc_driver_spanner.dbapi as spanner
-from adbc_driver_spanner import ConnectionOptions, DatabaseOptions, StatementOptions
+import spanner_adbc.dbapi as spanner
+from spanner_adbc import ConnectionOptions, DatabaseOptions, StatementOptions
 
 with spanner.connect(
     db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/p/instances/i/databases/d"},
@@ -160,9 +161,9 @@ See [transactions](https://github.com/fornwall/spanner-adbc/blob/main/docs/trans
 bulk-ingest and partitioned-DML behavior.
 
 ```python
-import adbc_driver_spanner.dbapi as spanner
+import spanner_adbc.dbapi as spanner
 from adbc_driver_manager import ProgrammingError
-from adbc_driver_spanner import DatabaseOptions
+from spanner_adbc import DatabaseOptions
 
 with spanner.connect(
     db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
@@ -195,8 +196,8 @@ The quickstart uses pandas. The examples below use the same `Singers` table with
 **pyarrow — results as a native Arrow table:**
 
 ```python
-import adbc_driver_spanner.dbapi as spanner
-from adbc_driver_spanner import DatabaseOptions
+import spanner_adbc.dbapi as spanner
+from spanner_adbc import DatabaseOptions
 
 with spanner.connect(
     db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
@@ -210,8 +211,8 @@ with spanner.connect(
 
 ```python
 import polars as pl
-import adbc_driver_spanner.dbapi as spanner
-from adbc_driver_spanner import DatabaseOptions
+import spanner_adbc.dbapi as spanner
+from spanner_adbc import DatabaseOptions
 
 with spanner.connect(
     db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
@@ -226,8 +227,8 @@ with spanner.connect(
 
 ```python
 import duckdb
-import adbc_driver_spanner.dbapi as spanner
-from adbc_driver_spanner import DatabaseOptions
+import spanner_adbc.dbapi as spanner
+from spanner_adbc import DatabaseOptions
 
 with spanner.connect(
     db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
@@ -248,8 +249,8 @@ DataFrames to Arrow as shown here:
 ```python
 import pandas as pd
 import pyarrow as pa
-import adbc_driver_spanner.dbapi as spanner
-from adbc_driver_spanner import DatabaseOptions
+import spanner_adbc.dbapi as spanner
+from spanner_adbc import DatabaseOptions
 
 frame = pd.DataFrame({"SingerId": [10, 11], "FirstName": ["Carol", "Dave"]})
 
@@ -283,8 +284,8 @@ serverless [Data Boost] compute, so the work is isolated from your provisioned i
 the ADBC partitioned-execution extension (`adbc_execute_partitions` / `adbc_read_partition`):
 
 ```python
-import adbc_driver_spanner.dbapi as spanner
-from adbc_driver_spanner import DatabaseOptions, StatementOptions
+import spanner_adbc.dbapi as spanner
+from spanner_adbc import DatabaseOptions, StatementOptions
 
 with spanner.connect(
     db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},

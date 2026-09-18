@@ -42,10 +42,10 @@
 # library from the GitHub release archive was installed into the conventional
 # system location; change them to wherever you actually put it.
 #
-# Python users do not need to edit anything: `pip install adbc-driver-spanner`
+# Python users do not need to edit anything: `pip install spanner-adbc`
 # bundles the library, and
 #
-#     python -m adbc_driver_spanner.manifest install
+#     python -m spanner_adbc.manifest install
 #
 # writes a manifest pointing at the bundled library into a directory the driver
 # manager searches.

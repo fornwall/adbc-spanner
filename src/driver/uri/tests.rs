@@ -37,7 +37,7 @@ fn a_scheme_uri_sets_the_database_path() {
 #[test]
 fn the_documented_quickstart_uri_example_parses() {
     // The exact `uri=` example string shown in the quickstart docs (src/ffi.rs module doc,
-    // docs/adbc.md, python/adbc_driver_spanner/dbapi.py) must stay a form the driver accepts,
+    // docs/adbc.md, python/spanner_adbc/dbapi.py) must stay a form the driver accepts,
     // so the docs can't silently rot into a rejected spelling again.
     let mut db = new_database();
     set_uri(&mut db, "spanner:///projects/p/instances/i/databases/d").unwrap();

@@ -28,8 +28,8 @@ def t(fn):
 def profile_adbc(database, rows_per_batch=None):
     import polars as pl
 
-    import adbc_driver_spanner.dbapi as spanner_adbc
-    from adbc_driver_spanner import DatabaseOptions, StatementOptions
+    import spanner_adbc.dbapi as spanner_adbc
+    from spanner_adbc import DatabaseOptions, StatementOptions
 
     conn = spanner_adbc.connect(
         db_kwargs={

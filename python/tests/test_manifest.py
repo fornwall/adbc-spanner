@@ -13,8 +13,8 @@ import tomllib
 
 import pytest
 
-import adbc_driver_spanner
-from adbc_driver_spanner import manifest as manifest_mod
+import spanner_adbc
+from spanner_adbc import manifest as manifest_mod
 
 # Architecture / OS names from the spec's authoritative platform-tuple table.
 _SPEC_OSES = {"linux", "macos", "windows", "freebsd", "openbsd"}
@@ -41,7 +41,7 @@ _SPEC_ENVS = {"musl", "mingw"}
 
 def _has_library() -> bool:
     try:
-        adbc_driver_spanner._driver_path()
+        spanner_adbc._driver_path()
     except RuntimeError:
         return False
     return True
@@ -74,10 +74,10 @@ def test_manifest_parses_and_has_the_required_keys():
     assert isinstance(shared, str)
     assert os.path.isabs(shared), shared
     assert os.path.isfile(shared), shared
-    assert shared == adbc_driver_spanner._driver_path()
+    assert shared == spanner_adbc._driver_path()
 
-    assert doc["Driver"]["entrypoint"] == adbc_driver_spanner.ENTRYPOINT
-    assert doc["version"] == adbc_driver_spanner.__version__
+    assert doc["Driver"]["entrypoint"] == spanner_adbc.ENTRYPOINT
+    assert doc["version"] == spanner_adbc.__version__
     assert doc["ADBC"]["version"] == "1.1.0"
 
 
@@ -152,7 +152,7 @@ def test_manifest_makes_the_driver_discoverable_by_name(
             assert cur.fetchone() == (1,)
 
     # (2) By URI scheme alone — no `driver` option at all. This is what the
-    # manifest buys over the bundled-path `adbc_driver_spanner.connect()`.
+    # manifest buys over the bundled-path `spanner_adbc.connect()`.
     with adbc_driver_manager.dbapi.connect(
         uri=uri, db_kwargs=db_kwargs, autocommit=True
     ) as conn:

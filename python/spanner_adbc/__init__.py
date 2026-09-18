@@ -6,13 +6,13 @@ module just locates the bundled library and hands it to ``adbc_driver_manager``,
 which loads it over the ADBC C ABI.
 
 For a DBAPI 2.0 (PEP 249) connection with pandas/polars/Arrow helpers, use
-:func:`adbc_driver_spanner.dbapi.connect` instead of the low-level
+:func:`spanner_adbc.dbapi.connect` instead of the low-level
 :func:`connect` here.
 
 To reach the driver through the *generic* ``adbc_driver_manager`` instead — as
 ``driver="spanner"``, or by URI scheme alone from ``uri="spanner:///..."`` —
 install an ADBC driver manifest once with ``python -m
-adbc_driver_spanner.manifest install`` (see :mod:`adbc_driver_spanner.manifest`).
+spanner_adbc.manifest install`` (see :mod:`spanner_adbc.manifest`).
 """
 
 import functools
@@ -55,7 +55,7 @@ def connect(
         ``{DatabaseOptions.URI.value: "...", DatabaseOptions.KEYFILE.value: "/path/key.json"}``
         or ``{DatabaseOptions.URI.value: "...", DatabaseOptions.EMULATOR.value: "true"}``.
 
-    For a DBAPI 2.0 connection, prefer :func:`adbc_driver_spanner.dbapi.connect`.
+    For a DBAPI 2.0 connection, prefer :func:`spanner_adbc.dbapi.connect`.
     """
     # ** unpacking accepts the dotted, non-identifier option keys; they land in
     # AdbcDatabase's **kwargs and are forwarded as ADBC options.
@@ -74,7 +74,7 @@ def _driver_path() -> str:
         if candidate.is_file():
             return str(candidate)
     raise RuntimeError(
-        "adbc_driver_spanner: no bundled Spanner driver library found next to "
+        "spanner_adbc: no bundled Spanner driver library found next to "
         f"{here}. This usually means a source/sdist install without a matching "
         "platform wheel; install a prebuilt wheel for your platform instead."
     )

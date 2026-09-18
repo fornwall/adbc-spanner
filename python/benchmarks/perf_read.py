@@ -31,8 +31,8 @@ def main() -> int:
     print(f">> setup {N} rows", flush=True)
     bp.setup_table(database, N, 20000)
 
-    import adbc_driver_spanner.dbapi as spanner_adbc
-    from adbc_driver_spanner import DatabaseOptions
+    import spanner_adbc.dbapi as spanner_adbc
+    from spanner_adbc import DatabaseOptions
 
     conn = spanner_adbc.connect(
         db_kwargs={
