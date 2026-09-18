@@ -2739,7 +2739,7 @@ dependencies = [
 
 [[package]]
 name = "spanner-adbc"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
